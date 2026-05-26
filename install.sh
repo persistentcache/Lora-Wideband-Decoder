@@ -42,13 +42,37 @@ sudo apt-get install -y python3 python3-pip build-essential libusb-1.0-0 \
 #   * libiio/libad9361 so a from-source SoapyPlutoSDR build works later.
 # NOTE: SoapyPlutoSDR (ADALM-Pluto) and SoapyAirspyHF are NOT packaged in
 # Debian/Ubuntu — for those, build the Soapy module from source.
+# Most SDR tools live in the 'universe' component.  Make sure it's enabled —
+# without it `apt-cache show bladerf` returns nothing and every device package
+# below will skip.  Idempotent: if universe is already in sources.list this is
+# a no-op.
+if ! grep -qhE '(^|[[:space:]])universe([[:space:]]|$)' \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.list \
+        /etc/apt/sources.list.d/*.sources 2>/dev/null; then
+    echo "==> Enabling 'universe' apt component (needed for SDR packages) ..."
+    sudo apt-get install -y software-properties-common >/dev/null 2>&1 || true
+    sudo add-apt-repository -y universe 2>&1 | tail -2
+    sudo apt-get update
+fi
+
 echo "==> Installing SDR device support (skips anything not in your repo) ..."
-for pkg in soapysdr-module-all soapysdr-module-xtrx \
-           bladerf hackrf rtl-sdr airspy airspyhf \
-           uhd-host soapysdr-module-uhd \
+# Two-stage: (1) check apt cache so 'not in any source' is reported clearly;
+# (2) install with apt-get, surfacing real errors instead of swallowing them.
+# Without this, a missing 'universe' or a held package looks the same as "doesn't
+# exist anywhere" — and we couldn't diagnose either.
+for pkg in soapysdr-module-all soapysdr-module-uhd soapysdr-module-xtrx \
+           bladerf hackrf rtl-sdr airspy airspyhf uhd-host \
            libiio-utils libad9361-0; do
-    sudo apt-get install -y "$pkg" >/dev/null 2>&1 && echo "   + $pkg" \
-        || echo "   - $pkg (not available — skipped)"
+    if ! apt-cache show "$pkg" >/dev/null 2>&1; then
+        echo "   - $pkg  (not found in any apt source)"
+        continue
+    fi
+    if out=$(sudo apt-get install -y "$pkg" 2>&1); then
+        echo "   + $pkg"
+    else
+        err=$(echo "$out" | grep -E "^E:|Unable to locate|held|Depends:" | head -1)
+        echo "   - $pkg  (install failed: ${err:-see apt output})"
+    fi
 done
 
 # UHD (USRP B200/B205mini/B210) FPGA + firmware images.  uhd-host ships the
@@ -60,10 +84,17 @@ if command -v uhd_images_downloader >/dev/null 2>&1; then
 fi
 
 echo "==> Installing Python requirements ..."
-# --user keeps it out of the system site; --break-system-packages satisfies PEP 668
-# (it only touches ~/.local).  The system python3 — which the pipeline spawns —
-# sees ~/.local, so the gate/decoder get these too.
-pip3 install --user --break-system-packages -r "$HERE/requirements.txt"
+# --user keeps it out of the system site; --break-system-packages is only used
+# when this pip supports it (added in pip 23.0.1; PEP 668 enforcement applies
+# from Debian 12 / Ubuntu 23.04 onwards).  Ubuntu 22.04 ships pip 22.0.2 which
+# doesn't recognize the flag and doesn't need it — so probe first.  The system
+# python3 — which the pipeline spawns — sees ~/.local, so the gate/decoder
+# get these too.
+PIP_FLAGS="--user"
+if pip3 install --help 2>/dev/null | grep -q -- '--break-system-packages'; then
+    PIP_FLAGS="$PIP_FLAGS --break-system-packages"
+fi
+pip3 install $PIP_FLAGS -r "$HERE/requirements.txt"
 
 echo "==> SDR device access ..."
 sudo usermod -aG plugdev "$USER" 2>/dev/null || true   # device packages add udev rules
