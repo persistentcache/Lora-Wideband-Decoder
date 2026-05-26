@@ -1,0 +1,10 @@
+# LoRa / Meshtastic wideband intercept receiver — runtime dependencies.
+#   pip install -r requirements.txt
+numpy
+scipy
+cryptography          # Ed25519 ADVERT verification + AES channel decrypt
+flask                 # web UI (lora_web)
+# tomli               # ONLY needed on Python < 3.11 (3.11+ has stdlib tomllib for lora.toml)
+#
+# SoapySDR (universal multi-SDR support) is a SYSTEM package, not pip — install it
+# + your device's module via ./install.sh, or:  apt install python3-soapysdr soapysdr-module-<dev>

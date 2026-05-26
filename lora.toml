@@ -1,0 +1,37 @@
+# LoRa wideband receiver — central config.
+# Avoids passing long flag strings every run.  lora_web.py reads this to launch
+# the pipeline; lora_detect.py can load it with `--config lora.toml` (explicit
+# CLI flags still override).  All keys are optional; sane defaults apply.
+
+[radio]
+rate_hz       = 28000000     # SDR sample rate (full bandwidth to monitor)
+bandwidth_hz  = 28000000     # SDR RX bandwidth
+center_mhz    = 915.0        # SDR center freq (park between channels so the DC
+                             # spike doesn't sit on a signal)
+format        = "sc16"       # bladeRF stream format
+# gain        = 48           # OPTIONAL global RX gain (dB) or "auto" for AGC.
+                             # If unset (default), each SDR uses ITS OWN profile
+                             # default — bladeRF 48 (highest before the noise floor
+                             # clips; beats AGC), HackRF 40, etc. Uncomment to force
+                             # one gain across every SDR.
+
+[detect]
+threshold        = 0.55      # Schmidl-Cox preamble threshold
+energy_threshold = 5.0       # gate energy-peak threshold (dB)
+overlap          = 0.5       # window overlap (0.5 = 50%)
+detect_workers   = -1        # -1 = auto-scale from cpu_count (plug-and-play)
+buf_seconds      = 16        # ring buffer seconds (bigger = more burst headroom)
+commit_lag       = 4         # detect-pool commit depth (lower = lower latency)
+
+[decode]
+budget_s    = 10.0                       # per-capture decode CPU budget
+workers     = 10                         # decode worker processes
+export_dir  = "/dev/shm/live_caps"       # where captures are written (tmpfs)
+packet_log  = "/tmp/lora_packets.jsonl"  # structured packet log the web tails
+key         = "default"                  # "default" | "NOKEY" | hex/base64 PSK
+
+[web]
+host = "127.0.0.1"   # localhost-only (SECURE DEFAULT — the UI has NO authentication).
+                     # Set "0.0.0.0" to expose on the LAN, but only on a trusted
+                     # network or behind a reverse proxy with auth.
+port = 5000

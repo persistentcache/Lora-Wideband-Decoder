@@ -1,0 +1,1111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LoRa Intercept</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root{--bg:#0e1116;--panel:#161b22;--panel2:#1c232c;--line:#2b333d;--fg:#d6dee7;
+        --mut:#8b97a5;--acc:#3fa7ff;--ok:#37d67a;--enc:#ffb454;--warn:#ff5d5d;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,monospace}
+  header{display:flex;align-items:center;gap:14px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:6}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px}
+  .stats{display:flex;gap:16px;margin-left:auto;color:var(--mut);font-size:12px;align-items:center}
+  .stats b{color:var(--fg)}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+  .dot.on{background:var(--ok)} .dot.off{background:var(--warn)}
+  button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 11px;cursor:pointer;font-size:12px}
+  button:hover{border-color:var(--acc)}
+  button.go{border-color:var(--ok);color:var(--ok)} button.stop{border-color:var(--warn);color:var(--warn)}
+  nav{display:flex;gap:2px;padding:0 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+  nav a{padding:9px 16px;color:var(--mut);cursor:pointer;border-bottom:2px solid transparent}
+  nav a.active{color:var(--fg);border-bottom-color:var(--acc)}
+  .toolbar{display:flex;gap:8px;align-items:center;padding:10px 16px;flex-wrap:wrap}
+  .toolbar input[type=text]{background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--fg);padding:6px 10px;width:260px;font-size:12px}
+  .toolbar label{color:var(--mut);font-size:12px;display:flex;align-items:center;gap:5px}
+  .chip{padding:4px 10px;border:1px solid var(--line);border-radius:14px;cursor:pointer;color:var(--mut);font-size:12px}
+  .chip.active{color:var(--fg);border-color:var(--acc);background:rgba(63,167,255,.1)}
+  .wrap{padding:0 16px 40px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{position:sticky;top:0;background:var(--panel2);color:var(--mut);cursor:pointer;user-select:none;font-weight:600}
+  th:hover{color:var(--fg)} th.sorted::after{content:" \25BE";color:var(--acc)} th.sorted.asc::after{content:" \25B4"}
+  tbody tr:hover{background:var(--panel)}
+  .mono,td.mono{font-family:ui-monospace,Menlo,monospace}
+  .tag{border-radius:4px;padding:1px 7px;font-size:11px;font-weight:600}
+  .tag.dec{background:rgba(55,214,122,.15);color:var(--ok)}
+  .tag.enc{background:rgba(255,180,84,.15);color:var(--enc)}
+  .pill{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:1px 7px;color:var(--mut);font-size:11px}
+  .rssi{font-variant-numeric:tabular-nums}
+  .muted{color:var(--mut)} .right{text-align:right}
+  .empty{color:var(--mut);padding:40px;text-align:center}
+  tr.noderow{cursor:pointer} tr.noderow .caret{display:inline-block;width:12px;color:var(--mut)}
+  tr.noderow.open .caret{color:var(--acc)}
+  .rowbtn{background:rgba(63,167,255,.12);border:1px solid var(--line);border-radius:4px;cursor:pointer;
+          font-size:11px;line-height:1;padding:2px 6px;color:var(--acc);vertical-align:middle;margin-left:4px}
+  .rowbtn:hover{background:rgba(63,167,255,.30)}
+  .detail{background:#10151c}
+  .detail td{padding:0}
+  .detailbox{padding:12px 16px;display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:18px}
+  .detailbox h4{margin:0 0 6px;font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.4px}
+  .msglist{max-height:220px;overflow:auto} .msglist div{padding:2px 0;border-bottom:1px solid var(--line)}
+  .bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;margin-top:3px} .bar>i{display:block;height:100%;background:var(--acc)}
+  #net{width:100%;height:72vh;background:radial-gradient(circle at 50% 40%,#121821,#0e1116);border:1px solid var(--line);border-radius:8px;display:block}
+  .netlegend{display:flex;gap:16px;color:var(--mut);font-size:12px;padding:8px 2px}
+  .swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:middle}
+</style>
+</head>
+<body>
+<header>
+  <h1>LoRa Intercept</h1>
+  <span class="muted" id="center"></span>
+  <div class="stats">
+    <span><span class="dot off" id="pipedot"></span><span id="pipetxt">stopped</span></span>
+    <span>pkts <b id="s_pkts">0</b></span>
+    <span>decoded <b id="s_dec">0</b></span>
+    <span>encrypted <b id="s_enc">0</b></span>
+    <span>nodes <b id="s_nodes">0</b></span>
+    <button class="go" id="btnStart">Start</button>
+    <button class="stop" id="btnStop">Stop</button>
+    <button id="btnImport">Import</button>
+    <button id="btnSave">Save session</button>
+    <label title="auto-save: continuously back the session up to an importable file (the toggle is remembered across restarts)"><input type="checkbox" id="autosave"> auto-save</label>
+    <button id="btnClear">Clear</button>
+    <input type="file" id="importFile" accept=".jsonl,.json,.csv,.txt" style="display:none">
+  </div>
+</header>
+<nav>
+  <a data-tab="pkts" class="active">Packets</a>
+  <a data-tab="nodes">Nodes</a>
+  <a data-tab="net">Network</a>
+  <a data-tab="wf">Waterfall</a>
+  <a data-tab="map">Map</a>
+  <a data-tab="search">Search</a>
+  <a data-tab="stats">Stats</a>
+  <a data-tab="config">Config</a>
+  <span id="bell" title="Alerts" style="margin-left:auto;align-self:center;cursor:pointer;position:relative;padding:0 14px;font-size:15px">🔔<span id="bellct" style="display:none;position:absolute;top:-2px;right:6px;background:var(--warn);color:#fff;border-radius:9px;font-size:10px;padding:0 5px;line-height:15px"></span></span>
+  <span id="healthbar" style="align-self:center;font-size:12px;color:var(--mut);padding-right:12px"></span>
+</nav>
+<div id="warnbar" style="display:none;background:rgba(255,93,93,.15);color:#ff8c8c;padding:7px 16px;border-bottom:1px solid var(--warn);font-size:12px"></div>
+<div class="wrap">
+  <div id="tab-pkts">
+    <div class="toolbar">
+      <input type="text" id="filter" placeholder="filter (node id, text, channel, type)…">
+      <span class="chip active" data-f="all">all</span>
+      <span class="chip" data-f="dec">decoded</span>
+      <span class="chip" data-f="enc">encrypted</span>
+      <span class="chip" data-f="text">text</span>
+      <span class="chip" data-f="pos">position</span>
+      <span class="chip" data-f="nodeinfo">nodeinfo</span>
+      <span class="chip" data-f="telem">telemetry</span>
+      <span class="chip" data-f="meshtastic" style="border-color:var(--ok)">Meshtastic</span>
+      <span class="chip" data-f="lorawan" style="border-color:var(--acc)">LoRaWAN</span>
+      <span class="chip" data-f="meshcore" style="border-color:var(--acc)">MeshCore</span>
+      <span class="chip" data-f="unknown" style="border-color:var(--warn)">unknown</span>
+      <label><input type="checkbox" id="follow" checked> follow live</label>
+      <span class="muted" id="shown"></span>
+    </div>
+    <div id="pktbody"></div>
+  </div>
+  <div id="tab-nodes" style="display:none"></div>
+  <div id="tab-map" style="display:none">
+    <div id="mapinfo" class="muted" style="padding:6px 2px;font-size:12px"></div>
+    <div id="mapc" style="height:calc(100vh - 175px);min-height:420px;border:1px solid var(--line);border-radius:6px"></div>
+  </div>
+  <div id="tab-search" style="display:none"></div>
+  <div id="tab-wf" style="display:none">
+    <div class="toolbar"><label class="muted" style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" id="wfon"> Stream waterfall <span style="font-size:11px">— uses a little CPU/bandwidth while on; setting persists across sessions</span></label></div>
+    <div id="wfwrap">
+      <div class="muted" style="padding:6px 2px;font-size:12px">Live spectrum waterfall — newest row at the bottom. <span id="wfinfo"></span></div>
+      <canvas id="wfcanvas" width="512" height="300" style="width:100%;height:380px;border:1px solid var(--line);border-radius:6px;image-rendering:pixelated;background:#000;display:block"></canvas>
+      <div style="display:flex;justify-content:space-between;color:var(--mut);font-size:11px;padding:4px 4px"><span id="wf-l"></span><span id="wf-c"></span><span id="wf-r"></span></div>
+    </div>
+    <div id="wfoff" class="empty" style="display:none">Waterfall streaming is off — the gate isn't spending any cycles on it. Tick "Stream waterfall" above to enable it (persists across sessions).</div>
+  </div>
+  <div id="tab-stats" style="display:none"></div>
+  <div id="tab-config" style="display:none"></div>
+  <div id="tab-net" style="display:none">
+    <div id="topsummary" class="muted" style="padding:8px 2px;font-size:13px"></div>
+    <div class="netlegend">
+      <span><span class="swatch" style="background:#3fa7ff"></span>router / repeater</span>
+      <span><span class="swatch" style="background:#37d67a"></span>client / leaf</span>
+      <span><span class="swatch" style="background:#c77dff"></span>MQTT gateway ⬆</span>
+      <span><span class="swatch" style="background:#37d67a;height:3px;border-radius:0"></span>RF link (green→red = strong→weak SNR)</span>
+      <span>hN = relay hops from you · node size = RF neighbors</span>
+      <label style="display:flex;gap:5px;align-items:center;cursor:pointer"><input type="checkbox" id="rftoggle" checked> show RF links</label>
+    </div>
+    <svg id="net"></svg>
+  </div>
+</div>
+
+<script>
+const PK=[]; let TAB='pkts', FILTER='', PFILT='all', OPEN=new Set();
+let CFGW={}, KEYS={try_default:true,keys:[]};
+let ALERTS={rules:[]}, ALERT_LOG=[], ALERT_UNREAD=0, ALERTPANEL_OPEN=false;
+const SEEN_NODES=new Set(); const _alertFired=new Set(); const _geoState={};
+const STATIC=(()=>{try{return new URLSearchParams(location.search).has('static');}catch(e){return false;}})();
+const SORT={pkts:{k:'ts',dir:-1}, nodes:{k:'count',dir:-1}};
+const $=s=>document.querySelector(s);
+const fmtTime=ts=>ts?new Date(ts*1000).toLocaleTimeString():'';
+const fmtDateTime=ts=>ts?new Date(ts*1000).toLocaleString():'';
+const ago=ts=>ts?Math.max(0,Math.round(Date.now()/1000-ts))+'s':'';
+const esc=s=>(s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const NAMES={};                       // node id -> friendly name (from NODEINFO)
+let NODEMETA={};                       // node id -> {label,notes,watch,watch_mode} (user-set)
+function noteName(p){ const n=p.node_short||p.node_long; if(n&&p.from)NAMES[p.from]=n; }
+function disp(id){ const m=NODEMETA[id]; if(m&&m.label)return m.label; return (id&&NAMES[id])?NAMES[id]:id; }
+// node id cell: user label > NODEINFO name > raw id, with a watchlist dot
+function idCell(id){ if(!id)return '<span class="muted">—</span>'; const m=NODEMETA[id]||{}; const lbl=m.label||(id&&NAMES[id]); const w=m.watch?'<span title="watchlist" style="color:var(--warn)">●</span> ':'';
+  return lbl?`${w}${esc(lbl)} <span class="muted">${esc(id)}</span>`:`${w}<span class="mono">${esc(id)}</span>`; }
+
+function nodeStats(){
+  const m={};
+  for(const p of PK){
+    const id=p.from; if(!id)continue;   // unknown-protocol frames have no sender identity
+    const n=m[id]||(m[id]={id,count:0,decoded:0,encrypted:0,rssiSum:0,rssiN:0,rssiMin:1e9,rssiMax:-1e9,first:p.ts,last:p.ts,chans:new Set(),lastText:null,long:null,short:null,hw:null,role:null,hopmin:99,mqtt:false});
+    n.count++; (p.decrypted?n.decoded++:n.encrypted++);
+    if(p.node_long)n.long=p.node_long; if(p.node_short)n.short=p.node_short; if(p.hw)n.hw=p.hw; if(p.role)n.role=p.role;
+    if(p.hops!=null&&p.hops<n.hopmin)n.hopmin=p.hops;   // closest we've heard this node (hops from us)
+    if(p.via_mqtt)n.mqtt=true;                          // bridged to the internet via an MQTT gateway
+    if(p.ts<n.first)n.first=p.ts; if(p.ts>n.last)n.last=p.ts;
+    if(p.chan)n.chans.add(p.chan); if(p.text)n.lastText=p.text;
+    if(p.hops===0&&p.rssi!=null){n.rssiSum+=p.rssi;n.rssiN++;n.rssiMin=Math.min(n.rssiMin,p.rssi);n.rssiMax=Math.max(n.rssiMax,p.rssi);}
+  }
+  return Object.values(m).map(n=>({...n,avg:(n.rssiN?n.rssiSum/n.rssiN:null),chans:[...n.chans],hopmin:(n.hopmin===99?null:n.hopmin)}));
+}
+function edgeStats(){
+  const m={};
+  for(const p of PK){
+    const k=(p.from||'?')+'|'+(p.to||'?');
+    const e=m[k]||(m[k]={from:p.from||'?',to:p.to||'?',count:0,decoded:0,encrypted:0,last:p.ts});
+    e.count++; (p.decrypted?e.decoded++:e.encrypted++); e.last=p.ts;
+  }
+  return Object.values(m);
+}
+function neighborEdges(){
+  // Latest NeighborInfo per reporting node → RF links (reporter heard neighbor @ SNR).
+  const latest={};
+  for(const p of PK){ if(p.neighbors&&p.neighbors.length){const t=p.ts||0; if(!latest[p.from]||t>=latest[p.from].ts) latest[p.from]={ts:t,list:p.neighbors};} }
+  const out=[];
+  for(const id in latest) for(const nb of latest[id].list){ if(nb.node&&nb.node!==id) out.push({from:id,to:nb.node,snr:nb.snr}); }
+  return out;
+}
+function nodeDetail(id){
+  // Group a message's hop copies (same pktid: hop0 original + hop1.. relays)
+  // into ONE entry annotated with how many times it was relayed, instead of
+  // listing the same text once per hop.
+  const byPid={},convo={},pkts=[]; let pos=null, meta={}, tel=null, rt=null, nbr=null;
+  for(const p of PK){ if((p.from||'?')!==id) continue;
+    pkts.push(p);
+    const to=p.to||'?'; convo[to]=(convo[to]||0)+1;
+    if(p.lat!=null&&p.lon!=null) pos={lat:p.lat,lon:p.lon,alt:p.alt,ts:p.ts};
+    if(p.route&&p.route.length) rt={route:p.route,snr:p.route_snr,to:to,ts:p.ts};
+    if(p.neighbors&&p.neighbors.length) nbr={list:p.neighbors,interval:p.nbr_interval,ts:p.ts};
+    if(p.battery!=null||p.voltage!=null||p.chutil!=null) tel={battery:p.battery,voltage:p.voltage,chutil:p.chutil,airutil:p.airutil,ts:p.ts};
+    if(p.node_long)meta.long=p.node_long; if(p.node_short)meta.short=p.node_short;
+    if(p.hw)meta.hw=p.hw; if(p.role)meta.role=p.role;
+    if(p.decrypted&&p.text){
+      const g=byPid[p.pktid]||(byPid[p.pktid]={ts:p.ts,to:to,text:p.text,maxhop:0,copies:0});
+      g.copies++; g.maxhop=Math.max(g.maxhop,p.hops||0); if(p.ts<g.ts){g.ts=p.ts;}
+    }
+  }
+  const msgs=Object.values(byPid).sort((a,b)=>b.ts-a.ts).slice(0,60);
+  return {msgs, convo:Object.entries(convo).sort((a,b)=>b[1]-a[1]), pkts:pkts.slice(-30).reverse(), pos, meta, tel, rt, nbr};
+}
+const TYPEMAP={text:'TEXT_MESSAGE_APP',pos:'POSITION_APP',nodeinfo:'NODEINFO_APP',telem:'TELEMETRY_APP'};
+const PROTOS=['meshtastic','lorawan','meshcore','unknown'];
+const proto=p=>p.proto||'meshtastic';
+function matchFilter(p){
+  const pr=proto(p);
+  if(PFILT==='dec'&&!p.decrypted) return false;
+  if(PFILT==='enc'&&!(pr==='meshtastic'&&!p.decrypted)) return false;   // "encrypted" = undecoded Meshtastic
+  if(PROTOS.includes(PFILT)&&pr!==PFILT) return false;
+  if(TYPEMAP[PFILT]&&p.port_name!==TYPEMAP[PFILT]) return false;
+  if(!FILTER) return true;
+  const f=FILTER.toLowerCase();
+  return [p.from,p.to,p.text,p.summary,p.chan,p.port_name,p.pktid,p.proto,p.raw_hex].some(x=>x&&String(x).toLowerCase().includes(f));
+}
+// per-protocol cell renderers for the packet feed
+// Trust badge: how sure are we this frame is a real frame of its claimed protocol?
+//  verified  = cryptographic proof (e.g. MeshCore ADVERT Ed25519 signature)
+//  confirmed = behavioral proof (persistent identity + coherent frame counter)
+//  candidate = structurally valid but unverified — treat with caution
+function confBadge(p){const c=p.confidence;
+  if(c==='verified') return ' <span class="tag" title="cryptographically verified (signature or decrypt) — definitely this protocol" style="background:rgba(46,204,113,.18);color:#2ecc71">✓ verified</span>';
+  if(c==='confirmed')return ' <span class="tag" title="behaviorally confirmed: persistent identity + coherent counter — effectively certain" style="background:rgba(63,167,255,.18);color:var(--acc)">✓ confirmed</span>';
+  return '';}
+// An 'unknown' frame may structurally RESEMBLE a protocol without being identified.
+// We never claim it — only show a non-committal hint (could be that protocol, or one
+// we haven't implemented).  Promotes to a named protocol only on positive evidence.
+function hintBadge(p){if(!p.hint)return '';
+  const nm={lorawan:'LoRaWAN',meshcore:'MeshCore'}[p.hint]||esc(p.hint);
+  const og=(p.on_grid===false)?' <span class="tag" title="off the LoRaWAN channel grid for this region" style="background:rgba(255,93,93,.16);color:var(--warn)">off-grid</span>':'';
+  const kh=(p.mc_known_hops)?' <span class="tag" title="routed through '+p.mc_known_hops+' crypto-verified MeshCore node(s) — needs 2 to confirm" style="background:rgba(63,167,255,.16);color:var(--acc)">via '+p.mc_known_hops+' known</span>':'';
+  return ' <span class="tag" title="structurally resembles '+nm+' but NOT identified — unconfirmed, could be an unimplemented protocol" style="background:rgba(255,176,32,.16);color:#ffb020">? looks like '+nm+'</span>'+og+kh;}
+function pktState(p){const pr=proto(p);
+  if(pr==='meshtastic')return p.decrypted?'<span class="tag dec">decoded</span>':'<span class="tag enc">encrypted'+(p.enc_hex?' ▸':'')+'</span>';
+  if(pr==='unknown')return '<span class="tag" style="background:rgba(150,150,150,.16);color:#9aa6b2">unknown</span>'+hintBadge(p)+confBadge(p);
+  const lbl={lorawan:'LoRaWAN',meshcore:'MeshCore'}[pr]||esc(pr);
+  return '<span class="tag" style="background:rgba(63,167,255,.15);color:var(--acc)">'+esc(lbl)+'</span>'+confBadge(p);}
+function pktType(p){const pr=proto(p);
+  if(pr==='meshtastic')return esc(p.port_name||(p.decrypted?'':'—'));
+  if(pr==='lorawan')return esc(p.msg_type||'LoRaWAN');
+  if(pr==='meshcore')return esc(p.mc_type||'MeshCore');
+  return '<span class="muted">—</span>';}
+function meshSummary(p){   // human one-liner for a decoded Meshtastic packet (never blank)
+  if(p.text)return esc(p.text);
+  const pn=p.port_name||'';
+  if(pn==='POSITION_APP'&&p.lat!=null)return '📍 '+p.lat+', '+p.lon+(p.alt!=null?' · '+p.alt+'m':'');
+  if(pn==='NODEINFO_APP')return [p.node_long||p.node_short,p.hw,p.role].filter(Boolean).map(esc).join(' · ')||'node info';
+  if(pn==='MAP_REPORT_APP')return [p.node_long||p.node_short,(p.lat!=null?'📍 '+p.lat+', '+p.lon:null)].filter(Boolean).map(esc).join(' · ')||'map report';
+  if(pn==='TELEMETRY_APP'){const t=[];if(p.battery!=null)t.push('🔋 '+p.battery+'%');if(p.voltage!=null)t.push(p.voltage+'V');if(p.chutil!=null)t.push('ch '+p.chutil+'%');if(p.airutil!=null)t.push('airTX '+p.airutil+'%');return t.join(' · ')||'telemetry';}
+  if(pn==='TRACEROUTE_APP'&&p.route)return 'route: '+p.route.map(h=>esc(disp(h))).join(' → ');
+  if(pn==='NEIGHBORINFO_APP'&&p.neighbors)return p.neighbors.length+' RF neighbor'+(p.neighbors.length===1?'':'s');
+  if(pn==='WAYPOINT_APP'&&p.waypoint)return '📍 '+esc(p.waypoint.name||'waypoint');
+  if(pn==='ROUTING_APP'&&p.routing)return esc(p.routing);
+  if(p.pax_wifi!=null)return 'wifi '+p.pax_wifi+' · ble '+p.pax_ble;
+  if(p.payload_hex)return '<span class="mono muted">hex '+esc(p.payload_hex.slice(0,24))+'</span>';
+  return '<span class="muted">'+esc(pn||'decoded')+'</span>';}
+function pktMsg(p){const pr=proto(p);
+  if(pr==='meshtastic')return p.decrypted?meshSummary(p):'<span class="muted">— contents hidden —</span>';
+  if(p.summary)return esc(p.summary);
+  if(p.raw_hex)return '<span class="mono muted">'+esc(p.raw_hex.slice(0,40))+(p.raw_hex.length>40?'…':'')+'</span>';
+  return '';}
+function sortRows(rows,k,dir){return rows.slice().sort((a,b)=>{let x=a[k],y=b[k];if(x==null)x=-Infinity;if(y==null)y=-Infinity;if(typeof x==='string'||typeof y==='string'){x=String(x);y=String(y);return x<y?-dir:x>y?dir:0;}return (x-y)*dir;});}
+function thead(cols,tab){const s=SORT[tab];return '<tr>'+cols.map(c=>`<th data-k="${c.k}" class="${s.k===c.k?'sorted '+(s.dir>0?'asc':''):''}">${c.t}</th>`).join('')+'</tr>';}
+function wireSort(el,tab,render){el.querySelectorAll('th[data-k]').forEach(th=>th.onclick=()=>{const k=th.dataset.k,s=SORT[tab];if(s.k===k)s.dir=-s.dir;else{s.k=k;s.dir=-1;}render();});}
+
+// ---------- PACKETS ----------
+function renderPkts(){
+  const cols=[{k:'ts',t:'time'},{k:'from',t:'from'},{k:'to',t:'to'},{k:'hops',t:'hops'},
+              {k:'chan',t:'chan'},{k:'port_name',t:'type'},{k:'rssi',t:'rssi'},{k:'decrypted',t:'state'},{k:'text',t:'message / payload'}];
+  // Conjoin a message's hop copies (same pktid received at hop0, hop1, …) into ONE
+  // row.  Representative = the best reception (decoded first, then fewest hops);
+  // `_maxhop` records how far it was relayed.  Non-Meshtastic frames (no pktid)
+  // stay as individual rows.
+  const groups=new Map(); let _gi=0;
+  for(const p of PK.filter(matchFilter)){
+    const key=(proto(p)==='meshtastic'&&p.pktid!=null)?('m|'+p.pktid):('x'+(_gi++));
+    const g=groups.get(key);
+    if(!g){groups.set(key,{rep:p,maxhop:(p.hops||0)});}
+    else{g.maxhop=Math.max(g.maxhop,p.hops||0);
+      const better=((p.decrypted?1:0)-(g.rep.decrypted?1:0))||((g.rep.hops??99)-(p.hops??99));
+      if(better>0)g.rep=p;}
+  }
+  let reps=[...groups.values()].map(g=>({...g.rep,_maxhop:g.maxhop}));
+  reps=sortRows(reps,SORT.pkts.k,SORT.pkts.dir);
+  $('#shown').textContent=reps.length+' shown / '+PK.length+' packets';
+  const body=reps.slice(0,3000).map(p=>{const ret=!p.decrypted&&p.enc_hex; const wm=NODEMETA[p.from]; const hi=wm&&wm.watch&&wm.watch_mode!=='alert';
+    const hopcell=p._maxhop>0?`<span class="pill" title="received via up to ${p._maxhop} relay hop${p._maxhop===1?'':'s'}">↻ ${p._maxhop}</span>`:(p.hops??'');
+    return `<tr data-pktid="${esc(p.pktid)}" data-hops="${p.hops}"${ret?' class="encrow"':''}${hi?' style="background:rgba(255,93,93,.13);box-shadow:inset 3px 0 0 var(--warn)"':''}>
+    <td class="muted">${fmtTime(p.ts)}</td><td>${idCell(p.from)}</td><td>${idCell(p.to)}</td>
+    <td>${hopcell}</td><td class="mono muted">${esc(p.chan||'')}</td>
+    <td>${pktType(p)}</td><td class="rssi">${p.rssi==null?'':p.rssi}</td>
+    <td>${pktState(p)}${ret?' <button class="rowbtn keytry" title="try decoding with a channel key">🔑 key</button>':''}</td>
+    <td>${pktMsg(p)}</td></tr>`}).join('');
+  const el=$('#pktbody');
+  el.innerHTML=`<table><thead>${thead(cols,'pkts')}</thead><tbody>${body||'<tr><td colspan=9 class=empty>no packets yet — press Start</td></tr>'}</tbody></table>`;
+  wireSort(el,'pkts',renderPkts);
+  wireRetryMenu(el);
+  // Left-click 🔑 button → same decode menu (reliable everywhere; right-click also works).
+  el.querySelectorAll('.keytry').forEach(b=>b.onclick=e=>{e.stopPropagation();
+    const tr=b.closest('tr'), r=b.getBoundingClientRect();
+    showDecodeMenu(tr.dataset.pktid, parseInt(tr.dataset.hops), r.left, r.bottom);});
+}
+
+// ---------- NODES (expandable) ----------
+function renderNodes(){
+  const cols=[{k:'id',t:'node'},{k:'count',t:'packets'},{k:'decoded',t:'decoded'},{k:'encrypted',t:'encrypted'},
+              {k:'avg',t:'avg rssi (own tx)'},{k:'last',t:'last seen'},{k:'lastText',t:'last message'}];
+  let rows=nodeStats().filter(n=>!FILTER||matchFilter({from:n.id,text:n.lastText,chan:n.chans.join(' ')}));
+  rows=sortRows(rows,SORT.nodes.k,SORT.nodes.dir);
+  const avgs=rows.map(n=>n.avg).filter(v=>v!=null); const maxR=avgs.length?Math.max(...avgs):1,minR=avgs.length?Math.min(...avgs):0;
+  let body='';
+  for(const n of rows){
+    const frac=(n.avg!=null&&maxR>minR)?(n.avg-minR)/(maxR-minR):0; const op=OPEN.has(n.id);
+    body+=`<tr class="noderow ${op?'open':''}" data-id="${esc(n.id)}">
+      <td><span class="caret">${op?'▾':'▸'}</span> ${idCell(n.id)} ${n.chans.map(c=>`<span class="pill">${esc(c)}</span>`).join('')}<button class="rowbtn nodemenu" title="node options — label, note, watchlist">⋯</button></td>
+      <td class="right">${n.count}</td><td class="right">${n.decoded}</td>
+      <td class="right">${n.encrypted?'<span class="tag enc">'+n.encrypted+'</span>':'0'}</td>
+      <td class="right rssi">${n.avg==null?'<span class=muted>—</span>':n.avg.toFixed(1)}${n.avg!=null?`<div class="bar"><i style="width:${Math.round(frac*100)}%"></i></div>`:''}</td>
+      <td class="muted">${ago(n.last)} ago</td><td>${esc(n.lastText||'')}</td></tr>`;
+    if(op){
+      const d=nodeDetail(n.id);
+      const convo=d.convo.map(([to,c])=>`<div>→ ${idCell(to)} <span class="pill">${c}</span></div>`).join('')||'<span class=muted>none</span>';
+      const msgs=d.msgs.map(m=>`<div><span class="muted">${fmtTime(m.ts)}</span> <span class="mono">→${esc(m.to)}</span> ${esc(m.text)}${m.maxhop>0?` <span class="pill">↻ hopped ${m.maxhop}×</span>`:''}</div>`).join('')||'<span class=muted>no decoded messages</span>';
+      const rssi=n.avg==null?'<span class=muted>no own-tx samples</span>':`avg <b>${n.avg.toFixed(1)}</b> · min ${n.rssiMin} · max ${n.rssiMax} · ${n.rssiN} samples`;
+      const meta=d.meta||{}; const idn=meta.long||meta.short;
+      const _hopline=(n.hopmin!=null?(n.hopmin===0?'<span class="pill">heard directly</span>':'<span class="pill">via '+n.hopmin+' hop'+(n.hopmin===1?'':'s')+'</span>'):'')+(n.mqtt?' <span class="pill" style="color:#c77dff">⬆ MQTT gateway</span>':'');
+      const ident=(idn||meta.hw||meta.role||_hopline)?`<h4>Identity</h4>${idn?esc(idn)+' ':''}${meta.hw?'<span class="pill">'+esc(meta.hw)+'</span> ':''}${meta.role?'<span class="pill">'+esc(meta.role)+'</span> ':''}${_hopline}<br><br>`:'';
+      const um=NODEMETA[n.id]||{}; const note=um.notes?`<h4>Notes</h4>${esc(um.notes)}<br><br>`:''; const watch=um.watch?`<h4>Watchlist</h4><span style="color:var(--warn)">● watching (${esc(um.watch_mode||'highlight')})</span><br><br>`:'';
+      const loc=d.pos?`<h4>Location</h4>📍 ${d.pos.lat}, ${d.pos.lon}${d.pos.alt!=null?' · '+d.pos.alt+'m':''} <a target="_blank" href="https://www.openstreetmap.org/?mlat=${d.pos.lat}&mlon=${d.pos.lon}#map=14/${d.pos.lat}/${d.pos.lon}">map</a><br><br>`:'';
+      const t=d.tel; const tel=t?`<h4>Telemetry</h4>${t.battery!=null?'🔋 '+t.battery+'%':''}${t.voltage!=null?' · '+t.voltage+'V':''}${t.chutil!=null?' · ch '+t.chutil+'%':''}${t.airutil!=null?' · airTX '+t.airutil+'%':''}<br><br>`:'';
+      const rt=d.rt; const route=rt?`<h4>Traceroute</h4><span class="mono">${esc(disp(n.id))} → ${rt.route.map(h=>esc(disp(h))).join(' → ')} → ${esc(disp(rt.to))}</span>${rt.snr&&rt.snr.length?'<br><span class="muted">SNR: '+rt.snr.map(s=>esc(s)).join(', ')+'</span>':''}<br><br>`:'';
+      const nb=d.nbr; const neigh=nb?`<h4>RF neighbors (${nb.list.length})</h4>${nb.list.map(x=>`<span class="mono">${esc(disp(x.node))}</span>${x.snr!=null?' <span class="muted">'+esc(x.snr)+'dB</span>':''}`).join('<br>')}<br><br>`:'';
+      body+=`<tr class="detail"><td colspan="7"><div class="detailbox">
+        <div><h4>Messages</h4><div class="msglist">${msgs}</div></div>
+        <div><h4>Talks to</h4>${convo}</div>
+        <div>${ident}${note}${watch}${loc}${tel}${route}${neigh}<h4>Signal (own transmissions)</h4>${rssi}<br><br>
+          <h4>Totals</h4>${n.count} packets · ${n.decoded} decoded · ${n.encrypted} encrypted<br>channels: ${n.chans.map(c=>esc(c)).join(', ')||'—'}<br>
+          first seen: ${fmtDateTime(n.first)}<br>last seen: ${fmtDateTime(n.last)} <span class="muted">(${ago(n.last)} ago)</span></div>
+      </div></td></tr>`;
+    }
+  }
+  const el=$('#tab-nodes');
+  el.innerHTML=`<div class="toolbar"><input type="text" id="filter2" placeholder="filter nodes…" value="${esc(FILTER)}"><span class="muted">click a row to expand</span></div>
+    <table><thead>${thead(cols,'nodes')}</thead><tbody>${body||'<tr><td colspan=7 class=empty>no nodes yet</td></tr>'}</tbody></table>`;
+  el.querySelectorAll('tr.noderow').forEach(tr=>tr.onclick=()=>{const id=tr.dataset.id;OPEN.has(id)?OPEN.delete(id):OPEN.add(id);renderNodes();});
+  // Left-click ⋯ button → node menu (reliable; right-click also works). stopPropagation
+  // so it doesn't also toggle the row's expand.
+  el.querySelectorAll('.nodemenu').forEach(b=>b.onclick=e=>{e.stopPropagation();
+    const tr=b.closest('tr'), r=b.getBoundingClientRect();
+    showNodeMenu(tr.dataset.id, r.left, r.bottom);});
+  wireSort(el,'nodes',renderNodes);
+  const f2=$('#filter2'); if(f2)f2.oninput=e=>{FILTER=e.target.value.trim();renderNodes();};
+}
+
+// ---------- NETWORK (force-directed) ----------
+const G={nodes:[],edges:[],rfedges:[],raf:null,hover:null,map:{}};
+let SHOW_RF=true;
+const svg=$('#net');
+function gw(){return svg.clientWidth||800;} function gh(){return svg.clientHeight||500;}
+const BACKBONE_ROLES=new Set(['ROUTER','ROUTER_CLIENT','REPEATER']);
+function buildGraph(){
+  const ns=nodeStats(), es=edgeStats(); const old={}; G.nodes.forEach(n=>old[n.id]=n);
+  const W=gw(),H=gh();
+  G.nodes=ns.map(s=>{const o=old[s.id]||{x:W/2+(Math.random()-.5)*240,y:H/2+(Math.random()-.5)*240,vx:0,vy:0};
+    return {id:s.id,x:o.x,y:o.y,vx:o.vx,vy:o.vy,count:s.count,enc:s.encrypted,dec:s.decoded,
+            role:s.role,hopmin:s.hopmin,mqtt:s.mqtt,deg:0};});
+  // ensure broadcast / unicast destinations that never transmit also appear
+  const have={}; G.nodes.forEach(n=>have[n.id]=n);
+  const rfs=SHOW_RF?neighborEdges():[];
+  const addNode=id=>{if(!have[id]){const o=old[id]||{x:W/2+(Math.random()-.5)*240,y:H/2+(Math.random()-.5)*240,vx:0,vy:0};
+    const nn={id,x:o.x,y:o.y,vx:o.vx,vy:o.vy,count:0,enc:0,dec:0,role:null,hopmin:null,mqtt:false,deg:0};have[id]=nn;G.nodes.push(nn);}};
+  for(const e of es){ addNode(e.from); addNode(e.to); }
+  for(const e of rfs){ addNode(e.from); addNode(e.to); }
+  G.map=have;
+  G.edges=es.map(e=>({a:have[e.from],b:have[e.to],count:e.count,enc:e.encrypted})).filter(e=>e.a&&e.b);
+  G.rfedges=rfs.map(e=>({a:have[e.from],b:have[e.to],snr:e.snr})).filter(e=>e.a&&e.b);
+  // RF-neighbor degree = how many nodes this one is directly linked to (importance)
+  for(const e of G.rfedges){ e.a.deg++; e.b.deg++; }
+  _updateTopoSummary();
+}
+function _updateTopoSummary(){
+  const el=$('#topsummary'); if(!el)return;
+  const real=G.nodes.filter(n=>n.id!=='broadcast');
+  const routers=real.filter(n=>n.role&&BACKBONE_ROLES.has(n.role)).length;
+  const gws=real.filter(n=>n.mqtt).length;
+  const depths=real.map(n=>n.hopmin).filter(h=>h!=null);
+  const maxd=depths.length?Math.max(...depths):null;
+  const direct=real.filter(n=>n.hopmin===0).length;
+  el.innerHTML=`<b>${real.length}</b> nodes · <b>${routers}</b> router/repeater · <b>${gws}</b> MQTT gateway`
+    +` · <b>${direct}</b> heard directly${maxd!=null?` · max relay depth <b>${maxd}</b> hop${maxd===1?'':'s'}`:''}`
+    +` · <b>${G.rfedges.length}</b> RF links`+(G.rfedges.length?'':' <span style="color:var(--mut)">(none yet — nodes must broadcast NeighborInfo)</span>');
+}
+function tick(){
+  const W=gw(),H=gh(),N=G.nodes;
+  const rep=Math.max(9000,W*H/22);   // scale repulsion to canvas so it fills it
+  for(let i=0;i<N.length;i++)for(let j=i+1;j<N.length;j++){
+    let dx=N[i].x-N[j].x,dy=N[i].y-N[j].y,d2=dx*dx+dy*dy+0.01,d=Math.sqrt(d2),f=rep/d2,fx=f*dx/d,fy=f*dy/d;
+    N[i].vx+=fx;N[i].vy+=fy;N[j].vx-=fx;N[j].vy-=fy;}
+  for(const e of G.edges){if(e.a===e.b)continue;let dx=e.b.x-e.a.x,dy=e.b.y-e.a.y,d=Math.sqrt(dx*dx+dy*dy)+0.01,f=(d-160)*0.011,fx=f*dx/d,fy=f*dy/d;
+    e.a.vx+=fx;e.a.vy+=fy;e.b.vx-=fx;e.b.vy-=fy;}
+  for(const e of G.rfedges){if(e.a===e.b)continue;let dx=e.b.x-e.a.x,dy=e.b.y-e.a.y,d=Math.sqrt(dx*dx+dy*dy)+0.01,f=(d-130)*0.006,fx=f*dx/d,fy=f*dy/d;
+    e.a.vx+=fx;e.a.vy+=fy;e.b.vx-=fx;e.b.vy-=fy;}
+  for(const n of N){n.vx+=(W/2-n.x)*0.003;n.vy+=(H/2-n.y)*0.003;n.vx*=0.86;n.vy*=0.86;n.x+=n.vx;n.y+=n.vy;
+    n.x=Math.max(30,Math.min(W-30,n.x));n.y=Math.max(30,Math.min(H-30,n.y));}
+}
+// Colour = ROLE (the overarching topology): gateway > backbone > leaf.
+function nodeColor(n){ if(n.id==='broadcast')return '#3a4654';   // app-layer pseudo-node, muted
+  if(n.mqtt)return '#c77dff';                                    // MQTT gateway (internet bridge)
+  if(n.role&&BACKBONE_ROLES.has(n.role))return '#3fa7ff';        // router / repeater (backbone)
+  return '#37d67a'; }                                            // client / leaf
+function nodeR(n){ if(n.id==='broadcast')return 9;
+  const base=(n.role&&BACKBONE_ROLES.has(n.role))?10:7;          // backbone drawn larger
+  return base+Math.sqrt(n.deg||0)*2.0; }                         // + RF-neighbour degree
+function drawGraph(){
+  const hv=G.hover, conn=new Set();
+  if(hv){conn.add(hv); G.edges.forEach(e=>{if(e.a.id===hv){conn.add(e.b.id);}if(e.b.id===hv){conn.add(e.a.id);}});
+    G.rfedges.forEach(e=>{if(e.a.id===hv){conn.add(e.b.id);}if(e.b.id===hv){conn.add(e.a.id);}});}
+  // arrowhead markers (grey for decoded, orange for encrypted)
+  let s='<defs>'+
+    '<marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#5a6b7d"/></marker>'+
+    '<marker id="ahe" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#ffb454"/></marker></defs>';
+  // RF-neighbor links (NeighborInfo) = the real radio topology.  Colour by link
+  // quality: strong ≥ -7 dB green, marginal yellow, weak < -15 dB red; SNR on hover.
+  for(const e of G.rfedges){ if(e.a===e.b)continue;
+    const on=!hv||(e.a.id===hv||e.b.id===hv);
+    const col=(e.snr==null)?'#5a6b7d':(e.snr>=-7?'#37d67a':(e.snr>=-15?'#e8c06a':'#ff5d5d'));
+    s+=`<line x1="${e.a.x}" y1="${e.a.y}" x2="${e.b.x}" y2="${e.b.y}" stroke="${col}" stroke-opacity="${on?0.75:0.07}" stroke-width="2"/>`;
+    if(hv&&(e.a.id===hv||e.b.id===hv)&&e.snr!=null)
+      s+=`<text x="${(e.a.x+e.b.x)/2}" y="${(e.a.y+e.b.y)/2-3}" fill="${col}" font-size="10" text-anchor="middle">${esc(e.snr)}dB</text>`;
+  }
+  for(const e of G.edges){ if(e.a===e.b)continue;
+    const on=!hv||(e.a.id===hv||e.b.id===hv); const col=e.enc?'#ffb454':'#3a4654';
+    // stop the line at the receiver's circle edge so the arrow (who→whom) shows
+    let dx=e.b.x-e.a.x,dy=e.b.y-e.a.y,d=Math.sqrt(dx*dx+dy*dy)||1, r=nodeR(e.b)+8;
+    let x2=e.b.x-dx/d*r, y2=e.b.y-dy/d*r;
+    s+=`<line x1="${e.a.x}" y1="${e.a.y}" x2="${x2}" y2="${y2}" stroke="${col}" stroke-opacity="${on?0.75:0.07}" stroke-width="${Math.min(6,1+Math.log2(1+e.count))}" marker-end="url(#${e.enc?'ahe':'ah'})"/>`;
+  }
+  for(const n of G.nodes){ const on=!hv||conn.has(n.id); const r=nodeR(n);
+    const tag=(n.id!=='broadcast'&&n.hopmin!=null)?` <tspan fill="#8b97a5">h${n.hopmin}</tspan>`:'';
+    const gw=n.mqtt?'<tspan fill="#c77dff"> ⬆</tspan>':'';
+    s+=`<g opacity="${on?1:0.18}" data-id="${esc(n.id)}" style="cursor:pointer">
+      <circle cx="${n.x}" cy="${n.y}" r="${r}" fill="${nodeColor(n)}" stroke="#0e1116" stroke-width="1.5"/>
+      <text x="${n.x}" y="${n.y-r-5}" fill="#d6dee7" font-size="12" text-anchor="middle" font-family="ui-monospace">${esc(disp(n.id))}${tag}${gw}</text></g>`;
+  }
+  svg.innerHTML=s;
+  svg.querySelectorAll('g[data-id]').forEach(g=>{
+    g.onmouseenter=()=>{G.hover=g.dataset.id;}; g.onmouseleave=()=>{G.hover=null;};
+  });
+}
+function netLoop(){ if(TAB!=='net'){G.raf=null;return;} tick(); drawGraph(); G.raf=requestAnimationFrame(netLoop); }
+function startNet(){
+  const rt=$('#rftoggle'); if(rt){rt.checked=SHOW_RF; rt.onchange=()=>{SHOW_RF=rt.checked;buildGraph();drawGraph();};}
+  buildGraph();
+  if(STATIC){ for(let i=0;i<400;i++)tick(); drawGraph(); return; }   // fixed layout for screenshots
+  if(!G.raf)G.raf=requestAnimationFrame(netLoop); }
+
+// ---------- STATS dashboard ----------
+function renderStatsTab(){
+  const el=$('#tab-stats');
+  const total=PK.length, dec=PK.filter(p=>p.decrypted).length, enc=total-dec;
+  const ns=nodeStats();
+  const ts=PK.map(p=>p.ts).filter(Boolean);
+  const span=ts.length>1?(Math.max(...ts)-Math.min(...ts)):0;
+  const ppm=span>5?(total/(span/60)):0;
+  const types={}; for(const p of PK){if(proto(p)!=='meshtastic')continue; const t=p.decrypted?(p.port_name||'OTHER'):'(encrypted)'; types[t]=(types[t]||0)+1;}
+  const ch={}; for(const p of PK){if(p.chan)ch[p.chan]=(ch[p.chan]||0)+1;}
+  const prots={}; for(const p of PK){const pr=proto(p); prots[pr]=(prots[pr]||0)+1;}
+  const topN=ns.slice().sort((a,b)=>b.count-a.count).slice(0,12);
+  const bar=(label,val,max,color)=>`<div style="display:flex;align-items:center;gap:8px;margin:3px 0"><div style="width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" class="mono">${esc(label)}</div><div class="bar" style="flex:1;height:14px"><i style="width:${max?Math.round(val/max*100):0}%;background:${color||'var(--acc)'}"></i></div><div style="width:46px;text-align:right">${val}</div></div>`;
+  const tmax=Math.max(1,...Object.values(types)), nmax=Math.max(1,...topN.map(n=>n.count)), cmax=Math.max(1,...Object.values(ch)), pmax=Math.max(1,...Object.values(prots));
+  const card=(lbl,val,col)=>`<div class="nodecard" style="min-width:96px"><div class="muted" style="font-size:11px">${lbl}</div><div style="font-size:22px;font-weight:700${col?';color:'+col:''}">${val}</div></div>`;
+  el.innerHTML=`<div style="padding:16px 0;max-width:920px">
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:18px">
+      ${card('packets',total)}${card('decoded',dec,'var(--ok)')}${card('encrypted',enc,'var(--enc)')}${card('nodes',ns.length)}${card('packets/min',ppm.toFixed(1))}</div>
+    <h4 style="color:var(--mut)">Protocols</h4>
+    ${Object.entries(prots).sort((a,b)=>b[1]-a[1]).map(([t,v])=>bar(t,v,pmax,t==='meshtastic'?'var(--ok)':t==='unknown'?'var(--warn)':'var(--acc)')).join('')||'<span class=muted>none</span>'}
+    <h4 style="color:var(--mut);margin-top:18px">Packet types (Meshtastic)</h4>
+    ${Object.entries(types).sort((a,b)=>b[1]-a[1]).map(([t,v])=>bar(t,v,tmax,t==='(encrypted)'?'var(--enc)':'var(--acc)')).join('')||'<span class=muted>none</span>'}
+    <h4 style="color:var(--mut);margin-top:18px">Top nodes</h4>
+    ${topN.map(n=>bar(disp(n.id),n.count,nmax)).join('')||'<span class=muted>none</span>'}
+    <h4 style="color:var(--mut);margin-top:18px">Channels</h4>
+    ${Object.entries(ch).sort((a,b)=>b[1]-a[1]).map(([c,v])=>bar(c,v,cmax)).join('')||'<span class=muted>none</span>'}
+  </div>`;
+}
+
+// ---------- HEALTH panel ----------
+function renderHealth(h){
+  const hb=$('#healthbar'); if(hb){
+    if(h.msps==null){hb.textContent='';}
+    else{const rate=h.rate_msps||28, behind=h.msps<0.95*rate;
+      hb.innerHTML=`gate <b style="color:${behind?'#ff8c8c':'var(--ok)'}">${h.msps.toFixed(1)}</b>/${rate.toFixed(0)} Msps`+
+        ` · dec_q ${h.dec_q==null?'–':h.dec_q} · pipe ${h.pipe_ms==null?'–':h.pipe_ms}ms`+
+        (h.drops_m?` · <span style="color:#ff8c8c">drops ${h.drops_m}M</span>`:'')+
+        (h.detect_workers?` · ${h.detect_workers}w`:'');}
+  }
+  const wb=$('#warnbar'); if(wb){ if(h.warn){wb.style.display='';wb.textContent='⚠ '+h.warn;} else {wb.style.display='none';} }
+}
+
+// ---------- CONFIG (decryption keys) ----------
+const maskKey=s=>{s=s||'';return s.length<=10?s:s.slice(0,5)+'…'+s.slice(-4);};
+function renderConfig(){ Promise.all([fetch('/api/keys').then(r=>r.json()),fetch('/api/alerts').then(r=>r.json())]).then(([k,a])=>{KEYS=k;ALERTS=a;_renderConfigBody();}).catch(()=>_renderConfigBody()); }
+const _postDefault=body=>fetch('/api/keys/default',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()).then(res=>{if(res.keys)KEYS=res.keys;});
+const _kprio=k=>k.priority!=null?k.priority:(k.scope==='all'?100:10);
+let _KROWS=[];
+// One updater for every row.  Built-in rows map to their dedicated endpoints
+// (Meshtastic default ↔ /api/keys/default; MeshCore default ↔ /api/keys/meshcore-default);
+// custom rows hit /api/keys/<id>/update.  Key VALUE is never editable.
+function _kRowUpdate(ri,patch){
+  const row=_KROWS[ri]; let url,body={};
+  if(row.kind==='custom'){url='/api/keys/'+row.id+'/update';body=patch;}
+  else if(row.ep==='mesh-default'){url='/api/keys/default';
+    if('enabled'in patch)body.try_default=patch.enabled;
+    if('notes'in patch)body.default_notes=patch.notes;
+    if('priority'in patch)body.default_priority=patch.priority;
+    if('scope'in patch||'nodes'in patch)body.default_nodes=(patch.scope==='all')?[]:patch.nodes;}
+  else {url='/api/keys/meshcore-default';
+    if('enabled'in patch)body.enabled=patch.enabled;
+    if('notes'in patch)body.notes=patch.notes;
+    if('priority'in patch)body.priority=patch.priority;
+    if('scope'in patch||'nodes'in patch)body.nodes=(patch.scope==='all')?[]:patch.nodes;}
+  return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>r.json()).then(res=>{if(res.keys){KEYS=res.keys;_renderConfigBody();}});
+}
+function _renderConfigBody(){
+  const el=$('#tab-config'); const B=KEYS._builtin||{}; const md=KEYS.meshcore_default||{};
+  _KROWS=[
+    {kind:'builtin',ep:'mesh-default',proto:'meshtastic',label:'Meshtastic Public/Default',
+     value:B.meshtastic||'AQ==',on:KEYS.try_default!==false,nodes:KEYS.default_nodes||[],
+     prio:KEYS.default_priority!=null?KEYS.default_priority:50,notes:KEYS.default_notes||''},
+    {kind:'builtin',ep:'meshcore-default',proto:'meshcore',label:'MeshCore Public/Default',
+     value:B.meshcore||'',on:md.enabled!==false,nodes:md.nodes||[],
+     prio:md.priority!=null?md.priority:50,notes:md.notes||''},
+    ...(KEYS.keys||[]).map(k=>({kind:'custom',id:k.id,proto:k.protocol||'meshtastic',label:k.label||'',
+     value:k.key,on:k.enabled!==false,nodes:k.nodes||[],prio:_kprio(k),notes:k.notes||''}))
+  ];
+  _KROWS.forEach(r=>{r.scope=(r.nodes&&r.nodes.length)?'nodes':'all';});
+  const ptag=p=>p==='meshcore'
+    ?'<span class="tag" style="background:rgba(199,125,255,.16);color:#c77dff">MeshCore</span>'
+    :'<span class="tag" style="background:rgba(63,167,255,.16);color:var(--acc)">Meshtastic</span>';
+  const rowHtml=(r,ri)=>{const lock=r.kind==='builtin';
+    const keyCell=lock
+      ?'<span class="mono" style="opacity:.5" title="built-in public key — value locked">'+esc(r.value)+' 🔒</span>'
+      :'<span class="mono muted">'+esc(maskKey(r.value))+'</span>';
+    const scopeCtl='<select class="kscope" data-ri="'+ri+'"><option value="all"'+(r.scope==='all'?' selected':'')+'>all nodes</option><option value="nodes"'+(r.scope==='nodes'?' selected':'')+'>specific</option></select>'
+      +' <input type="text" class="knodes" data-ri="'+ri+'" placeholder="!a, !b" value="'+esc((r.nodes||[]).join(', '))+'" style="width:130px;display:'+(r.scope==='nodes'?'':'none')+'">';
+    const action=lock?'<span class="muted" style="font-size:11px" title="built-in keys cannot be deleted">locked</span>':'<button class="kdel" data-ri="'+ri+'">delete</button>';
+    return '<tr'+(lock?' style="background:rgba(63,167,255,.05)"':'')+'>'
+      +'<td><input type="number" class="kprio" data-ri="'+ri+'" value="'+r.prio+'" style="width:56px"'+(r.on?'':' disabled')+'></td>'
+      +'<td><input type="checkbox" class="ktoggle" data-ri="'+ri+'"'+(r.on?' checked':'')+' title="enable / disable"></td>'
+      +'<td>'+ptag(r.proto)+'</td>'
+      +'<td class="mono">'+(lock?'<b>'+esc(r.label)+'</b>':esc(r.label))+'</td>'
+      +'<td>'+scopeCtl+'</td>'
+      +'<td>'+keyCell+'</td>'
+      +'<td><input type="text" class="knotes" data-ri="'+ri+'" placeholder="notes…" value="'+esc(r.notes)+'" style="width:150px"></td>'
+      +'<td class="right">'+action+'</td></tr>';};
+  el.innerHTML=`<div style="max-width:1000px;padding:16px 0">
+    <h3 style="margin:0 0 4px">Channel keys</h3>
+    <p class="muted" style="line-height:1.5">Keys are tagged by <b>protocol</b> (the crypto differs, so a key can't be shared between them) and tried in ascending <b>priority</b> (<b>lower = first</b>); the first valid decode wins. A key applies if it targets <b>all nodes</b> or <b>lists the sender</b>. The two <b>Public/Default</b> keys are built in — their value is locked and they can't be deleted, but you can enable/disable, node-scope, and annotate them. Persists across sessions; applies live.</p>
+    <table style="margin:8px 0;width:100%"><thead><tr><th style="width:60px">prio</th><th style="width:34px">on</th><th style="width:90px">protocol</th><th>label</th><th style="width:200px">scope</th><th>key</th><th style="width:160px">notes</th><th></th></tr></thead><tbody>${_KROWS.map(rowHtml).join('')}</tbody></table>
+    <div class="nodecard" style="margin-top:12px">
+      <h4 style="margin:0 0 10px;color:var(--mut)">Add a custom key</h4>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <select id="kproto" title="which protocol this key decrypts"><option value="meshtastic">Meshtastic</option><option value="meshcore">MeshCore</option></select>
+        <input type="text" id="klabel" placeholder="label" style="width:140px">
+        <input type="text" id="kkey" placeholder="key — base64 or hex" style="width:300px">
+        <input type="text" id="knotesadd" placeholder="notes (optional)" style="width:170px">
+        <select id="kscopeadd"><option value="all">all nodes</option><option value="nodes">specific nodes</option></select>
+        <input type="text" id="knodeadd" placeholder="!a1b2c3d4, !e5f6a7b8" style="width:200px;display:none">
+        <input type="number" id="kprioadd" placeholder="prio" title="optional — lower = tried first" style="width:72px">
+        <button id="kadd" class="go">Add key</button>
+      </div>
+      <div class="muted" style="margin-top:6px;font-size:11px">MeshCore channel keys are 16 bytes (AES-128); Meshtastic accepts 16/24/32 (AES-128/192/256). Node-scope lists ids separated by commas/spaces. Priority defaults: node-specific 10, all-nodes 100, built-in defaults 50.</div>
+      <div id="kerr" style="color:var(--warn);margin-top:8px;font-size:12px"></div>
+    </div>
+    <div style="margin-top:14px;display:flex;gap:8px">
+      <button id="kexport">Export key list</button>
+      <button id="kimport">Import key list</button>
+      <input type="file" id="kfile" accept=".json,application/json" style="display:none">
+    </div>
+  </div>`;
+  el.querySelectorAll('.ktoggle').forEach(c=>c.onchange=()=>_kRowUpdate(+c.dataset.ri,{enabled:c.checked}));
+  el.querySelectorAll('.knotes').forEach(i=>i.onchange=()=>_kRowUpdate(+i.dataset.ri,{notes:i.value}));
+  el.querySelectorAll('.kprio').forEach(i=>i.onchange=()=>_kRowUpdate(+i.dataset.ri,{priority:i.value}));
+  el.querySelectorAll('.kscope').forEach(s=>s.onchange=()=>{const ri=+s.dataset.ri,ni=el.querySelector('.knodes[data-ri="'+ri+'"]');
+    if(s.value==='nodes'){ni.style.display='';ni.focus();}else{_kRowUpdate(ri,{scope:'all',nodes:[]});}});
+  el.querySelectorAll('.knodes').forEach(i=>i.onchange=()=>_kRowUpdate(+i.dataset.ri,{scope:'nodes',nodes:i.value}));
+  el.querySelectorAll('.kdel').forEach(b=>b.onclick=()=>{const r=_KROWS[+b.dataset.ri]; if(!r||r.kind!=='custom')return;
+    fetch('/api/keys/'+r.id,{method:'DELETE'}).then(x=>x.json()).then(res=>{KEYS=res.keys;_renderConfigBody();});});
+  const sca=$('#kscopeadd'); sca.onchange=()=>{$('#knodeadd').style.display=sca.value==='nodes'?'':'none';};
+  $('#kadd').onclick=()=>{const body={protocol:$('#kproto').value,label:$('#klabel').value,key:$('#kkey').value,notes:$('#knotesadd').value,scope:sca.value,nodes:$('#knodeadd').value};
+    if($('#kprioadd').value!=='')body.priority=$('#kprioadd').value;
+    fetch('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()).then(res=>{if(res.ok){KEYS=res.keys;_renderConfigBody();}else{$('#kerr').textContent=res.error||'failed to add key';}});};
+  $('#kexport').onclick=()=>{window.location='/api/keys/export';};
+  $('#kimport').onclick=()=>$('#kfile').click();
+  $('#kfile').onchange=e=>{const f=e.target.files[0]; if(!f)return; const rd=new FileReader();
+    rd.onload=()=>fetch('/api/keys/import?merge=1',{method:'POST',body:rd.result}).then(x=>x.json()).then(res=>{if(res.keys){KEYS=res.keys;_renderConfigBody();}}); rd.readAsText(f); e.target.value='';};
+  const sc=document.createElement('div'); el.insertBefore(sc, el.firstChild); renderSdrConfig(sc);
+  const ac=document.createElement('div'); el.appendChild(ac); renderAlertsConfig(ac);
+  const uc=document.createElement('div'); el.appendChild(uc); renderAdvancedConfig(uc);
+}
+function renderSdrConfig(box){
+  fetch('/api/sdr').then(r=>r.json()).then(d=>{
+    const profs=d.profiles||[], cur=d.current||'bladerf', r=d.radio||{};
+    const byId=id=>profs.find(p=>p.id===id)||{};
+    const opt=p=>'<option value="'+p.id+'"'+(p.id===cur?' selected':'')+'>'+esc(p.label)+(p.tested?'':' — best-effort')+'</option>';
+    box.innerHTML='<div style="max-width:1000px;padding:16px 0;border-bottom:1px solid var(--line)">'
+      +'<h3 style="margin:0 0 4px">SDR / Radio</h3>'
+      +'<p class="muted" style="line-height:1.5">Pick your SDR and radio settings — persists across sessions; applies on the next <b>Start</b>. Inputs are limited to the device\'s capabilities. Only <b>bladeRF</b> is validated here; others need their tool on PATH (HackRF→<code>hackrf_transfer</code>, or any device via <b>SoapySDR</b>→<code>python3-soapysdr</code>).</p>'
+      +'<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">'
+        +'<label>SDR<br><select id="sdrsel">'+profs.map(opt).join('')+'</select></label>'
+        +'<label>Center (MHz)<br><input id="sdrcen" type="number" step="0.1" value="'+(r.center_mhz!=null?r.center_mhz:915.0)+'" style="width:104px"></label>'
+        +'<label>Sample rate (MHz)<br><input id="sdrrate" type="number" step="0.1" value="'+((r.rate_hz||28000000)/1e6)+'" style="width:120px"></label>'
+        +'<label>Bandwidth (MHz)<br><input id="sdrbw" type="number" step="0.1" value="'+((r.bandwidth_hz||28000000)/1e6)+'" style="width:120px"></label>'
+        +'<span id="sdrgainwrap" style="display:contents"></span>'
+        +'<label id="sdrdrvwrap" style="display:'+(cur==="soapy"?"":"none")+'">Soapy driver<br><input id="sdrdrv" type="text" value="'+esc(r.soapy_driver||"hackrf")+'" placeholder="hackrf/rtlsdr/lime…" style="width:150px"></label>'
+        +'<button id="sdrsave" class="go">Save</button>'
+        +'<button id="sdrdetect">Detect</button>'
+      +'</div>'
+      +'<div id="sdrnote" class="muted" style="margin-top:6px;font-size:11px"></div>'
+      +'<div id="sdrresult" style="margin-top:8px;font-size:12px;min-height:16px"></div>'
+    +'</div>';
+    const q=id=>box.querySelector(id);
+    const noAgc=d.soapy_no_agc||{};
+    // Effective gain capability for the current SDR (+ driver for generic SoapySDR).
+    const gainInfo=(id)=>{
+      if(id==='soapy'){const drv=(q('#sdrdrv')?q('#sdrdrv').value:(r.soapy_driver||'hackrf')).trim().toLowerCase();
+        if(drv in noAgc)return{agc_ok:false,default_gain:noAgc[drv]}; return{agc_ok:true,default_gain:40};}
+      const p=byId(id); return{agc_ok:p.agc_ok!==false, default_gain:(p.default_gain!=null?p.default_gain:40)};};
+    // Gain control. AGC-capable devices: an AGC checkbox (default on); when off, a
+    // dB input (default from the profile) appears. AGC-less devices (HackRF): just
+    // the dB input. _gain is the source of truth ('auto' = AGC on, else a number).
+    let _gain=r.gain;   // preserve a previously-saved gain across re-renders
+    const isAutoStr=g=>{const s=String(g==null?'':g).trim().toLowerCase(); return s===''||s==='auto';};
+    const renderGain=(id)=>{const gi=gainInfo(id); const wrap=q('#sdrgainwrap');
+      const manualVal=(!isAutoStr(_gain)&&!isNaN(parseFloat(_gain)))?parseFloat(_gain):gi.default_gain;
+      if(gi.agc_ok){
+        const on=isAutoStr(_gain);
+        wrap.innerHTML='<label style="display:flex;align-items:center;gap:6px;white-space:nowrap">'
+            +'<input type="checkbox" id="sdragc"'+(on?' checked':'')+'> AGC</label>'
+          +'<label id="sdrgainml" style="display:'+(on?'none':'')+'">Gain (dB)<br>'
+            +'<input id="sdrgain" type="number" min="0" step="1" value="'+esc(String(manualVal))+'" style="width:84px"></label>';
+        const sync=()=>{const c=q('#sdragc').checked; q('#sdrgainml').style.display=c?'none':'';
+          _gain=c?'auto':(q('#sdrgain').value.trim()||String(gi.default_gain));};
+        q('#sdragc').onchange=sync; q('#sdrgain').onchange=sync;
+      } else {
+        wrap.innerHTML='<label>Gain (dB)<br><input id="sdrgain" type="number" min="0" step="1" value="'+esc(String(manualVal))+'" style="width:84px"></label>'
+          +'<div class="muted" style="flex-basis:100%;font-size:11px;margin-top:-2px">No AGC on this device — set gain manually in dB (default '+esc(String(gi.default_gain))+').</div>';
+        _gain=String(manualVal);   // AGC-less device is never 'auto'
+        q('#sdrgain').onchange=()=>{_gain=q('#sdrgain').value.trim()||String(gi.default_gain);};
+      }};
+    // Apply the selected SDR's capability limits to the inputs (and clamp values).
+    // liveLim = ranges queried from the actual device (override the static profile
+    // limits when present, so this exact unit's caps are enforced).
+    let liveLim=null;
+    const applyLimits=(id)=>{const p=byId(id), L={...(p.limits||{}), ...(liveLim||{})};
+      const cfg=(el,lim,div)=>{if(!el)return; if(lim){el.min=lim[0]/div; el.max=lim[1]/div;
+          const v=parseFloat(el.value); if(!isNaN(v))el.value=Math.max(el.min,Math.min(el.max,v));}};
+      cfg(q('#sdrrate'),L.rate_hz,1e6); cfg(q('#sdrbw'),L.bandwidth_hz,1e6); cfg(q('#sdrcen'),L.center_mhz,1);
+      q('#sdrnote').innerHTML=esc(p.note||'')+' · stream format '+esc(p.format||'')
+        +(L.rate_hz?' · max rate '+(L.rate_hz[1]/1e6)+' MHz':'')+(L.bandwidth_hz?' · max bw '+(L.bandwidth_hz[1]/1e6)+' MHz':'')
+        +(liveLim?' · <span style="color:#2ecc71">✓ queried from device</span>':'');
+      q('#sdrdrvwrap').style.display=(id==='soapy')?'':'none';
+      renderGain(id);};
+    const clampInput=el=>{const v=parseFloat(el.value); const lo=parseFloat(el.min), hi=parseFloat(el.max);
+      if(!isNaN(v)){if(!isNaN(lo)&&v<lo)el.value=lo; if(!isNaN(hi)&&v>hi)el.value=hi;}};
+    // Query the LIVE device for its real capability ranges and clamp inputs to them
+    // (so e.g. a bladeRF1 can't be set past 40 Msps / 28 MHz). Falls back to the
+    // static profile limits if the device isn't reachable or is held by a run.
+    const fetchLiveLimits=(id)=>{
+      const body={sdr:id}; if(id==='soapy')body.soapy_driver=(q('#sdrdrv')?q('#sdrdrv').value.trim():'hackrf');
+      q('#sdrnote').innerHTML='<span class="muted">querying device limits…</span>';
+      fetch('/api/sdr/limits',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+        .then(r=>r.json()).then(res=>{ if(q('#sdrsel').value!==id) return;   // user switched away
+          liveLim=(res.ok&&res.limits&&Object.keys(res.limits).length)?res.limits:null; applyLimits(id);
+        }).catch(()=>{applyLimits(id);});};
+    // Reset gain to the device's profile default (a fixed dB value) when the
+    // SDR/driver changes — fixed gain beats AGC for sensitivity, so every device
+    // defaults to fixed (bladeRF 48, HackRF 40, …); AGC stays available via the box.
+    const resetGain=id=>{const gi=gainInfo(id); _gain=gi.default_gain;};
+    ['#sdrrate','#sdrbw','#sdrcen'].forEach(s=>q(s).onchange=()=>clampInput(q(s)));
+    q('#sdrsel').onchange=()=>{const id=q('#sdrsel').value; liveLim=null; resetGain(id); applyLimits(id); fetchLiveLimits(id);};
+    // Changing the SoapySDR driver flips both AGC support and the device limits.
+    q('#sdrdrv').onchange=()=>{const id=q('#sdrsel').value; resetGain(id); renderGain(id);
+      if(id==='soapy'){liveLim=null; applyLimits(id); fetchLiveLimits(id);}};
+    applyLimits(cur); fetchLiveLimits(cur);
+    // Read the effective gain: AGC checkbox on → 'auto', else the dB input.
+    const readGain=()=>{const c=q('#sdragc'); if(c)return c.checked?'auto':(q('#sdrgain').value.trim()||'auto');
+      return (q('#sdrgain')&&q('#sdrgain').value.trim())||'auto';};
+    const saveSdr=()=>{['#sdrrate','#sdrbw','#sdrcen'].forEach(s=>clampInput(q(s)));
+      const body={sdr:q('#sdrsel').value, radio:{
+        center_mhz:parseFloat(q('#sdrcen').value),
+        rate_hz:Math.round(parseFloat(q('#sdrrate').value)*1e6),
+        bandwidth_hz:Math.round(parseFloat(q('#sdrbw').value)*1e6),
+        gain:readGain()}};
+      if(q('#sdrsel').value==='soapy')body.radio.soapy_driver=q('#sdrdrv').value.trim();
+      return fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(x=>x.json());};
+    q('#sdrsave').onclick=()=>saveSdr().then(()=>{q('#sdrresult').innerHTML='<span style="color:#2ecc71">saved — applies on next Start</span>';});
+    q('#sdrdetect').onclick=()=>{q('#sdrresult').textContent='detecting…';
+      saveSdr().then(()=>fetch('/api/sdr/detect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdr:q('#sdrsel').value})}).then(x=>x.json()).then(res=>{
+        if(res.found)q('#sdrresult').innerHTML='<span style="color:#2ecc71">✓ Found'+(res.serial?' — serial <span class="mono">'+esc(res.serial)+'</span>':'')+'</span>';
+        else q('#sdrresult').innerHTML='<span style="color:var(--warn)">✗ '+esc(res.error||'device not found')+'</span>';
+      }).catch(()=>{q('#sdrresult').innerHTML='<span style="color:var(--warn)">✗ detect failed</span>';}));};
+  }).catch(()=>{box.innerHTML='';});
+}
+function renderAdvancedConfig(box){
+  Promise.all([fetch('/api/settings').then(r=>r.json()),fetch('/api/unknown').then(r=>r.json())]).then(([s,u])=>{
+    const pr=s.protocols||{meshtastic:true,meshcore:true,lorawan:true};
+    const unk=!!s.unknown;
+    const cb=(id,on,lbl)=>`<label style="display:flex;gap:8px;align-items:flex-start;margin:5px 0"><input type="checkbox" id="${id}"${on?' checked':''} style="margin-top:3px"> <span>${lbl}</span></label>`;
+    box.innerHTML=`<details style="max-width:920px;margin-top:20px;border:1px solid var(--line);border-radius:6px;padding:6px 12px">
+      <summary style="cursor:pointer;font-weight:600;font-size:15px;padding:4px 0">Advanced Options</summary>
+      <div style="padding:8px 2px 4px">
+        <h4 style="margin:10px 0 2px">Protocols</h4>
+        <p class="muted" style="font-size:11px;margin:0 0 4px;line-height:1.5">Disable protocols you don't need. The decoder skips them — and when <b>Unknown</b> is off it also skips decoding frames whose sync word can't belong to any enabled protocol, saving compute. Applies on next Start.</p>
+        ${cb('pmesh',pr.meshtastic!==false,'Meshtastic')}
+        ${cb('pmc',pr.meshcore!==false,'MeshCore')}
+        ${cb('plw',pr.lorawan!==false,'LoRaWAN')}
+        <h4 style="margin:18px 0 2px">Unknown protocols</h4>
+        ${cb('unk',unk,'<b>Unknown (Off / On)</b><br><span class="muted" style="font-size:11px">Surface intact LoRa frames (good CRC) that match no enabled protocol — a possible new/unsupported protocol. Off by default; off also lets the decoder skip them entirely to save compute.</span>')}
+        <h4 style="margin:18px 0 2px">Unknown-protocol report</h4>
+        <p class="muted" style="font-size:11px;margin:0 0 4px">Raw bytes + PHY params of captured unknown frames — hand to a developer to add support. Needs Unknown on.</p>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="muted" id="unkcount">${u.count||0} frame(s)</span>
+          <button id="unkdl"${u.count?'':' disabled'}>Download</button>
+          <button id="unkclr"${u.count?'':' disabled'}>Clear</button>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin:18px 0 0">
+          <span class="muted">LoRa SF/BW scan:</span>
+          <select id="scanmode">
+            <option value="all"${s.wide_scan?' selected':''}>All SF/BW combinations (recommended)</option>
+            <option value="presets"${!s.wide_scan?' selected':''}>Meshtastic presets only</option>
+          </select>
+          <span class="muted" style="font-size:11px">applies on next Start</span>
+        </div>
+      </div>
+    </details>`;
+    const q=id=>box.querySelector(id);
+    const post=b=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+    const saveProtos=()=>post({protocols:{meshtastic:q('#pmesh').checked,meshcore:q('#pmc').checked,lorawan:q('#plw').checked}});
+    ['#pmesh','#pmc','#plw'].forEach(s=>q(s).onchange=saveProtos);
+    q('#unk').onchange=e=>post({unknown:e.target.checked});
+    q('#scanmode').onchange=e=>post({wide_scan:e.target.value==='all'});
+    q('#unkdl').onclick=()=>{window.location='/api/unknown?download=1';};
+    q('#unkclr').onclick=()=>{if(confirm('Clear the unknown-protocol report?'))fetch('/api/unknown',{method:'DELETE'}).then(()=>renderAdvancedConfig(box));};
+  }).catch(()=>{});
+}
+function renderAlertsConfig(box){
+  const rules=ALERTS.rules||[];
+  const rows=rules.map(r=>`<tr>
+    <td><input type="checkbox" class="al-en" data-id="${r.id}"${r.enabled?' checked':''}></td>
+    <td>${esc(r.label||alertTypeName(r))}</td><td class="muted">${esc(alertSummary(r))}</td>
+    <td><label class="muted" style="font-size:11px"><input type="checkbox" class="al-no" data-id="${r.id}"${r.notify?' checked':''}> notify</label> <label class="muted" style="font-size:11px"><input type="checkbox" class="al-so" data-id="${r.id}"${r.sound?' checked':''}> sound</label></td>
+    <td class="right"><button data-aldel="${r.id}">delete</button></td></tr>`).join('')
+    ||'<tr><td colspan=5 class=muted style="padding:10px">no alert rules — add one below</td></tr>';
+  box.innerHTML=`<div style="max-width:900px">
+    <h3 style="margin:24px 0 4px">Alerts &amp; triggers</h3>
+    <p class="muted" style="line-height:1.5">Fire a notification when intercepted traffic matches a rule. Evaluated live in this browser (keep a tab open); rules persist across sessions. Pick a trigger type, set its condition, and choose whether it shows a desktop notification and/or plays a sound. Fired alerts collect under the 🔔 bell.</p>
+    <table style="margin:6px 0"><thead><tr><th></th><th>label</th><th>condition</th><th>actions</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="nodecard" style="margin-top:12px">
+      <h4 style="margin:0 0 10px;color:var(--mut)">Add an alert</h4>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <select id="al-type">
+          <option value="new_node">New node appears</option>
+          <option value="node">Specific node active</option>
+          <option value="content">Message contains…</option>
+          <option value="type">Packet type</option>
+          <option value="signal">Signal (RSSI) threshold</option>
+          <option value="channel">Channel</option>
+          <option value="geofence">Geofence (enter/exit)</option>
+        </select>
+        <input type="text" id="al-label" placeholder="label (optional)" style="width:150px">
+        <span class="alp" id="alp-node"><input type="text" id="al-node" placeholder="!nodeid" style="width:120px"><select id="al-dir"><option value="any">from or to</option><option value="from">from</option><option value="to">to</option></select></span>
+        <span class="alp" id="alp-content"><input type="text" id="al-keyword" placeholder="keyword" style="width:170px"></span>
+        <span class="alp" id="alp-type"><select id="al-port"><option value="encrypted">encrypted (undecoded)</option><option>TEXT_MESSAGE_APP</option><option>POSITION_APP</option><option>NODEINFO_APP</option><option>TELEMETRY_APP</option><option>TRACEROUTE_APP</option><option>NEIGHBORINFO_APP</option><option>WAYPOINT_APP</option><option>MAP_REPORT_APP</option><option>RANGE_TEST_APP</option><option>DETECTION_SENSOR_APP</option></select></span>
+        <span class="alp" id="alp-signal"><select id="al-op"><option value="below">below</option><option value="above">above</option></select><input type="number" id="al-value" placeholder="rssi" style="width:80px"></span>
+        <span class="alp" id="alp-channel"><input type="text" id="al-chan" placeholder="channel e.g. LongFast" style="width:150px"></span>
+        <span class="alp" id="alp-geofence"><input type="number" step="any" id="al-lat" placeholder="lat" style="width:90px"><input type="number" step="any" id="al-lon" placeholder="lon" style="width:90px"><input type="number" step="any" id="al-radius" placeholder="km" style="width:60px"><select id="al-event"><option value="both">enter or exit</option><option value="enter">enter</option><option value="exit">exit</option></select></span>
+        <label class="muted" style="font-size:12px"><input type="checkbox" id="al-notify" checked> notify</label>
+        <label class="muted" style="font-size:12px"><input type="checkbox" id="al-sound"> sound</label>
+        <button id="al-add" class="go">Add alert</button>
+      </div>
+      <div id="al-err" style="color:var(--warn);margin-top:8px;font-size:12px"></div>
+    </div>
+    ${('Notification' in window)?'<div style="margin-top:10px"><button id="al-perm">Enable browser notifications</button> <span class="muted" id="al-perms" style="font-size:12px"></span></div>':'<div class="muted" style="margin-top:10px;font-size:12px">(this browser has no notification support — alerts still show in-app)</div>'}
+  </div>`;
+  const ty=box.querySelector('#al-type');
+  const showParams=()=>{box.querySelectorAll('.alp').forEach(x=>x.style.display='none'); const m={node:'alp-node',content:'alp-content',type:'alp-type',signal:'alp-signal',channel:'alp-channel',geofence:'alp-geofence'}[ty.value]; if(m)box.querySelector('#'+m).style.display='';};
+  ty.onchange=showParams; showParams();
+  box.querySelectorAll('.al-en').forEach(c=>c.onchange=()=>postAlert(c.dataset.id,{enabled:c.checked}));
+  box.querySelectorAll('.al-no').forEach(c=>c.onchange=()=>postAlert(c.dataset.id,{notify:c.checked}));
+  box.querySelectorAll('.al-so').forEach(c=>c.onchange=()=>postAlert(c.dataset.id,{sound:c.checked}));
+  box.querySelectorAll('button[data-aldel]').forEach(b=>b.onclick=()=>fetch('/api/alerts/'+b.dataset.aldel,{method:'DELETE'}).then(r=>r.json()).then(res=>{ALERTS=res.alerts;renderAlertsConfig(box);}));
+  box.querySelector('#al-add').onclick=()=>{
+    const t=ty.value, err=box.querySelector('#al-err'); err.textContent='';
+    const body={type:t,label:box.querySelector('#al-label').value,notify:box.querySelector('#al-notify').checked,sound:box.querySelector('#al-sound').checked};
+    if(t==='node'){body.node=box.querySelector('#al-node').value.trim();body.dir=box.querySelector('#al-dir').value; if(!body.node){err.textContent='enter a node id';return;}}
+    else if(t==='content'){body.keyword=box.querySelector('#al-keyword').value; if(!body.keyword){err.textContent='enter a keyword';return;}}
+    else if(t==='type'){body.port=box.querySelector('#al-port').value;}
+    else if(t==='signal'){body.op=box.querySelector('#al-op').value;body.value=box.querySelector('#al-value').value; if(body.value===''){err.textContent='enter a value';return;}}
+    else if(t==='channel'){body.chan=box.querySelector('#al-chan').value.trim(); if(!body.chan){err.textContent='enter a channel';return;}}
+    else if(t==='geofence'){body.lat=box.querySelector('#al-lat').value;body.lon=box.querySelector('#al-lon').value;body.radius=box.querySelector('#al-radius').value;body.event=box.querySelector('#al-event').value; if(body.lat===''||body.lon===''||body.radius===''){err.textContent='enter lat, lon and radius';return;}}
+    fetch('/api/alerts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()).then(res=>{if(res.ok){ALERTS=res.alerts;renderAlertsConfig(box);}else{err.textContent=res.error||'failed to add alert';}});
+  };
+  const pb=box.querySelector('#al-perm'); if(pb){const upd=()=>{box.querySelector('#al-perms').textContent='status: '+Notification.permission;}; upd(); pb.onclick=()=>Notification.requestPermission().then(upd);}
+}
+
+// ---------- WATERFALL (spectrum) ----------
+let WF=null, WFON=true;
+function wfColor(v){ const t=v/255; let r,g,b;
+  if(t<0.25){const u=t/0.25;r=0;g=0;b=(60+195*u)|0;}
+  else if(t<0.5){const u=(t-0.25)/0.25;r=0;g=(255*u)|0;b=255;}
+  else if(t<0.75){const u=(t-0.5)/0.25;r=(255*u)|0;g=255;b=(255*(1-u))|0;}
+  else {const u=(t-0.75)/0.25;r=255;g=(255*(1-u))|0;b=0;}
+  return [r,g,b]; }
+function updateWFAxis(){ if(!WF)return; const c=WF.center, half=WF.rate/2;
+  $('#wf-l').textContent=(c-half).toFixed(2)+' MHz'; $('#wf-c').textContent=c.toFixed(2)+' MHz'; $('#wf-r').textContent=(c+half).toFixed(2)+' MHz';
+  $('#wfinfo').textContent='span '+WF.rate.toFixed(0)+' MHz @ '+c.toFixed(2)+' MHz center'; }
+function renderWaterfall(){
+  const on=$('#wfon'); if(on){on.checked=WFON; on.onchange=()=>{WFON=on.checked; fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({waterfall:WFON})}); renderWaterfall();};}
+  $('#wfwrap').style.display=WFON?'':'none';
+  $('#wfoff').style.display=WFON?'none':'';
+  if(!WFON)return;
+  const cnv=$('#wfcanvas'); if(!cnv)return;
+  if(!WF){WF={cnv,ctx:cnv.getContext('2d'),w:cnv.width,h:cnv.height,center:CFGW.center_mhz||915,rate:CFGW.rate_mhz||(CFGW.rate_hz?CFGW.rate_hz/1e6:28)};WF.ctx.fillStyle='#000';WF.ctx.fillRect(0,0,WF.w,WF.h);}
+  updateWFAxis();
+  fetch('/api/psd').then(r=>r.json()).then(d=>{if(d&&d.b64)wfRow(d);}).catch(()=>{});
+}
+function wfRow(d){
+  if(!WF||!d||!d.b64)return;
+  if(d.center_mhz)WF.center=d.center_mhz; if(d.rate_mhz)WF.rate=d.rate_mhz;
+  const bytes=atob(d.b64), n=bytes.length, ctx=WF.ctx, W=WF.w, H=WF.h;
+  ctx.drawImage(WF.cnv,0,1,W,H-1,0,0,W,H-1);          // scroll up 1px
+  const img=ctx.createImageData(W,1);
+  for(let x=0;x<W;x++){ const bin=Math.min(n-1,(x/W*n)|0); const [r,g,b]=wfColor(bytes.charCodeAt(bin)); const o=x*4; img.data[o]=r;img.data[o+1]=g;img.data[o+2]=b;img.data[o+3]=255; }
+  ctx.putImageData(img,0,H-1);
+  updateWFAxis();
+}
+
+// ---------- MAP (Leaflet) ----------
+let MAP=null, MAP_LAYER=null;
+function renderMap(){
+  if(!window.L){ $('#mapinfo').textContent='map library failed to load (offline? Leaflet loads from a CDN).'; return; }
+  if(!MAP){
+    MAP=L.map('mapc',{preferCanvas:true}).setView([20,0],2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap'}).addTo(MAP);
+    MAP_LAYER=L.layerGroup().addTo(MAP);
+    setTimeout(()=>{MAP.invalidateSize();drawMap();},60);
+  } else { MAP.invalidateSize(); }
+  drawMap();
+}
+function drawMap(){
+  if(!MAP||!MAP_LAYER)return;
+  MAP_LAYER.clearLayers();
+  const tracks={}, wps=[];
+  for(const p of PK){
+    if(p.waypoint&&p.waypoint.lat!=null) wps.push(p);
+    if(p.lat!=null&&p.lon!=null)(tracks[p.from]=tracks[p.from]||[]).push({lat:p.lat,lon:p.lon,ts:p.ts||0});
+  }
+  const bounds=[];
+  for(const id in tracks){
+    const pts=tracks[id].slice().sort((a,b)=>a.ts-b.ts);
+    const lls=pts.map(p=>[p.lat,p.lon]);
+    if(lls.length>1)L.polyline(lls,{color:'#3fa7ff',weight:2,opacity:.55}).addTo(MAP_LAYER);
+    const last=pts[pts.length-1];
+    L.circleMarker([last.lat,last.lon],{radius:7,color:'#0e1116',weight:1.5,fillColor:'#37d67a',fillOpacity:1}).addTo(MAP_LAYER)
+      .bindPopup(`<b>${esc(disp(id))}</b><br>${esc(id)}<br>${last.lat.toFixed(5)}, ${last.lon.toFixed(5)}`+(pts.length>1?`<br>${pts.length} fixes`:''));
+    lls.forEach(ll=>bounds.push(ll));
+  }
+  for(const p of wps){const w=p.waypoint;
+    L.circleMarker([w.lat,w.lon],{radius:6,color:'#0e1116',weight:1.5,fillColor:'#ffb454',fillOpacity:1}).addTo(MAP_LAYER)
+      .bindPopup(`<b>${w.icon?esc(w.icon)+' ':''}${esc(w.name||'waypoint')}</b>`+(w.desc?`<br>${esc(w.desc)}`:'')+`<br>from ${esc(disp(p.from))}`);
+    bounds.push([w.lat,w.lon]);
+  }
+  if(bounds.length&&!MAP._fitDone){MAP.fitBounds(bounds,{padding:[40,40],maxZoom:14});MAP._fitDone=true;}
+  const nc=Object.keys(tracks).length;
+  $('#mapinfo').textContent = nc?(nc+' located node'+(nc>1?'s':'')+(wps.length?' · '+wps.length+' waypoint'+(wps.length>1?'s':''):'')):'no positions yet — POSITION / MAP_REPORT / WAYPOINT packets appear here';
+}
+
+// ---------- SEARCH ----------
+let SEARCHQ='';
+function renderSearch(){
+  const el=$('#tab-search');
+  el.innerHTML=`<div class="toolbar"><input type="text" id="searchq" placeholder="search messages, node names/ids, types, channels, coordinates, waypoints…" value="${esc(SEARCHQ)}" style="flex:1;max-width:560px"></div><div id="searchres"></div>`;
+  const inp=$('#searchq'); inp.oninput=e=>{SEARCHQ=e.target.value;drawSearch();}; inp.focus();
+  drawSearch();
+}
+function drawSearch(){
+  const box=$('#searchres'); if(!box)return;
+  const q=SEARCHQ.trim().toLowerCase();
+  if(!q){box.innerHTML='<div class="empty">type to search across all packets and nodes</div>';return;}
+  const hay=(...xs)=>xs.some(x=>x!=null&&String(x).toLowerCase().includes(q));
+  const nodes=nodeStats().filter(n=>hay(n.id,disp(n.id),n.long,n.short,n.hw,n.role,n.lastText,(n.chans||[]).join(' '))).sort((a,b)=>b.count-a.count).slice(0,40);
+  const pkts=PK.filter(p=>hay(p.from,disp(p.from),p.to,p.text,p.chan,p.port_name,p.pktid,p.lat,p.lon,p.key,p.payload_hex,p.node_long,p.node_short,p.hw,p.role,p.waypoint&&p.waypoint.name,p.waypoint&&p.waypoint.desc)).slice(-300).reverse();
+  const nrows=nodes.map(n=>`<div class="srow" data-node="${esc(n.id)}" style="padding:6px 8px;cursor:pointer;border-bottom:1px solid var(--line)">${idCell(n.id)}${n.long?' <span class="muted">'+esc(n.long)+'</span>':''}${n.role?' <span class="pill">'+esc(n.role)+'</span>':''} <span class="muted">· ${n.count} pkts · ${n.decoded} dec</span>${n.lastText?` <span class="muted">— ${esc(n.lastText.slice(0,60))}</span>`:''}</div>`).join('')||'<div class="muted" style="padding:8px">no node matches</div>';
+  const prows=pkts.slice(0,400).map(p=>`<tr><td class="muted">${fmtTime(p.ts)}</td><td>${idCell(p.from)}</td><td>${idCell(p.to)}</td><td>${esc(p.port_name||'')}</td><td>${p.decrypted?esc(p.text||(p.waypoint&&p.waypoint.name)||(p.payload_hex?'hex':'')):'<span class="muted">encrypted</span>'}</td></tr>`).join('')||'<tr><td colspan=5 class=muted style="padding:8px">no packet matches</td></tr>';
+  box.innerHTML=`<h4 style="color:var(--mut);margin:14px 0 4px">Nodes (${nodes.length})</h4>${nrows}
+    <h4 style="color:var(--mut);margin:18px 0 4px">Packets (${pkts.length})</h4>
+    <table><thead><tr><th>time</th><th>from</th><th>to</th><th>type</th><th>message</th></tr></thead><tbody>${prows}</tbody></table>`;
+  box.querySelectorAll('.srow[data-node]').forEach(r=>r.onclick=()=>{OPEN.add(r.dataset.node);activateTab('nodes');});
+}
+
+// ---------- retry-decode context menu ----------
+const MENU_CSS=(x,y)=>`position:fixed;left:${x}px;top:${y}px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 0;z-index:9999;min-width:170px;box-shadow:0 8px 28px rgba(0,0,0,.55)`;
+function closeCtxMenu(){document.querySelectorAll('.ctxmenu').forEach(m=>m.remove());}
+function menuItem(label,onClick){
+  const d=document.createElement('div'); d.innerHTML=label;
+  d.style.cssText='padding:6px 14px;cursor:pointer;font-size:13px;white-space:nowrap;position:relative';
+  d.onmouseenter=()=>d.style.background='rgba(63,167,255,.15)';
+  d.onmouseleave=()=>d.style.background='';
+  if(onClick)d.onclick=e=>{e.stopPropagation();closeCtxMenu();onClick();};
+  return d;
+}
+function wireRetryMenu(el){ /* handled by the delegated contextmenu listener below */ }
+function showDecodeMenu(pktid, hops, x, y){
+  closeCtxMenu();
+  const menu=document.createElement('div'); menu.className='ctxmenu'; menu.style.cssText=MENU_CSS(x,y);
+  const h=document.createElement('div'); h.textContent='Decode with…';
+  h.style.cssText='padding:4px 14px 6px;color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.4px';
+  menu.appendChild(h);
+  menu.appendChild(menuItem('All keys',()=>doRetry(pktid,hops,'all')));
+  const spec=menuItem('Specific key&nbsp;&nbsp;▸',null);
+  spec.onmouseenter=()=>{ spec.style.background='rgba(63,167,255,.15)';
+    if(spec.querySelector('.ctxmenu'))return;
+    const r=spec.getBoundingClientRect();
+    const sub=document.createElement('div'); sub.className='ctxmenu'; sub.style.cssText=MENU_CSS(r.right-4,r.top);
+    sub.appendChild(menuItem('Default Meshtastic key',()=>doRetry(pktid,hops,'__default__')));
+    const _mk=(KEYS.keys||[]).filter(k=>(k.protocol||'meshtastic')!=='meshcore'); // retry-decode is Meshtastic-only
+    _mk.forEach(k=>sub.appendChild(menuItem(esc(k.label)+' <span style="color:var(--mut);font-size:11px">'+(k.scope==='all'?'all':esc((k.nodes||[]).join(',')))+'</span>',()=>doRetry(pktid,hops,k.id))));
+    if(!_mk.length){const e2=document.createElement('div');e2.textContent='(no custom Meshtastic keys — add in Config)';e2.style.cssText='padding:6px 14px;color:var(--mut);font-size:11px';sub.appendChild(e2);}
+    spec.appendChild(sub);
+  };
+  menu.appendChild(spec);
+  document.body.appendChild(menu);
+}
+function postNodeMeta(id,patch){
+  fetch('/api/nodes/'+encodeURIComponent(id)+'/meta',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)})
+    .then(r=>r.json()).then(res=>{ if(res.meta)NODEMETA=res.meta; renderCurrent(); toast('node updated'); });
+}
+function showNodeMenu(id,x,y){
+  closeCtxMenu();
+  const m=NODEMETA[id]||{};
+  const menu=document.createElement('div'); menu.className='ctxmenu'; menu.style.cssText=MENU_CSS(x,y);
+  const h=document.createElement('div'); h.textContent=disp(id); h.style.cssText='padding:4px 14px 6px;color:var(--mut);font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'; menu.appendChild(h);
+  menu.appendChild(menuItem('Edit label…',()=>{const v=prompt('Custom label for '+id,m.label||''); if(v!==null)postNodeMeta(id,{label:v});}));
+  menu.appendChild(menuItem(m.notes?'Edit note…':'Add note…',()=>{const v=prompt('Note for '+id,m.notes||''); if(v!==null)postNodeMeta(id,{notes:v});}));
+  if(m.watch){
+    const lbl=document.createElement('div'); lbl.textContent='On watchlist ('+(m.watch_mode||'highlight')+')'; lbl.style.cssText='padding:6px 14px;color:var(--ok);font-size:12px'; menu.appendChild(lbl);
+    const ch=menuItem('Change mode&nbsp;&nbsp;▸',null);
+    ch.onmouseenter=()=>{ch.style.background='rgba(63,167,255,.15)'; if(ch.querySelector('.ctxmenu'))return; const r=ch.getBoundingClientRect(); const sub=document.createElement('div'); sub.className='ctxmenu'; sub.style.cssText=MENU_CSS(r.right-4,r.top); ['highlight','alert','both'].forEach(mo=>sub.appendChild(menuItem(mo,()=>postNodeMeta(id,{watch:true,watch_mode:mo})))); ch.appendChild(sub);};
+    menu.appendChild(ch);
+    menu.appendChild(menuItem('Remove from watchlist',()=>postNodeMeta(id,{watch:false})));
+  } else {
+    const add=menuItem('Add to watchlist&nbsp;&nbsp;▸',null);
+    add.onmouseenter=()=>{add.style.background='rgba(63,167,255,.15)'; if(add.querySelector('.ctxmenu'))return; const r=add.getBoundingClientRect(); const sub=document.createElement('div'); sub.className='ctxmenu'; sub.style.cssText=MENU_CSS(r.right-4,r.top);
+      [['highlight','highlight new messages red'],['alert','alert on new messages'],['both','highlight + alert']].forEach(([mo,desc])=>sub.appendChild(menuItem(esc(desc),()=>postNodeMeta(id,{watch:true,watch_mode:mo})))); add.appendChild(sub);};
+    menu.appendChild(add);
+  }
+  document.body.appendChild(menu);
+}
+function doRetry(pktid,hops,keysel){
+  closeCtxMenu(); toast('decoding…');
+  fetch('/api/decode_retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pktid:pktid,hops:hops,key_id:keysel})})
+    .then(r=>r.json()).then(res=>{
+      if(res.ok&&res.packet){const i=PK.findIndex(x=>x.pktid===pktid&&x.hops===hops); if(i>=0)PK[i]=res.packet; noteName(res.packet); renderCurrent(); toast('✓ decoded'+(res.key?' with '+res.key:''));}
+      else toast('✗ '+(res.error||'decode failed'));
+    }).catch(()=>toast('✗ request failed'));
+}
+let _toastT=null;
+function toast(msg){
+  let t=$('#toast'); if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);color:var(--fg);padding:8px 16px;border-radius:6px;z-index:10000;font-size:13px;box-shadow:0 6px 24px rgba(0,0,0,.5)';document.body.appendChild(t);}
+  t.textContent=msg; t.style.display=''; clearTimeout(_toastT); _toastT=setTimeout(()=>{t.style.display='none';},2600);
+}
+document.addEventListener('click',closeCtxMenu);
+document.addEventListener('scroll',closeCtxMenu,true);
+// Delegated right-click (robust across re-renders AND Firefox, where per-element
+// oncontextmenu + preventDefault was unreliable).  preventDefault here reliably
+// suppresses the browser's native menu.
+document.addEventListener('contextmenu',e=>{
+  const enc=e.target.closest&&e.target.closest('tr.encrow');
+  if(enc){ e.preventDefault(); showDecodeMenu(enc.dataset.pktid, parseInt(enc.dataset.hops), e.clientX, e.clientY); return; }
+  const nd=e.target.closest&&e.target.closest('tr.noderow');
+  if(nd){ e.preventDefault(); showNodeMenu(nd.dataset.id, e.clientX, e.clientY); return; }
+});
+
+// ---------- ALERTS / TRIGGERS (client-side evaluation) ----------
+function haversine(la1,lo1,la2,lo2){const R=6371,dLa=(la2-la1)*Math.PI/180,dLo=(lo2-lo1)*Math.PI/180,a=Math.sin(dLa/2)**2+Math.cos(la1*Math.PI/180)*Math.cos(la2*Math.PI/180)*Math.sin(dLo/2)**2;return 2*R*Math.asin(Math.sqrt(a));}
+function alertTypeName(r){return {new_node:'New node',node:'Node activity',content:'Message content',type:'Packet type',signal:'Signal threshold',channel:'Channel',geofence:'Geofence'}[r.type]||r.type;}
+function alertSummary(r){
+  if(r.type==='new_node')return 'any never-seen node transmits';
+  if(r.type==='node')return (r.dir||'any')+' '+disp(r.node);
+  if(r.type==='content')return 'text contains “'+r.keyword+'”';
+  if(r.type==='type')return r.port;
+  if(r.type==='signal')return 'rssi '+r.op+' '+r.value;
+  if(r.type==='channel')return 'channel '+r.chan;
+  if(r.type==='geofence')return (r.event||'both')+' '+(+r.radius)+'km of '+r.lat+','+r.lon;
+  return '';
+}
+function evalAlerts(p){
+  // Watchlist: a node flagged with mode alert/both fires on each new message.
+  const wm=NODEMETA[p.from];
+  if(wm&&wm.watch&&(wm.watch_mode==='alert'||wm.watch_mode==='both')){
+    const wk='watch|'+p.from+'|'+p.pktid;
+    if(!_alertFired.has(wk)){ _alertFired.add(wk); fireAlert({label:'Watchlist: '+disp(p.from),notify:true,sound:true}, p, 'message from watched node'); }
+  }
+  if(!ALERTS.rules||!ALERTS.rules.length){ if(p.from)SEEN_NODES.add(p.from); return; }
+  if(_alertFired.size>8000)_alertFired.clear();
+  for(const r of ALERTS.rules){
+    if(!r.enabled)continue;
+    let hit=false, why='';
+    if(r.type==='new_node'){ if(p.from&&!SEEN_NODES.has(p.from)){hit=true;why='new node '+disp(p.from);} }
+    else if(r.type==='node'){ const d=r.dir||'any'; if((d!=='to'&&p.from===r.node)||(d!=='from'&&p.to===r.node)){hit=true;why=disp(r.node)+' active';} }
+    else if(r.type==='content'){ if(r.keyword&&p.decrypted&&p.text&&p.text.toLowerCase().includes(String(r.keyword).toLowerCase())){hit=true;why='“'+r.keyword+'” in message';} }
+    else if(r.type==='type'){ if(r.port==='encrypted'){ if(!p.decrypted){hit=true;why='encrypted packet';} } else if(p.port_name===r.port){hit=true;why=r.port;} }
+    else if(r.type==='signal'){ if(p.rssi!=null&&r.value!=null&&r.value!==''){ const v=+r.value; if((r.op==='below'&&p.rssi<v)||(r.op==='above'&&p.rssi>v)){hit=true;why='signal '+p.rssi+' '+r.op+' '+v;} } }
+    else if(r.type==='channel'){ if(p.chan===r.chan){hit=true;why='channel '+r.chan;} }
+    else if(r.type==='geofence'){ if(p.lat!=null&&p.lon!=null&&r.lat!=null&&r.lon!=null){
+        const inside=haversine(p.lat,p.lon,+r.lat,+r.lon)<=(+r.radius||1); const gk=r.id+'|'+p.from; const prev=_geoState[gk]; const ev=r.event||'both';
+        if(prev!==undefined){ if(!prev&&inside&&ev!=='exit'){hit=true;why=disp(p.from)+' entered area';} else if(prev&&!inside&&ev!=='enter'){hit=true;why=disp(p.from)+' left area';} }
+        _geoState[gk]=inside; } }
+    if(r.type!=='new_node'&&r.type!=='geofence'){ const key=r.id+'|'+p.pktid; if(hit&&_alertFired.has(key))hit=false; else if(hit)_alertFired.add(key); }
+    if(hit)fireAlert(r,p,why);
+  }
+  if(p.from)SEEN_NODES.add(p.from);
+}
+function fireAlert(r,p,why){
+  ALERT_LOG.unshift({ts:Date.now()/1000,label:r.label||alertTypeName(r),why,from:p.from,pktid:p.pktid,hops:p.hops,text:p.text});
+  if(ALERT_LOG.length>200)ALERT_LOG.pop();
+  ALERT_UNREAD++; updateBell();
+  toast('🔔 '+(r.label||alertTypeName(r))+': '+why);
+  if(r.sound)beep();
+  if(r.notify&&window.Notification&&Notification.permission==='granted'){try{new Notification('LoRa alert: '+(r.label||alertTypeName(r)),{body:why+(p.text?'\n'+p.text:'')});}catch(e){}}
+  if(ALERTPANEL_OPEN)renderAlertPanel();
+}
+let _ac=null;
+function beep(){try{_ac=_ac||new (window.AudioContext||window.webkitAudioContext)();const o=_ac.createOscillator(),g=_ac.createGain();o.connect(g);g.connect(_ac.destination);o.frequency.value=880;g.gain.value=0.07;o.start();setTimeout(()=>o.stop(),160);}catch(e){}}
+function updateBell(){const b=$('#bellct');if(!b)return; if(ALERT_UNREAD>0){b.textContent=ALERT_UNREAD>99?'99+':ALERT_UNREAD;b.style.display='';}else b.style.display='none';}
+function toggleAlertPanel(){let p=$('#alertpanel'); if(p){p.remove();ALERTPANEL_OPEN=false;return;} ALERT_UNREAD=0;updateBell();ALERTPANEL_OPEN=true;
+  p=document.createElement('div');p.id='alertpanel';p.style.cssText='position:fixed;right:12px;top:88px;width:370px;max-height:72vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:8px;z-index:9998;box-shadow:0 10px 30px rgba(0,0,0,.55)';document.body.appendChild(p);renderAlertPanel();}
+function renderAlertPanel(){const p=$('#alertpanel');if(!p)return;
+  const rows=ALERT_LOG.map((a,i)=>`<div class="alrow" data-i="${i}" style="padding:8px 12px;border-bottom:1px solid var(--line);cursor:pointer"><div><b>${esc(a.label)}</b> <span class="muted" style="font-size:11px">${fmtTime(a.ts)}</span></div><div class="muted" style="font-size:12px">${esc(a.why)}${a.text?' — '+esc(String(a.text).slice(0,50)):''}</div></div>`).join('')||'<div class="muted" style="padding:14px">no alerts yet</div>';
+  p.innerHTML=`<div style="padding:8px 12px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center"><b>Alerts</b><a id="al-clearlog" class="muted" style="cursor:pointer;font-size:12px">clear</a></div>${rows}`;
+  p.querySelector('#al-clearlog').onclick=()=>{ALERT_LOG.length=0;renderAlertPanel();};
+  p.querySelectorAll('.alrow').forEach(r=>r.onclick=()=>{const a=ALERT_LOG[+r.dataset.i]; if(a&&a.from){OPEN.add(a.from);toggleAlertPanel();activateTab('nodes');}});
+}
+function postAlert(id,patch){fetch('/api/alerts/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(r=>r.json()).then(res=>{if(res.alerts)ALERTS=res.alerts;});}
+
+function renderCurrent(){ if(TAB==='pkts')renderPkts(); else if(TAB==='nodes')renderNodes(); else if(TAB==='net')startNet(); else if(TAB==='wf')renderWaterfall(); else if(TAB==='map')renderMap(); else if(TAB==='search')renderSearch(); else if(TAB==='stats')renderStatsTab(); else if(TAB==='config')renderConfig(); }
+function renderStats(s){$('#s_pkts').textContent=s.packets;$('#s_dec').textContent=s.decoded;$('#s_enc').textContent=s.encrypted;$('#s_nodes').textContent=s.nodes;$('#pipedot').className='dot '+(s.pipeline_running?'on':'off');$('#pipetxt').textContent=s.pipeline_running?'running':'stopped';}
+
+const TABS=['pkts','nodes','net','wf','map','search','stats','config'];
+function activateTab(name){
+  if(!TABS.includes(name))name='pkts';
+  document.querySelectorAll('nav a').forEach(x=>x.classList.toggle('active',x.dataset.tab===name));
+  TAB=name; TABS.forEach(t=>$('#tab-'+t).style.display=t===TAB?'':'none');
+  if(location.hash.slice(1)!==name) history.replaceState(null,'','#'+name);
+  renderCurrent();
+}
+document.querySelectorAll('nav a').forEach(a=>a.onclick=()=>activateTab(a.dataset.tab));
+$('#filter').oninput=e=>{FILTER=e.target.value.trim();renderPkts();};
+document.querySelectorAll('.chip[data-f]').forEach(c=>c.onclick=()=>{document.querySelectorAll('.chip[data-f]').forEach(x=>x.classList.remove('active'));c.classList.add('active');PFILT=c.dataset.f;renderPkts();});
+$('#btnStart').onclick=()=>fetch('/api/pipeline/start',{method:'POST'});
+$('#btnStop').onclick=()=>fetch('/api/pipeline/stop',{method:'POST'});
+$('#btnSave').onclick=()=>{window.location='/api/export?fmt=csv';};
+$('#btnImport').onclick=()=>$('#importFile').click();
+$('#importFile').onchange=e=>{const f=e.target.files[0]; if(!f)return; const r=new FileReader();
+  r.onload=()=>{fetch('/api/import',{method:'POST',body:r.result}).then(x=>x.json()).then(res=>{
+    fetch('/api/state').then(r=>r.json()).then(d=>{PK.length=0;PK.push(...d.packets);d.packets.forEach(noteName);renderStats(d.stats);G.nodes=[];OPEN.clear();renderCurrent();});
+    alert('Imported '+res.imported+' packets. Start the pipeline to add new data, then Save to export old + new.');});};
+  r.readAsText(f); e.target.value='';};
+const _as=$('#autosave');
+fetch('/api/settings').then(r=>r.json()).then(s=>{_as.checked=!!s.autosave;WFON=s.waterfall!==false;}).catch(()=>{});
+_as.onchange=()=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autosave:_as.checked})});
+$('#btnClear').onclick=()=>{if(confirm('Clear all captured packets (also clears the saved log)?')){fetch('/api/clear',{method:'POST'});PK.length=0;G.nodes=[];OPEN.clear();renderCurrent();}};
+try{new URLSearchParams(location.search).getAll('open').forEach(id=>OPEN.add(id));}catch(e){}
+try{const _q=new URLSearchParams(location.search).get('q'); if(_q)SEARCHQ=_q;}catch(e){}
+fetch('/api/state').then(r=>r.json()).then(d=>{PK.push(...d.packets);d.packets.forEach(noteName);d.packets.forEach(p=>{if(p.from)SEEN_NODES.add(p.from);});renderStats(d.stats);CFGW=d.config||{};activateTab(location.hash.slice(1)||'pkts');
+  if(d.config&&d.config.center_mhz)$('#center').textContent='center '+d.config.center_mhz+' MHz · key '+(d.config.key||'default');}).catch(()=>activateTab('pkts'));
+fetch('/api/health').then(r=>r.json()).then(renderHealth).catch(()=>{});
+fetch('/api/keys').then(r=>r.json()).then(k=>{KEYS=k;}).catch(()=>{});   // for the retry-decode menu
+fetch('/api/alerts').then(r=>r.json()).then(a=>{ALERTS=a;}).catch(()=>{});   // alert rules
+fetch('/api/nodes/meta').then(r=>r.json()).then(m=>{NODEMETA=m||{}; if(TAB!=='net'&&TAB!=='config')renderCurrent();}).catch(()=>{});   // node labels/notes/watchlist
+{const b=$('#bell'); if(b)b.onclick=toggleAlertPanel;}
+if(!STATIC){
+  const es=new EventSource('/api/stream');
+  es.addEventListener('packet',e=>{const p=JSON.parse(e.data);evalAlerts(p);PK.push(p);noteName(p); if(TAB==='pkts'&&!$('#follow').checked)return; if(TAB!=='net'&&TAB!=='config')renderCurrent();});
+  es.addEventListener('update',e=>{const p=JSON.parse(e.data);evalAlerts(p);const i=PK.findIndex(x=>x.pktid===p.pktid&&x.hops===p.hops); if(i>=0)PK[i]=p; else PK.push(p); noteName(p); if(TAB!=='net'&&TAB!=='config')renderCurrent();});
+  es.addEventListener('confirm',e=>{const d=JSON.parse(e.data); if(d&&d.devaddr){let ch=false; for(const p of PK){if(p.devaddr===d.devaddr&&p.proto==='unknown'){p.proto='lorawan';p.confidence='confirmed';p.from='LW:'+d.devaddr;delete p.hint;ch=true;}} if(ch&&TAB!=='net'&&TAB!=='config')renderCurrent();}});
+  es.addEventListener('stats',e=>renderStats(JSON.parse(e.data)));
+  es.addEventListener('health',e=>renderHealth(JSON.parse(e.data)));
+  es.addEventListener('psd',e=>{ if(TAB==='wf'&&WF)wfRow(JSON.parse(e.data)); });
+  es.addEventListener('nodemeta',e=>{ const d=JSON.parse(e.data); if(d&&d.id){ if(d.meta&&Object.keys(d.meta).length)NODEMETA[d.id]=d.meta; else delete NODEMETA[d.id]; if(TAB!=='net'&&TAB!=='config')renderCurrent(); } });
+  setInterval(()=>{if(TAB==='nodes')renderNodes();else if(TAB==='net')buildGraph();},5000);
+}
+</script>
+</body>
+</html>

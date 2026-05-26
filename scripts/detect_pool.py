@@ -1,0 +1,151 @@
+"""Multiprocess Schmidl-Cox detection pool.
+
+The gate's per-window detect_preamble (1Msps extract + multi-lag SC + dechirp
+confirm) is the only thing that can't sustain 28 Msps in one process — the
+producer (read + Welch + slide) runs at ~57 Msps with headroom, but detect is
+~0.8x real-time serial.  Detection of each time-window is independent, so this
+pool fans windows out to N single-threaded worker PROCESSES (true parallelism,
+no GIL), fed via shared-memory slots so the 224 MB window is never pickled.
+
+Results are identical to calling detect_preamble directly — same algorithm, run
+on different cores.  The caller collects in window order.
+
+Usage:
+    pool = DetectPool(n_workers=6, n_slots=10, win_n=28_000_000, params={...})
+    slot = pool.acquire_slot()              # blocks until a slot is free
+    pool.slot_array(slot)[:n] = window_iq   # write the window into the slot
+    pool.dispatch(slot, seq, n, psd, peaks) # hand to a worker
+    ...
+    dets = pool.result(seq)                 # blocks until window `seq` is done
+    pool.release_slot(slot)                 # return slot to the free pool
+    pool.close()
+"""
+import os
+import queue
+import numpy as np
+import multiprocessing as mp
+from multiprocessing import shared_memory
+
+
+def _worker_main(shm_names, win_n, task_q, result_q, params):
+    # Single-threaded inside each worker so N workers ≈ N cores (no
+    # oversubscription).  detect_preamble reads these envs.
+    os.environ['LORA_FFT_WORKERS'] = '1'
+    os.environ['LORA_DETECT_SERIAL'] = '1'
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import lora_detect as L
+
+    # Attach to every shared slot once; build a numpy view per slot.
+    shms = [shared_memory.SharedMemory(name=nm) for nm in shm_names]
+    views = [np.ndarray((win_n,), dtype=np.complex64, buffer=s.buf) for s in shms]
+
+    wb_fs = params['wb_fs']; wb_bw = params['wb_bw']; center = params['center']
+    sc_thr = params['sc_threshold']; ethr = params['ethresh']
+    dc_notch = params['dc_notch']; spur_notch = params['spur_notch']
+    spur_default = params.get('spur_db_default', None)
+
+    while True:
+        task = task_q.get()
+        if task is None:
+            break
+        slot, seq, n, psd, peaks, spur_db = task
+        iq = views[slot][:n]
+        try:
+            kw = dict(sc_threshold=sc_thr, ethresh=ethr,
+                      dc_notch_mhz=dc_notch, spur_notch_hz=spur_notch,
+                      debug=0, cached_psd=psd, cached_peaks=peaks)
+            if spur_db is not None:
+                kw['spur_db'] = spur_db
+            dets = L.detect_preamble(iq, wb_fs, wb_bw, center, **kw)
+        except Exception as e:
+            dets = []
+            result_q.put((seq, dets, 'ERR:%s' % e))
+            continue
+        result_q.put((seq, dets, None))
+
+    for s in shms:
+        s.close()
+
+
+class DetectPool:
+    def __init__(self, n_workers, n_slots, win_n, params):
+        self.win_n = win_n
+        self.n_slots = n_slots
+        # Shared-memory slots, each holds one full window (complex64).
+        self._shms = [shared_memory.SharedMemory(create=True,
+                                                 size=win_n * 8)
+                      for _ in range(n_slots)]
+        self._views = [np.ndarray((win_n,), dtype=np.complex64, buffer=s.buf)
+                       for s in self._shms]
+        self._free = list(range(n_slots))
+        names = [s.name for s in self._shms]
+
+        # 'fork' so workers inherit the already-imported numpy/scipy/lora_detect
+        # (fast startup).  CRITICAL: the caller must build this pool BEFORE
+        # starting any other threads (recorder save-workers, decoder managers,
+        # the stdin drainer) — forking a multithreaded process inherits their
+        # held locks and the workers deadlock.  Built first, the process is
+        # single-threaded and fork is safe.
+        ctx = mp.get_context('fork')
+        self._task_q = ctx.Queue()
+        self._result_q = ctx.Queue()
+        self._workers = []
+        for _ in range(n_workers):
+            p = ctx.Process(target=_worker_main,
+                            args=(names, win_n, self._task_q,
+                                  self._result_q, params),
+                            daemon=True)
+            p.start()
+            self._workers.append(p)
+        self._results = {}   # seq -> dets, filled as results arrive
+
+    def acquire_slot(self):
+        # Single-threaded caller (the gate producer), so no lock needed.
+        return self._free.pop() if self._free else None
+
+    def slot_array(self, slot):
+        return self._views[slot]
+
+    def release_slot(self, slot):
+        self._free.append(slot)
+
+    def n_free(self):
+        return len(self._free)
+
+    def dispatch(self, slot, seq, n, psd, peaks, spur_db=None):
+        self._task_q.put((slot, seq, n, psd, peaks, spur_db))
+
+    def result(self, seq):
+        """Block until window `seq`'s detection is available; return dets."""
+        while seq not in self._results:
+            rseq, dets, err = self._result_q.get()
+            self._results[rseq] = dets
+        return self._results.pop(seq)
+
+    def ready(self, seq):
+        """Non-blocking: drain any arrived results, return True if `seq` is done.
+        Lets the gate make a tail-aware commit decision without blocking the
+        realtime read on a not-yet-finished detection."""
+        try:
+            while True:
+                rseq, dets, err = self._result_q.get_nowait()
+                self._results[rseq] = dets
+        except queue.Empty:
+            pass
+        return seq in self._results
+
+    def peek(self, seq):
+        """Return `seq`'s dets without removing them (call after ready())."""
+        return self._results.get(seq)
+
+    def close(self):
+        for _ in self._workers:
+            self._task_q.put(None)
+        for p in self._workers:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+        for s in self._shms:
+            s.close()
+            s.unlink()

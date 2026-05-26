@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# IQ data (large)
+*.sc16
+*.cf32
+*.fc32
+captures/
+recordings/
+
+# Test data / runtime logs
+*.jsonl
+*.log
+*.npz
+
+# User-specific runtime config + autosaved data
+web_settings.json
+lora_web/web_settings.json
+lora_web/lora_autosave.jsonl
+lora_web/lora_unknown.jsonl
+lora_web/lora_packets.jsonl
+lora_web/dec_pkts.jsonl
+
+# Secrets
+*.key
+*.pem
+keys.json
+keystore.json
+
+# Local agent config
+.claude/
+
+# Old baselines / build artifacts
+archive/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
