@@ -45,10 +45,19 @@ sudo apt-get install -y python3 python3-pip build-essential libusb-1.0-0 \
 echo "==> Installing SDR device support (skips anything not in your repo) ..."
 for pkg in soapysdr-module-all soapysdr-module-xtrx \
            bladerf hackrf rtl-sdr airspy airspyhf \
+           uhd-host soapysdr-module-uhd \
            libiio-utils libad9361-0; do
     sudo apt-get install -y "$pkg" >/dev/null 2>&1 && echo "   + $pkg" \
         || echo "   - $pkg (not available — skipped)"
 done
+
+# UHD (USRP B200/B205mini/B210) FPGA + firmware images.  uhd-host ships the
+# downloader; the images themselves are pulled separately (~70 MB).  Without
+# these, B205mini fails to enumerate on first connect.  Idempotent.
+if command -v uhd_images_downloader >/dev/null 2>&1; then
+    echo "==> Downloading UHD FPGA/firmware images (USRP devices) ..."
+    sudo uhd_images_downloader 2>&1 | tail -4
+fi
 
 echo "==> Installing Python requirements ..."
 # --user keeps it out of the system site; --break-system-packages satisfies PEP 668

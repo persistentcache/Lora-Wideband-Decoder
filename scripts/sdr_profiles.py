@@ -95,6 +95,18 @@ SDR_PROFILES = {
         note='Via SoapySDR. Fixed rates (e.g. 10/2.5 Msps).',
         limits={'rate_hz': (2500000, 10000000), 'bandwidth_hz': (2500000, 10000000),
                 'center_mhz': (24.0, 1800.0)}),
+    # USRP B-series (B200/B205mini/B210) via SoapyUHD.  No hardware AGC — gain is
+    # an analog 0-89.75 dB knob on the AD9364, so we force manual gain.  B205mini
+    # sustains ~30 Msps over USB 3.0; needs UHD FPGA images (uhd_images_downloader
+    # — pulled by the installer) on first connect.
+    'usrp': _soapy_profile(
+        'USRP B-series (Ettus)', 'uhd', tested=False, agc_ok=False, default_gain=40,
+        note='Via SoapyUHD. B200/B205mini/B210. USB3.0 sustains ~30 Msps. '
+             'No AGC — set gain in dB (0-89.75; default 40). First connect '
+             'downloads FPGA image; run `sudo uhd_images_downloader` if it fails.',
+        limits={'rate_hz': (200000, 56000000),
+                'bandwidth_hz': (200000, 56000000),
+                'center_mhz': (70.0, 6000.0)}),
     # ---- Generic SoapySDR — anything not named above (LimeSDR/USRP/Pluto/…) ----
     'soapy': {
         'label': 'SoapySDR — other device',
@@ -118,8 +130,9 @@ SDR_PROFILES = {
 DEFAULT_SDR = 'bladerf'
 
 # SoapySDR drivers whose AGC is unreliable (rails the ADC, destroying the signal)
-# → force manual gain.  Value = a sensible default gain (dB) for that device.
-_SOAPY_NO_AGC = {'hackrf': 40}
+# or whose device has no hardware AGC → force manual gain.  Value = a sensible
+# default gain (dB) for that device.  USRP B-series has no AGC — pure analog gain.
+_SOAPY_NO_AGC = {'hackrf': 40, 'uhd': 40}
 
 
 def gain_ui(sdr, soapy_driver='hackrf'):
