@@ -1480,6 +1480,79 @@ def _emit_pkt(rec):
 
 _UNKNOWN_SEEN = set()   # per-process dedup of unknown-protocol frames (by content)
 
+# ---- Known-node registry for chase plausibility (behavioral verification) ----
+# Populated as clean-CRC Meshtastic packets emit (their src/dst are known-real
+# nodes).  Used to gate chase recovery for encrypted DMs without a key: a
+# random byte pattern that happens to pass CRC-16 AND look structurally like a
+# Meshtastic header AND has its src/dst match a previously-seen real node is
+# astronomically unlikely (combined ~1/2^80).  Bootstrap (cold start): until
+# the first clean decode populates the set, chase falls back to strict
+# broadcast-only gate so no FPs leak.
+_KNOWN_NODES = set()
+_KNOWN_NODES_LOCK = None
+try:
+    import threading as _thr_kn
+    _KNOWN_NODES_LOCK = _thr_kn.Lock()
+except Exception:
+    pass
+
+def _register_known_node(addr_int):
+    """Add a Meshtastic node address (32-bit int) to the known set."""
+    if not addr_int:
+        return
+    if addr_int == 0xFFFFFFFF:   # broadcast — not a node
+        return
+    if _KNOWN_NODES_LOCK is not None:
+        with _KNOWN_NODES_LOCK:
+            _KNOWN_NODES.add(int(addr_int) & 0xFFFFFFFF)
+    else:
+        _KNOWN_NODES.add(int(addr_int) & 0xFFFFFFFF)
+
+def _is_chase_acceptable_uni(tr):
+    """Chase recovery gate for unicast DMs (encrypted, no key for verification).
+    Accept iff recovered header is structurally a valid unicast frame AND its
+    dst OR src is a previously-seen real node.  Strict broadcast (dst==FFFFFFFF)
+    is always accepted (matches the original chase gate)."""
+    if len(tr) < 16:
+        return False
+    # Broadcast — always accept (original behavior)
+    if tr[0] == 0xFF and tr[1] == 0xFF and tr[2] == 0xFF and tr[3] == 0xFF:
+        return True
+    # Unicast: require known node + plausible structure
+    dst_int = int(tr[0]) | (int(tr[1]) << 8) | (int(tr[2]) << 16) | (int(tr[3]) << 24)
+    src_int = int(tr[4]) | (int(tr[5]) << 8) | (int(tr[6]) << 16) | (int(tr[7]) << 24)
+    if dst_int == 0 or src_int == 0:
+        return False
+    if dst_int == src_int:   # nonsensical
+        return False
+    # Behavioral gate: at least one endpoint must be a known node
+    snapshot = set(_KNOWN_NODES) if _KNOWN_NODES_LOCK is None else None
+    if _KNOWN_NODES_LOCK is not None:
+        with _KNOWN_NODES_LOCK:
+            snapshot = set(_KNOWN_NODES)
+    if not (dst_int in snapshot or src_int in snapshot):
+        return False
+    # Structural: hop_limit ≤ hop_start (Meshtastic invariant).
+    # Meshtastic header layout: dst[0:4] src[4:8] pktid[8:12] flags[12] chan[13]
+    flags = int(tr[12])
+    hop_limit = flags & 0x07
+    hop_start = (flags >> 5) & 0x07
+    return hop_limit <= hop_start
+
+# Optional bootstrap of the known-node set from an env var
+# (e.g. LORA_KNOWN_NODES=aabbccdd,11223344).  Avoids the cold-start window where
+# unicast chase has no nodes to verify against; once any clean Meshtastic
+# packet decodes, that node's address is auto-registered and the env var is
+# no longer needed.
+import os as _os_kn
+_seed = _os_kn.environ.get('LORA_KNOWN_NODES', '')
+for _tok in _seed.replace(' ', '').split(','):
+    if _tok:
+        try:
+            _register_known_node(int(_tok, 16))
+        except ValueError:
+            pass
+
 
 def _report_unknown(payload, sf, bw, cr, sync, name):
     """Log a clean-CRC LoRa frame that NO parser recognised (not Meshtastic /
@@ -1654,6 +1727,10 @@ def parse_meshtastic_packet(payload, aes_key=None, no_key=False, _clean_crc=Fals
                           reply_id, chr(emoji) if emoji and emoji > 0x1f else ("0x%x" % emoji if emoji else "")))
 
     if inner_payload is None or len(inner_payload) == 0:
+        # Clean decrypted packet — register the endpoints as known nodes for
+        # behavioral chase verification on subsequent encrypted-DM recoveries.
+        _register_known_node(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24))
+        _register_known_node(p[4] | (p[5] << 8) | (p[6] << 16) | (p[7] << 24))
         _emit_pkt(_rec)
         return
 
@@ -1663,6 +1740,9 @@ def parse_meshtastic_packet(payload, aes_key=None, no_key=False, _clean_crc=Fals
         print("  Message: \"%s\"" % _enr['text'])
     elif _enr.get('payload_hex'):
         print("  Payload (%d bytes): %s" % (len(inner_payload), _enr['payload_hex']))
+    # Clean decrypted packet — register the endpoints as known nodes.
+    _register_known_node(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24))
+    _register_known_node(p[4] | (p[5] << 8) | (p[6] << 16) | (p[7] << 24))
     _emit_pkt(_rec)
 
 
@@ -3019,18 +3099,33 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     _sfd_fine_bin -= N
                 sfd_cfo_bins_cand.append(_sfd_fine_bin)
 
-            # SFD CFO magnitude penalty: large residual usually means the
-            # detected preamble bin is off (wrong cyclic shift), so dropping
-            # this candidate prevents the downstream decode from operating
-            # on a misaligned signal.  Tied scores between gated/ungated FFT
-            # runs (parallel scipy FFT is non-deterministic to ~10⁻⁶) flip
-            # candidate ordering — this term is large enough to dominate
-            # those ties and pick the SFD-aligned preamble every time.
+            # SFD CFO magnitude penalty: large SFD CFO usually means the
+            # detected preamble bin is off (wrong cyclic shift).  BUT if the
+            # SFD CFO is CONSISTENT with the preamble bin (signal really IS
+            # far from baseband — captured well off-centre), it's a real
+            # signal and shouldn't be penalised.  Test11/14 at SF12 had real
+            # preambles at bin ~3018 (=-1078 signed = -33 kHz CFO); their
+            # SFD CFO measurements also landed at ~-1078, so the penalty
+            # fires HUGE (-3000) for a perfectly real signal and the
+            # decoder picks a noise-peak candidate instead.  Only penalise
+            # when SFD CFO disagrees with preamble bin (i.e., the detection
+            # was inconsistent — likely a noise/spur preamble).  Tied scores
+            # between gated/ungated FFT runs (parallel scipy FFT is
+            # non-deterministic to ~10⁻⁶) flip candidate ordering — this
+            # term is large enough to dominate those ties when it does fire.
             _sfd_cfo_cand_mean = (sum(sfd_cfo_bins_cand) / len(sfd_cfo_bins_cand)
                                   if sfd_cfo_bins_cand else 0.0)
+            # SFD CFO penalty REMOVED 2026-05-27 — it was over-aggressive and
+            # killed real off-baseband preambles at high SF.  Test11/Test14
+            # source DMs at SF12/-33 kHz CFO were correctly detected by the
+            # preamble but penalised by -3000+ (because their SFD CFO measured
+            # at the same large value), causing the decoder to pick a noise-
+            # peak candidate instead.  Without the penalty: all 4 known-failing
+            # captures (Test3, Test11, Test14, Test19) decode at budget=10.
+            # The wrong-cyclic-shift case the penalty was originally guarding
+            # against is now caught by the skip_bins retry loop (try next
+            # candidate when CRC fails on the chosen one).
             sfd_cfo_penalty = 0.0
-            if abs(_sfd_cfo_cand_mean) > 2.0:
-                sfd_cfo_penalty = -3.0 * (abs(_sfd_cfo_cand_mean) - 2.0)
 
             cand_score = (12.0 * min(pre_len_cand, 18) +
                           2.0 * run_mean_pmr +
@@ -3112,6 +3207,21 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     cfo_hz = k_hat_fine * bw / N
     t_cfo = np.arange(len(iq1), dtype=np.float64) / bw
     iq1 = (iq1 * np.exp(-1j * 2.0 * np.pi * cfo_hz * t_cfo)).astype(np.complex64)
+
+    # ---- Per-sample CFO DRIFT correction (quadratic phase) ----
+    # The regression measures both intercept (k_hat_fine, applied above as
+    # constant cfo_hz) AND slope (drift_bins_per_sym).  Apply the slope as a
+    # quadratic phase correction with time origin at preamble_start (so the
+    # regression's per-symbol-index mapping is preserved — using bare sample
+    # index introduces a spurious cross-term).  At SF7 the payload is ~10
+    # syms so cumulative drift is < 0.1 bins and this correction is a near-
+    # no-op; at SF12 the payload is ~80 syms and cumulative drift can be 4+
+    # bins, putting every payload symbol's FFT peak in the wrong bin.
+    # SF/BW-agnostic.  Latency: one numpy multiply, negligible.
+    if abs(drift_bins_per_sym) > 1e-4:
+        _n_drift = np.arange(len(iq1), dtype=np.float64) - preamble_start
+        _drift_phase = -np.pi * drift_bins_per_sym * (_n_drift / N) ** 2
+        iq1 = (iq1 * np.exp(1j * _drift_phase)).astype(np.complex64)
 
     # Measure post-correction residual on preamble symbols.
     # The regression can be off by 0.1-0.2 bins, which causes ±1 bin errors
@@ -3673,6 +3783,15 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
               "— likely demod error, retry via chase")
         crc_ok = False  # force chase to try recovery
         _clean_crc = False
+    # Behavioral gate (same as sweep direct CRC path): broadcast or a known
+    # node.  Without this, a primary CRC-16 coincidence on a 1/65536 random
+    # match × ~1/2^16 uni-structural validity will leak ~1 FP per ~150
+    # captures of a high-SF DM test, all with bit-flipped src/dst.
+    if crc_ok and not _is_chase_acceptable_uni(raw_bytes):
+        print("  BEHAVIORAL: primary CRC OK but header src/dst is not a known "
+              "node — likely demod error, retry via chase")
+        crc_ok = False
+        _clean_crc = False
 
     # ---- Chase on primary decode ----
     # The chase loop has its own broadcast-header plausibility gate
@@ -3739,7 +3858,16 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 # consistent: a real packet recovered at the right timing has a
                 # valid header (CRC validates the header bytes), so this NEVER
                 # rejects a real packet; only coincidences on garbage are blocked.
-                if ok and _is_plausible_mesh_header_uni(tr_raw):
+                # Behavioral gate: broadcast OR (structural unicast AND a
+                # known node we've already decoded clean traffic from).
+                # _is_chase_acceptable_uni handles both: dst=FFFFFFFF always
+                # passes; unicast requires src or dst ∈ _KNOWN_NODES.  Without
+                # this, sweep CRC-16 coincidence × structural-uni-plausibility
+                # leaks ~1 FP per ~150 captures with from/to addresses that
+                # are bit-flipped Node addresses.  _KNOWN_NODES auto-populates
+                # from clean Meshtastic decrypts; bootstrap via env
+                # LORA_KNOWN_NODES=hex,hex,...
+                if ok and _is_chase_acceptable_uni(tr_raw):
                     print("  %s ds=%+d slope=%+.3f tau=%+.4f: CRC %s OK!" % (label, ds_off, slope, frac_tau, method))
                     crc_ok, crc_method = True, method
                     # Sweep DIRECT CRC + plausibility gate = effectively a "clean"
