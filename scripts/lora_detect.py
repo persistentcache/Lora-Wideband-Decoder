@@ -2234,8 +2234,19 @@ class BackgroundDecoder:
             _env_nw_i = 0
         # -1 / 0 / unset → auto-scale.  Plug-and-play on any core count:
         # leave the gate, detect-pool, and a small reserve enough CPU.
-        self._n_workers = (_env_nw_i if _env_nw_i > 0
-                           else max(2, min(16, _ncpu - 6)))
+        # Workers are niced +10 (set in _lower_priority) so the OS preempts
+        # them for the realtime-critical gate, which lets us oversubscribe
+        # mildly on low-core hosts without dropping samples.  At LOW core
+        # counts (≤6), the `_ncpu - 6` formula would clamp to the minimum
+        # 2 workers and dec_q backs up at slow SFs; instead reserve a
+        # proportional fraction so smaller hosts get more decode bandwidth.
+        if _ncpu <= 4:
+            _w_auto = max(2, _ncpu - 1)             # 4 cores → 3 workers
+        elif _ncpu <= 8:
+            _w_auto = max(2, _ncpu - 2)             # 8 cores → 6 workers
+        else:
+            _w_auto = max(2, min(16, _ncpu - 6))    # ≥12 cores → ncpu-6 (cap 16)
+        self._n_workers = (_env_nw_i if _env_nw_i > 0 else _w_auto)
         # ---- Two-tier decode on the SAME workers (no oversubscription) ----
         # Each manager serves the FAST queue first; only when it's empty does it
         # pull from the SLOW queue.  A capture the fast pass BAILS on ("[BUDGET]
