@@ -2231,13 +2231,14 @@ def _extract_tx_fingerprint(iq1, preamble_start, sf, bw):
     Nfft_scan = min(Nfft_scan, 4096)                       # never larger than 4096
     freqs_scan = np.fft.fftshift(np.fft.fftfreq(Nfft_scan, d=1.0 / bw))
     boundary_dist_thresh = max(5000.0, bw * 0.05)
+    best_offset = 0
+    best_score = -1.0
     iq_len = len(iq1)
-
-    def _score_offset(off):
-        """Score a single sub-symbol offset.  Returns (score, valid)."""
+    for off in range(-N_sym // 2, N_sym // 2 + 1, max(1, N_sym // 16)):
         s_start = preamble_start + off
         if s_start < 0 or s_start + 8 * N_sym > iq_len:
-            return -1.0, False
+            continue
+        # 8 symbol windows × N_sym samples → (8, N_sym), one batched FFT.
         segs8 = iq1[s_start:s_start + 8 * N_sym].reshape(8, N_sym) * downchirp
         F = np.fft.fft(segs8, n=Nfft_scan, axis=1)
         sF_scan = np.fft.fftshift(F.sum(axis=0))
@@ -2246,33 +2247,10 @@ def _extract_tx_fingerprint(iq1, preamble_start, sf, bw):
         pk_freq = freqs_scan[pk_idx]
         pk_amp = float(cmag[pk_idx])
         boundary_dist = bw / 2 - abs(pk_freq)
-        bp = 1.0 if boundary_dist > boundary_dist_thresh else (boundary_dist / boundary_dist_thresh)
-        return pk_amp * bp, True
-
-    # Coarse-then-fine alignment search.  Was 17 brute-force offsets at step
-    # N_sym/16 across ±N_sym/2; now does ~5 coarse (step N_sym/4) + ~4 fine
-    # (step N_sym/16 around the coarse winner).  Same precision, ~half the
-    # batched FFT calls.  Feature extraction below uses the WINNER's offset
-    # at full Nfft=65536 unchanged so fingerprint values are bit-identical
-    # whenever both searches agree on best_offset (the dominant case at any
-    # reasonable SNR).
-    best_offset = 0
-    best_score = -1.0
-    coarse_step = max(1, N_sym // 4)
-    for off in range(-N_sym // 2, N_sym // 2 + 1, coarse_step):
-        sc, ok = _score_offset(off)
-        if ok and sc > best_score:
-            best_score = sc
-            best_offset = off
-    fine_step = max(1, N_sym // 16)
-    fine_lo = best_offset - coarse_step
-    fine_hi = best_offset + coarse_step
-    for off in range(fine_lo, fine_hi + 1, fine_step):
-        if off == best_offset:
-            continue   # already evaluated in the coarse pass
-        sc, ok = _score_offset(off)
-        if ok and sc > best_score:
-            best_score = sc
+        boundary_penalty = 1.0 if boundary_dist > boundary_dist_thresh else (boundary_dist / boundary_dist_thresh)
+        score = pk_amp * boundary_penalty
+        if score > best_score:
+            best_score = score
             best_offset = off
     aligned_start = preamble_start + best_offset
     if aligned_start < 0 or aligned_start + 8 * N_sym > iq_len:
