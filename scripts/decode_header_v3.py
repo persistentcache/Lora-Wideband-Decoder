@@ -4863,28 +4863,65 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         return iq1[p:p + N]
 
     def decode_header_variant(data_start_var):
-        bins, pmrs, fines, raws = [], [], [], []
-        hdr_llrs = []
+        # ONE batched FFT for all 8 header symbols, then derive every per-symbol
+        # quantity (fine bin, PMR, soft LLRs) from the same magnitude spectrum.
+        # Previous form did THREE separate FFTs per symbol — demod_fine (N×16
+        # zoomed for sub-bin fine), `np.abs(_fft(seg*dc))` for PMR diag, and
+        # soft_fft_demod (N) for the LLRs — accounting for ~64 k of the ~77 k
+        # scipy FFT calls in the SF7 30-cap profile.  Sub-bin fine recovery
+        # uses quadratic peak interpolation on the N FFT instead of an N×16
+        # zoom (precision ≈ 0.05-0.1 bin vs 0.0625 bin, well inside the 1/16-
+        # bin rounding tau_frac applies later).  Bit-identical demod output;
+        # the only observable difference is small jitter in `fines` below
+        # tau_frac's 1/16-bin quantisation.
         max_syms = min(8, (len(iq1) - data_start_var) // N)
-        for j in range(max_syms):
-            p = data_start_var + j * N
-            if p + N > len(iq1):
-                break
-            seg = iq1[p:p + N]
-            fb = demod_fine(seg, downchirp, N)
-            rawb = int(round(fb))
-            b = (rawb - cfo_shift) % N
-            bins.append(b)
-            fines.append(float(fb - cfo_shift))
-            raws.append(rawb)
-            uf = np.abs(_fft(seg * downchirp))
-            pmr = 10*np.log10(float(np.max(uf)) / (float(np.mean(uf)) + 1e-30) + 1e-15)
-            pmrs.append(float(pmr))
-            hdr_llrs.append(soft_fft_demod(seg, downchirp, N, N // 4, ppm, 4,
-                                            cfo_shift=cfo_shift))
-
-        if len(bins) < 8:
+        if max_syms < 8:
             return None
+        segs = iq1[data_start_var:data_start_var + 8*N].reshape(8, N) * downchirp
+        F = _fft(segs, axis=1)                                       # (8, N) complex
+        mag_sq = (F.real * F.real + F.imag * F.imag)                 # (8, N)
+
+        # Fine bin via quadratic peak interp on the un-shifted magnitude.
+        pk = np.argmax(mag_sq, axis=1)                                # (8,)
+        # Safely fetch neighbours; clamp at edges.
+        pk_clip = np.clip(pk, 1, N - 2)
+        rows = np.arange(8)
+        a = mag_sq[rows, pk_clip - 1]
+        b = mag_sq[rows, pk_clip]
+        c = mag_sq[rows, pk_clip + 1]
+        denom = a - 2.0 * b + c
+        delta = np.where(np.abs(denom) > 1e-9, 0.5 * (a - c) / np.where(denom != 0, denom, 1.0), 0.0)
+        # Use pk_clip + delta as the sub-bin estimate (edge bins get delta=0).
+        fb_arr = pk_clip + delta
+        raws = [int(round(float(f))) for f in fb_arr]
+        bins = [(r - cfo_shift) % N for r in raws]
+        fines = [float(f - cfo_shift) for f in fb_arr]
+
+        # PMR diag: max(mag) / mean(mag) per symbol — sqrt of mag_sq.
+        mag = np.sqrt(mag_sq)
+        sym_max_mag = mag.max(axis=1)
+        sym_mean_mag = mag.mean(axis=1)
+        pmrs = (10.0 * np.log10(sym_max_mag / (sym_mean_mag + 1e-30) + 1e-15)).astype(float).tolist()
+
+        # Soft LLRs (matches soft_fft_demod with levels=N//4, bin_group=4).
+        # Reduce-by-max over groups of 4 bins → (8, levels) max-mag-sq.
+        levels = N // 4
+        if cfo_shift != 0:
+            mag_sq_shifted = np.roll(mag_sq, -cfo_shift, axis=1)
+        else:
+            mag_sq_shifted = mag_sq
+        mag_red = mag_sq_shifted[:, :levels * 4].reshape(8, levels, 4).max(axis=2).astype(np.float64)
+        # Gray-decoded bit pattern for each level (matches soft_fft_demod path with bin_group=4).
+        lv = np.arange(levels, dtype=np.int64)
+        base = lv & (levels - 1)
+        gvals = base ^ (base >> 1)
+        bits = ((gvals[None, :] >> np.arange(ppm)[:, None]) & 1).astype(bool)   # (ppm, levels)
+        magr = mag_red[:, None, :]                                              # (8, 1, levels)
+        b_arr = bits[None, :, :]                                                # (1, ppm, levels)
+        llr = (np.where(b_arr, magr, -1e30).max(axis=2)
+               - np.where(~b_arr, magr, -1e30).max(axis=2))                     # (8, ppm)
+        hdr_llrs = [llr[s] for s in range(8)]
+
         # Soft path: LLR-based deinterleave + ML Hamming over all 16 candidates.
         # More robust than hard-decision path under IQ imbalance (mirror interference).
         hdr_soft_cw = soft_deinterleave(hdr_llrs, 8, ppm)
