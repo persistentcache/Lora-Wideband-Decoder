@@ -76,6 +76,10 @@ export_dec  = 8                          # capture oversampling — 8 = 2 MHz fo
 # key        = "1PG7OiApB1nwvP+rz05pAQ==" # ALT: custom PSK (base64) for a private Meshtastic channel.
 # export_dec = 4                         # ALT: 4 Msps captures — faster decode, less fingerprint resolution.
 # export_dec = 16                        # ALT: 1 Msps captures — highest fingerprint resolution, slowest decode.
+# Set LORA_FINGERPRINT=0 in the env to disable per-packet RF hardware
+# fingerprinting (UMOP feature extraction).  Default is ON — feeds web UI
+# device clustering + Mystery Devices.  Disable on low-core hosts to save
+# ~10-15 % decode CPU at the cost of those features.  See .env.example.
 
 [web]
 host = "127.0.0.1"   # localhost-only (SECURE DEFAULT — the UI has NO authentication).
