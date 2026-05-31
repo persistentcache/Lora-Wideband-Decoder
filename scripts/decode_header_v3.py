@@ -114,13 +114,24 @@ def ordered_unique_floats(vals, digits=4):
 # Returns ppm LLR values. llr[b] = LLR for bit b (0=LSB, ppm-1=MSB).
 # Positive LLR → bit more likely 1.
 # ============================================================================
-def soft_fft_demod(seg, downchirp, N, levels, ppm, bin_group, cfo_shift=0):
+def soft_fft_demod(seg, downchirp, N, levels, ppm, bin_group, cfo_shift=0,
+                    _precomp_mag_sq=None):
     """Soft demod: returns list of ppm floats (LLR per bit).
     cfo_shift: circular-shift FFT bins by this amount (= preamble_bin)
-    to remove CFO without phase correction."""
-    # 1. Dechirp + FFT → magnitude squared per bin
-    x = _fft(seg * downchirp)
-    mag_sq = np.abs(x) ** 2  # use magnitude squared (= norm in C++)
+    to remove CFO without phase correction.
+
+    `_precomp_mag_sq`: optional precomputed |FFT(seg*downchirp)|² for this
+    symbol.  When supplied, the internal FFT is skipped — used by
+    `decode_header_variant` to avoid doing the SAME FFT twice (once for
+    PMR, once for soft LLR) on every header symbol of every timing
+    variant.  Bit-identical math, just no duplicate FFT.
+    """
+    if _precomp_mag_sq is not None:
+        mag_sq = _precomp_mag_sq
+    else:
+        # 1. Dechirp + FFT → magnitude squared per bin
+        x = _fft(seg * downchirp)
+        mag_sq = np.abs(x) ** 2  # use magnitude squared (= norm in C++)
 
     # Circular-shift to remove CFO (equivalent to subtracting preamble_bin)
     if cfo_shift != 0:
@@ -4940,11 +4951,22 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             bins.append(b)
             fines.append(float(fb - cfo_shift))
             raws.append(rawb)
+            # Compute |FFT(seg*downchirp)| ONCE per symbol and reuse for
+            # PMR + squared form for soft LLR — the soft path otherwise
+            # repeats the same FFT internally.  Saves one full-N FFT per
+            # header symbol per variant (at ~50 variants × 8 syms per
+            # header decode, that's ~400 redundant FFT calls eliminated).
+            # Match the original `np.abs(x)**2` rounding exactly: compute
+            # uf = |x| first, then mag_sq = uf**2 — so the precomputed
+            # mag_sq is bit-identical to what soft_fft_demod would compute
+            # internally.
             uf = np.abs(_fft(seg * downchirp))
+            _hdr_mag_sq = uf ** 2
             pmr = 10*np.log10(float(np.max(uf)) / (float(np.mean(uf)) + 1e-30) + 1e-15)
             pmrs.append(float(pmr))
             hdr_llrs.append(soft_fft_demod(seg, downchirp, N, N // 4, ppm, 4,
-                                            cfo_shift=cfo_shift))
+                                            cfo_shift=cfo_shift,
+                                            _precomp_mag_sq=_hdr_mag_sq))
 
         if len(bins) < 8:
             return None
