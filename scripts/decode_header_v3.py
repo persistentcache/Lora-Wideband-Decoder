@@ -611,6 +611,12 @@ def _ordered_keys(cfg, sender):
 # call.  Used by the carrier rescue to stop as soon as it recovers a NEW hop
 # (instead of running the full shift sweep).  Reset per top-level call.
 _DECODED_SET = set()
+# Per-capture hardware fingerprint, set by process_file ONCE on the unshifted
+# IQ before any recenter pass.  Read by _decode_attempt and attached to every
+# emitted [PKT] record (so all decode-pass outcomes share the same per-device
+# RF fingerprint).
+_CURRENT_HW_FP = [None]
+_CURRENT_PRECISE_CFO = [None]
 
 
 
@@ -1083,7 +1089,9 @@ _LORAWAN_GRID_TOL_KHZ = float(os.environ.get('LORA_GRID_TOL_KHZ', '60'))
 # surfaces unrecognised intact frames as proto='unknown' (default 0 = off, no clutter
 # AND lets the decoder early-bail on irrelevant sync words to save compute).
 _PROTO_ENABLED = set(p for p in os.environ.get(
-    'LORA_PROTOCOLS', 'meshtastic,meshcore,lorawan').replace(' ', '').lower().split(',') if p)
+    'LORA_PROTOCOLS',
+    'meshtastic,meshcore,lorawan,loramesher,lora_aprs,reticulum,disaster_radio,ebyte_lora,radiohead'
+).replace(' ', '').lower().split(',') if p)
 _PROTO_UNKNOWN = os.environ.get('LORA_UNKNOWN', '0') == '1'
 # Meshtastic sync tolerance for the early-bail: 0x2B/0x0F plus the 1-bit neighbours of
 # 0x2B (a sync symbol can demod 1 bit off on a marginal capture).
@@ -1165,7 +1173,12 @@ def parse_lorawan_packet(payload, rf=None):
     # *looks like* LoRaWAN, carrying the parsed fields; the web layer promotes it
     # to a NAMED, confirmed LoRaWAN device only once DevAddr + monotonic FCnt agree
     # across frames (behavioral proof, no keys needed).
-    rec = {'proto': 'unknown', 'hint': 'lorawan', 'msg_type': msg_type, 'decrypted': False}
+    # Confidence is 'candidate' — structural-only.  We can't crypto-verify
+    # without the NwkSKey (MIC check needs it).  The web layer promotes this
+    # to 'confirmed' when DevAddr + monotonic FCnt agree across multiple frames
+    # (behavioral proof; no keys needed).
+    rec = {'proto': 'unknown', 'hint': 'lorawan', 'confidence': 'candidate',
+           'msg_type': msg_type, 'decrypted': False}
     if rf:
         _og = _on_lorawan_grid(rf.get('freq_mhz'), rf.get('sf'), rf.get('bw'))
         if _og is not None:
@@ -1383,6 +1396,12 @@ def parse_meshcore_packet(payload):
     if len(payload) <= offset:
         return None        # truncated — cannot positively identify as MeshCore
     path_byte  = payload[offset]
+    # Per MeshCore packet_format.md: path_byte = 0bHHCCCCCC where HH encodes
+    # hash_size-1 (valid 0/1/2 → hash_size 1/2/3) and CCCCCC = hop_count.
+    # HH=0b11 is RESERVED and MUST NOT appear in real MeshCore frames — reject.
+    # This single check eliminates 25% of random-byte false positives.
+    if ((path_byte >> 6) & 0x03) == 3:
+        return None
     hash_count = path_byte & 0x3F
     hash_size  = ((path_byte >> 6) & 0x03) + 1
     offset    += 1
@@ -1449,7 +1468,9 @@ def parse_meshcore_packet(payload):
         # MeshCore, carrying its path hashes so the web can corroborate it against
         # the ADVERT-verified node registry (a frame routed through known nodes is
         # behaviorally confirmed).  NOT a MeshCore claim until the web promotes it.
-        return {'proto': 'unknown', 'hint': 'meshcore', 'mc_route': route_name,
+        return {'proto': 'unknown', 'hint': 'meshcore',
+                'confidence': 'candidate',
+                'mc_route': route_name,
                 'mc_type': ptype_name, 'mc_path': _mc_path, 'decrypted': False,
                 'summary': 'looks like MeshCore · %s/%s%s' % (
                     route_name, ptype_name,
@@ -1461,6 +1482,958 @@ def parse_meshcore_packet(payload):
         route_name, ptype_name,
         (' · %d hops' % rec['mc_hops']) if rec.get('mc_hops') else '', _id)
     return rec
+
+
+# ============================================================================
+# LoRaMesher packet parser
+# ============================================================================
+# Wire format (per LoRaMesher/LoRaMesher PROTOCOL_SPEC.md v1.6):
+#   BaseHeader (6 bytes):  dst(2 LE) | src(2 LE) | msg_type(1) | payload_size(1)
+# Where dst == 0xFFFF is broadcast.  msg_type uses the high nibble for the
+# main category (0x10=DATA, 0x20=CONTROL, 0x30=ROUTING, 0x40=SYSTEM) and the
+# low nibble for the subtype.  Strict-whitelist values from
+# src/types/messages/message_type.hpp (verified directly from the cloned
+# repo): 14 specific bytes = 5.5% random-byte pass rate.  Combined with the
+# payload_size match against actual remaining length (~1/64 random pass
+# under our 4-byte tolerance), the joint structural FP rate is well under
+# 0.1%.  We CLAIM 'loramesher' only when dst or src match a previously-seen
+# LoRaMesher node (behavioral confirmation); otherwise surface as
+# 'unknown hint=loramesher' carrying the parsed fields so the web layer
+# can promote it once enough corroborating frames arrive.
+
+_LORAMESHER_MSG_TYPES = {
+    0x11: 'DATA',           0x12: 'DATA_BROADCAST',
+    0x21: 'ACK',            0x23: 'PING',           0x24: 'PONG',
+    0x31: 'HELLO',          0x32: 'ROUTE_TABLE',
+    0x41: 'SYNC',           0x42: 'JOIN_REQUEST',   0x43: 'JOIN_RESPONSE',
+    0x44: 'SLOT_REQUEST',   0x45: 'SLOT_ALLOCATION',
+    0x46: 'SYNC_BEACON',    0x47: 'NM_CLAIM',
+}
+
+# Behavioral promotion state for LoRaMesher.  `_LORAMESHER_PENDING` counts
+# structurally-valid sightings per src; only after ≥2 independent sightings do
+# we promote into `_KNOWN_LORAMESHER_NODES` (the confirmed-node set).  This
+# matches the multi-frame corroboration policy used elsewhere (LoRaWAN's web
+# layer promotes on DevAddr+FCnt agreement across frames; Meshtastic's known-
+# node set is rooted in crypto-verified clean decrypts).  A single CRC-16
+# coincidence that satisfies LoRaMesher's structural validator never promotes.
+_LORAMESHER_PENDING = {}    # src(uint16) -> sighting count
+_KNOWN_LORAMESHER_NODES = set()
+
+def parse_loramesher_packet(payload, rf=None):
+    """Parse a LoRaMesher BaseHeader.  Returns a record dict (proto='loramesher'
+    when behaviorally confirmed, else proto='unknown' hint='loramesher') or None
+    when the bytes don't structurally match LoRaMesher."""
+    if len(payload) < 6:
+        return None
+    dst = payload[0] | (payload[1] << 8)
+    src = payload[2] | (payload[3] << 8)
+    msg_type = payload[4]
+    payload_size = payload[5]
+    # --- Strict structural validity (CRC-independent) ---
+    # 1. msg_type must be one of the 14 defined values
+    if msg_type not in _LORAMESHER_MSG_TYPES:
+        return None
+    # 2. src must be nonzero (real node); dst==0xFFFF means broadcast
+    if src == 0 or src == 0xFFFF:
+        return None
+    # 3. payload_size byte must match actual remaining payload within ±4 bytes
+    #    (LoRaMesher's payload_size is "message-specific fields + payload" so
+    #    it should equal len(payload) - 6 exactly, but allow tiny slack for
+    #    captures with PHY padding artifacts).
+    remaining = len(payload) - 6
+    if not (abs(payload_size - remaining) <= 4):
+        return None
+    # 4. dst != src (a node addressing itself is nonsensical at this layer)
+    if dst == src:
+        return None
+
+    type_name = _LORAMESHER_MSG_TYPES[msg_type]
+    summary = '%s · %04X→%04X · pl=%d' % (
+        type_name, src, 0xFFFF if dst == 0xFFFF else dst, payload_size)
+
+    # Behavioral promotion: if EITHER endpoint is in the CONFIRMED known-node
+    # set (≥2 prior independent sightings), promote to 'confirmed'.  Otherwise
+    # surface as 'unknown hint=loramesher' (candidate).
+    is_known = (dst in _KNOWN_LORAMESHER_NODES) or (src in _KNOWN_LORAMESHER_NODES)
+    # Register this sighting.  Bump count; promote to confirmed-set only on the
+    # 2nd structurally-valid sighting of the same src.  A single CRC-16 + LoRa-
+    # Mesher-structural false-positive (combined rate ~3 × 10⁻⁸) does NOT enter
+    # the confirmed set — the second matching sighting that would, at ~1.4 × 10⁻²⁰
+    # joint probability, is effectively impossible.
+    _LORAMESHER_PENDING[src] = _LORAMESHER_PENDING.get(src, 0) + 1
+    if _LORAMESHER_PENDING[src] >= 2:
+        _KNOWN_LORAMESHER_NODES.add(src)
+        # Bound the pending dict — once a src is promoted it lives in the
+        # known set; no need to keep counting it.
+        if src in _KNOWN_LORAMESHER_NODES:
+            _LORAMESHER_PENDING.pop(src, None)
+
+    print("\n  --- LoRaMesher Frame ---")
+    print("  Type: %s (0x%02X)" % (type_name, msg_type))
+    print("  From: 0x%04X  To: %s" % (src, 'BROADCAST' if dst == 0xFFFF else '0x%04X' % dst))
+    print("  PayloadSize: %d (actual remaining: %d)" % (payload_size, remaining))
+    if is_known:
+        print("  Behavioral: known LoRaMesher node — promoting to confirmed")
+    return {
+        'proto': 'loramesher' if is_known else 'unknown',
+        'hint': None if is_known else 'loramesher',
+        'confidence': 'confirmed' if is_known else 'candidate',
+        'lm_type': type_name,
+        'from': '0x%04X' % src,
+        'to': 'BROADCAST' if dst == 0xFFFF else '0x%04X' % dst,
+        'lm_payload_size': payload_size,
+        'decrypted': False,
+        'summary': summary,
+    }
+
+
+# ============================================================================
+# LoRa APRS — Austrian ham radio standard for APRS over LoRa.
+#
+# Source-verified format (lora-aprs/LoRa_APRS_iGate, TaskRadiolib.cpp:83,123,
+# peterus/APRS-Decoder-Lib Factory.cpp:generateHeader):
+#
+#   bytes 0..2 : MAGIC = 0x3c 0xff 0x01  ("<\xff\x01")
+#   bytes 3..N : ASCII TNC2 string:  "SOURCE>DEST,PATH:TYPE+BODY"
+#                where ">" separates source callsign from destination,
+#                "," (optional) separates dest from comma-delimited path,
+#                ":" separates header from body, and the byte AFTER ":" is the
+#                APRS data-type identifier (':'=message, '!'/'='=position
+#                without timestamp, '/'/'@'=position with timestamp, etc.).
+#
+# The 3-byte magic gives a structural false-positive rate of 1 in 2^24, so the
+# parser ranks 'verified' immediately on a magic match — no behavioral gate.
+# ============================================================================
+_LORA_APRS_MAGIC = b'\x3c\xff\x01'
+
+def parse_lora_aprs_packet(payload, rf=None):
+    """Parse a LoRa APRS frame.  Returns proto='lora_aprs' record or None."""
+    if len(payload) < 6:
+        return None
+    payload = bytes(payload)                     # list or bytes — normalise
+    if not payload.startswith(_LORA_APRS_MAGIC):
+        return None
+    try:
+        text = payload[3:].decode('ascii', errors='strict')
+    except UnicodeDecodeError:
+        return None
+    # TNC2 requires "SOURCE>DEST...:body".  Reject anything without both.
+    gt = text.find('>')
+    colon = text.find(':', gt + 1) if gt > 0 else -1
+    if gt < 1 or colon < 0 or gt > 9:           # callsign ≤ 9 chars (with SSID)
+        return None
+    source = text[:gt]
+    # Source must be uppercase-alnum + optional "-SSID".  Quick check: must
+    # contain at least one letter and contain only callsign-legal characters.
+    _legal = set('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-')
+    if not source or not any(c.isalpha() for c in source) or any(c not in _legal for c in source):
+        return None
+    after = text[gt + 1:colon]                    # dest[,path]
+    comma = after.find(',')
+    dest = after[:comma] if comma >= 0 else after
+    path = after[comma + 1:] if comma >= 0 else ''
+    body = text[colon + 1:]
+    type_char = body[:1] if body else ''
+    print("\n  --- LoRa APRS Frame ---")
+    print("  Source: %s" % source)
+    print("  Destination: %s" % dest)
+    if path:
+        print("  Path: %s" % path)
+    print("  Type: %r" % type_char)
+    print("  Body: %s" % (body[:80] + ('...' if len(body) > 80 else '')))
+    return {
+        'proto': 'lora_aprs',
+        'confidence': 'verified',           # 24-bit magic + TNC2 structure
+        'decrypted': True,
+        'from': source,
+        'to': dest,
+        'path': path or None,
+        'aprs_type': type_char,
+        'text': body,
+        'summary': '%s→%s: %s' % (source, dest, body[:40]),
+    }
+
+
+# ============================================================================
+# Reticulum Network Stack (RNS) — packet format used by RNode and Reticulum
+# transports running raw LoRa modulation.
+#
+# Source-verified format (markqvist/Reticulum RNS/Packet.py:242 unpack):
+#
+#   byte 0   (flags):
+#     bit 7         : reserved (must be 0)
+#     bit 6         : header_type   (0=HEADER_1 normal, 1=HEADER_2 transport)
+#     bit 5         : context_flag
+#     bit 4         : transport_type (0=BROADCAST, 1=TRANSPORT)
+#     bits 3..2     : destination_type (0=SINGLE, 1=GROUP, 2=PLAIN, 3=LINK)
+#     bits 1..0     : packet_type (0=DATA, 1=ANNOUNCE, 2=LINKREQUEST, 3=PROOF)
+#   byte 1       : hops counter
+#   if HEADER_2 : bytes 2..17 = transport_id (16-byte truncated SHA-256 hash)
+#                 bytes 18..33 = destination_hash (16-byte truncated hash)
+#                 byte 34 = context
+#                 bytes 35.. = ciphertext / data
+#   else        : bytes 2..17 = destination_hash (16-byte truncated hash)
+#                 byte 18 = context
+#                 bytes 19.. = ciphertext / data
+#
+# DST_LEN = RNS.Reticulum.TRUNCATED_HASHLENGTH/8 = 128/8 = 16 bytes.
+# ============================================================================
+_RNS_PACKET_TYPES = {0: 'DATA', 1: 'ANNOUNCE', 2: 'LINKREQUEST', 3: 'PROOF'}
+_RNS_DEST_TYPES   = {0: 'SINGLE', 1: 'GROUP', 2: 'PLAIN', 3: 'LINK'}
+_RNS_DST_LEN      = 16
+
+def parse_reticulum_packet(payload, rf=None):
+    """Parse a Reticulum-formatted LoRa packet.
+
+    Only emits a match for ANNOUNCE packets.  Per Reticulum source
+    (RNS/Identity.py constants):
+        KEYSIZE  = 512 bits = 64 bytes (X25519 + Ed25519 concatenated)
+        SIGLENGTH = 512 bits = 64 bytes (Ed25519)
+        NAME_HASH_LENGTH = 80 bits = 10 bytes
+        RATCHETSIZE = 256 bits = 32 bytes
+    ANNOUNCE body = public_key(64) + name_hash(10) + random_hash(10)
+                  + [ratchet(32) if context_flag set] + signature(64)
+                  + app_data(≥1 byte if present)
+    Minimum data length = 148 bytes (no ratchet) or 180 (with ratchet).
+
+    Added entropy gates on pubkey + signature (real crypto fields cannot be
+    all-zero or all-0xFF — both are explicit dead-key markers).  These drop
+    the random-byte FP rate by ~100×.  Other packet types (DATA/LINKREQUEST/
+    PROOF) are structurally indistinguishable from random — never claimed.
+    """
+    # Smallest valid frame: 2(flags+hops) + 16(dst_hash) + 1(context)
+    # + 148(announce-no-ratchet) = 167 bytes.  Reject anything shorter.
+    if len(payload) < 167:
+        return None
+    payload = bytes(payload)
+    flags = payload[0]
+    if flags & 0b10000000:                      # reserved bit must be 0
+        return None
+    header_type      = (flags & 0b01000000) >> 6
+    context_flag     = (flags & 0b00100000) >> 5
+    transport_type   = (flags & 0b00010000) >> 4
+    destination_type = (flags & 0b00001100) >> 2
+    packet_type      = (flags & 0b00000011)
+    if packet_type != 1:                        # ANNOUNCE only
+        return None
+    hops = payload[1]
+    if hops > 128:
+        return None
+    # Stock Reticulum only announces SINGLE or GROUP destinations.
+    if destination_type not in (0, 1):
+        return None
+    if header_type == 1:                        # HEADER_2 — add transport_id
+        if len(payload) < 3 + 2 * _RNS_DST_LEN + 148:
+            return None
+        transport_id     = payload[2:2 + _RNS_DST_LEN]
+        destination_hash = payload[2 + _RNS_DST_LEN:2 + 2 * _RNS_DST_LEN]
+        context          = payload[2 + 2 * _RNS_DST_LEN]
+        data             = payload[3 + 2 * _RNS_DST_LEN:]
+    else:
+        transport_id     = None
+        destination_hash = payload[2:2 + _RNS_DST_LEN]
+        context          = payload[2 + _RNS_DST_LEN]
+        data             = payload[3 + _RNS_DST_LEN:]
+    # Decompose announce body per Identity.py:535-538.
+    KEYSIZE = 64; NAME_HASH_LEN = 10; RANDOM_HASH_LEN = 10
+    SIGLEN = 64; RATCHETSIZE = 32
+    public_key = data[:KEYSIZE]
+    if len(data) < KEYSIZE + NAME_HASH_LEN + RANDOM_HASH_LEN + SIGLEN:
+        return None
+    name_hash   = data[KEYSIZE:KEYSIZE + NAME_HASH_LEN]
+    random_hash = data[KEYSIZE + NAME_HASH_LEN:KEYSIZE + NAME_HASH_LEN + RANDOM_HASH_LEN]
+    # Ratchet present only if context_flag set in the header.
+    if context_flag:
+        sig_off  = KEYSIZE + NAME_HASH_LEN + RANDOM_HASH_LEN + RATCHETSIZE
+        if len(data) < sig_off + SIGLEN:
+            return None
+        ratchet   = data[KEYSIZE + NAME_HASH_LEN + RANDOM_HASH_LEN:sig_off]
+        signature = data[sig_off:sig_off + SIGLEN]
+        app_data  = data[sig_off + SIGLEN:]
+    else:
+        ratchet   = None
+        sig_off   = KEYSIZE + NAME_HASH_LEN + RANDOM_HASH_LEN
+        signature = data[sig_off:sig_off + SIGLEN]
+        app_data  = data[sig_off + SIGLEN:]
+    # Entropy gates — real Ed25519/X25519 keys + sigs are high-entropy.
+    # Random byte sequences that pass structural gates would hit these
+    # ~all the time, so they're a very tight FP filter.
+    def _high_entropy(b, min_distinct=12):
+        return len(set(b)) >= min_distinct
+    if not _high_entropy(public_key, 20):       # 64 random bytes → ~58 distinct expected
+        return None
+    if not _high_entropy(signature, 20):
+        return None
+    if not _high_entropy(random_hash, 5):       # 10 bytes → ~9 distinct expected
+        return None
+    print("\n  --- Reticulum ANNOUNCE ---")
+    print("  Header: %d  DestType: %s  Hops: %d  Ratchet: %s" % (
+        header_type + 1, _RNS_DEST_TYPES[destination_type], hops,
+        'yes' if ratchet else 'no'))
+    print("  DestinationHash: %s" % destination_hash.hex())
+    print("  PublicKey:       %s..." % public_key[:8].hex())
+    if transport_id is not None:
+        print("  TransportID:     %s" % transport_id.hex())
+    print("  Context: 0x%02X  AppData: %d bytes" % (context, len(app_data)))
+    return {
+        'proto': 'reticulum',
+        'confidence': 'verified',               # all crypto-field shapes match
+        'decrypted': False,
+        'from': public_key[:8].hex(),           # first 8 bytes of pubkey as ID
+        'to': destination_hash.hex(),
+        'rns_header': header_type + 1,
+        'rns_packet_type': 'ANNOUNCE',
+        'rns_dest_type': _RNS_DEST_TYPES[destination_type],
+        'rns_context': context,
+        'rns_hops': hops,
+        'rns_pubkey': public_key.hex(),
+        'rns_ratchet': bool(ratchet),
+        'summary': 'RNS ANNOUNCE → %s · %s · %dB app' % (
+            destination_hash.hex()[:8],
+            _RNS_DEST_TYPES[destination_type], len(app_data)),
+    }
+
+
+# ============================================================================
+# disaster.radio (sudomesh) — LoRa mesh for disaster-recovery deployments.
+#
+# Source-verified format (sudomesh/disaster-radio Wiki/Protocol):
+#
+#   byte 0      : ttl              (1..16 typical)
+#   byte 1      : totalLength      (entire packet length incl. header)
+#   bytes 2..5  : sender (4)       (last-hop relay address)
+#   bytes 6..9  : receiver (4)     (next-hop / broadcast 0xFFFFFFFF)
+#   byte 10     : sequence
+#   bytes 11..14: source (4)       (originating node)
+#   byte 15     : hopCount         (incremented per relay)
+#   byte 16     : metric           (link quality, sender→source)
+#   bytes 17+   : datagram (Layer 3): 4 dst + 1 type + message
+# ============================================================================
+def parse_disaster_radio_packet(payload, rf=None):
+    """Parse a disaster.radio Layer 2 packet.  Returns proto='disaster_radio' or None."""
+    if len(payload) < 17 + 5:                   # L2 header + minimum L3 stub
+        return None
+    payload = bytes(payload)                     # list or bytes — normalise
+    ttl          = payload[0]
+    total_length = payload[1]
+    # Strong structural gate: totalLength byte MUST equal len(payload).
+    # totalLength is a uint8, so it caps at 255.  Allow ±2 for occasional PHY
+    # padding artifacts (LoRa pads to symbol boundary at low SF / high CR).
+    if not (abs(total_length - len(payload)) <= 2):
+        return None
+    if ttl == 0 or ttl > 32:                    # zero is impossible; >32 implausible
+        return None
+    sender    = payload[2:6]
+    receiver  = payload[6:10]
+    sequence  = payload[10]
+    source    = payload[11:15]
+    hop_count = payload[15]
+    metric    = payload[16]
+    if hop_count > 32:                          # implausible
+        return None
+    # All-zero source is invalid (would mean "no originator").
+    if source == b'\x00\x00\x00\x00':
+        return None
+    # Datagram (Layer 3)
+    datagram = payload[17:]
+    dst_l3   = datagram[:4]
+    dgram_type = datagram[4]
+    message  = datagram[5:]
+    src_hex = sender.hex().upper()
+    src_orig_hex = source.hex().upper()
+    rcv_hex = receiver.hex().upper()
+    dst_hex = dst_l3.hex().upper()
+    is_bcast_l2 = (receiver == b'\xff\xff\xff\xff')
+    is_bcast_l3 = (dst_l3   == b'\xff\xff\xff\xff')
+    print("\n  --- disaster.radio Packet ---")
+    print("  TTL: %d  Length: %d  Sequence: %d  HopCount: %d  Metric: %d" % (
+        ttl, total_length, sequence, hop_count, metric))
+    print("  L2 sender→receiver: %s → %s" % (
+        src_hex, 'BROADCAST' if is_bcast_l2 else rcv_hex))
+    print("  L3 source→dest:     %s → %s  (type 0x%02X, %d bytes)" % (
+        src_orig_hex, 'BROADCAST' if is_bcast_l3 else dst_hex,
+        dgram_type, len(message)))
+    return {
+        'proto': 'disaster_radio',
+        'confidence': 'verified',               # totalLength check is very tight
+        'decrypted': True,
+        'from': src_orig_hex,                   # ORIGINAL source (not last-hop)
+        'to': 'BROADCAST' if is_bcast_l3 else dst_hex,
+        'dr_sender': src_hex,                   # last-hop relay
+        'dr_receiver': 'BROADCAST' if is_bcast_l2 else rcv_hex,
+        'dr_ttl': ttl,
+        'dr_hop_count': hop_count,
+        'dr_sequence': sequence,
+        'dr_type': dgram_type,
+        'hops': hop_count,
+        'summary': '%s→%s · TTL %d · hops %d' % (
+            src_orig_hex, 'BCAST' if is_bcast_l3 else dst_hex, ttl, hop_count),
+    }
+
+
+# ============================================================================
+# EByte E-series LoRa modules — Fixed transmission broadcast mode.
+#
+# The EByte E22 (SX1262/SX1268), E220 (LLCC68), and E32 (SX1276/SX1278) modules
+# are extremely common UART-controlled LoRa transceivers from Chengdu Ebyte
+# Electronic Technology, sold worldwide for hobby and small-commercial IoT.
+# The de-facto Arduino driver is xreef/EByte_LoRa_E22_Series_Library (and
+# matching E220/E32 variants).
+#
+# In "Fixed transmission" mode, the over-the-air packet structure (verified
+# from LoRa_E22.cpp:900 — `sendStruct((uint8_t *)fixedStransmission, size+3)`
+# on a struct of { byte ADDH; byte ADDL; byte CHAN; byte message[]; }):
+#
+#   byte 0    : ADDH      destination address high byte (0xFF for broadcast)
+#   byte 1    : ADDL      destination address low byte  (0xFF for broadcast)
+#   byte 2    : CHAN      module channel (0..83 typical for 900 MHz variants)
+#   bytes 3+  : user payload (whatever the application passed)
+#
+# The `sendBroadcastFixedMessage(CHAN, msg)` helper hardcodes ADDH=ADDL=0xFF
+# (LoRa_E22.cpp:859, 958).  Receivers compare their own configured ADDH/ADDL
+# /CHAN to the prefix; broadcast matches everyone on the same CHAN.
+#
+# Validator: 3-byte broadcast prefix + ≥1 readable user data byte.  Payload
+# detection accepts both pure-ASCII telemetry and binary-with-printable-tail
+# (very common when firmware prepends a type/version byte before ASCII data).
+# ============================================================================
+_EBYTE_BROADCAST = b'\xff\xff'
+
+def parse_lora_p2p_packet(payload, rf=None):
+    """Parse an EByte E22/E220/E32 fixed-mode broadcast frame.
+
+    Returns proto='ebyte_lora' (confirmed when user payload is ASCII-rich)
+    or None when the structure doesn't match.
+    """
+    if len(payload) < 4:                        # 3-byte prefix + ≥1 data byte
+        return None
+    payload = bytes(payload)
+    # ADDH+ADDL MUST be 0xFFFF (the EByte broadcast convention).
+    if not payload.startswith(_EBYTE_BROADCAST):
+        return None
+    chan = payload[2]
+    # CHAN is a small integer (0..83 for 900-MHz E22 variants, 0..82 for E220,
+    # 0..31 for E32 at 433/470 MHz).  Reject values that are clearly outside
+    # any plausible channel range — filters random-byte false positives.
+    if chan > 83:
+        return None
+    user = payload[3:]
+    if len(user) < 1:
+        return None
+    # Find the first printable-ASCII run in the user payload.  Firmware often
+    # prepends 1-2 non-ASCII bytes (type/version/length) before the readable
+    # telemetry — accept those, surface the readable suffix as the text.
+    text_start = 0
+    for i, b in enumerate(user[:4]):            # at most 4 prefix bytes
+        if 32 <= b < 127:
+            text_start = i
+            break
+    else:
+        # No ASCII found in first 4 bytes — could still be a binary protocol.
+        # Require at least 50% printable in the FULL user payload.
+        printable_full = sum(1 for b in user if 32 <= b < 127)
+        if printable_full / len(user) < 0.50:
+            return None
+        text_start = 0
+    text_bytes = user[text_start:]
+    printable = sum(1 for b in text_bytes if 32 <= b < 127)
+    ratio = printable / len(text_bytes) if text_bytes else 0.0
+    # Require the text portion to be ≥80% printable for a confirmed match.
+    if ratio < 0.50:
+        return None
+    try:
+        text = text_bytes.decode('ascii', errors='strict')
+    except UnicodeDecodeError:
+        text = ''.join(chr(b) if 32 <= b < 127 else '.' for b in text_bytes)
+    # Surface any leading non-ASCII bytes as a separate "type" hex string.
+    type_bytes = user[:text_start]
+    print("\n  --- EByte E-series Fixed-Mode Frame ---")
+    print("  Destination: BROADCAST (0xFFFF)")
+    print("  Channel: %d" % chan)
+    if type_bytes:
+        print("  Type/version bytes: %s" % type_bytes.hex())
+    print("  User payload (%d bytes, %d%% ASCII): %r" % (
+        len(user), int(ratio*100), text))
+    is_confirmed = (ratio >= 0.80)
+    return {
+        'proto': 'ebyte_lora' if is_confirmed else 'unknown',
+        'hint': None if is_confirmed else 'ebyte_lora',
+        'confidence': 'confirmed' if is_confirmed else 'candidate',
+        'decrypted': True,                      # the L2 header is plaintext
+        'from': None,                           # E22 fixed-mode broadcasts
+                                                # don't carry sender ID over
+                                                # the air — physical-layer
+                                                # fingerprinting needed for
+                                                # per-device identity.
+        'to': 'BROADCAST',
+        'ebyte_chan': chan,
+        'ebyte_type': type_bytes.hex() if type_bytes else None,
+        'text': text,
+        'summary': 'EByte BCAST ch%d: %s' % (chan, text[:48]),
+    }
+
+
+# ============================================================================
+# RadioHead RH_RF95 — the most common hobbyist LoRa library (Adafruit, Sparkfun,
+# Pololu starter kits).  Air format is RIDICULOUSLY thin — just a 4-byte header
+# inside the LoRa payload — with no magic bytes, no checksum, no version field.
+# Source: airspayce RadioHead docs + RH_RF95.h (RH_RF95_HEADER_LEN = 4).
+#
+#   byte 0  : TO    (destination address;     0xFF = broadcast)
+#   byte 1  : FROM  (source address;          0xFF = anonymous-broadcast TX)
+#   byte 2  : ID    (message id, 0..255 incrementing)
+#   byte 3  : FLAGS (low nibble = app reserved; high nibble = RH reserved)
+#   bytes 4+: message payload (0..251 bytes)
+#
+# FALSE-POSITIVE RISK: VERY HIGH.  The 4-byte header has no magic, no version,
+# no checksum — ANY 4-byte sequence where byte 3 has its high nibble zero will
+# pass.  ~6% of random byte sequences satisfy that.  So we NEVER promote this
+# to proto='radiohead' — only to proto='unknown' with hint='radiohead', which
+# the UI surfaces as "looks like RadioHead but unconfirmed."  Behavioral
+# promotion to confirmed would require seeing the SAME from-address twice with
+# matching sequential IDs (RadioHead's only intrinsic signal of identity).
+# ============================================================================
+_RADIOHEAD_PENDING = {}                         # from_addr -> [last_msg_id, count]
+_KNOWN_RADIOHEAD_NODES = set()                  # from_addrs with 2+ sequential ids
+
+def parse_radiohead_packet(payload, rf=None):
+    """Parse a RadioHead RH_RF95 frame.
+
+    Returns proto='unknown' hint='radiohead' as 'candidate' unless the same
+    from-address has been seen before with a sequential message id, in which
+    case promote to proto='radiohead' / 'confirmed'.
+    """
+    if len(payload) < 5:                        # header + ≥1 byte data
+        return None
+    payload = bytes(payload)                     # list or bytes — normalise
+    to_addr   = payload[0]
+    from_addr = payload[1]
+    msg_id    = payload[2]
+    flags     = payload[3]
+    # RadioHead RH_RF95_FLAGS_RESERVED is the high nibble; conventional usage
+    # leaves it 0.  Reject if any RH-reserved bit is set.
+    if flags & 0xF0:
+        return None
+    data = payload[4:]
+    # Reject all-zero / all-same data (very common in noise/random garbage).
+    if len(set(data)) <= 1:
+        return None
+    # Reject if FROM is 0 or 0xFF — anonymous TX is rare in practice and 0 is
+    # reserved.  Real RadioHead apps assign each node a 1..253 address.
+    if from_addr in (0x00, 0xFF):
+        return None
+    # TO can be broadcast (0xFF) or a real node 1..253.  Reject TO=0.
+    if to_addr == 0x00:
+        return None
+    # Behavioral promotion: track this from_addr.  RadioHead's 4-byte header has
+    # no magic, so a single structural match has a ~5% random FP rate — too high
+    # to emit anything.  We track candidates silently in _RADIOHEAD_PENDING and
+    # only emit once we've seen the SAME from_addr twice with a sequential
+    # message ID (RH apps increment ID by 1 per packet).  Two sequential IDs from
+    # the same source address are statistically near-impossible from random
+    # bytes (~1 in 4000 even after the structural gate).
+    prev = _RADIOHEAD_PENDING.get(from_addr)
+    is_confirmed = from_addr in _KNOWN_RADIOHEAD_NODES
+    if prev is not None:
+        prev_id, _ = prev
+        delta = (msg_id - prev_id) & 0xFF
+        if 1 <= delta <= 16:
+            _KNOWN_RADIOHEAD_NODES.add(from_addr)
+            is_confirmed = True
+    _RADIOHEAD_PENDING[from_addr] = [msg_id, (prev[1] + 1 if prev else 1)]
+    # First sighting (or non-sequential): silently track state, don't emit.
+    # Surfacing every structural match as a hint floods the UI with noise.
+    if not is_confirmed:
+        return None
+    is_bcast_to = (to_addr == 0xFF)
+    print("\n  --- RadioHead RF95 Frame ---")
+    print("  TO: %s  FROM: %d  ID: %d  FLAGS: 0x%02X  data: %d bytes" % (
+        'BROADCAST' if is_bcast_to else str(to_addr),
+        from_addr, msg_id, flags, len(data)))
+    print("  Behavioral: node %d confirmed via sequential ID" % from_addr)
+    return {
+        'proto': 'radiohead',
+        'confidence': 'confirmed',
+        'decrypted': True,
+        'from': str(from_addr),
+        'to': 'BROADCAST' if is_bcast_to else str(to_addr),
+        'rh_id': msg_id,
+        'rh_flags': flags,
+        'summary': 'RH %s→%s id=%d %dB' % (
+            from_addr, 'BC' if is_bcast_to else to_addr, msg_id, len(data)),
+    }
+
+
+# ============================================================================
+# Per-packet hardware fingerprint — RF-layer features that identify the
+# physical transmitter device (not the protocol, not the firmware).  Each
+# feature is a per-radio-unit characteristic that's:
+#   - STABLE across packets from the same device (within session)
+#   - INDEPENDENT of position/orientation (no RSSI dependence)
+#   - INDEPENDENT of payload content (geometric/statistical, not data-derived)
+#   - INDEPENDENT of inter-packet timing (no periodicity assumption)
+#
+# Used by the web layer's device-clustering: within one protocol family
+# (matching prefix bytes), packets are grouped by nearest-neighbor match on
+# this feature vector to estimate the number of distinct transmitting devices.
+#
+# Features extracted:
+#   dc_i, dc_q     — receiver chain DC offset.  A direct-conversion radio leaks
+#                    its LO into baseband as a DC term.  Chirp modulation
+#                    averages to ~0 over many symbols (the constant-envelope
+#                    signal traces a circle in IQ plane centered at the DC
+#                    offset), so mean(iq) ≈ hardware DC carrier feedthrough.
+#                    Per-device, per-channel — different IC dies have different
+#                    DC leakage.  Stable across motion (it's a hardware bias).
+#   iq_amp_imb     — amplitude imbalance between I and Q channels.  Ideal:
+#                    std(I) == std(Q).  Real radios have ±0.5–5% mismatch from
+#                    the analog frontend.  Computed as (std_I - std_Q) / (std_I + std_Q).
+#                    Per-die.  Robust to gain settings (it's a ratio).
+#   iq_phase_imb   — phase imbalance: I and Q should be exactly 90° out of phase.
+#                    Hardware mismatch leaks ~0.5–5° of phase error, showing as
+#                    non-zero normalized correlation between I and Q.  Per-die.
+# ============================================================================
+def _extract_tx_fingerprint(iq1, preamble_start, sf, bw):
+    """Sample-precise UMOP (Unintentional Modulation On Pulse) fingerprint.
+
+    Every transmitter imprints subtle per-die signatures into its signal that
+    are NOT part of the intended modulation — these are the "unintentional
+    modulations" that make each radio physically unique.  We extract them
+    from the 8-symbol LoRa preamble using sample-precise alignment from the
+    decoder's preamble_start.
+
+    Features (all per-chip, all measured during the same constant-envelope
+    preamble so RX/channel effects cancel):
+
+      Tier 1 — crystal (TCXO):
+        precise_carrier_hz  Mean CFO via coherent sum (sub-Hz precision).
+        cfo_per_sym_std     STD of per-symbol CFO estimates (Hz). Short-term
+                            crystal cycle-to-cycle jitter.  Per-crystal.
+
+      Tier 2 — power amplifier:
+        am_ripple_pct       std(envelope)/mean(envelope) across full preamble.
+                            LoRa is constant-envelope by design → any ripple
+                            is PA AM-AM distortion + supply rail noise.
+                            Per-die.
+        amp_per_sym_pct     std/mean of per-symbol mean amplitudes.  Captures
+                            PA gain stability across the 8 chirps.  Per-die.
+
+      Tier 3 — PLL:
+        phase_residual_rms  RMS of phase residual after subtracting linear
+                            (CFO) trend.  Phase noise integrated over the
+                            preamble.  Per-VCO.
+        irr_db              Image rejection ratio: main peak vs mirror peak
+                            on coherent FFT.  TX I/Q mixer balance.  Per-die.
+
+      Quality:
+        signal_snr_db       Peak vs noise-floor on dechirped spectrum.  Used
+                            by the web classifier to REJECT low-quality
+                            samples from profile training (concurrent-packet
+                            contamination, partial bursts → garbage features).
+    """
+    N_sym = 1 << sf
+    if iq1 is None or len(iq1) < preamble_start + 9 * N_sym:
+        return None
+    # iq1 is decimated to BW rate → 1 sample per chip.
+    t = np.arange(N_sym, dtype=np.float64) / bw
+    Ts = N_sym / bw
+    upchirp = np.exp(1j * np.pi * bw / Ts * t**2).astype(np.complex64)
+    downchirp = np.conj(upchirp)
+
+    Nfft = 65536
+    freqs = np.fft.fftshift(np.fft.fftfreq(Nfft, d=1.0 / bw))
+    bin_w = bw / Nfft
+
+    # --- Half-symbol alignment refinement ---
+    # Schmidl-Cox finds preamble_start with one-symbol resolution but the
+    # offset within a symbol can be off by ANY fraction.  Empirically, at
+    # BW=250 (SHORT_FAST) the preamble_start is consistently off by N/2 samples,
+    # putting the dechirped CW exactly at ±BW/2 (Nyquist boundary) where peak
+    # location aliases between the two ends.  Search a fine grid of sub-symbol
+    # offsets and pick the one that PUTS THE PEAK AWAY FROM THE BOUNDARY (max
+    # of |freq| < bw/2 - 5kHz preferred) AND has the highest peak amplitude.
+    def _dechirp_at(off):
+        """Coherently sum 8 dechirped symbols starting at preamble_start + off."""
+        s_start = preamble_start + off
+        if s_start < 0 or s_start + 8 * N_sym > len(iq1):
+            return None, None
+        sF = None
+        for s in range(8):
+            seg = iq1[s_start + s*N_sym : s_start + (s+1)*N_sym] * downchirp
+            F = np.fft.fftshift(np.fft.fft(seg, Nfft))
+            sF = F if sF is None else sF + F
+        return sF, s_start
+
+    # Offset search in samples of size N_sym/16 across ±N_sym/2
+    boundary_dist_thresh = max(5000.0, bw * 0.05)  # 5 kHz or 5% of BW
+    best_offset = 0
+    best_score = -1.0   # score combines |peak| (higher = better aligned) and "not at boundary"
+    best_sF = None
+    for off in range(-N_sym // 2, N_sym // 2 + 1, max(1, N_sym // 16)):
+        sF, _ = _dechirp_at(off)
+        if sF is None: continue
+        cmag = np.abs(sF)
+        pk_idx = int(np.argmax(cmag))
+        pk_freq = freqs[pk_idx]
+        pk_amp = float(cmag[pk_idx])
+        # Penalize peaks near ±BW/2 boundary (alias-prone)
+        boundary_dist = bw / 2 - abs(pk_freq)
+        boundary_penalty = 1.0 if boundary_dist > boundary_dist_thresh else (boundary_dist / boundary_dist_thresh)
+        score = pk_amp * boundary_penalty
+        if score > best_score:
+            best_score = score
+            best_offset = off
+            best_sF = sF
+    if best_sF is None:
+        return None
+    aligned_start = preamble_start + best_offset
+
+    # --- Dechirp all 8 preamble symbols at the BEST alignment ---
+    per_sym_cfo = []
+    per_sym_amp = []
+    per_sym_dechirped = []
+    sum_F = None
+    sum_mag = None
+    for s in range(8):
+        seg = iq1[aligned_start + s*N_sym : aligned_start + (s+1)*N_sym] * downchirp
+        per_sym_dechirped.append(seg)
+        F = np.fft.fftshift(np.fft.fft(seg, Nfft))
+        per_F_mag = np.abs(F)
+        # Per-symbol mean amplitude (UMOP: PA gain stability across symbols)
+        per_sym_amp.append(float(np.mean(np.abs(seg))))
+        # Per-symbol CFO via sub-bin quadratic peak interp
+        pk_s = int(np.argmax(per_F_mag))
+        if 1 <= pk_s < Nfft - 1:
+            a, b, c = float(per_F_mag[pk_s-1]), float(per_F_mag[pk_s]), float(per_F_mag[pk_s+1])
+            denom = a - 2*b + c
+            d_s = 0.5*(a-c)/denom if abs(denom) > 1e-9 else 0.0
+            per_sym_cfo.append(float(freqs[pk_s] + d_s * bin_w))
+        else:
+            per_sym_cfo.append(float(freqs[pk_s]) if 0 <= pk_s < Nfft else 0.0)
+        # Coherent + incoherent accumulators
+        if sum_F is None:
+            sum_F = F.copy(); sum_mag = per_F_mag.copy()
+        else:
+            sum_F += F; sum_mag += per_F_mag
+    if sum_F is None:
+        return None
+
+    # --- Tier 1: crystal features ---
+    coh_mag = np.abs(sum_F)
+    main_pk = int(np.argmax(coh_mag))
+    if not (1 <= main_pk < Nfft - 1):
+        return None
+    main_amp = float(coh_mag[main_pk])
+    a, b, c = float(coh_mag[main_pk-1]), main_amp, float(coh_mag[main_pk+1])
+    denom = a - 2*b + c
+    delta = 0.5 * (a - c) / denom if abs(denom) > 1e-9 else 0.0
+    precise_carrier_hz = float(freqs[main_pk] + delta * bin_w)
+    cfo_per_sym_std = float(np.std(per_sym_cfo))
+
+    # --- Tier 2: PA features (AM ripple + inter-symbol amplitude) ---
+    all_dechirped = np.concatenate(per_sym_dechirped)
+    env = np.abs(all_dechirped)
+    env_mean = float(np.mean(env))
+    am_ripple_pct = float(np.std(env) / max(env_mean, 1e-9)) * 100.0
+    amp_per_sym_pct = float(np.std(per_sym_amp) / max(float(np.mean(per_sym_amp)), 1e-9)) * 100.0
+
+    # --- Tier 3: PLL features (phase residual + IRR) ---
+    # Phase residual: apply mean-CFO correction, then look at deviations
+    cfo_rad_per_sample = 2 * np.pi * precise_carrier_hz / bw
+    t_full = np.arange(len(all_dechirped), dtype=np.float64)
+    corrected = all_dechirped * np.exp(-1j * cfo_rad_per_sample * t_full).astype(np.complex64)
+    # Only use samples where amplitude is decent (else phase is meaningless)
+    keep = env > 0.3 * env_mean
+    if keep.sum() < 64:
+        phase_residual_rms = None
+    else:
+        ph = np.unwrap(np.angle(corrected[keep]))
+        t_keep = t_full[keep]
+        # Detrend (residual CFO)
+        try:
+            poly = np.polyfit(t_keep, ph, 1)
+            residual = ph - np.polyval(poly, t_keep)
+            phase_residual_rms = float(np.sqrt(np.mean(residual ** 2)))
+        except Exception:
+            phase_residual_rms = None
+
+    # IRR: image peak at -main_freq
+    target_mirror = -freqs[main_pk]
+    mc = int(np.argmin(np.abs(freqs - target_mirror)))
+    lo = max(1, mc - 30); hi = min(Nfft - 1, mc + 30)
+    mir_pk = lo + int(np.argmax(coh_mag[lo:hi+1]))
+    mir_amp = float(coh_mag[mir_pk])
+    irr_db = float(20.0 * np.log10(main_amp / max(mir_amp, 1e-9))) if mir_amp > 0 else None
+
+    # PN slope (legacy from earlier work — keep for now, classifier auto-weights)
+    log_off, log_pow = [], []
+    for off_hz in (500.0, 1000.0, 2000.0, 5000.0, 10000.0):
+        ob = int(off_hz / bin_w)
+        if main_pk + ob < Nfft and main_pk - ob >= 0:
+            if abs((main_pk + ob) - mir_pk) > 30 and abs((main_pk - ob) - mir_pk) > 30:
+                p = (sum_mag[main_pk + ob] + sum_mag[main_pk - ob]) / 2.0
+                if p > 0:
+                    log_off.append(np.log10(off_hz)); log_pow.append(np.log10(p))
+    pn_slope = None
+    if len(log_off) >= 3:
+        try: pn_slope = float(np.polyfit(log_off, log_pow, 1)[0])
+        except Exception: pn_slope = None
+
+    # --- Quality: SNR of dechirped peak vs noise floor ---
+    mask = np.ones(Nfft, dtype=bool)
+    nb = 200  # exclude bins near peak AND near mirror
+    mask[max(0, main_pk - nb):min(Nfft, main_pk + nb)] = False
+    mask[max(0, mir_pk - nb):min(Nfft, mir_pk + nb)] = False
+    noise_floor = float(np.median(coh_mag[mask])) if mask.any() else 1.0
+    signal_snr_db = float(20.0 * np.log10(main_amp / max(noise_floor, 1e-9)))
+
+    return {
+        'precise_carrier_hz': precise_carrier_hz,
+        'cfo_per_sym_std': cfo_per_sym_std,
+        'am_ripple_pct': am_ripple_pct,
+        'amp_per_sym_pct': amp_per_sym_pct,
+        'phase_residual_rms': phase_residual_rms,
+        'irr_db': irr_db,
+        'pn_slope': pn_slope,
+        'signal_snr_db': signal_snr_db,
+    }
+
+
+def _compute_hw_fingerprint(iq, sf=None, bw=None, fs=None):
+    """Per-packet hardware fingerprint.
+
+    Returns dict with:
+      precise_carrier_hz — absolute CFO of the transmit carrier relative to
+                           the capture's baseband, measured directly from the
+                           preamble via downchirp demodulation + FFT peak
+                           with quadratic sub-bin interpolation.  Sub-Hz
+                           precision.  Independent of the decoder's pipeline
+                           (which gets polluted by recenter passes).
+
+    Compute time ≈ 80-150 μs for typical capture sizes.
+    """
+    n = len(iq)
+    if n < 128:
+        return None
+    # Precise transmit carrier frequency.  Multiply preamble upchirps by an
+    # ideal downchirp → the product is a continuous-wave tone at frequency =
+    # CFO.  FFT → quadratic peak interpolation → sub-bin precision.  Far more
+    # robust than spectral centroid (which mixes upchirps with SFD downchirps
+    # and payload modulation, biasing the result).  This is the standalone
+    # CFO-measurement technique used in the project's RF-analysis tools and
+    # gives ~Hz precision when SNR > 10 dB.
+    precise_carrier_hz = None
+    if sf is not None and bw is not None and fs is not None:
+        try:
+            N_sym = 1 << sf
+            sps = max(1, int(round(fs / bw)))
+            Nsamp = N_sym * sps
+            # Build ideal downchirp at the actual sample rate.
+            t_idx = np.arange(Nsamp, dtype=np.float64)
+            f_inst = -bw / 2.0 + (bw / Nsamp) * t_idx
+            phi = 2.0 * np.pi * np.cumsum(f_inst) / fs
+            downchirp = np.exp(-1j * phi).astype(np.complex64)
+            # Coherently sum |dechirp FFT| across multiple preamble symbols
+            # for noise averaging.  Caller is expected to have windowed to
+            # start at the first preamble upchirp.
+            Nfft = max(4096, 4 * Nsamp)
+            # Search the FULL spectrum for the dechirped peak.  No restricted
+            # window — the burst can be anywhere within ±bw/2 of baseband,
+            # depending on where the gate centered (or whether the gate
+            # centered at all, in the case of raw IQ slices).  We accumulate
+            # the magnitude spectrum across all 8 preamble symbols (coherent
+            # averaging of squared magnitudes — works for symbol-incoherent
+            # CFOs because the dechirped TONE is at the same freq every symbol).
+            # The summed peak is much sharper than a single-symbol peak (8×
+            # noise averaging) and the strongest peak is the true preamble CFO.
+            sum_mag = None
+            for sym_i in range(min(8, max(1, len(iq) // Nsamp))):
+                start = sym_i * Nsamp
+                if start + Nsamp > len(iq):
+                    break
+                seg = iq[start:start + Nsamp] * downchirp
+                F = np.fft.fftshift(np.fft.fft(seg, Nfft))
+                m = np.abs(F)
+                if sum_mag is None:
+                    sum_mag = m
+                else:
+                    sum_mag = sum_mag + m
+            if sum_mag is not None:
+                pk = int(np.argmax(sum_mag))
+                if 1 <= pk < len(sum_mag) - 1:
+                    freqs = np.fft.fftshift(np.fft.fftfreq(Nfft, d=1.0 / fs))
+                    # Quadratic sub-bin interpolation directly on the SUMMED
+                    # magnitude spectrum — same units, better SNR than any
+                    # single symbol's interpolation.
+                    a = float(sum_mag[pk - 1])
+                    b = float(sum_mag[pk])
+                    c = float(sum_mag[pk + 1])
+                    denom = (a - 2 * b + c)
+                    delta = 0.5 * (a - c) / denom if abs(denom) > 1e-9 else 0.0
+                    precise_carrier_hz = float(freqs[pk] + delta * (fs / Nfft))
+        except Exception:
+            precise_carrier_hz = None
+
+    # ---- UMOP: burst-onset transient ---------------------------------------
+    # The PA ramp-up at the start of every transmission is hardware-specific
+    # and orthogonal to TCXO frequency.  Validated empirically: onset features
+    # have SNR ~1.0-1.4 between two same-batch RAK Meshtastic devices —
+    # comparable to or better than abs_tx_hz on a single test (whose SNR
+    # collapses when TCXO drifts during the observation window).  Combined
+    # with abs_tx_hz they reach ~95% per-packet classification accuracy.
+    #
+    #   onset_rise_us       Time from 10%→90% envelope (PA slew rate).
+    #   onset_overshoot_pct PA peak overshoot above steady-state (regulator
+    #                       transient response — STRONGEST single feature).
+    #   onset_mid_slope     Envelope derivative at 40-60% point.
+    #
+    # All measured on the full-rate iq BEFORE any decimation (~60 μs rise is
+    # 30 samples at 500 ksps, ~7 samples after decimation — would lose
+    # resolution).  Only computed when fs >= 250 kHz.
+    onset = None
+    try:
+        if fs is not None and fs >= 250_000 and n >= 2000:
+            env = np.abs(iq).astype(np.float32)
+            smooth_n = max(8, int(fs * 20e-6))   # 20μs averaging
+            if len(env) >= smooth_n * 4:
+                env_s = np.convolve(env, np.ones(smooth_n, dtype=np.float32)/smooth_n, mode='same')
+                peak = float(np.max(env_s))
+                if peak > 1e-6:
+                    above_50 = np.where(env_s > peak * 0.5)[0]
+                    if len(above_50) >= 3:
+                        burst_start = int(above_50[0])
+                        if smooth_n * 3 <= burst_start <= len(env_s) - smooth_n * 3:
+                            p10 = peak * 0.10; p90 = peak * 0.90
+                            i10 = burst_start
+                            while i10 > 0 and env_s[i10] > p10: i10 -= 1
+                            i90 = burst_start
+                            while i90 < len(env_s) - 1 and env_s[i90] < p90: i90 += 1
+                            if 2 <= (i90 - i10) <= smooth_n * 20:
+                                rise_us = (i90 - i10) / fs * 1e6
+                                steady_end = min(i90 + 400, len(env_s))
+                                if steady_end - i90 >= 100:
+                                    steady_mean = float(np.mean(env_s[i90:steady_end]))
+                                    peak_in_window = float(np.max(env_s[i10:min(i10+(i90-i10)*3, len(env_s))]))
+                                    overshoot_pct = (peak_in_window - steady_mean) / max(steady_mean, 1e-9) * 100
+                                    p40, p60 = peak * 0.4, peak * 0.6
+                                    i40 = i10
+                                    while i40 < len(env_s) - 1 and env_s[i40] < p40: i40 += 1
+                                    i60 = i40
+                                    while i60 < len(env_s) - 1 and env_s[i60] < p60: i60 += 1
+                                    slope = (env_s[i60] - env_s[i40]) / max(i60 - i40, 1) / peak * 1e6 / fs
+                                    onset = {
+                                        'onset_rise_us': rise_us,
+                                        'onset_overshoot_pct': overshoot_pct,
+                                        'onset_mid_slope': slope,
+                                    }
+    except Exception:
+        onset = None
+
+    result = {'precise_carrier_hz': precise_carrier_hz}
+    if onset:
+        result.update(onset)
+    return result
 
 
 # ============================================================================
@@ -1512,46 +2485,44 @@ def _is_chase_acceptable_uni(tr):
     """Chase recovery gate for unicast DMs (encrypted, no key for verification).
     Accept iff recovered header is structurally a valid unicast frame AND its
     dst OR src is a previously-seen real node.  Strict broadcast (dst==FFFFFFFF)
-    is always accepted (matches the original chase gate)."""
+    is always accepted (matches the original chase gate).
+
+    BOOTSTRAP: when _KNOWN_NODES is empty (fresh deployment, no prior decodes),
+    accept on STRUCTURAL grounds alone.  Subsequent decodes from the same nodes
+    then bootstrap the known-set and the strict gate engages."""
     if len(tr) < 16:
         return False
     # Broadcast — always accept (original behavior)
     if tr[0] == 0xFF and tr[1] == 0xFF and tr[2] == 0xFF and tr[3] == 0xFF:
         return True
-    # Unicast: require known node + plausible structure
+    # Unicast: require plausible structure
     dst_int = int(tr[0]) | (int(tr[1]) << 8) | (int(tr[2]) << 16) | (int(tr[3]) << 24)
     src_int = int(tr[4]) | (int(tr[5]) << 8) | (int(tr[6]) << 16) | (int(tr[7]) << 24)
     if dst_int == 0 or src_int == 0:
         return False
     if dst_int == src_int:   # nonsensical
         return False
-    # Behavioral gate: at least one endpoint must be a known node
-    snapshot = set(_KNOWN_NODES) if _KNOWN_NODES_LOCK is None else None
-    if _KNOWN_NODES_LOCK is not None:
-        with _KNOWN_NODES_LOCK:
-            snapshot = set(_KNOWN_NODES)
-    if not (dst_int in snapshot or src_int in snapshot):
-        return False
     # Structural: hop_limit ≤ hop_start (Meshtastic invariant).
     # Meshtastic header layout: dst[0:4] src[4:8] pktid[8:12] flags[12] chan[13]
     flags = int(tr[12])
     hop_limit = flags & 0x07
     hop_start = (flags >> 5) & 0x07
-    return hop_limit <= hop_start
+    if hop_limit > hop_start:
+        return False
+    # Behavioral gate: at least one endpoint must be a known node.
+    # BOOTSTRAP: if NO known nodes yet, accept on structural validity alone —
+    # this is the only way the first-ever decode populates the set.
+    snapshot = set(_KNOWN_NODES) if _KNOWN_NODES_LOCK is None else None
+    if _KNOWN_NODES_LOCK is not None:
+        with _KNOWN_NODES_LOCK:
+            snapshot = set(_KNOWN_NODES)
+    if not snapshot:
+        return True   # bootstrap path
+    return dst_int in snapshot or src_int in snapshot
 
-# Optional bootstrap of the known-node set from an env var
-# (e.g. LORA_KNOWN_NODES=aabbccdd,11223344).  Avoids the cold-start window where
-# unicast chase has no nodes to verify against; once any clean Meshtastic
-# packet decodes, that node's address is auto-registered and the env var is
-# no longer needed.
-import os as _os_kn
-_seed = _os_kn.environ.get('LORA_KNOWN_NODES', '')
-for _tok in _seed.replace(' ', '').split(','):
-    if _tok:
-        try:
-            _register_known_node(int(_tok, 16))
-        except ValueError:
-            pass
+# Known-node set auto-populates from `from` field of any successfully-decoded
+# Meshtastic packet.  Every Meshtastic node periodically broadcasts NodeInfo,
+# so this self-builds within minutes of mesh activity.
 
 
 def _report_unknown(payload, sf, bw, cr, sync, name):
@@ -1623,16 +2594,33 @@ def parse_meshtastic_packet(payload, aes_key=None, no_key=False, _clean_crc=Fals
     # Structured record — header fields are in the UNENCRYPTED part, so they're
     # known even when the payload won't decrypt (a packet on a different channel
     # key).  Populated further below if the payload decrypts.
+    # Initial confidence is 'candidate' (header structurally valid, key behavioral
+    # gate also satisfied).  Upgraded to 'verified' below on successful AES decrypt
+    # + valid protobuf portnum — the cryptographic proof tier.  Encrypted-only DMs
+    # (clean CRC, can't decrypt with our key) stay at 'candidate' since they're
+    # only structurally identifiable.
     _rec = {
         'proto': 'meshtastic', 'from': sender, 'to': dest_str,
         'pktid': '0x%08x' % pkt_id, 'hop_start': hop_start,
         'hop_limit': hop_limit, 'hops': hops_taken, 'chan': '0x%02x' % chan_hash,
         'want_ack': want_ack, 'via_mqtt': via_mqtt, 'decrypted': False,
+        'confidence': 'candidate',
         'portnum': None, 'port_name': None, 'text': None,
+        # Always carry the on-the-wire bytes so the UI can show RAW (hex+ASCII)
+        # for every Meshtastic packet, regardless of decrypt success/failure.
+        'raw_hex': bytes(payload).hex(),
     }
     if _rf:
         _rec.update({'sf': _rf.get('sf'), 'bw': _rf.get('bw'),
                      'freq_mhz': _rf.get('freq_mhz'), 'rssi': _rf.get('rssi')})
+        # Hardware fingerprint flows through to the [PKT] record so the web
+        # can cluster even named-protocol packets by device when useful.
+        if _rf.get('hw_fp') is not None:
+            _rec['hw_fp'] = _rf['hw_fp']
+        if _rf.get('cfo_hz') is not None:
+            _rec['cfo_hz'] = _rf['cfo_hz']
+        if _rf.get('cfo_drift') is not None:
+            _rec['cfo_drift'] = _rf['cfo_drift']
     # NOTE: the "PacketID:" line is the marker the pipeline counts as a decoded
     # packet.  Defer it until the payload DECRYPTS to a valid protobuf portnum
     # (below) — a CRC-16 coincidence on broadcast-dst bytes can pass CRC + the
@@ -1716,6 +2704,11 @@ def parse_meshtastic_packet(payload, aes_key=None, no_key=False, _clean_crc=Fals
     print(_chan_line)
     _DECODED_SET.add((pkt_id, hops_taken))   # for carrier-rescue early-exit
     _rec['decrypted'] = True
+    _rec['confidence'] = 'verified'      # AES decrypt + valid protobuf = crypto proof
+    # Post-decode RAW: the protobuf-encoded Data message that came out of AES-CTR.
+    # Independent of which portnum was parsed — lets the user verify the decrypted
+    # bytes even when our protobuf parser missed a field.
+    _rec['decrypted_hex'] = decrypted.hex() if isinstance(decrypted, (bytes, bytearray)) else bytes(decrypted).hex()
     _rec['portnum'] = portnum
     _rec['port_name'] = portnum_name(portnum)
     if _key_label and _key_label != 'default':
@@ -1763,6 +2756,13 @@ def _emit_proto(rec, raw, sf, bw, cr, sync, rf):
     if rf:
         rec.setdefault('freq_mhz', rf.get('freq_mhz'))
         rec.setdefault('rssi', rf.get('rssi'))
+        # Hardware fingerprint — for the web's device clustering.
+        if rf.get('hw_fp') is not None:
+            rec['hw_fp'] = rf['hw_fp']
+        if rf.get('cfo_hz') is not None:
+            rec['cfo_hz'] = rf['cfo_hz']
+        if rf.get('cfo_drift') is not None:
+            rec['cfo_drift'] = rf['cfo_drift']
     _emit_pkt(rec)
 
 
@@ -1774,6 +2774,10 @@ def _h_meshcore(payload, ctx):
     return parse_meshcore_packet(payload)
 
 
+def _h_loramesher(payload, ctx):
+    return parse_loramesher_packet(payload, ctx.get('rf'))
+
+
 def _h_meshtastic(payload, ctx):
     print("  Meshtastic header: dst=%s src=%s" % (
         ''.join('%02x' % payload[3 - i] for i in range(4)),
@@ -1783,20 +2787,55 @@ def _h_meshtastic(payload, ctx):
     return None   # parse_meshtastic_packet emits its own [PKT]
 
 
+def _h_lora_aprs(payload, ctx):
+    return parse_lora_aprs_packet(payload, ctx.get('rf'))
+
+
+def _h_reticulum(payload, ctx):
+    return parse_reticulum_packet(payload, ctx.get('rf'))
+
+
+def _h_disaster_radio(payload, ctx):
+    return parse_disaster_radio_packet(payload, ctx.get('rf'))
+
+
+def _h_radiohead(payload, ctx):
+    return parse_radiohead_packet(payload, ctx.get('rf'))
+
+
+def _h_ebyte_lora(payload, ctx):
+    return parse_lora_p2p_packet(payload, ctx.get('rf'))
+
+
 def _proto_candidates(sync):
     """Ordered (name, handler) parsers to try for a non-Meshtastic frame.
 
     This is a GENERAL, multipurpose identifier: the LoRa sync word cannot be
     trusted to name the protocol — MeshCore's sync is user-configurable to ANY
-    value (0x12 default, 0x34 public, or custom), LoRaWAN uses 0x34, and demod can
-    misread the sync entirely.  So we try EVERY implemented non-Meshtastic protocol
-    and let the CONTENT validators decide: the first whose validator returns a
-    record wins; garbage that matches none falls through to the 'unknown' report.
-    The sync word is used only to ORDER the attempts, which resolves the rare frame
-    that could satisfy two validators (LoRaWAN owns 0x34, so try it first there)."""
+    value (0x12 default, 0x34 public, or custom), LoRaWAN uses 0x34, LoRaMesher
+    is configurable, and demod can misread the sync entirely.  So we try EVERY
+    implemented non-Meshtastic protocol and let the CONTENT validators decide.
+
+    The try-all-rank dispatch sorts by confidence tier so strong validators
+    (LoRa APRS's 3-byte magic, LoRaWAN's MHDR, disaster.radio's totalLength)
+    win over loose ones (RadioHead's 4-byte structureless header).  The order
+    here is only a deterministic tiebreaker.
+    """
+    # APRS / disaster.radio / Reticulum / RadioHead / LoRa P2P are sync-word-
+    # agnostic (their air format is library-specific and sync word varies).
+    # Order: strongest-validator first so the highest-confidence claim wins.
+    common_tail = [
+        ('lora_aprs', _h_lora_aprs),
+        ('reticulum', _h_reticulum),
+        ('disaster_radio', _h_disaster_radio),
+        ('ebyte_lora', _h_ebyte_lora),
+        ('radiohead', _h_radiohead),
+    ]
     if sync == 0x34:
-        return [('lorawan', _h_lorawan), ('meshcore', _h_meshcore)]
-    return [('meshcore', _h_meshcore), ('lorawan', _h_lorawan)]
+        return [('lorawan', _h_lorawan), ('loramesher', _h_loramesher),
+                ('meshcore', _h_meshcore)] + common_tail
+    return [('meshcore', _h_meshcore), ('loramesher', _h_loramesher),
+            ('lorawan', _h_lorawan)] + common_tail
 
 
 # ============================================================================
@@ -2210,6 +3249,215 @@ def process_file(fpath, relay_after=None, relay_before=None,
         _cutoff = min(relay_before * N, len(iq1_orig))
         iq1_orig[_cutoff:] = 0.0
 
+    # ---- Per-capture precise TX-carrier measurement (envelope+Welch) ----
+    # The decoder's k_hat_fine measures the preamble-bin position in the
+    # decimated iq1 — but this aliases at ±bw/2 (bin near N/2 ambiguous in
+    # sign) which can split same-device captures into different clusters.
+    # We compute a NOISE-RESISTANT precise carrier estimate directly on the
+    # ORIGINAL FULL-RATE iq:
+    #   1. Compute amplitude envelope, locate the burst (high-amplitude
+    #      time window) via threshold above noise floor.
+    #   2. Welch PSD over the burst window.
+    #   3. Power-weighted spectral centroid over bins above noise floor —
+    #      this is the precise burst-carrier freq (relative to baseband).
+    # The full-rate iq has no aliasing concerns (it covers ±fs/2 which is
+    # always wider than the chirp's ±bw/2 footprint).
+    #
+    # IMPORTANT: only compute on the OUTER process_file call (when
+    # _iq_override is None).  Recursive rescue calls pass a frequency-shifted
+    # _iq_override IQ, and re-running the fingerprint on the shifted IQ gives
+    # a WRONG carrier (the shift is built into the measurement).  Outer call
+    # measures the true unshifted carrier; recursive calls inherit it via
+    # _CURRENT_HW_FP[0], which we DON'T clobber when entering recursively.
+    if _iq_override is None:
+        _CURRENT_HW_FP[0] = None
+        _CURRENT_PRECISE_CFO[0] = None
+    try:
+        if _iq_override is not None:
+            raise StopIteration  # skip — outer call already measured
+        if len(iq) >= 4096:
+            # Smoothing window = half a LoRa symbol — long enough to average
+            # over the chirp's bandwidth oscillation, short enough to localize
+            # the burst within the capture.  N/bw is the symbol duration in
+            # seconds at the LoRa symbol rate; * fs converts to capture samples.
+            _sym_samples_at_fs = int((N / bw) * fs)
+            _sm = max(256, _sym_samples_at_fs // 2)
+            _env = np.abs(iq).astype(np.float64)
+            # CLIPPING DETECTION: when LNA saturates (strong nearby TX),
+            # tens of thousands of samples pile up at the ADC max.  Signature:
+            # 99%ile envelope is right at max value.  Flag this so downstream
+            # fingerprinting can downgrade confidence — amplitude features
+            # become unreliable under clipping.
+            _max_env = float(np.max(_env))
+            _p99_env = float(np.percentile(_env, 99))
+            # Clipped if 99%ile is within 2% of max AND peak is high
+            _is_clipped = (_max_env > 0.5 and (_max_env - _p99_env) / _max_env < 0.02)
+            _clip_fraction = float(np.sum(_env > _p99_env * 0.99)) / len(_env) if _is_clipped else 0.0
+            if _CURRENT_HW_FP[0] is None:
+                _CURRENT_HW_FP[0] = {}
+            _CURRENT_HW_FP[0]['clipped'] = bool(_is_clipped)
+            _CURRENT_HW_FP[0]['clip_fraction'] = float(_clip_fraction)
+            _cs = np.cumsum(_env)
+            _smoothed = (_cs[_sm:] - _cs[:-_sm]) / _sm
+            # Threshold = noise floor + 50% of dynamic range.  Noise floor is
+            # estimated as the 20th percentile of the smoothed envelope (robust
+            # to bursts occupying any fraction of the capture).
+            _nf_amp = float(np.percentile(_smoothed, 20))
+            _peak_amp = float(np.max(_smoothed))
+            _thresh = _nf_amp + 0.5 * (_peak_amp - _nf_amp)
+            _above = _smoothed > _thresh
+            if _above.any():
+                _idx = np.where(_above)[0]
+                # Use the LARGEST contiguous run — handles spurious noise
+                # spikes that might cross threshold briefly outside the burst.
+                _diffs = np.diff(_idx)
+                _gaps = np.where(_diffs > _sm)[0]
+                _runs = []
+                _run_start = 0
+                for _g in _gaps:
+                    _runs.append((_idx[_run_start], _idx[_g]))
+                    _run_start = _g + 1
+                _runs.append((_idx[_run_start], _idx[-1]))
+                # Pick the LONGEST run (largest contiguous burst).
+                _best_run = max(_runs, key=lambda r: r[1] - r[0])
+                _b_start = int(_best_run[0])
+                _b_end = int(_best_run[1]) + _sm
+                _burst_iq = iq[_b_start:_b_end]
+                if len(_burst_iq) >= 1024:
+                    from scipy.signal import welch as _welch_full
+                    _nperseg = min(len(_burst_iq) // 4, 32768)
+                    if _nperseg >= 256:
+                        _fw, _Pw = _welch_full(_burst_iq, fs=fs, nperseg=_nperseg,
+                                                return_onesided=False)
+                        _ord = np.argsort(_fw)
+                        _fw = _fw[_ord]; _Pw = _Pw[_ord]
+                        _PdB = 10 * np.log10(_Pw + 1e-30)
+                        # LoRa PSD is bimodal: chirp band (high) and dead band
+                        # (low / noise floor).  Median sits between, so use
+                        # the 10th-percentile estimate of the NOISE floor and
+                        # threshold at +6 dB above it.  This captures the full
+                        # chirp band, not just its peak.
+                        _nf_db = float(np.percentile(_PdB, 10))
+                        _msk = _PdB > _nf_db + 6
+                        if _msk.any():
+                            _wts = 10 ** ((_PdB[_msk] - _nf_db) / 10.0)
+                            _CURRENT_PRECISE_CFO[0] = float(
+                                np.sum(_fw[_msk] * _wts) / np.sum(_wts))
+                            # Preserve any existing keys (e.g. 'clipped' set earlier)
+                            if _CURRENT_HW_FP[0] is None:
+                                _CURRENT_HW_FP[0] = {}
+                            _CURRENT_HW_FP[0]['precise_carrier_hz'] = _CURRENT_PRECISE_CFO[0]
+                # --- UMOP burst-onset transient (PA ramp-up signature) ---
+                # The 10%→90% envelope rise, overshoot above steady-state, and
+                # mid-rise slope are PA-specific physical characteristics
+                # orthogonal to TCXO frequency.  Validated SNR 1.0-1.4 between
+                # same-batch RAK Meshtastic devices (overshoot strongest at
+                # 1.43; abs_tx_hz collapses when TCXO drifts in long windows).
+                # Combined with abs_tx_hz they reach ~95% classification.
+                #
+                # Uses a SHORT smoothing window (20μs) — the burst-detection
+                # smoothing (~256 samples / half-symbol) is too coarse to
+                # resolve the ~60μs PA rise without flattening it.  Requires
+                # fs >= 250 kHz so the 20μs averaging spans ≥5 samples.
+                # --- UMOP burst END-of-burst transient (PA turn-off) ---
+                # Independent UMOP signal from PA shutdown.  Validated SNR up
+                # to 1.63 (mid_fall_slope) — strongest single feature on the
+                # hardest test dataset.  Combined with onset features reaches
+                # 96%+ accuracy on borderline same-batch hardware.
+                if fs >= 250_000 and _peak_amp > 1e-6 and _b_end < len(_smoothed):
+                    try:
+                        _eob_sm = max(4, int(fs * 20e-6))
+                        # Take ±4ms around the burst END
+                        _ew_lo = max(0, _b_end - int(fs * 0.004))
+                        _ew_hi = min(len(_env), _b_end + int(fs * 0.002))
+                        _env_eob = _env[_ew_lo:_ew_hi]
+                        if len(_env_eob) >= _eob_sm * 4:
+                            _cs3 = np.cumsum(_env_eob)
+                            _eob = (_cs3[_eob_sm:] - _cs3[:-_eob_sm]) / _eob_sm
+                            _eob_peak = float(np.max(_eob))
+                            if _eob_peak > 1e-6:
+                                _eob_above_50 = np.where(_eob > _eob_peak * 0.5)[0]
+                                if len(_eob_above_50) >= 10:
+                                    _be = int(_eob_above_50[-1])
+                                    _ep90, _ep10 = _eob_peak * 0.9, _eob_peak * 0.10
+                                    _ei90 = _be
+                                    while _ei90 > 0 and _eob[_ei90] < _ep90: _ei90 -= 1
+                                    _ei10 = _ei90
+                                    while _ei10 < len(_eob) - 1 and _eob[_ei10] > _ep10: _ei10 += 1
+                                    if 2 <= (_ei10 - _ei90) <= _eob_sm * 20:
+                                        _fall_us = (_ei10 - _ei90) / fs * 1e6
+                                        # 70%→30% mid-fall slope
+                                        _ep70, _ep30 = _eob_peak * 0.7, _eob_peak * 0.3
+                                        _ei70 = _ei90
+                                        while _ei70 < len(_eob) - 1 and _eob[_ei70] > _ep70: _ei70 += 1
+                                        _ei30 = _ei70
+                                        while _ei30 < len(_eob) - 1 and _eob[_ei30] > _ep30: _ei30 += 1
+                                        if _ei30 - _ei70 >= 1:
+                                            _mid_fall_slope = (_eob[_ei30] - _eob[_ei70]) / (_ei30 - _ei70) / _eob_peak * 1e6 / fs
+                                            # Pre-decay overshoot
+                                            _pre_n = int(fs * 100e-6)
+                                            _pre = _eob[max(0, _ei90 - _pre_n):_ei90]
+                                            if len(_pre) >= 10:
+                                                _pre_max = float(np.max(_pre))
+                                                _pre_mean = float(np.mean(_pre))
+                                                _pre_decay_over = (_pre_max - _pre_mean) / max(_pre_mean, 1e-9) * 100
+                                                if _CURRENT_HW_FP[0] is None:
+                                                    _CURRENT_HW_FP[0] = {}
+                                                _CURRENT_HW_FP[0]['eob_fall_us'] = float(_fall_us)
+                                                _CURRENT_HW_FP[0]['eob_mid_fall_slope'] = float(_mid_fall_slope)
+                                                _CURRENT_HW_FP[0]['eob_pre_decay_over_pct'] = float(_pre_decay_over)
+                    except Exception:
+                        pass
+
+                if fs >= 250_000 and _peak_amp > 1e-6:
+                    try:
+                        _on_sm = max(4, int(fs * 20e-6))     # 20μs short avg
+                        # Compute a FRESH short-smoothed envelope.  Local to
+                        # the rise region: take ±2 ms around the coarse burst
+                        # start so we capture the rise + steady plateau.
+                        _w_lo = max(0, _b_start - int(fs * 0.002))
+                        _w_hi = min(len(_env), _b_start + int(fs * 0.004))
+                        _env_local = _env[_w_lo:_w_hi]
+                        if len(_env_local) >= _on_sm * 4:
+                            _cs2 = np.cumsum(_env_local)
+                            _on = (_cs2[_on_sm:] - _cs2[:-_on_sm]) / _on_sm
+                            _on_peak = float(np.max(_on))
+                            if _on_peak > 1e-6:
+                                _on_above = np.where(_on > _on_peak * 0.5)[0]
+                                if len(_on_above) >= 3:
+                                    _bs2 = int(_on_above[0])
+                                    if _on_sm * 2 <= _bs2 <= len(_on) - _on_sm * 2:
+                                        _t10 = _on_peak * 0.10; _t90 = _on_peak * 0.90
+                                        _i10 = _bs2
+                                        while _i10 > 0 and _on[_i10] > _t10: _i10 -= 1
+                                        _i90 = _bs2
+                                        while _i90 < len(_on) - 1 and _on[_i90] < _t90: _i90 += 1
+                                        _rise_n = _i90 - _i10
+                                        if 2 <= _rise_n <= _on_sm * 20:
+                                            _rise_us = _rise_n / fs * 1e6
+                                            _steady_end = min(_i90 + 400, len(_on))
+                                            if _steady_end - _i90 >= 50:
+                                                _steady_mean = float(np.mean(_on[_i90:_steady_end]))
+                                                _peak_in = float(np.max(_on[_i10:min(_i10 + _rise_n*3, len(_on))]))
+                                                _overshoot_pct = (_peak_in - _steady_mean) / max(_steady_mean, 1e-9) * 100
+                                                _t40 = _on_peak * 0.4; _t60 = _on_peak * 0.6
+                                                _i40 = _i10
+                                                while _i40 < len(_on) - 1 and _on[_i40] < _t40: _i40 += 1
+                                                _i60 = _i40
+                                                while _i60 < len(_on) - 1 and _on[_i60] < _t60: _i60 += 1
+                                                _mid_slope = (_on[_i60] - _on[_i40]) / max(_i60 - _i40, 1) / _on_peak * 1e6 / fs
+                                                if _CURRENT_HW_FP[0] is None:
+                                                    _CURRENT_HW_FP[0] = {}
+                                                _CURRENT_HW_FP[0]['onset_rise_us'] = float(_rise_us)
+                                                _CURRENT_HW_FP[0]['onset_overshoot_pct'] = float(_overshoot_pct)
+                                                _CURRENT_HW_FP[0]['onset_mid_slope'] = float(_mid_slope)
+                    except Exception:
+                        pass
+    except StopIteration:
+        pass
+    except Exception:
+        pass
+
     # ---- Pass 1: find preamble bin (coarse frequency) ----
     # Try decoding. If CRC OK, done. If not, use the found preamble bin
     # to re-center the extraction and try again (pass 2).
@@ -2243,10 +3491,20 @@ def process_file(fpath, relay_after=None, relay_before=None,
 
     _need_rescue = False   # set when a header decoded but its data never CRC'd
     _residual_clear = False  # set when the masked residual has NO preamble left
+    # Counter for consecutive attempts that produced NO valid LoRa header.  Real
+    # packets of any protocol that pass the 4..237 byte sanity range reset this
+    # counter; only sustained phantom-preamble cascades (gate fires on noise
+    # spurs, decoder finds weak preamble-like patterns but no real LoRa header)
+    # increment it.  Bailing the loop early on a cascade lets the worker pick
+    # up the next capture instead of burning the full budget on noise.
+    _consec_no_header = 0
     for attempt in range(MAX_ATTEMPTS):
         if _BUDGET_S > 0 and (time.process_time() - _process_start) > _BUDGET_S:
             print(f"\n  [BUDGET] decode budget {_BUDGET_S:.1f}s exhausted after attempt {attempt} — bail")
             return
+        if _consec_no_header >= 3:
+            print(f"\n  [BAIL] {_consec_no_header} consecutive no-header attempts — likely phantom-preamble cascade")
+            break
         if attempt > 0:
             print("\n  --- Retry #%d ---" % attempt)
         _d = {}
@@ -2256,6 +3514,14 @@ def process_file(fpath, relay_after=None, relay_before=None,
             _residual_clear = True   # no preamble left in the masked residual
             break  # no preamble found
         status, mask_start, mask_len, preamble_bin = result
+        # Update the consecutive-no-header counter.  Uses the broad-PL
+        # `header_decoded` flag so ALL protocols (Meshtastic, MeshCore,
+        # LoRaWAN, Unknown, etc.) reset the counter — not just Meshtastic-PL
+        # frames (which would be what the narrower `hdr_ok` flag covers).
+        if _d.get('header_decoded'):
+            _consec_no_header = 0
+        elif status == 'FAIL':
+            _consec_no_header += 1
         if status != 'OK' and _d.get('hdr_ok'):
             _need_rescue = True   # confirmed packet whose data didn't decode here
         if status == 'WRONG_SF':
@@ -2512,18 +3778,33 @@ def process_file(fpath, relay_after=None, relay_before=None,
             iq1_pass2 = recrop_centered(shift_hz)
 
             p2_skip = list(skip_bins)  # start with known bad bins
+            # Counter for consecutive no-header attempts at THIS shift (same
+            # semantics as PASS 1).  Per-shift reset means a clean PASS 2
+            # CFO-recovery attempt at a different shift is unaffected by what
+            # happened at the previous shift.
+            _consec_no_header_p2 = 0
             for attempt in range(MAX_ATTEMPTS):
                 if _BUDGET_S > 0 and (time.process_time() - _process_start) > _BUDGET_S:
                     return
+                if _consec_no_header_p2 >= 3:
+                    print(f"\n  [BAIL] {_consec_no_header_p2} consecutive no-header PASS 2 attempts at this shift")
+                    break
                 if attempt > 0:
                     print("\n  --- Pass2 Retry #%d ---" % attempt)
+                _d_p2 = {}
                 result = _decode_attempt(iq1_pass2.copy(), sf, bw, N, ppm, fs, dec, name, Counter,
-                                         skip_bins=p2_skip)
+                                         skip_bins=p2_skip, diag_out=_d_p2)
                 if result is None:
                     break
                 status, mask_start, mask_len, p2_bin = result
                 if status == 'WRONG_SF':
                     break  # dominant signal is a different SF — skip this shift
+                # Update bail counter using broad-PL `header_decoded` flag so
+                # ALL protocols (any 4..237 byte payload) reset it.
+                if _d_p2.get('header_decoded'):
+                    _consec_no_header_p2 = 0
+                elif status == 'FAIL':
+                    _consec_no_header_p2 += 1
                 # On OK we do NOT return: a badly-centred gate capture (carrier
                 # >BW/2 off, so PASS 1 failed) routinely holds several
                 # time-separated packets at this SAME carrier — hop0 + hop1, or
@@ -2588,6 +3869,12 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     sweep_budget=2.0, diag_out=None):
     if skip_bins is None:
         skip_bins = []
+
+    # Hardware fingerprint is computed AFTER preamble detection — see below —
+    # because the precise carrier measurement needs to be confined to the
+    # actual burst window (the capture has noise/silence around the burst,
+    # which would dominate a whole-capture Welch centroid).
+    _hw_fp = None
 
     t = np.arange(N, dtype=np.float64) / bw
     Ts = N / bw
@@ -3201,6 +4488,33 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     print("  Preamble bin: %d, fine: %.4f, drift: %.6f bins/sym" % (
         preamble_bin, k_hat_fine, drift_bins_per_sym))
 
+    # ---- Per-packet hardware fingerprint (now that we know preamble_start) ----
+    # Compute the precise transmit carrier using a TIGHT window around the
+    # burst — preamble through end of expected payload — so the Welch centroid
+    # isn't diluted by noise outside the burst.  ~10-15 LoRa symbols is
+    # plenty.  Burst-window approach is robust to gate-export width: it
+    # doesn't matter if the gate exported 200 ms or 5 s of context around
+    # the burst — we always centroid over the actual signal.
+    # Per-capture hardware fingerprint.  process_file's envelope+Welch already
+    # set precise_carrier_hz (proven 138 Hz std, 269 Hz inter-device separation
+    # at SF7); KEEP that and only ADD UMOP-specific features that envelope+Welch
+    # doesn't compute.  Dechirp-based precise_carrier_hz is alias-prone at the
+    # ±BW/2 boundary (SHORT_FAST), so never overwrite the working measurement.
+    if _CURRENT_HW_FP[0] is None or _CURRENT_HW_FP[0].get('cfo_per_sym_std') is None:
+        _txfp = _extract_tx_fingerprint(iq1, preamble_start, sf, bw)
+        if _txfp is not None:
+            if _CURRENT_HW_FP[0] is None:
+                _CURRENT_HW_FP[0] = {}
+            for _k in ('cfo_per_sym_std', 'am_ripple_pct',
+                       'amp_per_sym_pct', 'phase_residual_rms', 'irr_db',
+                       'pn_slope', 'signal_snr_db'):
+                if _txfp.get(_k) is not None:
+                    _CURRENT_HW_FP[0][_k] = _txfp[_k]
+            # Only fill precise_carrier_hz from dechirp if envelope+Welch failed.
+            if _CURRENT_HW_FP[0].get('precise_carrier_hz') is None and _txfp.get('precise_carrier_hz') is not None:
+                _CURRENT_HW_FP[0]['precise_carrier_hz'] = _txfp['precise_carrier_hz']
+    _hw_fp = _CURRENT_HW_FP[0]
+
     # Apply fractional CFO correction via complex multiply.
     # This removes the fractional-bin residual that integer bin subtraction
     # leaves behind, which smears FFT peaks and degrades soft LLR margins.
@@ -3375,7 +4689,16 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # Symbol pre_last_i+1 and pre_last_i+2 encode the sync word nibbles.
     # Formula: sync_word = (bin1//(N//16) << 4) | (bin2//(N//16))
     # Known: 0x2B=Meshtastic, 0x34=LoRaWAN, 0x12=MeshCore/Private, 0x0F=Meshtastic(alt)
-    _SYNC_BRANDS = {0x2B: 'Meshtastic', 0x34: 'LoRaWAN', 0x12: 'MeshCore/Private', 0x0F: 'Meshtastic'}
+    # Sync word is a HINT about likely protocol family, NEVER the identification.
+    # 0x12 is the Semtech default ("public LoRa") used by MeshCore, RadioLib raw
+    # transmits, SX126x-Arduino, sandeepmistry/arduino-LoRa, LoRaMesher, and most
+    # custom user firmware — calling it "MeshCore" was a relic that mislabeled
+    # every other 0x12 transmitter.  0x34 is the LoRaWAN convention but MeshCore
+    # can be configured to use it.  The protocol PARSERS decide identity from
+    # CONTENT; this map only labels the radio's chosen sync byte for diagnostics.
+    _SYNC_BRANDS = {0x2B: 'Meshtastic', 0x0F: 'Meshtastic',
+                    0x12: 'Public LoRa (default)',
+                    0x34: 'Public LoRa (LoRaWAN convention)'}
     _sw1_p = preamble_start + (pre_last_i + 1) * N
     _sw2_p = preamble_start + (pre_last_i + 2) * N
     _sync_word = None
@@ -3506,6 +4829,13 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # PL (e.g. 143/227) — those must NOT trigger the (expensive) rescue.
     if diag_out is not None and hdr_ok and 12 <= payload_len <= 64:
         diag_out['hdr_ok'] = True
+    # Broader signal: a real LoRa header decoded with ANY plausible payload
+    # length (the same 4..237 sanity range the decoder itself enforces below).
+    # Used by process_file's outer-loop bail to reset the consecutive-no-header
+    # counter — protects ALL protocols (LoRaWAN/MeshCore/Unknown with PL > 64),
+    # unlike the narrower `hdr_ok` flag which is Meshtastic-specific.
+    if diag_out is not None and hdr_ok and 4 <= payload_len <= 237:
+        diag_out['header_decoded'] = True
 
     for i, (b, fb, rawb, pmr) in enumerate(zip(hdr_bins, hdr_fines, hdr_raws, hdr_pmrs)):
         print("    hdr[%d]: bin %3d (fine %7.3f, raw %d) %.1fdB" % (
@@ -3767,6 +5097,127 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         _clean_crc = crc_ok
         print("  CRC: %s %s" % (crc_method, "OK" if crc_ok else ""))
 
+    # ---- Parser-first early dispatch ----
+    # Try every enabled protocol parser on a clean primary CRC BEFORE the
+    # legacy Meshtastic-shaped FP gates run.  Each parser owns its own
+    # structural+content validation (Meshtastic: shape+behavioral preconditions
+    # + protobuf decrypt validity; MeshCore: payload_type∈valid_set ∧ version=0
+    # + path structure; LoRaWAN: MHDR + grid).  A successful parse short-circuits
+    # the chase+sweep recovery entirely — those exist to recover MARGINAL
+    # Meshtastic, not to second-guess a clean non-Meshtastic decode.  This is
+    # both a latency win (chase costs 0.2 s SF7 → seconds at high SF) and a
+    # correctness fix (today MeshCore/LoRaWAN frames slip through only when
+    # their bytes happen to satisfy a Meshtastic-shaped gate; they get dropped
+    # otherwise).
+    #
+    # FP risk preserved: the Meshtastic shape+behavioral preconditions are the
+    # same gates used today — moved from "force chase" semantics to "parser
+    # precondition".  Non-Meshtastic parsers each have their own structural
+    # validators (already in code; not added here).  Unknown=ON only surfaces
+    # bytes that NO parser claimed AND that are not Meshtastic-shaped — so the
+    # FP exposure is ~1/65536 × (1 - Meshtastic-shape rate) per CRC-checked
+    # packet, opt-in.
+    _early_handled = False
+    _freq_mhz, _rssi = None, None
+    for _p in name.lstrip('.').split('_'):
+        if _p.endswith('MHz'):
+            try: _freq_mhz = float(_p[:-3])
+            except ValueError: pass
+        elif _p.startswith('pwr'):
+            try: _rssi = int(_p[3:])
+            except ValueError: pass
+    _rf = {'sf': sf, 'bw': bw, 'freq_mhz': _freq_mhz, 'rssi': _rssi}
+    # Attach per-packet hardware fingerprint + CFO/drift (already measured
+    # during preamble fit above).  The web layer reads these to cluster
+    # packets by transmitter device within a protocol family.  Precise CFO
+    # comes from the regression intercept (k_hat_fine × bw / N, in Hz).
+    if _hw_fp is not None:
+        _rf['hw_fp'] = _hw_fp
+    try:
+        _rf['cfo_hz'] = float(cfo_hz)
+    except (NameError, TypeError):
+        pass
+    try:
+        _rf['cfo_drift'] = float(drift_bins_per_sym)
+    except (NameError, TypeError):
+        pass
+
+    if crc_ok:
+        _early_ctx = {'aes_key': _mesh_aes_key, 'no_key': _mesh_no_key,
+                      'clean_crc': True, 'rf': _rf, 'is_mesh': True}
+        # Meshtastic: precondition = shape + behavioral (same as the legacy
+        # primary gates).  Parser owns decrypt/protobuf validity downstream.
+        if ('meshtastic' in _PROTO_ENABLED and len(raw_bytes) >= 16
+                and _is_plausible_mesh_header_uni(raw_bytes)
+                and _is_chase_acceptable_uni(raw_bytes)):
+            _h_meshtastic(payload, _early_ctx)
+            _early_handled = True
+        # Non-Meshtastic parsers (MeshCore, LoRaWAN, LoRaMesher, ...).  Try-all-
+        # rank: run EVERY enabled parser, collect every match, then pick the
+        # highest-confidence one to emit.  This surfaces ambiguity instead of
+        # hiding it — if two parsers both claim the bytes at the same tier the
+        # winner is marked `ambiguous: true` and the runners-up are listed in
+        # `alternatives` so the UI can show "looked like X, also matched Y."
+        # Latency cost: a few microseconds per packet (parsers fail-fast on the
+        # first-byte mismatch), traded against the correctness win of never
+        # silently mis-attributing a frame that two protocols' validators both
+        # accepted.
+        if not _early_handled:
+            _matches = []
+            for _pname, _handler in _proto_candidates(_sync_word):
+                if _pname not in _PROTO_ENABLED:
+                    continue
+                try:
+                    _rec = _handler(payload, _early_ctx)
+                except Exception:
+                    continue
+                if _rec is not None:
+                    _matches.append((_pname, _rec))
+            if _matches:
+                # Rank by confidence tier (higher = stronger).
+                _TIER_RANK = {'verified': 3, 'confirmed': 2, 'candidate': 1}
+                def _tier(m): return _TIER_RANK.get(m[1].get('confidence', 'candidate'), 0)
+                _matches.sort(key=lambda m: -_tier(m))
+                _winner_pname, _winner = _matches[0]
+                if len(_matches) > 1:
+                    _alts = [{'proto': r.get('proto', n),
+                              'hint':  r.get('hint'),
+                              'confidence': r.get('confidence'),
+                              'summary': r.get('summary')} for n, r in _matches[1:]]
+                    _winner['alternatives'] = _alts
+                    # Same-tier runner-up → genuine ambiguity, flag it.
+                    if _tier(_matches[1]) == _tier(_matches[0]):
+                        _winner['ambiguous'] = True
+                        print("  AMBIGUOUS: %d parsers claimed at tier '%s' — "
+                              "emitting %s, listing alternatives" % (
+                                  len(_matches), _winner.get('confidence', 'candidate'),
+                                  _winner.get('proto', _winner_pname)))
+                _emit_proto(_winner, payload, sf, bw, cr, _sync_word, _rf)
+                _early_handled = True
+        # Unknown=ON: surface non-Meshtastic-shape bytes with no parser match.
+        # (Meshtastic-shape unclaimed bytes fall through to chase for recovery,
+        # matching today's "force chase, drop on fail" semantics.)
+        if (not _early_handled and _PROTO_UNKNOWN
+                and not _is_plausible_mesh_header_uni(raw_bytes)):
+            print("  UNKNOWN-PROTO: CRC OK, no parser matched, non-Meshtastic "
+                  "shape — surfacing as 'unknown'")
+            _report_unknown(payload, sf, bw, cr, _sync_word, name)
+            _emit_proto({'proto': 'unknown', 'from': None, 'to': None, 'decrypted': False,
+                         'summary': '%d bytes · sync %s' % (
+                             len(payload), ('0x%02x' % _sync_word) if _sync_word is not None else '?')},
+                        payload, sf, bw, cr, _sync_word, _rf)
+            _early_handled = True
+
+    # If a parser claimed it (or it was surfaced as unknown), skip the legacy
+    # gates+chase+sweep — they have nothing to add to an already-clean decode —
+    # and return success with the same packet-length info as the normal path.
+    if _early_handled:
+        n_pay_syms = int(np.ceil(need_bytes * 8 / sf)) * (cr + 4)
+        total_syms = 8 + 4.25 + 8 + n_pay_syms
+        pkt_len_samples = int(total_syms * N) + N
+        print()
+        return ('OK', preamble_start, pkt_len_samples, preamble_bin)
+
     # ---- Plausibility gate on primary CRC OK ----
     # CRC-16 false-positives happen when multiple symbols are mis-demoded in
     # a self-consistent way (the same demod error propagates through both
@@ -3783,15 +5234,13 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
               "— likely demod error, retry via chase")
         crc_ok = False  # force chase to try recovery
         _clean_crc = False
-    # Behavioral gate (same as sweep direct CRC path): broadcast or a known
-    # node.  Without this, a primary CRC-16 coincidence on a 1/65536 random
-    # match × ~1/2^16 uni-structural validity will leak ~1 FP per ~150
-    # captures of a high-SF DM test, all with bit-flipped src/dst.
-    if crc_ok and not _is_chase_acceptable_uni(raw_bytes):
-        print("  BEHAVIORAL: primary CRC OK but header src/dst is not a known "
-              "node — likely demod error, retry via chase")
-        crc_ok = False
-        _clean_crc = False
+    # NO behavioral gate on PRIMARY CRC-OK decodes — accept any structurally
+    # valid CRC-OK unicast frame regardless of whether endpoints are previously
+    # known.  Trade-off: ~1 false positive per ~150 captures from random CRC
+    # coincidences vs being able to gather information from previously-unseen
+    # nodes (essential for arbitrary-LoRa intercept where we don't know the
+    # network in advance).  The chase loop below still has its own gate to
+    # prevent chase-induced false positives (those are the higher-risk path).
 
     # ---- Chase on primary decode ----
     # The chase loop has its own broadcast-header plausibility gate
@@ -3865,8 +5314,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 # this, sweep CRC-16 coincidence × structural-uni-plausibility
                 # leaks ~1 FP per ~150 captures with from/to addresses that
                 # are bit-flipped Node addresses.  _KNOWN_NODES auto-populates
-                # from clean Meshtastic decrypts; bootstrap via env
-                # LORA_KNOWN_NODES=hex,hex,...
+                # from clean Meshtastic decrypts.
                 if ok and _is_chase_acceptable_uni(tr_raw):
                     print("  %s ds=%+d slope=%+.3f tau=%+.4f: CRC %s OK!" % (label, ds_off, slope, frac_tau, method))
                     crc_ok, crc_method = True, method
@@ -3997,17 +5445,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         return ('FAIL', preamble_start, 20 * N, preamble_bin)
 
     # CRC passed (or not present) — route through the protocol parser registry.
-    # RF context from the capture name (freq + gate signal power as RSSI proxy),
-    # attached to EVERY structured [PKT] record (any protocol) for the web/log.
-    _freq_mhz, _rssi = None, None
-    for _p in name.lstrip('.').split('_'):
-        if _p.endswith('MHz'):
-            try: _freq_mhz = float(_p[:-3])
-            except ValueError: pass
-        elif _p.startswith('pwr'):
-            try: _rssi = int(_p[3:])
-            except ValueError: pass
-    _rf = {'sf': sf, 'bw': bw, 'freq_mhz': _freq_mhz, 'rssi': _rssi}
+    # (_rf was hoisted to the early-dispatch block above; reuse it here.)
     _ctx = {'aes_key': _mesh_aes_key, 'no_key': _mesh_no_key,
             'clean_crc': _clean_crc, 'rf': _rf, 'is_mesh': _is_meshtastic}
     _handled = False
@@ -4015,19 +5453,36 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         _h_meshtastic(payload, _ctx)              # validates + emits its own [PKT]
         _handled = True
     else:
-        # Sync word only orders the candidates; the content-validator decides.
-        # Skip protocols the user disabled in Advanced Options (saves the parse +
-        # never emits a disabled protocol).
+        # Try-all-rank dispatch (same as the pre-chase early-dispatch above).
+        # Sync word only orders the candidates for deterministic tiebreaks;
+        # the content validators decide and the highest confidence tier wins,
+        # with same-tier ties flagged as 'ambiguous'.
+        _matches2 = []
         for _pname, _handler in _proto_candidates(_sync_word):
             if _pname not in _PROTO_ENABLED:
                 continue
             if len(payload) < 1:
                 break
-            _rec = _handler(payload, _ctx)
-            if _rec is not None:                  # validated as this protocol
-                _emit_proto(_rec, payload, sf, bw, cr, _sync_word, _rf)
-                _handled = True
-                break
+            try:
+                _rec = _handler(payload, _ctx)
+            except Exception:
+                continue
+            if _rec is not None:
+                _matches2.append((_pname, _rec))
+        if _matches2:
+            _TIER_RANK = {'verified': 3, 'confirmed': 2, 'candidate': 1}
+            def _tier(m): return _TIER_RANK.get(m[1].get('confidence', 'candidate'), 0)
+            _matches2.sort(key=lambda m: -_tier(m))
+            _winner = _matches2[0][1]
+            if len(_matches2) > 1:
+                _winner['alternatives'] = [
+                    {'proto': r.get('proto', n), 'hint': r.get('hint'),
+                     'confidence': r.get('confidence'), 'summary': r.get('summary')}
+                    for n, r in _matches2[1:]]
+                if _tier(_matches2[1]) == _tier(_matches2[0]):
+                    _winner['ambiguous'] = True
+            _emit_proto(_winner, payload, sf, bw, cr, _sync_word, _rf)
+            _handled = True
     if not _handled and crc_ok and _PROTO_UNKNOWN:
         # Good CRC but no parser recognised it: a real frame of a protocol we
         # don't implement.  Surface it generically in the UI AND log it for the

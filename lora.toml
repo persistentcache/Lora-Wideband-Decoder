@@ -17,7 +17,10 @@ format        = "sc16"       # bladeRF stream format
 
 [detect]
 threshold        = 0.55      # Schmidl-Cox preamble threshold
-energy_threshold = 5.0       # gate energy-peak threshold (dB)
+energy_threshold = 12.0      # gate energy-peak threshold (dB) — strict default,
+                             # filters noise/spurs.  Lower to 5.0 if you need to
+                             # catch very weak distant signals at the cost of
+                             # more spurious captures the decoder must reject.
 overlap          = 0.5       # window overlap (0.5 = 50%)
 detect_workers   = -1        # -1 = auto-scale from cpu_count (plug-and-play)
 buf_seconds      = 16        # ring buffer seconds (bigger = more burst headroom)
@@ -29,6 +32,11 @@ workers     = 10                         # decode worker processes
 export_dir  = "/dev/shm/live_caps"       # where captures are written (tmpfs)
 packet_log  = "/tmp/lora_packets.jsonl"  # structured packet log the web tails
 key         = "default"                  # "default" | "NOKEY" | hex/base64 PSK
+export_dec  = 8                          # capture oversampling — 8 = 2 MHz for SF7/BW250.
+                                         # Higher rate gives clean dechirp + better
+                                         # PA-onset temporal resolution for fingerprinting.
+                                         # Decode keeps up at this rate IF the gate's
+                                         # energy_threshold (12.0 default) filters noise.
 
 [web]
 host = "127.0.0.1"   # localhost-only (SECURE DEFAULT — the UI has NO authentication).
