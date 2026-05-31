@@ -2154,7 +2154,16 @@ class BackgroundDecoder:
         self._verbose = verbose
         self._aes_key = aes_key
         self._no_key = no_key
-        self._queue = queue.Queue()
+        # LIFO so the newest captures decode FIRST under burst load — older
+        # captures get the same total decode work but only the median latency
+        # is what users feel.  Example: 30 captures in queue at 5s/decode each:
+        #   FIFO → p50 ≈ 75 s (everyone waits behind the queue)
+        #   LIFO → p50 ≈ 5 s  (newest decoded immediately; oldest still 75 s)
+        # Set LORA_DECODE_FIFO=1 to revert.
+        if os.environ.get('LORA_DECODE_FIFO', '0').strip() in ('1', 'true', 'on'):
+            self._queue = queue.Queue()
+        else:
+            self._queue = queue.LifoQueue()
         self._lock = threading.Lock()
         # Structured packet log (JSONL) the web UI tails.  Each decoded/encrypted
         # [PKT] record from the workers is appended here with a receive timestamp.
