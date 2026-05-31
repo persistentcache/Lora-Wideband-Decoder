@@ -4142,9 +4142,17 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         the dominant FFT work in this function with no observed loss of
         offset selection on the harness reference (payload bytes
         identical, only intermediate margins shift).
+
+        PERF (range): _find_coarse_positions returns positions at
+        half-block resolution (multiples of N/2), so the true start is
+        within ±N/4 of `coarse`.  Searching ±N/2 instead of ±N halves
+        the coarse-offset count again while still covering the input
+        position's worst-case uncertainty.
         """
-        lo = max(0, coarse - N)
-        hi = min(len(iq_data) - N * max(1, n_score), coarse + N)
+        # ±N/2 covers _find_coarse_positions' half-block quantisation.
+        _refine_half_range = N // 2
+        lo = max(0, coarse - _refine_half_range)
+        hi = min(len(iq_data) - N * max(1, n_score), coarse + _refine_half_range)
         if hi <= lo:
             return coarse
         step = max(1, dec // 2)
