@@ -4070,9 +4070,10 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     def _refine_start(iq_data, coarse, n_score=8):
         """Fallback: refine coarse position by maximizing dechirp peak energy.
 
-        PERF: batches all (offset, symbol) FFTs into ONE scipy.fft call per pass,
-        replacing ~1000 sequential single FFTs.  Bit-identical to the per-FFT
-        loop (max/argmax along axis=1 produces the same values as per-row).
+        PERF: batches per-symbol FFTs (one batched call per offset).  For
+        large-N (SF11/12) chunks the scratch array so memory stays bounded.
+        Bit-identical to the per-FFT loop (max/argmax along axis=1 produces
+        the same values as the per-row scalar version).
         """
         lo = max(0, coarse - N)
         hi = min(len(iq_data) - N * max(1, n_score), coarse + N)
@@ -4080,34 +4081,49 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             return coarse
         step = max(1, dec // 2)
 
+        # Memory budget for the batched scratch: 16 MB worth of complex64.
+        # `K` = how many offsets to stack per batched FFT call.  At small N
+        # (SF7-9) K covers the entire range in one call; at large N (SF11/12)
+        # K shrinks so the scratch stays bounded (was 1.6 GB before this).
+        BATCH_BYTES = 16 * 1024 * 1024
+        K = max(1, BATCH_BYTES // max(1, n_score * N * 8))
+
         def _batched_pass(offsets_iter):
-            """Return (best_off, best_score) over the given offsets."""
             offsets = [o for o in offsets_iter
                        if 0 <= o and o + n_score * N <= len(iq_data)]
             if not offsets:
                 return coarse, 0.0
             n_offs = len(offsets)
-            # Build (n_offs * n_score, N) matrix of segments × downchirp.
-            segs = np.empty((n_offs * n_score, N), dtype=iq_data.dtype)
-            for oi, off in enumerate(offsets):
-                segs[oi*n_score:(oi+1)*n_score] = (
-                    iq_data[off:off + n_score*N].reshape(n_score, N))
-            segs *= downchirp
-            ff = np.abs(_fft(segs, axis=1))                          # (n_offs*n_score, N)
-            maxes = ff.max(axis=1).reshape(n_offs, n_score)
-            arg = ff.argmax(axis=1).reshape(n_offs, n_score)
-            scores = maxes.sum(axis=1)
-            # Consistent-bin bonus: any single bin showing ≥4 times boosts score 1.5×.
-            for oi in range(n_offs):
-                row = arg[oi]
-                # bincount on small integers in [0, N) — N ≤ 4096 for any LoRa SF.
-                if N <= 4096:
-                    bc = np.bincount(row, minlength=0)
-                    if bc.max() >= 4:
-                        scores[oi] *= 1.5
-                else:
-                    if Counter(row.tolist()).most_common(1)[0][1] >= 4:
-                        scores[oi] *= 1.5
+            all_maxes = np.empty((n_offs, n_score), dtype=np.float32)
+            all_arg = np.empty((n_offs, n_score), dtype=np.int32)
+            for bs in range(0, n_offs, K):
+                batch = offsets[bs:bs + K]
+                kb = len(batch)
+                segs = np.empty((kb * n_score, N), dtype=iq_data.dtype)
+                for oi, off in enumerate(batch):
+                    segs[oi*n_score:(oi+1)*n_score] = (
+                        iq_data[off:off + n_score*N].reshape(n_score, N))
+                segs *= downchirp
+                ff = np.abs(_fft(segs, axis=1)).astype(np.float32, copy=False)
+                all_maxes[bs:bs+kb] = ff.max(axis=1).reshape(kb, n_score)
+                all_arg[bs:bs+kb] = ff.argmax(axis=1).reshape(kb, n_score)
+            scores = all_maxes.sum(axis=1).astype(np.float64)
+            # Consistent-bin bonus: max bincount per row.  Vectorised via
+            # sort+diff: in a sorted row, a run of ≥4 identical bins → ≥3
+            # consecutive zeros in diff(sorted_row).  Compute max-run-length
+            # per row with one numpy pass (no Python per-row loop).
+            sorted_arg = np.sort(all_arg, axis=1)
+            same = np.diff(sorted_arg, axis=1) == 0    # (n_offs, n_score-1) bool
+            # Per-row max consecutive-True length: a vectorised cumulative
+            # reset-counter (cumsum that zeros at every False).  Equivalent
+            # to the per-row run-length code, all-numpy.
+            run = np.zeros_like(same, dtype=np.int32)
+            if same.shape[1] > 0:
+                run[:, 0] = same[:, 0].astype(np.int32)
+                for c in range(1, same.shape[1]):
+                    run[:, c] = np.where(same[:, c], run[:, c-1] + 1, 0)
+                max_run = run.max(axis=1)              # max consecutive True per row
+                scores[max_run + 1 >= 4] *= 1.5
             bi = int(np.argmax(scores))
             return offsets[bi], float(scores[bi])
 
@@ -4328,14 +4344,18 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     def refine_preamble_start(pre_loc, pre_bin, nscore_syms):
         """Refine preamble start by maximising sum-of-FFT-peaks.
 
-        PERF: same batched-FFT pattern as _refine_start — ~1000 sequential
-        single FFTs become two batched FFT calls.  Bit-identical results.
+        PERF: batched per-symbol FFTs, with the batch size capped so the
+        scratch array stays bounded on large-N (SF11/12) — the previous
+        single-call batching allocated 1+ GB at SF12 and was 70 s slower
+        than the per-FFT loop.
         """
         lo = max(0, pre_loc - N)
         hi = min(len(iq1) - N * max(1, nscore_syms), pre_loc + N)
         if hi < lo:
             return pre_loc
         coarse_step = max(1, dec // 2)
+        BATCH_BYTES = 16 * 1024 * 1024
+        K = max(1, BATCH_BYTES // max(1, nscore_syms * N * 8))
 
         def _batched_pass(offsets_iter):
             offsets = [o for o in offsets_iter
@@ -4343,24 +4363,30 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             if not offsets:
                 return pre_loc, -1.0
             n_offs = len(offsets)
-            segs = np.empty((n_offs * nscore_syms, N), dtype=iq1.dtype)
-            for oi, off in enumerate(offsets):
-                segs[oi*nscore_syms:(oi+1)*nscore_syms] = (
-                    iq1[off:off + nscore_syms*N].reshape(nscore_syms, N))
-            segs *= downchirp
-            ff = np.abs(_fft(segs, axis=1))
-            maxes = ff.max(axis=1).reshape(n_offs, nscore_syms)
-            arg = ff.argmax(axis=1).reshape(n_offs, nscore_syms)
-            scores = maxes.sum(axis=1)
-            for oi in range(n_offs):
-                row = arg[oi]
-                if N <= 4096:
-                    bc = np.bincount(row, minlength=0)
-                    if bc.max() >= 4:
-                        scores[oi] *= 1.5
-                else:
-                    if Counter(row.tolist()).most_common(1)[0][1] >= 4:
-                        scores[oi] *= 1.5
+            all_maxes = np.empty((n_offs, nscore_syms), dtype=np.float32)
+            all_arg = np.empty((n_offs, nscore_syms), dtype=np.int32)
+            for bs in range(0, n_offs, K):
+                batch = offsets[bs:bs + K]
+                kb = len(batch)
+                segs = np.empty((kb * nscore_syms, N), dtype=iq1.dtype)
+                for oi, off in enumerate(batch):
+                    segs[oi*nscore_syms:(oi+1)*nscore_syms] = (
+                        iq1[off:off + nscore_syms*N].reshape(nscore_syms, N))
+                segs *= downchirp
+                ff = np.abs(_fft(segs, axis=1)).astype(np.float32, copy=False)
+                all_maxes[bs:bs+kb] = ff.max(axis=1).reshape(kb, nscore_syms)
+                all_arg[bs:bs+kb] = ff.argmax(axis=1).reshape(kb, nscore_syms)
+            scores = all_maxes.sum(axis=1).astype(np.float64)
+            # Consistent-bin bonus (≥4 identical bins) — vectorised.
+            sorted_arg = np.sort(all_arg, axis=1)
+            same = np.diff(sorted_arg, axis=1) == 0
+            if same.shape[1] > 0:
+                run = np.zeros_like(same, dtype=np.int32)
+                run[:, 0] = same[:, 0].astype(np.int32)
+                for c in range(1, same.shape[1]):
+                    run[:, c] = np.where(same[:, c], run[:, c-1] + 1, 0)
+                max_run = run.max(axis=1)
+                scores[max_run + 1 >= 4] *= 1.5
             bi = int(np.argmax(scores))
             return offsets[bi], float(scores[bi])
 
@@ -5366,8 +5392,35 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             for idx, best, second, margin in flipped:
                 print("    nib[%d]: 0x%x → 0x%x (margin=%.1f)" % (idx, best, second, margin))
 
+    # ---- Skip sweep on confident encrypted-DM demod (perf, esp. low-core SF12) ----
+    # The sweep block below burns ~1-2 s exploring timing offsets that might
+    # recover a marginal demod.  But when the demod was already CONFIDENT (high
+    # median margin) AND the cleartext header shows a real unicast DM (dst not
+    # broadcast, dst != src, hop_limit ≤ hop_start), the payload bytes are AES-
+    # encrypted ciphertext and no timing tweak can satisfy CRC — we will only
+    # ever surface this packet as encrypted-header-only.  Skipping the sweep
+    # lets the worker free up for the next capture immediately.  Negligible
+    # FP risk: structural unicast plausibility + dst≠broadcast is essentially
+    # the same gate the sweep itself uses to accept matches (line ~5452).
+    _skip_sweep = False
+    if crc_present and not crc_ok and pay_soft_info and len(raw_bytes) >= 16:
+        _med_m = float(np.median([s[3] for s in pay_soft_info]))
+        _min_m = float(min(s[3] for s in pay_soft_info))
+        _dst = raw_bytes[0] | (raw_bytes[1] << 8) | (raw_bytes[2] << 16) | (raw_bytes[3] << 24)
+        _src = raw_bytes[4] | (raw_bytes[5] << 8) | (raw_bytes[6] << 16) | (raw_bytes[7] << 24)
+        _flags = raw_bytes[12]
+        _hop_limit = _flags & 0x07
+        _hop_start = (_flags >> 5) & 0x07
+        _is_confident = _med_m > 50000.0 and _min_m > 2000.0
+        _is_uni_dm = (_dst != 0xFFFFFFFF and _src not in (0, 0xFFFFFFFF)
+                      and _hop_limit <= _hop_start and 1 <= _hop_start <= 7)
+        if _is_confident and _is_uni_dm:
+            print("  SKIP SWEEP: confident demod (med=%.0f min=%.0f) + unicast DM "
+                  "structure → encrypted payload, sweep won't help" % (_med_m, _min_m))
+            _skip_sweep = True
+
     # ---- Combined timing sweep with chase ----
-    if crc_present and not crc_ok:
+    if crc_present and not crc_ok and not _skip_sweep:
         print("\n  === SWEEP (timing × chase) ===")
         # Limited sweep: ~20 timing offsets × decode-only + chase(1 flip)
         # More offsets × more flips = more false CRC-16 matches

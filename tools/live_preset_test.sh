@@ -36,7 +36,8 @@ else
 fi
 
 rm -rf "$CAPS"; mkdir -p "$CAPS"; rm -f "$LOG" "$SENDLOG" "$ERR"
-export LORA_DECODE_BUDGET_S=${LORA_BUDGET:-10.0} LORA_DECODE_WORKERS=10 LORA_DEDUP_KEEP=$KEEP
+export LORA_DECODE_BUDGET_S=${LORA_BUDGET:-10.0} LORA_DEDUP_KEEP=$KEEP
+# LORA_DECODE_WORKERS unset → auto-scale.  Override via `LORA_DECODE_WORKERS=N` env if needed.
 bladeRF-cli -e "set frequency rx 915000000; set samplerate rx 28000000; set bandwidth rx 28000000; set agc rx on; rx config file=/dev/stdout format=bin n=0 buffers=512 samples=32768 xfers=64; rx start; rx wait" 2>"$ERR" \
   | python3 scripts/lora_detect.py -r 28000000 -b 28000000 -c 915.0 -t sc16 \
       --threshold 0.55 --overlap 0.5 --energy-threshold 5.0 \
