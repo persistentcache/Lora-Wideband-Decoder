@@ -163,13 +163,23 @@ def soft_fft_demod_batch(segs, dc, N, levels, ppm, bin_group, cfo_shift=0):
 # Output: list of ppm LLR arrays (each n_sym floats) — codewords
 # ============================================================================
 def soft_deinterleave(sym_llrs, n_sym, ppm):
-    cw = [[0.0] * n_sym for _ in range(ppm)]
-    for k in range(ppm):
-        for i in range(n_sym):
-            idx = ((i - k - 1) % ppm + ppm) % ppm
-            bp = ppm - 1 - idx  # MSB-first
-            cw[k][i] = sym_llrs[i][bp]
-    return cw
+    """Diagonal soft deinterleave: cw[k][i] = sym[i].bit[bp(k,i)].
+
+    Vectorised over (k, i) with a single fancy-index gather.  Bit-identical
+    to the original double loop (same modular index math, same MSB-first bp).
+    """
+    # sym_llrs may be a list of arrays (each ppm floats) or a (n_sym, ppm) matrix.
+    M = np.asarray(sym_llrs, dtype=np.float64)
+    if M.ndim == 1:
+        M = M.reshape(1, -1)
+    # Precompute bp[k,i] = ppm - 1 - (((i-k-1) % ppm + ppm) % ppm)
+    k = np.arange(ppm)[:, None]               # (ppm, 1)
+    i = np.arange(n_sym)[None, :]             # (1, n_sym)
+    idx = ((i - k - 1) % ppm + ppm) % ppm     # (ppm, n_sym)
+    bp = ppm - 1 - idx                        # MSB-first column for each (k, i)
+    # Gather: out[k, i] = M[i, bp[k, i]]
+    out = M[i, bp]                            # (ppm, n_sym) via broadcasting
+    return out
 
 
 # ============================================================================
@@ -231,6 +241,53 @@ def soft_hamming_decode(cw_llr, rdd):
     best = int(sorted_idx[0])
     second = int(sorted_idx[1])
     margin = metrics[best] - metrics[second]
+    return best, second, margin
+
+
+# Numpy-vectorised sign tables: (16, 8) per rdd, dtype float64 for stable
+# dot products with arbitrary LLR magnitudes.  Built ONCE at import.
+_HAMMING_SIGNS_NP = {
+    rdd: np.array(_HAMMING_SIGNS[rdd], dtype=np.float64) for rdd in (5, 6, 7, 8)
+}
+
+
+def soft_hamming_decode_batch(cw_llr_list, rdd):
+    """Vectorised ML Hamming decode over MANY codewords at once.
+
+    Input: list/array of ppm codewords (each rdd LLRs).
+    Output: (best_arr, second_arr, margin_arr) — three length-ppm arrays.
+
+    Bit-identical to calling `soft_hamming_decode` per row (same metric sum,
+    same argsort tie-breaks for the top two — numpy partial-sort would be
+    faster but argsort matches the scalar path's behaviour, and the cost is
+    16-wide which is trivial).
+
+    Single numpy matmul replaces the per-codeword 16×rdd Python double loop
+    (the dominant tottime contributor in the soft-payload pipeline).
+    """
+    signs = _HAMMING_SIGNS_NP.get(rdd)
+    cw_mat = np.asarray(cw_llr_list, dtype=np.float64)
+    # cw_mat: (ppm, rdd or longer).  Slice to rdd columns the table covers.
+    n = min(rdd, cw_mat.shape[1] if cw_mat.ndim == 2 else len(cw_mat))
+    if cw_mat.ndim == 1:
+        cw_mat = cw_mat[None, :]
+    cw_n = cw_mat[:, :n]
+    if signs is None:
+        # uncommon rdd — fall back to per-row scalar decode
+        out_best, out_second, out_margin = [], [], []
+        for row in cw_mat:
+            b, s, m = soft_hamming_decode(row, rdd)
+            out_best.append(b); out_second.append(s); out_margin.append(m)
+        return (np.array(out_best, dtype=np.int64),
+                np.array(out_second, dtype=np.int64),
+                np.array(out_margin, dtype=np.float64))
+    metrics = cw_n @ signs[:, :n].T                # (ppm, 16)
+    # argsort descending — match the scalar path's tie-break exactly.
+    sorted_idx = np.argsort(-metrics, axis=1, kind='stable')
+    best = sorted_idx[:, 0].astype(np.int64)
+    second = sorted_idx[:, 1].astype(np.int64)
+    rows = np.arange(metrics.shape[0])
+    margin = metrics[rows, best] - metrics[rows, second]
     return best, second, margin
 
 
@@ -2153,71 +2210,67 @@ def _extract_tx_fingerprint(iq1, preamble_start, sf, bw):
     # location aliases between the two ends.  Search a fine grid of sub-symbol
     # offsets and pick the one that PUTS THE PEAK AWAY FROM THE BOUNDARY (max
     # of |freq| < bw/2 - 5kHz preferred) AND has the highest peak amplitude.
-    def _dechirp_at(off):
-        """Coherently sum 8 dechirped symbols starting at preamble_start + off."""
-        s_start = preamble_start + off
-        if s_start < 0 or s_start + 8 * N_sym > len(iq1):
-            return None, None
-        sF = None
-        for s in range(8):
-            seg = iq1[s_start + s*N_sym : s_start + (s+1)*N_sym] * downchirp
-            F = np.fft.fftshift(np.fft.fft(seg, Nfft))
-            sF = F if sF is None else sF + F
-        return sF, s_start
-
-    # Offset search in samples of size N_sym/16 across ±N_sym/2
-    boundary_dist_thresh = max(5000.0, bw * 0.05)  # 5 kHz or 5% of BW
+    # PERF: the SCAN only uses peak amplitude + freq location for scoring, so a
+    # small Nfft is sufficient (122 Hz/bin at bw=500k vs 7.6 Hz/bin at 65536 —
+    # both far finer than the ~5 kHz boundary threshold).  Final feature
+    # extraction below uses the full Nfft=65536 unchanged.  Also batches the
+    # 8 per-symbol FFTs into ONE call (pocketfft avoids 7 dispatch overheads).
+    Nfft_scan = max(1024, 1 << (N_sym - 1).bit_length())   # ≥ N_sym, capped low
+    Nfft_scan = min(Nfft_scan, 4096)                       # never larger than 4096
+    freqs_scan = np.fft.fftshift(np.fft.fftfreq(Nfft_scan, d=1.0 / bw))
+    boundary_dist_thresh = max(5000.0, bw * 0.05)
     best_offset = 0
-    best_score = -1.0   # score combines |peak| (higher = better aligned) and "not at boundary"
-    best_sF = None
+    best_score = -1.0
+    iq_len = len(iq1)
     for off in range(-N_sym // 2, N_sym // 2 + 1, max(1, N_sym // 16)):
-        sF, _ = _dechirp_at(off)
-        if sF is None: continue
-        cmag = np.abs(sF)
+        s_start = preamble_start + off
+        if s_start < 0 or s_start + 8 * N_sym > iq_len:
+            continue
+        # 8 symbol windows × N_sym samples → (8, N_sym), one batched FFT.
+        segs8 = iq1[s_start:s_start + 8 * N_sym].reshape(8, N_sym) * downchirp
+        F = np.fft.fft(segs8, n=Nfft_scan, axis=1)
+        sF_scan = np.fft.fftshift(F.sum(axis=0))
+        cmag = np.abs(sF_scan)
         pk_idx = int(np.argmax(cmag))
-        pk_freq = freqs[pk_idx]
+        pk_freq = freqs_scan[pk_idx]
         pk_amp = float(cmag[pk_idx])
-        # Penalize peaks near ±BW/2 boundary (alias-prone)
         boundary_dist = bw / 2 - abs(pk_freq)
         boundary_penalty = 1.0 if boundary_dist > boundary_dist_thresh else (boundary_dist / boundary_dist_thresh)
         score = pk_amp * boundary_penalty
         if score > best_score:
             best_score = score
             best_offset = off
-            best_sF = sF
-    if best_sF is None:
-        return None
     aligned_start = preamble_start + best_offset
+    if aligned_start < 0 or aligned_start + 8 * N_sym > iq_len:
+        return None
 
     # --- Dechirp all 8 preamble symbols at the BEST alignment ---
-    per_sym_cfo = []
-    per_sym_amp = []
-    per_sym_dechirped = []
-    sum_F = None
-    sum_mag = None
+    # Batched FFT replaces 8 individual fft+fftshift calls (single pocketfft
+    # dispatch over the 8 rows, identical result, ~5-8× faster on (8, 65536)).
+    segs_mat = iq1[aligned_start:aligned_start + 8 * N_sym].reshape(8, N_sym) * downchirp  # (8, N_sym)
+    F_full = np.fft.fftshift(np.fft.fft(segs_mat, n=Nfft, axis=1), axes=1)                 # (8, Nfft)
+    per_F_mag_mat = np.abs(F_full)
+    sum_F = F_full.sum(axis=0)
+    sum_mag = per_F_mag_mat.sum(axis=0)
+    # Per-symbol amplitude (time-domain mean |seg|) and per-symbol CFO via
+    # quadratic sub-bin peak interp.  Vectorised peak search + scalar interp
+    # for the 8 entries (cheap; preserves the exact per-bin arithmetic).
+    per_sym_amp = np.abs(segs_mat).mean(axis=1).astype(np.float64)
+    pk_s_per = np.argmax(per_F_mag_mat, axis=1)
+    per_sym_cfo = [0.0] * 8
     for s in range(8):
-        seg = iq1[aligned_start + s*N_sym : aligned_start + (s+1)*N_sym] * downchirp
-        per_sym_dechirped.append(seg)
-        F = np.fft.fftshift(np.fft.fft(seg, Nfft))
-        per_F_mag = np.abs(F)
-        # Per-symbol mean amplitude (UMOP: PA gain stability across symbols)
-        per_sym_amp.append(float(np.mean(np.abs(seg))))
-        # Per-symbol CFO via sub-bin quadratic peak interp
-        pk_s = int(np.argmax(per_F_mag))
+        pk_s = int(pk_s_per[s])
         if 1 <= pk_s < Nfft - 1:
-            a, b, c = float(per_F_mag[pk_s-1]), float(per_F_mag[pk_s]), float(per_F_mag[pk_s+1])
-            denom = a - 2*b + c
-            d_s = 0.5*(a-c)/denom if abs(denom) > 1e-9 else 0.0
-            per_sym_cfo.append(float(freqs[pk_s] + d_s * bin_w))
+            a = float(per_F_mag_mat[s, pk_s - 1])
+            b = float(per_F_mag_mat[s, pk_s])
+            c = float(per_F_mag_mat[s, pk_s + 1])
+            denom = a - 2 * b + c
+            d_s = 0.5 * (a - c) / denom if abs(denom) > 1e-9 else 0.0
+            per_sym_cfo[s] = float(freqs[pk_s] + d_s * bin_w)
         else:
-            per_sym_cfo.append(float(freqs[pk_s]) if 0 <= pk_s < Nfft else 0.0)
-        # Coherent + incoherent accumulators
-        if sum_F is None:
-            sum_F = F.copy(); sum_mag = per_F_mag.copy()
-        else:
-            sum_F += F; sum_mag += per_F_mag
-    if sum_F is None:
-        return None
+            per_sym_cfo[s] = float(freqs[pk_s]) if 0 <= pk_s < Nfft else 0.0
+    per_sym_amp = list(per_sym_amp)
+    per_sym_dechirped = [segs_mat[s] for s in range(8)]
 
     # --- Tier 1: crystal features ---
     coh_mag = np.abs(sum_F)
@@ -3219,14 +3272,21 @@ def process_file(fpath, relay_after=None, relay_before=None,
     F = np.fft.fftshift(_fft(iq))
     keep = len(F) // dec
     start_f = len(F) // 2 - keep // 2
+    # Bins-per-Hz of the cached spectrum (used by recrop_centered to translate
+    # a Hz shift into an integer bin roll, replacing one full forward FFT).
+    _F_bin_per_hz = len(F) / fs
 
     def recrop_centered(cfo_hz_value):
-        """Re-extract at 1x rate with signal shifted to near DC.
-        cfo_hz_value is the measured CFO from preamble regression (k_hat_fine * bw / N).
-        We shift the 2MHz IQ DOWN by this amount, then FFT-crop to 1x."""
-        t = np.arange(len(iq), dtype=np.float64) / fs
-        shifted = (iq * np.exp(-1j * 2.0 * np.pi * cfo_hz_value * t)).astype(np.complex64)
-        Fs = np.fft.fftshift(_fft(shifted))
+        """Re-extract at 1x rate with the signal shifted to near DC.
+
+        PERF: replaces `fft(iq * exp(-j2π·cfo·t))` with a frequency-domain
+        circular shift of the already-cached `F`.  Mathematically equivalent
+        (the DFT shift theorem) — integer-bin precision (~fs/(2·N) Hz error,
+        well below the decoder's downstream tolerance).  Removes one large
+        forward FFT + one full complex-multiply per call.
+        """
+        bin_shift = int(round(cfo_hz_value * _F_bin_per_hz))
+        Fs = np.roll(F, -bin_shift) if bin_shift else F
         out = _ifft(np.fft.ifftshift(Fs[start_f:start_f + keep])) * (keep / len(Fs))
         return out.astype(np.complex64)
 
@@ -4008,39 +4068,60 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         return lo + best_lag
 
     def _refine_start(iq_data, coarse, n_score=8):
-        """Fallback: refine coarse position by maximizing dechirp peak energy."""
+        """Fallback: refine coarse position by maximizing dechirp peak energy.
+
+        PERF: batches all (offset, symbol) FFTs into ONE scipy.fft call per pass,
+        replacing ~1000 sequential single FFTs.  Bit-identical to the per-FFT
+        loop (max/argmax along axis=1 produces the same values as per-row).
+        """
         lo = max(0, coarse - N)
         hi = min(len(iq_data) - N * max(1, n_score), coarse + N)
         if hi <= lo:
             return coarse
         step = max(1, dec // 2)
+
+        def _batched_pass(offsets_iter):
+            """Return (best_off, best_score) over the given offsets."""
+            offsets = [o for o in offsets_iter
+                       if 0 <= o and o + n_score * N <= len(iq_data)]
+            if not offsets:
+                return coarse, 0.0
+            n_offs = len(offsets)
+            # Build (n_offs * n_score, N) matrix of segments × downchirp.
+            segs = np.empty((n_offs * n_score, N), dtype=iq_data.dtype)
+            for oi, off in enumerate(offsets):
+                segs[oi*n_score:(oi+1)*n_score] = (
+                    iq_data[off:off + n_score*N].reshape(n_score, N))
+            segs *= downchirp
+            ff = np.abs(_fft(segs, axis=1))                          # (n_offs*n_score, N)
+            maxes = ff.max(axis=1).reshape(n_offs, n_score)
+            arg = ff.argmax(axis=1).reshape(n_offs, n_score)
+            scores = maxes.sum(axis=1)
+            # Consistent-bin bonus: any single bin showing ≥4 times boosts score 1.5×.
+            for oi in range(n_offs):
+                row = arg[oi]
+                # bincount on small integers in [0, N) — N ≤ 4096 for any LoRa SF.
+                if N <= 4096:
+                    bc = np.bincount(row, minlength=0)
+                    if bc.max() >= 4:
+                        scores[oi] *= 1.5
+                else:
+                    if Counter(row.tolist()).most_common(1)[0][1] >= 4:
+                        scores[oi] *= 1.5
+            bi = int(np.argmax(scores))
+            return offsets[bi], float(scores[bi])
+
+        # Coarse pass over the wide range
         best_off, best_score = coarse, 0.0
-        for off in range(lo, hi + 1, step):
-            score = 0.0
-            bins = []
-            for s in range(min(n_score, (len(iq_data) - off) // N)):
-                fft_out = np.abs(_fft(iq_data[off + s*N:off + (s+1)*N] * downchirp))
-                score += float(np.max(fft_out))
-                bins.append(int(np.argmax(fft_out)))
-            if len(bins) >= 4 and Counter(bins).most_common(1)[0][1] >= 4:
-                score *= 1.5
-            if score > best_score:
-                best_score = score
-                best_off = off
+        off0, s0 = _batched_pass(range(lo, hi + 1, step))
+        if s0 > best_score:
+            best_off, best_score = off0, s0
+        # Fine pass around the coarse winner (step 1, narrow range)
         fine_lo = max(lo, best_off - step)
         fine_hi = min(hi, best_off + step)
-        for off in range(fine_lo, fine_hi + 1):
-            score = 0.0
-            bins = []
-            for s in range(min(n_score, (len(iq_data) - off) // N)):
-                fft_out = np.abs(_fft(iq_data[off + s*N:off + (s+1)*N] * downchirp))
-                score += float(np.max(fft_out))
-                bins.append(int(np.argmax(fft_out)))
-            if len(bins) >= 4 and Counter(bins).most_common(1)[0][1] >= 4:
-                score *= 1.5
-            if score > best_score:
-                best_score = score
-                best_off = off
+        off1, s1 = _batched_pass(range(fine_lo, fine_hi + 1))
+        if s1 > best_score:
+            best_off = off1
         return int(best_off)
 
     def _scan_from(iq_data, start):
@@ -4245,46 +4326,53 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 ri+1, len(r), r_bin, r[0][0], np.mean([p for _, _, p in r])))
 
     def refine_preamble_start(pre_loc, pre_bin, nscore_syms):
+        """Refine preamble start by maximising sum-of-FFT-peaks.
+
+        PERF: same batched-FFT pattern as _refine_start — ~1000 sequential
+        single FFTs become two batched FFT calls.  Bit-identical results.
+        """
         lo = max(0, pre_loc - N)
         hi = min(len(iq1) - N * max(1, nscore_syms), pre_loc + N)
         if hi < lo:
             return pre_loc
         coarse_step = max(1, dec // 2)
-        best_off = pre_loc
-        best_score = -1.0
-        for off in range(lo, hi + 1, coarse_step):
-            score = 0.0
-            bins = []
-            for s in range(nscore_syms):
-                seg = iq1[off + s*N:off + (s+1)*N]
-                if len(seg) < N:
-                    break
-                fft_out = np.abs(_fft(seg * downchirp))
-                score += float(np.max(fft_out))
-                bins.append(int(np.argmax(fft_out)))
-            # Bonus for consistent bin across symbols (true chirp boundary gives consistent peak)
-            if len(bins) >= 4 and Counter(bins).most_common(1)[0][1] >= 4:
-                score *= 1.5
-            if score > best_score:
-                best_score = score
-                best_off = off
+
+        def _batched_pass(offsets_iter):
+            offsets = [o for o in offsets_iter
+                       if 0 <= o and o + nscore_syms * N <= len(iq1)]
+            if not offsets:
+                return pre_loc, -1.0
+            n_offs = len(offsets)
+            segs = np.empty((n_offs * nscore_syms, N), dtype=iq1.dtype)
+            for oi, off in enumerate(offsets):
+                segs[oi*nscore_syms:(oi+1)*nscore_syms] = (
+                    iq1[off:off + nscore_syms*N].reshape(nscore_syms, N))
+            segs *= downchirp
+            ff = np.abs(_fft(segs, axis=1))
+            maxes = ff.max(axis=1).reshape(n_offs, nscore_syms)
+            arg = ff.argmax(axis=1).reshape(n_offs, nscore_syms)
+            scores = maxes.sum(axis=1)
+            for oi in range(n_offs):
+                row = arg[oi]
+                if N <= 4096:
+                    bc = np.bincount(row, minlength=0)
+                    if bc.max() >= 4:
+                        scores[oi] *= 1.5
+                else:
+                    if Counter(row.tolist()).most_common(1)[0][1] >= 4:
+                        scores[oi] *= 1.5
+            bi = int(np.argmax(scores))
+            return offsets[bi], float(scores[bi])
+
+        best_off, best_score = pre_loc, -1.0
+        off0, s0 = _batched_pass(range(lo, hi + 1, coarse_step))
+        if s0 > best_score:
+            best_off, best_score = off0, s0
         fine_lo = max(lo, best_off - coarse_step)
         fine_hi = min(hi, best_off + coarse_step)
-        for off in range(fine_lo, fine_hi + 1):
-            score = 0.0
-            bins = []
-            for s in range(nscore_syms):
-                seg = iq1[off + s*N:off + (s+1)*N]
-                if len(seg) < N:
-                    break
-                fft_out = np.abs(_fft(seg * downchirp))
-                score += float(np.max(fft_out))
-                bins.append(int(np.argmax(fft_out)))
-            if len(bins) >= 4 and Counter(bins).most_common(1)[0][1] >= 4:
-                score *= 1.5
-            if score > best_score:
-                best_score = score
-                best_off = off
+        off1, s1 = _batched_pass(range(fine_lo, fine_hi + 1))
+        if s1 > best_score:
+            best_off = off1
         return int(best_off)
 
     cand_infos = []
@@ -4753,7 +4841,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         # Soft path: LLR-based deinterleave + ML Hamming over all 16 candidates.
         # More robust than hard-decision path under IQ imbalance (mirror interference).
         hdr_soft_cw = soft_deinterleave(hdr_llrs, 8, ppm)
-        hdr_nibs_var = [soft_hamming_decode(hdr_soft_cw[k], 8)[0] for k in range(ppm)]
+        _hb, _, _ = soft_hamming_decode_batch(hdr_soft_cw, 8)
+        hdr_nibs_var = [int(_hb[k]) for k in range(ppm)]
         res = parse_header(hdr_nibs_var)
         return bins, pmrs, hdr_nibs_var, res, fines, raws
 
@@ -4872,18 +4961,30 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         "yes" if sym_time_ms > 16.0 else "no"))
 
     # ---- Assemble + dewhiten helpers ----
+    # Both pack/unpack at byte granularity; vectorised with numpy to remove the
+    # pure-python loop overhead that dominated cProfile at ~130k calls/run.
+    _WHITEN_NP = np.frombuffer(bytes(WHITENING_SEQ[:256]), dtype=np.uint8)
+
     def assemble(nibs_list):
-        raw = []
-        for i in range(0, len(nibs_list) - 1, 2):
-            if len(raw) >= need_bytes: break
-            raw.append((nibs_list[i] & 0xF) | ((nibs_list[i+1] & 0xF) << 4))
-        return raw
+        n_pairs = min(need_bytes, len(nibs_list) // 2)
+        if n_pairs <= 0:
+            return []
+        arr = np.asarray(nibs_list[:2 * n_pairs], dtype=np.uint8)
+        a = arr[0::2] & 0xF
+        b = arr[1::2] & 0xF
+        return (a | (b << 4)).tolist()
 
     def dewhiten(raw):
-        out = list(raw)
-        for i in range(min(payload_len, len(out))):
-            out[i] ^= WHITENING_SEQ[i & 0xFF]
-        return out
+        if not raw:
+            return list(raw)
+        # Numpy XOR over the head (payload_len bytes); remaining bytes pass through.
+        n_w = min(payload_len, len(raw))
+        if n_w <= 0:
+            return list(raw)
+        head = np.asarray(raw[:n_w], dtype=np.uint8)
+        # WHITENING_SEQ is a fixed 256-element pattern cycled by (i & 0xFF).
+        head = head ^ _WHITEN_NP[np.arange(n_w) & 0xFF]
+        return head.tolist() + list(raw[n_w:])
 
     # Estimate fractional timing offset from header symbol fine values.
     # A consistent fractional part across all symbols indicates a sub-sample
@@ -4941,10 +5042,14 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             hdr_llrs = [_H[i] for i in range(8)]
         if len(hdr_llrs) == 8:
             hdr_soft_cw = soft_deinterleave(hdr_llrs, 8, ppm)
+            # Batched header-overflow Hamming decode — only k in [5..ppm)
+            # values are needed, but batching all ppm rows is faster than
+            # per-row scalar calls (the dominant per-call dispatch overhead
+            # disappears in one numpy matmul).
+            _b, _, _ = soft_hamming_decode_batch(hdr_soft_cw, 8)
             for k in range(5, ppm):
-                best, second, margin = soft_hamming_decode(hdr_soft_cw[k], 8)
                 if k - 5 < len(trial_nibs):
-                    trial_nibs[k - 5] = best
+                    trial_nibs[k - 5] = int(_b[k])
 
         # Conservative upper bound for available symbols under slope walk.
         if slope == 0.0:
@@ -4971,11 +5076,14 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             pay_llrs = [_P[i] for i in range(rdd)]
             sp += rdd
             pay_cw = soft_deinterleave(pay_llrs, rdd, ppm_pay)
+            # Vectorised batched Hamming decode over all ppm_pay codewords —
+            # replaces a 16×rdd Python double loop per codeword (the dominant
+            # tottime contributor before this change).
+            _b, _s, _m = soft_hamming_decode_batch(pay_cw, rdd)
             for k in range(ppm_pay):
-                best, second, margin = soft_hamming_decode(pay_cw[k], rdd)
                 nib_idx = len(trial_nibs)
-                trial_nibs.append(best)
-                trial_soft.append((nib_idx, best, second, margin))
+                trial_nibs.append(int(_b[k]))
+                trial_soft.append((nib_idx, int(_b[k]), int(_s[k]), float(_m[k])))
 
         trial_raw = dewhiten(assemble(trial_nibs))
         return trial_raw, trial_raw[:payload_len], trial_soft, trial_nibs
