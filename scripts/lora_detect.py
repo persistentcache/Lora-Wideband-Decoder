@@ -1889,7 +1889,22 @@ class SignalRecorder:
                             c for c in self._img_carriers if c[2] > _cut]
 
                 sym_time = (2 ** sf) / bw
-                max_pkt_syms = 16 + 4.25 + 8 + 120
+                # Capture extent past the preamble = preamble (16) + SFD (4.25)
+                # + sync (8) + payload-symbol budget.  Originally 120 syms covered
+                # the absolute Meshtastic max (PL=237 / CR4/5 / LDRO) — but that
+                # tail is mostly silence for the typical 20-90 byte Meshtastic
+                # packet.  Slow SFs especially suffer: at SF12 sym_time≈33 ms so
+                # the unused tail adds ~3 s per capture, which both raises
+                # send→decoded latency by that much AND inflates the decode
+                # workload proportionally.  100 syms covers Meshtastic up to
+                # ~80 bytes after FEC (>99 % of real traffic incl. all standard
+                # text, telemetry, position, nodeinfo, routing); larger packets
+                # are truncated and may fail CRC.  Live SF11 4-core: latency
+                # p50 18s → 11s with this trim, 20/20 hops preserved.
+                # Tunable via LORA_PAYLOAD_SYM_BUDGET for users who need to
+                # capture giant packets at the cost of latency.
+                _pay_syms = int(os.environ.get('LORA_PAYLOAD_SYM_BUDGET', '100'))
+                max_pkt_syms = 16 + 4.25 + 8 + _pay_syms
                 max_pkt_s = max_pkt_syms * sym_time
                 buf_dur_s = pre_hop_s + wb_n / self.wb_fs
                 max_record_n = int((buf_dur_s + max_pkt_s) * self.wb_fs)
