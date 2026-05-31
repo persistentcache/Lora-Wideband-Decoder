@@ -4032,16 +4032,6 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 candidates.append((float(sums_h[i]), half + int(i) * N))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
-        # Early-exit: top candidate's SC sum is the maximum coherent-preamble
-        # energy anywhere in the buffer.  Each window's normalized SC ∈ [0,1],
-        # summed across 6 windows so the max is 6 and a real preamble scores
-        # 3+ at typical SNR.  Below 0.6 (avg 0.1 per window) there's nothing
-        # preamble-shaped left — common after PASS 1 has SIC-subtracted the
-        # only packet and the residual is noise.  Saves a full refine+scan
-        # pass per residual-check at every SF, biggest at SF11/12 where the
-        # scan is otherwise ~250-500 ms.
-        if not candidates or candidates[0][0] < 0.6:
-            return []
         seen = set()
         positions = []
         for score, pos in candidates:
