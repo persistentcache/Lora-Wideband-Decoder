@@ -5011,20 +5011,35 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         print("  NOT ENOUGH HEADER SYMBOLS")
         return ('FAIL', preamble_start, 20 * N, preamble_bin)
 
+    # If the base (td=0) variant is already a valid LoRa header, the sweep
+    # below is wasted work — the selection logic at line ~5043 only uses
+    # `valid_variants` when `base_hdr_valid` is False.  Skip the ~50-offset
+    # sweep entirely on the common case where td=0 already decodes.  PERF
+    # at SF11: removes ~50 * 8 = 400 per-symbol FFTs + the demod_fine /
+    # PMR / soft_fft_demod work for the unused variants.  Provably-
+    # equivalent: when base_hdr_valid, chosen_variant always = base_variant
+    # regardless of `valid_variants` contents.
+    _base_res = base_variant[3]
+    _base_hdr_valid = False
+    if _base_res is not None:
+        _bpl, _bcr, _bcrc, _bok = _base_res
+        _base_hdr_valid = bool(_bok and (4 <= _bpl <= 237) and (1 <= _bcr <= 4))
+
     valid_variants = []
-    for td in header_offsets:
-        v = decode_header_variant(base_data_start + td)
-        if v is None:
-            continue
-        bins2, pmrs2, nibs2, res2, fines2, raws2 = v
-        if res2 is None:
-            continue
-        pl2, cr2, crc2, ok2 = res2
-        pmr_med2 = float(np.median(pmrs2)) if pmrs2 else 0.0
-        plausible = (4 <= pl2 <= 237) and (1 <= cr2 <= 4)
-        if ok2 and plausible:
-            score = 1000.0 + 4.0 * pmr_med2 - 0.10 * abs(td)
-            valid_variants.append((score, td, v))
+    if not _base_hdr_valid:
+        for td in header_offsets:
+            v = decode_header_variant(base_data_start + td)
+            if v is None:
+                continue
+            bins2, pmrs2, nibs2, res2, fines2, raws2 = v
+            if res2 is None:
+                continue
+            pl2, cr2, crc2, ok2 = res2
+            pmr_med2 = float(np.median(pmrs2)) if pmrs2 else 0.0
+            plausible = (4 <= pl2 <= 237) and (1 <= cr2 <= 4)
+            if ok2 and plausible:
+                score = 1000.0 + 4.0 * pmr_med2 - 0.10 * abs(td)
+                valid_variants.append((score, td, v))
 
     # Be conservative with header realignment.
     # A valid explicit-header checksum can occur at the wrong timing offset,
