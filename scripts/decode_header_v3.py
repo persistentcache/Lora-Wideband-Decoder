@@ -4521,13 +4521,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # Adding the un-refined position as a second candidate lets the scoring
     # stage pick whichever gives the cleaner SC run + SFD.  SF/BW-agnostic:
     # all offsets are in `N` units which scales with sf and rate.
-    # Top-3 runs by length (was top-6): all_runs is sorted by run length DESC,
-    # so the first 3 are the strongest preamble candidates.  Weaker (shorter)
-    # runs rarely refine to a unique offset — they either point to the same
-    # preamble as a stronger run, or to noise.  Halving the call count of
-    # refine_preamble_start saves ~1.5 s/capture wall at SF11.
-    _N_RUN_REFINES = 3 if N >= 1024 else 6
-    for run_idx, run in enumerate(all_runs[:min(_N_RUN_REFINES, len(all_runs))]):
+    for run_idx, run in enumerate(all_runs[:min(6, len(all_runs))]):
         run_len = len(run)
         run_mean_pmr = float(np.mean([p for _, _, p in run]))
         run_bin = circular_mean_bin([b for _, b, _ in run], N)
