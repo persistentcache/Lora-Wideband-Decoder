@@ -3603,7 +3603,7 @@ def process_file(fpath, relay_after=None, relay_before=None,
             _consec_no_header = 0
         elif status == 'FAIL':
             _consec_no_header += 1
-        if status != 'OK' and _d.get('hdr_ok'):
+        if status != 'OK' and _d.get('hdr_ok') and not _d.get('no_rescue'):
             _need_rescue = True   # confirmed packet whose data didn't decode here
         if status == 'WRONG_SF':
             return  # dominant signal is a different SF — give up immediately
@@ -5436,6 +5436,11 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             print("  SKIP SWEEP: confident demod (med=%.0f min=%.0f) — "
                   "chase failed, sweep timing tweaks won't recover bits" % (_med_m, _min_m))
             _skip_sweep = True
+            # Also signal PASS 2 (CFO-recenter sweep) to skip this capture:
+            # for a CONFIDENT demod that failed CRC, no CFO shift will help
+            # either — the bits are correct, the failure is structural.
+            if diag_out is not None:
+                diag_out['no_rescue'] = True
 
     # ---- Combined timing sweep with chase ----
     if crc_present and not crc_ok and not _skip_sweep:
