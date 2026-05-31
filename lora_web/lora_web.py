@@ -42,7 +42,7 @@ if load_config is None:
                           'center_mhz': 915.0, 'format': 'sc16'},
                 'detect': {'threshold': 0.55, 'energy_threshold': 5.0, 'overlap': 0.5,
                            'detect_workers': -1, 'buf_seconds': 16, 'commit_lag': 4},
-                'decode': {'budget_s': 10.0, 'workers': 10,
+                'decode': {'budget_s': 10.0, 'workers': -1,
                            'export_dir': '/dev/shm/live_caps',
                            'packet_log': '/tmp/lora_packets.jsonl', 'key': 'default'},
                 'web': {'host': '127.0.0.1', 'port': 5000}, '_path': None}
@@ -1635,7 +1635,17 @@ def start_pipeline():
     env = dict(os.environ)
     env['LORA_PKT_LOG'] = dec['packet_log']
     env['LORA_DECODE_BUDGET_S'] = str(dec['budget_s'])
-    env['LORA_DECODE_WORKERS'] = str(dec['workers'])
+    # Only forward a pinned positive worker count.  -1 / 0 → leave env unset so
+    # the decoder auto-scales from cpu_count (multipurpose tool: must work on
+    # any machine from 4-core laptops to 32-core hosts without operator tuning).
+    try:
+        _cfg_workers = int(dec.get('workers', -1) or -1)
+    except (TypeError, ValueError):
+        _cfg_workers = -1
+    if _cfg_workers > 0:
+        env['LORA_DECODE_WORKERS'] = str(_cfg_workers)
+    else:
+        env.pop('LORA_DECODE_WORKERS', None)
     # Export capture rate (dec=8 → 2 MHz at SF7/BW250): better PA-onset
     # temporal resolution for the fingerprinter.  Default 2 if config omits.
     if dec.get('export_dec') is not None:

@@ -2222,7 +2222,13 @@ class BackgroundDecoder:
         # NOT slip is the gate's realtime sample intake.  So cap workers via
         # LORA_DECODE_WORKERS (live sets it low, e.g. ncpu - detect - reserve).
         _env_nw = os.environ.get('LORA_DECODE_WORKERS')
-        self._n_workers = (int(_env_nw) if _env_nw
+        try:
+            _env_nw_i = int(_env_nw) if _env_nw else 0
+        except ValueError:
+            _env_nw_i = 0
+        # -1 / 0 / unset → auto-scale.  Plug-and-play on any core count:
+        # leave the gate, detect-pool, and a small reserve enough CPU.
+        self._n_workers = (_env_nw_i if _env_nw_i > 0
                            else max(2, min(16, _ncpu - 6)))
         # ---- Two-tier decode on the SAME workers (no oversubscription) ----
         # Each manager serves the FAST queue first; only when it's empty does it
@@ -3013,7 +3019,11 @@ def main():
             # env-driven knobs (setdefault → an explicit env var still wins)
             os.environ.setdefault('LORA_COMMIT_LAG', str(_d.get('commit_lag', 4)))
             os.environ.setdefault('LORA_DECODE_BUDGET_S', str(_dec.get('budget_s', 10.0)))
-            os.environ.setdefault('LORA_DECODE_WORKERS', str(_dec.get('workers', 10)))
+            # Only export workers if user pinned a positive count.  Otherwise
+            # leave it unset so the auto-scale path (~ncpu-6, clamped 2..16) runs.
+            _cfg_w = int(_dec.get('workers', -1) or -1)
+            if _cfg_w > 0:
+                os.environ.setdefault('LORA_DECODE_WORKERS', str(_cfg_w))
             os.environ.setdefault('LORA_PKT_LOG',
                                   _dec.get('packet_log', '/tmp/lora_packets.jsonl'))
             print(f"Loaded config {_cfg.get('_path')}", file=sys.stderr, flush=True)
