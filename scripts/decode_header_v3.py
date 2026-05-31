@@ -5413,31 +5413,28 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             for idx, best, second, margin in flipped:
                 print("    nib[%d]: 0x%x → 0x%x (margin=%.1f)" % (idx, best, second, margin))
 
-    # ---- Skip sweep on confident encrypted-DM demod (perf, esp. low-core SF12) ----
-    # The sweep block below burns ~1-2 s exploring timing offsets that might
-    # recover a marginal demod.  But when the demod was already CONFIDENT (high
-    # median margin) AND the cleartext header shows a real unicast DM (dst not
-    # broadcast, dst != src, hop_limit ≤ hop_start), the payload bytes are AES-
-    # encrypted ciphertext and no timing tweak can satisfy CRC — we will only
-    # ever surface this packet as encrypted-header-only.  Skipping the sweep
-    # lets the worker free up for the next capture immediately.  Negligible
-    # FP risk: structural unicast plausibility + dst≠broadcast is essentially
-    # the same gate the sweep itself uses to accept matches (line ~5452).
+    # ---- Skip sweep on confident demod that failed CRC (perf, esp. low-core SF12) ----
+    # The sweep block below burns ~1-2 s exploring timing offsets, which only
+    # helps when bit errors were caused by timing (low demod margins).  When
+    # the demod was CONFIDENT (high median + no near-zero outliers) AND chase
+    # — which already ran above with up to 2 nibble flips — couldn't fix the
+    # CRC, the bits are correct as-is and the CRC fail is structural (encrypted
+    # payload, wrong PL/CR header byte interpretation, or a different protocol
+    # pretending to look Meshtastic-shaped).  Sweep timing tweaks won't help.
+    #
+    # Live SF12 4-core: 25/25 sweeps found NO CRC match on confident-demod
+    # captures, wasting ~25 × 1 s of decode budget.  Skipping recovers that
+    # time for actual queue drain without losing any real recoveries.
     _skip_sweep = False
     if crc_present and not crc_ok and pay_soft_info and len(raw_bytes) >= 16:
         _med_m = float(np.median([s[3] for s in pay_soft_info]))
         _min_m = float(min(s[3] for s in pay_soft_info))
-        _dst = raw_bytes[0] | (raw_bytes[1] << 8) | (raw_bytes[2] << 16) | (raw_bytes[3] << 24)
-        _src = raw_bytes[4] | (raw_bytes[5] << 8) | (raw_bytes[6] << 16) | (raw_bytes[7] << 24)
-        _flags = raw_bytes[12]
-        _hop_limit = _flags & 0x07
-        _hop_start = (_flags >> 5) & 0x07
-        _is_confident = _med_m > 50000.0 and _min_m > 2000.0
-        _is_uni_dm = (_dst != 0xFFFFFFFF and _src not in (0, 0xFFFFFFFF)
-                      and _hop_limit <= _hop_start and 1 <= _hop_start <= 7)
-        if _is_confident and _is_uni_dm:
-            print("  SKIP SWEEP: confident demod (med=%.0f min=%.0f) + unicast DM "
-                  "structure → encrypted payload, sweep won't help" % (_med_m, _min_m))
+        # Confident demod: median margin well above noise, no near-zero outliers.
+        # Chase decoder (above) already tried bit-flipping the lowest-margin nibbles —
+        # if it didn't find a CRC match, sweep timing tweaks won't either.
+        if _med_m > 50000.0 and _min_m > 2000.0:
+            print("  SKIP SWEEP: confident demod (med=%.0f min=%.0f) — "
+                  "chase failed, sweep timing tweaks won't recover bits" % (_med_m, _min_m))
             _skip_sweep = True
 
     # ---- Combined timing sweep with chase ----
