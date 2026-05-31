@@ -1150,6 +1150,12 @@ _PROTO_ENABLED = set(p for p in os.environ.get(
     'meshtastic,meshcore,lorawan,loramesher,lora_aprs,reticulum,disaster_radio,ebyte_lora,radiohead'
 ).replace(' ', '').lower().split(',') if p)
 _PROTO_UNKNOWN = os.environ.get('LORA_UNKNOWN', '0') == '1'
+# LORA_FINGERPRINT = '1' (default) enables hardware-fingerprint extraction on
+# every decoded packet (feeds web UI device clustering + Mystery Devices).
+# Set to '0' on low-core hosts to skip the per-packet UMOP feature extraction —
+# the decoder runs ~10-15 % faster.  Trade-off: no device clustering / RF
+# attribution / Mystery Devices panel.  Header decode coverage unchanged.
+_FINGERPRINT_ON = os.environ.get('LORA_FINGERPRINT', '1').strip().lower() not in ('0', 'false', 'off', 'no')
 # Meshtastic sync tolerance for the early-bail: 0x2B/0x0F plus the 1-bit neighbours of
 # 0x2B (a sync symbol can demod 1 bit off on a marginal capture).
 _MESH_SYNCS = {0x2B, 0x0F} | {0x2B ^ (1 << _i) for _i in range(8)}
@@ -2154,6 +2160,10 @@ def parse_radiohead_packet(payload, rf=None):
 def _extract_tx_fingerprint(iq1, preamble_start, sf, bw):
     """Sample-precise UMOP (Unintentional Modulation On Pulse) fingerprint.
 
+    Returns None when LORA_FINGERPRINT=0 (low-core fast path: skip the per-
+    packet FFT/feature work — saves ~10-15 % decode CPU, at the cost of the
+    web UI's device-clustering / Mystery Devices attribution).
+
     Every transmitter imprints subtle per-die signatures into its signal that
     are NOT part of the intended modulation — these are the "unintentional
     modulations" that make each radio physically unique.  We extract them
@@ -2189,6 +2199,8 @@ def _extract_tx_fingerprint(iq1, preamble_start, sf, bw):
                             samples from profile training (concurrent-packet
                             contamination, partial bursts → garbage features).
     """
+    if not _FINGERPRINT_ON:
+        return None
     N_sym = 1 << sf
     if iq1 is None or len(iq1) < preamble_start + 9 * N_sym:
         return None
@@ -2365,7 +2377,11 @@ def _compute_hw_fingerprint(iq, sf=None, bw=None, fs=None):
                            (which gets polluted by recenter passes).
 
     Compute time ≈ 80-150 μs for typical capture sizes.
+
+    Returns None when LORA_FINGERPRINT=0 (low-core fast path).
     """
+    if not _FINGERPRINT_ON:
+        return None
     n = len(iq)
     if n < 128:
         return None
@@ -3335,6 +3351,11 @@ def process_file(fpath, relay_after=None, relay_before=None,
     try:
         if _iq_override is not None:
             raise StopIteration  # skip — outer call already measured
+        # LORA_FINGERPRINT=0 → skip the envelope+Welch carrier-centroid block.
+        # (precise_carrier_hz is a fingerprint feature; the decoder uses the
+        # gate's per-window CFO estimate for the actual demod.)
+        if not _FINGERPRINT_ON:
+            raise StopIteration
         if len(iq) >= 4096:
             # Smoothing window = half a LoRa symbol — long enough to average
             # over the chirp's bandwidth oscillation, short enough to localize

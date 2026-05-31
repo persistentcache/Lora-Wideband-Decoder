@@ -60,6 +60,7 @@ def load_settings():
                                'loramesher': True, 'lora_aprs': True, 'reticulum': True,
                                'disaster_radio': True, 'ebyte_lora': True, 'radiohead': True},
                  'unknown': False,          # master: surface unidentified protocols (default OFF)
+                 'fingerprint': True,       # RF hardware fingerprinting (Mystery Devices + clustering)
                  'sdr': 'bladerf',          # selected SDR profile (persists across sessions)
                  'radio': {}}               # web overrides of lora.toml [radio] (rate/bw/center/gain)
     try:
@@ -1656,6 +1657,13 @@ def start_pipeline():
     # Advanced Options → decoder: which protocols to attempt + whether to surface
     # unknowns (off also lets the decoder early-bail on irrelevant sync words).
     env['LORA_UNKNOWN'] = '1' if SETTINGS.get('unknown') else '0'
+    # RF fingerprinting (UMOP feature extraction → web UI device clustering +
+    # Mystery Devices).  Default on.  Disable on low-core hosts to save
+    # ~10-15 % decode CPU at the cost of those features.
+    if SETTINGS.get('fingerprint', True):
+        env['LORA_FINGERPRINT'] = '1'
+    else:
+        env['LORA_FINGERPRINT'] = '0'
     _pr = SETTINGS.get('protocols') or {}
     env['LORA_PROTOCOLS'] = ','.join(k for k in (
         'meshtastic', 'meshcore', 'lorawan', 'loramesher',
@@ -1875,6 +1883,8 @@ def api_settings():
             SETTINGS['waterfall'] = bool(d['waterfall'])
         if 'unknown' in d:
             SETTINGS['unknown'] = bool(d['unknown'])
+        if 'fingerprint' in d:
+            SETTINGS['fingerprint'] = bool(d['fingerprint'])
         if 'protocols' in d and isinstance(d['protocols'], dict):
             pr = dict(SETTINGS.get('protocols') or {})
             for k in ('meshtastic', 'meshcore', 'lorawan', 'loramesher',
@@ -1903,7 +1913,7 @@ def api_settings():
             if sdr_profiles is not None:
                 rad = sdr_profiles.clamp_radio(SETTINGS.get('sdr', 'bladerf'), rad)
             SETTINGS['radio'] = rad
-        if any(k in d for k in ('autosave', 'waterfall', 'unknown',
+        if any(k in d for k in ('autosave', 'waterfall', 'unknown', 'fingerprint',
                                 'protocols', 'wide_scan', 'sdr', 'radio')):
             save_settings(SETTINGS)
             _apply_waterfall_flag()

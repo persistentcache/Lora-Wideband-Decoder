@@ -973,6 +973,8 @@ function renderAdvancedConfig(box){
         ${cb('prh',pr.radiohead!==false,'RadioHead RF95 <span class="muted" style="font-size:11px">(Adafruit/Sparkfun starter library)</span>')}
         <h4 style="margin:18px 0 2px">Unknown protocols</h4>
         ${cb('unk',unk,'<b>Unknown (Off / On)</b><br><span class="muted" style="font-size:11px">Surface intact LoRa frames (good CRC) that match no enabled protocol — a possible new/unsupported protocol. Off by default; off also lets the decoder skip them entirely to save compute.</span>')}
+        <h4 style="margin:18px 0 2px">RF hardware fingerprinting</h4>
+        ${cb('fp',s.fingerprint!==false,'<b>Fingerprint TX hardware (On / Off)</b><br><span class="muted" style="font-size:11px">Extract per-packet UMOP features (CFO jitter, AM ripple, PLL phase, I/Q balance) from the LoRa preamble. Feeds the <b>Mystery Devices</b> panel and per-node device clustering. On by default. Disable on low-core hosts to save ~10–15 % decode CPU — header decode coverage is unchanged.</span>')}
         <h4 style="margin:18px 0 2px">Unknown-protocol report</h4>
         <p class="muted" style="font-size:11px;margin:0 0 4px">Raw bytes + PHY params of captured unknown frames — hand to a developer to add support. Needs Unknown on.</p>
         <div style="display:flex;gap:8px;align-items:center">
@@ -1001,6 +1003,7 @@ function renderAdvancedConfig(box){
     }});
     ['#pmesh','#pmc','#plw','#plm','#paprs','#prns','#pdr','#peb','#prh'].forEach(s=>q(s).onchange=saveProtos);
     q('#unk').onchange=e=>post({unknown:e.target.checked});
+    q('#fp').onchange=e=>post({fingerprint:e.target.checked});
     q('#scanmode').onchange=e=>post({wide_scan:e.target.value==='all'});
     q('#unkdl').onclick=()=>{window.location='/api/unknown?download=1';};
     q('#unkclr').onclick=()=>{if(confirm('Clear the unknown-protocol report?'))fetch('/api/unknown',{method:'DELETE'}).then(()=>renderAdvancedConfig(box));};
