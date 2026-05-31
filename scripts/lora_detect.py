@@ -2109,17 +2109,21 @@ class SignalRecorder:
                         # residual.  Catches multi-packet files when SIC
                         # cancellation is clean (per-symbol amplitude OK).
                         self._decoder.submit(fpath, fname)
-                        # Pass 2 — TIME-ISOLATED on this preamble.  The
-                        # user noted hop1 arrives quickly (~50-100 ms)
-                        # after hop0; both land in the same wideband file
-                        # at different carriers AND at different times.
+                        # Pass 2 — TIME-ISOLATED on this preamble.  Useful at
+                        # FAST SF where the hop1 relay arrives ~50-200 ms
+                        # after hop0 and they share a single capture file;
                         # iso zeros everything outside [preamble-16,+149]
-                        # syms, giving the decoder a clean window with
-                        # only THIS preamble's packet in it — works even
-                        # when SIC's bin demod is biased by the concurrent
-                        # signal.  Each preamble found by save_worker gets
-                        # its own iso submission.
-                        if _preamble_sym > 0 and _preamble_sample > 0:
+                        # syms, giving the decoder a clean window with only
+                        # THIS preamble's packet in it.  At SLOW SF (≥10)
+                        # hop airtime is multi-second so hop0/hop1 land in
+                        # SEPARATE captures — PASS 2 just doubles the decode
+                        # workload with no gain.  Skipping it on slow SFs is
+                        # the biggest single latency win for SF11/12 live.
+                        # Set LORA_PASS2_SUBMIT=1 to force PASS 2 on slow SF
+                        # if a deployment hits same-window slow-SF concurrency.
+                        _pass2_force = os.environ.get('LORA_PASS2_SUBMIT', '0') == '1'
+                        _pass2_enable = sf <= 9 or _pass2_force
+                        if _pass2_enable and _preamble_sym > 0 and _preamble_sample > 0:
                             _iso_after  = max(0, _preamble_sym - 16)
                             _iso_before = _preamble_sym + 149
                             self._decoder.submit(
@@ -2154,16 +2158,7 @@ class BackgroundDecoder:
         self._verbose = verbose
         self._aes_key = aes_key
         self._no_key = no_key
-        # LIFO so the newest captures decode FIRST under burst load — older
-        # captures get the same total decode work but only the median latency
-        # is what users feel.  Example: 30 captures in queue at 5s/decode each:
-        #   FIFO → p50 ≈ 75 s (everyone waits behind the queue)
-        #   LIFO → p50 ≈ 5 s  (newest decoded immediately; oldest still 75 s)
-        # Set LORA_DECODE_FIFO=1 to revert.
-        if os.environ.get('LORA_DECODE_FIFO', '0').strip() in ('1', 'true', 'on'):
-            self._queue = queue.Queue()
-        else:
-            self._queue = queue.LifoQueue()
+        self._queue = queue.Queue()
         self._lock = threading.Lock()
         # Structured packet log (JSONL) the web UI tails.  Each decoded/encrypted
         # [PKT] record from the workers is appended here with a receive timestamp.
