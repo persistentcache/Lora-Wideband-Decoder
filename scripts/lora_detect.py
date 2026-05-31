@@ -2206,10 +2206,16 @@ class BackgroundDecoder:
         self._active_count = 0          # decodes currently in flight (for pending())
         self._workers = []              # subprocess handles, for drain cleanup
         self._workers_lock = threading.Lock()
+        # Respect cgroup/taskset CPU affinity — `os.cpu_count()` returns the
+        # SYSTEM count (e.g. 24) even when the process is pinned to 4 cores via
+        # taskset / cgroup; on those hosts that would auto-scale to 16 decode
+        # workers fighting for 4 cores, starving the gate.  Prefer the affinity
+        # count when available (Linux-only) so the auto-scale matches what we
+        # are actually allowed to run on.
         try:
+            _ncpu = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
             _ncpu = os.cpu_count() or 4
-        except Exception:
-            _ncpu = 4
         # Decode is the pipeline bottleneck (the gate runs ~real-time; decode of
         # the per-packet captures, esp. SF11/12 off-centre recovery, lags).
         # Each decode worker is single-threaded ≈ one core of decode throughput.
@@ -3056,7 +3062,11 @@ def main():
     # runtime by the keep-up monitor (it warns + recommends a lower --rate)
     # rather than silently dropping samples.
     if a.detect_workers is not None and a.detect_workers < 0:
-        _ncpu_auto = os.cpu_count() or 4
+        # Use affinity-aware count (see comment near the decode worker block).
+        try:
+            _ncpu_auto = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            _ncpu_auto = os.cpu_count() or 4
         a.detect_workers = max(2, min(8, _ncpu_auto // 4))
         print(f"Detect workers: AUTO = {a.detect_workers} (cpu_count={_ncpu_auto})",
               flush=True)
