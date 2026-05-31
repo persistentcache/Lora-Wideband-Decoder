@@ -2,6 +2,10 @@
 # Avoids passing long flag strings every run.  lora_web.py reads this to launch
 # the pipeline; lora_detect.py can load it with `--config lora.toml` (explicit
 # CLI flags still override).  All keys are optional; sane defaults apply.
+#
+# Commented-out lines below show alternative values you can swap in — they are
+# NOT applied unless you uncomment them.  See `.env.example` for finer-grained
+# tuning knobs that live as environment variables instead of TOML keys.
 
 [radio]
 rate_hz       = 28000000     # SDR sample rate (full bandwidth to monitor)
@@ -9,11 +13,20 @@ bandwidth_hz  = 28000000     # SDR RX bandwidth
 center_mhz    = 915.0        # SDR center freq (park between channels so the DC
                              # spike doesn't sit on a signal)
 format        = "sc16"       # bladeRF stream format
+# rate_hz     = 20000000     # ALT: 20 Msps for hosts that can't sustain 28 (laptops,
+# bandwidth_hz= 20000000     #      thermal-limited SBCs).  Covers all US915 channels.
+# center_mhz  = 868.0        # ALT: EU868 band centre.
+# center_mhz  = 433.0        # ALT: 433 MHz ISM band.
+# format      = "cs8"        # ALT: 8-bit IQ (HackRF native, half the I/O bandwidth).
 # gain        = 48           # OPTIONAL global RX gain (dB) or "auto" for AGC.
                              # If unset (default), each SDR uses ITS OWN profile
                              # default — bladeRF 48 (highest before the noise floor
                              # clips; beats AGC), HackRF 40, etc. Uncomment to force
                              # one gain across every SDR.
+# gain        = "auto"       # ALT: hardware AGC (works on HackRF/RTL-SDR; bladeRF
+                             #      AGC undershoots vs fixed 48 dB).
+# gain        = 30           # ALT: low gain — strong nearby TX (LNA saturation
+                             #      can crush the ML fingerprinter — see CLAUDE memory).
 
 [detect]
 threshold        = 0.55      # Schmidl-Cox preamble threshold
@@ -25,10 +38,25 @@ overlap          = 0.5       # window overlap (0.5 = 50%)
 detect_workers   = -1        # -1 = auto-scale from cpu_count (plug-and-play)
 buf_seconds      = 16        # ring buffer seconds (bigger = more burst headroom)
 commit_lag       = 4         # detect-pool commit depth (lower = lower latency)
+# threshold        = 0.45    # ALT: looser detector — catches more weak preambles,
+                             #      more phantom-preamble captures the decoder rejects.
+# threshold        = 0.65    # ALT: stricter — fewer false fires in noisy RF.
+# energy_threshold = 5.0     # ALT: chase distant/weak signals (more spurs to filter).
+# energy_threshold = 18.0    # ALT: strong-signal lab use only (filters anything <18 dB).
+# overlap          = 0.25    # ALT: less overlap → lower CPU, may miss edge-aligned packets.
+# overlap          = 0.75    # ALT: more overlap → better edge coverage, more CPU.
+# detect_workers   = 4       # ALT: pin to 4 (multi-tenant host where you must reserve cores).
+# buf_seconds      = 8       # ALT: smaller ring buffer (less RAM, less burst headroom).
+# buf_seconds      = 32      # ALT: bigger buffer for very bursty traffic.
+# commit_lag       = 2       # ALT: lower latency at the cost of slightly more rework.
+# commit_lag       = 8       # ALT: more stable on slow disks / busy hosts.
 
 [decode]
 budget_s    = 10.0                       # per-capture decode CPU budget
-workers     = 10                         # decode worker processes
+workers     = -1                         # -1 = auto-scale from cpu_count
+                                         # (plug-and-play across 4-core laptops to
+                                         # 32-core hosts).  Set a positive integer
+                                         # ONLY to pin it (e.g. shared host).
 export_dir  = "/dev/shm/live_caps"       # where captures are written (tmpfs)
 packet_log  = "/tmp/lora_packets.jsonl"  # structured packet log the web tails
 key         = "default"                  # "default" | "NOKEY" | hex/base64 PSK
@@ -37,9 +65,22 @@ export_dec  = 8                          # capture oversampling — 8 = 2 MHz fo
                                          # PA-onset temporal resolution for fingerprinting.
                                          # Decode keeps up at this rate IF the gate's
                                          # energy_threshold (12.0 default) filters noise.
+# budget_s   = 5.0                       # ALT: tight budget for low-latency / SF7-only setups.
+# budget_s   = 20.0                      # ALT: generous budget for SF11/12-heavy traffic
+                                         #      (lets PASS 2 CFO sweep complete on weak packets).
+# workers    = 4                         # ALT: pin to 4 decode workers (reserve cores for other apps).
+# workers    = 12                        # ALT: pin to 12 — useful on dedicated hosts when you've
+                                         #      measured a different sweet spot than the auto-scaler.
+# export_dir = "/tmp/live_caps"          # ALT: disk-backed captures (slower, but persists across reboot).
+# key        = "NOKEY"                   # ALT: skip Meshtastic AES — surface all packets encrypted-only.
+# key        = "1PG7OiApB1nwvP+rz05pAQ==" # ALT: custom PSK (base64) for a private Meshtastic channel.
+# export_dec = 4                         # ALT: 4 Msps captures — faster decode, less fingerprint resolution.
+# export_dec = 16                        # ALT: 1 Msps captures — highest fingerprint resolution, slowest decode.
 
 [web]
 host = "127.0.0.1"   # localhost-only (SECURE DEFAULT — the UI has NO authentication).
                      # Set "0.0.0.0" to expose on the LAN, but only on a trusted
                      # network or behind a reverse proxy with auth.
 port = 5000
+# host = "0.0.0.0"   # ALT: expose on LAN (do NOT do this on a public network — UI is unauth'd).
+# port = 8080        # ALT: serve on a non-default port (avoid conflicts / reverse-proxy targets).

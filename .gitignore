@@ -32,6 +32,10 @@ lora_web/dec_pkts.jsonl
 keys.json
 keystore.json
 
+# Local env-var overrides (committed template lives at .env.example)
+.env
+.env.local
+
 # Local agent config
 .claude/
 

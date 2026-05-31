@@ -15,7 +15,7 @@ _DEFAULTS = {
                'center_mhz': 915.0, 'format': 'sc16'},
     'detect': {'threshold': 0.55, 'energy_threshold': 5.0, 'overlap': 0.5,
                'detect_workers': -1, 'buf_seconds': 16, 'commit_lag': 4},
-    'decode': {'budget_s': 10.0, 'workers': 10, 'export_dir': '/dev/shm/live_caps',
+    'decode': {'budget_s': 10.0, 'workers': -1, 'export_dir': '/dev/shm/live_caps',
                'packet_log': '/tmp/lora_packets.jsonl', 'key': 'default'},
     'web':    {'host': '0.0.0.0', 'port': 5000},
 }
