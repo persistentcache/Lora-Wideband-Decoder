@@ -24,6 +24,27 @@ except ImportError:
 
 
 # ============================================================================
+# Equivalence harness — when LORA_HARNESS_OUT=<path> is set, dumps a per-attempt
+# fingerprint of decoder intermediate values to JSONL.  Zero overhead when unset.
+# Used by tools/equiv_harness.py to validate that algorithmic optimisations are
+# bit-identical / provably-equivalent BEFORE running expensive live tests.
+# ============================================================================
+_HARNESS_OUT = os.environ.get('LORA_HARNESS_OUT', '')
+_HARNESS_FH = None
+_HARNESS_ATTEMPT = [0]
+
+def _harness_emit(event, **kw):
+    if not _HARNESS_OUT:
+        return
+    global _HARNESS_FH
+    if _HARNESS_FH is None:
+        _HARNESS_FH = open(_HARNESS_OUT, 'a', buffering=1)
+    import json as _json
+    rec = {'event': event, 'attempt': _HARNESS_ATTEMPT[0], **kw}
+    _HARNESS_FH.write(_json.dumps(rec, default=lambda o: str(o)) + '\n')
+
+
+# ============================================================================
 # Whitening sequence (from lora_stdin.cpp, matches gr-lora_sdr)
 # ============================================================================
 WHITENING_SEQ = bytes([
@@ -3951,6 +3972,13 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     if skip_bins is None:
         skip_bins = []
 
+    if _HARNESS_OUT:
+        _HARNESS_ATTEMPT[0] += 1
+        _harness_emit('attempt_start',
+                      capture=(name.rsplit('/', 1)[-1] if name else ''),
+                      sf=int(sf), bw=int(bw), iq_len=int(len(iq1)),
+                      skip_bins=[int(b) for b in skip_bins])
+
     # Hardware fingerprint is computed AFTER preamble detection — see below —
     # because the precise carrier measurement needs to be confined to the
     # actual burst window (the capture has noise/silence around the burst,
@@ -4736,6 +4764,11 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     #   +1 sync1, +2 sync2, +3..+5.25 SFD (2.25 downchirps) → data
     data_start = preamble_start + int((pre_last_i + 5.25) * N)
 
+    if _HARNESS_OUT:
+        _harness_emit('preamble', preamble_start=int(preamble_start),
+                      pre_last_i=int(pre_last_i), preamble_bin=int(preamble_bin),
+                      data_start=int(data_start))
+
 
     n_data = (len(iq1) - data_start) // N
 
@@ -4972,6 +5005,13 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # unlike the narrower `hdr_ok` flag which is Meshtastic-specific.
     if diag_out is not None and hdr_ok and 4 <= payload_len <= 237:
         diag_out['header_decoded'] = True
+
+    if _HARNESS_OUT:
+        _harness_emit('header', chosen_td=int(chosen_td),
+                      hdr_bins=[int(b) for b in hdr_bins],
+                      payload_len=int(payload_len), cr=int(cr),
+                      crc_present=bool(crc_present), hdr_ok=bool(hdr_ok),
+                      data_start=int(data_start))
 
     for i, (b, fb, rawb, pmr) in enumerate(zip(hdr_bins, hdr_fines, hdr_raws, hdr_pmrs)):
         print("    hdr[%d]: bin %3d (fine %7.3f, raw %d) %.1fdB" % (
@@ -5252,6 +5292,18 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         _clean_crc = crc_ok
         print("  CRC: %s %s" % (crc_method, "OK" if crc_ok else ""))
 
+    if _HARNESS_OUT:
+        _margins = [float(s[3]) for s in pay_soft_info] if pay_soft_info else []
+        _harness_emit('primary_decode',
+                      nibs_count=int(len(decoded_nibs)),
+                      first_nibs=[int(n) for n in decoded_nibs[:32]],
+                      raw_hex=''.join('%02x' % b for b in raw_bytes[:32]),
+                      crc_ok=bool(crc_ok),
+                      tau_frac=float(tau_frac),
+                      margin_med=float(np.median(_margins)) if _margins else 0.0,
+                      margin_min=float(min(_margins)) if _margins else 0.0,
+                      margin_n=int(len(_margins)))
+
     # ---- Parser-first early dispatch ----
     # Try every enabled protocol parser on a clean primary CRC BEFORE the
     # legacy Meshtastic-shaped FP gates run.  Each parser owns its own
@@ -5371,6 +5423,10 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         total_syms = 8 + 4.25 + 8 + n_pay_syms
         pkt_len_samples = int(total_syms * N) + N
         print()
+        if _HARNESS_OUT:
+            _harness_emit('attempt_end', status='OK', via='early_dispatch',
+                          payload_hex=''.join('%02x' % b for b in payload),
+                          payload_len=int(len(payload)), crc_ok=bool(crc_ok))
         return ('OK', preamble_start, pkt_len_samples, preamble_bin)
 
     # ---- Plausibility gate on primary CRC OK ----
@@ -5405,6 +5461,10 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # those captures we lose the relay (hop1) decode for them.
     if crc_present and not crc_ok:
         ok, method, tr, flipped = chase_decode(decoded_nibs, pay_soft_info)
+        if _HARNESS_OUT:
+            _harness_emit('chase', used=True, ok=bool(ok), method=str(method or ''),
+                          n_flipped=int(len(flipped)),
+                          flips=[(int(i), int(b), int(s), float(m)) for i, b, s, m in flipped])
         if ok:
             crc_ok, crc_method = True, method
             raw_bytes = tr
@@ -5688,6 +5748,10 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     n_pay_syms = int(np.ceil(need_bytes * 8 / sf)) * (cr + 4)
     total_syms = 8 + 4.25 + 8 + n_pay_syms
     pkt_len_samples = int(total_syms * N) + N  # +1 sym safety
+    if _HARNESS_OUT:
+        _harness_emit('attempt_end', status='OK', via='full_path',
+                      payload_hex=''.join('%02x' % b for b in payload),
+                      payload_len=int(len(payload)), crc_ok=bool(crc_ok))
     return ('OK', preamble_start, pkt_len_samples, preamble_bin)
 
 # Module-level key config (set from command line)
