@@ -4149,16 +4149,26 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         the coarse-offset count again while still covering the input
         position's worst-case uncertainty.
         """
-        # ±N/2 covers _find_coarse_positions' half-block quantisation.
-        _refine_half_range = N // 2
+        # ±N/2 covers _find_coarse_positions' half-block quantisation at
+        # large N where it pays off.  At small N (SF7-9) the FFT is so
+        # cheap that ±N is fine and the wider safety margin protects
+        # borderline captures from spilling into PASS 2.  Gate on the
+        # same N≥1024 threshold as the n_score reduction above.
+        _refine_half_range = (N // 2) if N >= 1024 else N
         lo = max(0, coarse - _refine_half_range)
         hi = min(len(iq_data) - N * max(1, n_score), coarse + _refine_half_range)
         if hi <= lo:
             return coarse
         step = max(1, dec // 2)
-        # Reduced symbol count for the wide coarse search (still ≥4 so the
-        # "≥4 same-bin" bonus can still fire).  Fine pass uses full n_score.
-        n_score_coarse = min(n_score, 4)
+        # Reduced symbol count for the wide coarse search at large N where
+        # FFT cost dominates (SF≥10, N≥1024).  At small N the FFT is cheap
+        # so the reduced n_score doesn't save much wall but slightly
+        # noisier offset picks can push borderline captures into PASS 2 —
+        # net wall regression observed live at SF7 (N=128).  Gating on SF
+        # via N restores SF7's clean fast-path while keeping the SF11/12
+        # win.  Threshold N=1024 chosen so SF7/8/9 use full n_score and
+        # SF10/11/12 use the reduction.
+        n_score_coarse = min(n_score, 4) if N >= 1024 else n_score
 
         # Memory budget for the batched scratch: 16 MB worth of complex64.
         # `K` = how many offsets to stack per batched FFT call.  At small N
@@ -4444,10 +4454,12 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         if hi < lo:
             return pre_loc
         coarse_step = max(1, dec // 2)
-        # Reduced symbol count for the wide coarse search (still ≥4 so
-        # the "≥4 same-bin" bonus stays meaningful).  Fine pass uses
-        # full nscore_syms.
-        nsc_coarse = min(nscore_syms, 4)
+        # SF-conditional: only reduce n_score at large N (SF≥10) where the
+        # FFT cost is dominant.  At small N (SF7-9) the FFT is cheap and
+        # the slightly noisier coarse pick can push borderline captures
+        # into PASS 2, which regresses SF7 wall by ~17 %.  See the
+        # twin gate in _refine_start above.
+        nsc_coarse = min(nscore_syms, 4) if N >= 1024 else nscore_syms
         BATCH_BYTES = 16 * 1024 * 1024
 
         def _batched_pass(offsets_iter, n_sc):
