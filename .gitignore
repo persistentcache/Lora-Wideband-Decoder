@@ -43,3 +43,9 @@ archive/
 *.swp
 .idea/
 .vscode/
+
+# Per-deployment classifier state — built from each user's own Meshtastic traffic.
+# Should not be shipped — each user's system bootstraps to their own hardware.
+lora_web/lora_ml_model.pkl
+lora_web/lora_node_profiles.json
+lora_web/lora_device_clusters.json

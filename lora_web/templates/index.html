@@ -44,6 +44,12 @@
   .empty{color:var(--mut);padding:40px;text-align:center}
   tr.noderow{cursor:pointer} tr.noderow .caret{display:inline-block;width:12px;color:var(--mut)}
   tr.noderow.open .caret{color:var(--acc)}
+  tr.pktrow{cursor:pointer} tr.pktrow .caret{display:inline-block;width:12px;color:var(--mut)}
+  tr.pktrow.open .caret{color:var(--acc)}
+  tr.pktrow:hover{background:rgba(255,255,255,.03)}
+  .pktdetailbox{padding:12px 16px;display:grid;grid-template-columns:1fr 1.2fr;gap:18px}
+  .pktdetailbox > div > div{padding:2px 0;line-height:1.5}
+  .pktdetailbox h4{margin:0 0 6px;font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.4px}
   .rowbtn{background:rgba(63,167,255,.12);border:1px solid var(--line);border-radius:4px;cursor:pointer;
           font-size:11px;line-height:1;padding:2px 6px;color:var(--acc);vertical-align:middle;margin-left:4px}
   .rowbtn:hover{background:rgba(63,167,255,.30)}
@@ -104,9 +110,22 @@
       <span class="chip" data-f="meshtastic" style="border-color:var(--ok)">Meshtastic</span>
       <span class="chip" data-f="lorawan" style="border-color:var(--acc)">LoRaWAN</span>
       <span class="chip" data-f="meshcore" style="border-color:var(--acc)">MeshCore</span>
+      <span class="chip" data-f="loramesher" style="border-color:var(--acc)">LoRaMesher</span>
+      <span class="chip" data-f="lora_aprs" style="border-color:var(--acc)">LoRa APRS</span>
+      <span class="chip" data-f="reticulum" style="border-color:var(--acc)">Reticulum</span>
+      <span class="chip" data-f="disaster_radio" style="border-color:var(--acc)">disaster.radio</span>
+      <span class="chip" data-f="ebyte_lora" style="border-color:var(--acc)">EByte LoRa</span>
+      <span class="chip" data-f="radiohead" style="border-color:var(--acc)">RadioHead</span>
       <span class="chip" data-f="unknown" style="border-color:var(--warn)">unknown</span>
       <label><input type="checkbox" id="follow" checked> follow live</label>
       <span class="muted" id="shown"></span>
+    </div>
+    <div id="mysterybox" style="display:none;margin:8px 0;padding:8px 12px;background:rgba(255,176,32,.06);border:1px solid rgba(255,176,32,.25);border-radius:6px">
+      <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" id="mysterytoggle">
+        <span><span id="mysterycaret">▾</span> <b>Mystery Devices</b> <span class="muted" id="mysterycount"></span> — recurring unknown transmitters (≥2 sightings)</span>
+        <span class="muted" style="font-size:11px">click a row to filter</span>
+      </div>
+      <div id="mysterylist" style="margin-top:6px"></div>
     </div>
     <div id="pktbody"></div>
   </div>
@@ -142,7 +161,7 @@
 </div>
 
 <script>
-const PK=[]; let TAB='pkts', FILTER='', PFILT='all', OPEN=new Set();
+const PK=[]; let TAB='pkts', FILTER='', PFILT='all', OPEN=new Set(), PK_OPEN=new Set();
 let CFGW={}, KEYS={try_default:true,keys:[]};
 let ALERTS={rules:[]}, ALERT_LOG=[], ALERT_UNREAD=0, ALERTPANEL_OPEN=false;
 const SEEN_NODES=new Set(); const _alertFired=new Set(); const _geoState={};
@@ -216,7 +235,9 @@ function nodeDetail(id){
   return {msgs, convo:Object.entries(convo).sort((a,b)=>b[1]-a[1]), pkts:pkts.slice(-30).reverse(), pos, meta, tel, rt, nbr};
 }
 const TYPEMAP={text:'TEXT_MESSAGE_APP',pos:'POSITION_APP',nodeinfo:'NODEINFO_APP',telem:'TELEMETRY_APP'};
-const PROTOS=['meshtastic','lorawan','meshcore','unknown'];
+const PROTOS=['meshtastic','lorawan','meshcore','loramesher','lora_aprs','reticulum','disaster_radio','ebyte_lora','radiohead','unknown'];
+const PROTO_LABEL={lorawan:'LoRaWAN',meshcore:'MeshCore',loramesher:'LoRaMesher',lora_aprs:'LoRa APRS',reticulum:'Reticulum',disaster_radio:'disaster.radio',ebyte_lora:'EByte LoRa',radiohead:'RadioHead'};
+const PROTO_HINT_LABEL=PROTO_LABEL;   // same names for "looks like X" badges
 const proto=p=>p.proto||'meshtastic';
 function matchFilter(p){
   const pr=proto(p);
@@ -234,26 +255,52 @@ function matchFilter(p){
 //  confirmed = behavioral proof (persistent identity + coherent frame counter)
 //  candidate = structurally valid but unverified — treat with caution
 function confBadge(p){const c=p.confidence;
-  if(c==='verified') return ' <span class="tag" title="cryptographically verified (signature or decrypt) — definitely this protocol" style="background:rgba(46,204,113,.18);color:#2ecc71">✓ verified</span>';
-  if(c==='confirmed')return ' <span class="tag" title="behaviorally confirmed: persistent identity + coherent counter — effectively certain" style="background:rgba(63,167,255,.18);color:var(--acc)">✓ confirmed</span>';
-  return '';}
+  const amb=p.ambiguous?' <span class="tag" title="multiple parsers claimed this packet at the same confidence tier — see alternatives in the expanded detail" style="background:rgba(255,176,32,.16);color:#ffb020">⚠ ambiguous</span>':'';
+  if(c==='verified') return ' <span class="tag" title="cryptographically verified (signature or decrypt) — definitely this protocol" style="background:rgba(46,204,113,.18);color:#2ecc71">✓ verified</span>'+amb;
+  if(c==='confirmed')return ' <span class="tag" title="behaviorally confirmed: persistent identity + coherent counter — effectively certain" style="background:rgba(63,167,255,.18);color:var(--acc)">✓ confirmed</span>'+amb;
+  if(c==='candidate')return ' <span class="tag" title="structurally valid but not crypto/behaviorally proven — treat with caution" style="background:rgba(150,150,150,.18);color:#9aa6b2">? candidate</span>'+amb;
+  return amb;}
 // An 'unknown' frame may structurally RESEMBLE a protocol without being identified.
 // We never claim it — only show a non-committal hint (could be that protocol, or one
 // we haven't implemented).  Promotes to a named protocol only on positive evidence.
 function hintBadge(p){if(!p.hint)return '';
-  const nm={lorawan:'LoRaWAN',meshcore:'MeshCore'}[p.hint]||esc(p.hint);
+  const nm=PROTO_LABEL[p.hint]||esc(p.hint);
   const og=(p.on_grid===false)?' <span class="tag" title="off the LoRaWAN channel grid for this region" style="background:rgba(255,93,93,.16);color:var(--warn)">off-grid</span>':'';
   const kh=(p.mc_known_hops)?' <span class="tag" title="routed through '+p.mc_known_hops+' crypto-verified MeshCore node(s) — needs 2 to confirm" style="background:rgba(63,167,255,.16);color:var(--acc)">via '+p.mc_known_hops+' known</span>':'';
   return ' <span class="tag" title="structurally resembles '+nm+' but NOT identified — unconfirmed, could be an unimplemented protocol" style="background:rgba(255,176,32,.16);color:#ffb020">? looks like '+nm+'</span>'+og+kh;}
+// Inferred-from badge: when a packet matches the calibrated hardware profile
+// of a known node, surface that match.  Profile sources:
+//   - Real Meshtastic node IDs (e.g. !ba6a783c) — calibrated from labeled
+//     hop=0/hop=1 traffic
+//   - Mystery profile labels (e.g. mystery:ffff0000-915.0140MHz) — promoted
+//     anonymous clusters from recurring unknown transmitters
+function inferBadge(p){
+  if(p.inferred_from==null) return '';
+  const pct = Math.round((p.inferred_confidence||0)*100);
+  const id = String(p.inferred_from);
+  const isMystery = id.startsWith('mystery:');
+  const lbl = isMystery ? '≈ ' + id.replace('mystery:', '') : '⊕ ' + id;
+  const color = isMystery ? '#9b6dff' : '#2ecc71';
+  const bg = isMystery ? 'rgba(155,109,255,.18)' : 'rgba(46,204,113,.18)';
+  const tip = isMystery
+    ? `Hardware fingerprint matches a recurring anonymous transmitter (${id.replace('mystery:','')}).  No Meshtastic identity, but RF profile is consistent.  Confidence: ${pct}%.`
+    : `Hardware fingerprint matches the calibrated profile for ${id} (Meshtastic-labeled training).  Confidence: ${pct}%.`;
+  return ` <span class="tag" title="${esc(tip)}" style="background:${bg};color:${color}">${esc(lbl)} (${pct}%)</span>`;}
 function pktState(p){const pr=proto(p);
-  if(pr==='meshtastic')return p.decrypted?'<span class="tag dec">decoded</span>':'<span class="tag enc">encrypted'+(p.enc_hex?' ▸':'')+'</span>';
-  if(pr==='unknown')return '<span class="tag" style="background:rgba(150,150,150,.16);color:#9aa6b2">unknown</span>'+hintBadge(p)+confBadge(p);
-  const lbl={lorawan:'LoRaWAN',meshcore:'MeshCore'}[pr]||esc(pr);
-  return '<span class="tag" style="background:rgba(63,167,255,.15);color:var(--acc)">'+esc(lbl)+'</span>'+confBadge(p);}
+  if(pr==='meshtastic')return (p.decrypted?'<span class="tag dec">decoded</span>':'<span class="tag enc">encrypted'+(p.enc_hex?' ▸':'')+'</span>')+confBadge(p);
+  if(pr==='unknown')return '<span class="tag" style="background:rgba(150,150,150,.16);color:#9aa6b2">unknown</span>'+hintBadge(p)+inferBadge(p)+confBadge(p);
+  const lbl=PROTO_LABEL[pr]||esc(pr);
+  return '<span class="tag" style="background:rgba(63,167,255,.15);color:var(--acc)">'+esc(lbl)+'</span>'+inferBadge(p)+confBadge(p);}
 function pktType(p){const pr=proto(p);
   if(pr==='meshtastic')return esc(p.port_name||(p.decrypted?'':'—'));
   if(pr==='lorawan')return esc(p.msg_type||'LoRaWAN');
   if(pr==='meshcore')return esc(p.mc_type||'MeshCore');
+  if(pr==='loramesher')return esc(p.lm_type||'LoRaMesher');
+  if(pr==='lora_aprs')return esc(p.aprs_type||'APRS');
+  if(pr==='reticulum')return esc(p.rns_packet_type||'RNS');
+  if(pr==='disaster_radio')return esc('TTL '+(p.dr_ttl||'?'));
+  if(pr==='ebyte_lora')return esc('ch'+(p.ebyte_chan!=null?p.ebyte_chan:'?'));
+  if(pr==='radiohead')return esc('id '+(p.rh_id||'?'));
   return '<span class="muted">—</span>';}
 function meshSummary(p){   // human one-liner for a decoded Meshtastic packet (never blank)
   if(p.text)return esc(p.text);
@@ -274,11 +321,189 @@ function pktMsg(p){const pr=proto(p);
   if(p.summary)return esc(p.summary);
   if(p.raw_hex)return '<span class="mono muted">'+esc(p.raw_hex.slice(0,40))+(p.raw_hex.length>40?'…':'')+'</span>';
   return '';}
+// Stable key for a packet row so the open/closed state survives re-renders.
+// Meshtastic frames group by pktid+hops; others (no pktid) by content+ts.
+function pktKey(p){const pr=proto(p);
+  if(pr==='meshtastic'&&p.pktid!=null) return 'm|'+p.pktid;
+  return 'x|'+(p.raw_hex||'')+'|'+(p.ts||'');}
+// Render the expanded detail panel for one packet. Universal across protocols.
+function pktDetail(p){
+  const pr=proto(p);
+  // ASCII representation of raw bytes, with non-printable shown as ·
+  const asciiOf=h=>{if(!h)return '';let s='';for(let i=0;i<h.length;i+=2){const b=parseInt(h.substr(i,2),16);s+=(b>=0x20&&b<0x7f)?String.fromCharCode(b):'·';}return s;};
+  // Group hex into 16-byte rows for readability
+  const fmtHex=h=>{if(!h)return '';const lines=[];for(let i=0;i<h.length;i+=32){lines.push(h.substr(i,32).match(/.{1,2}/g).join(' '));}return lines.join('\n');};
+  const rows=[];
+  const row=(label,val)=>{if(val!==null&&val!==undefined&&val!=='') rows.push(`<div><span class="muted">${esc(label)}:</span> ${val}</div>`);};
+
+  // Identity
+  if(p.from) row('from', idCell(p.from));
+  if(p.to) row('to', idCell(p.to));
+  if(p.pktid!=null) row('pktid', `<span class="mono">${esc(p.pktid)}</span>`);
+  if(p.chan) row('chan', `<span class="mono">${esc(p.chan)}</span>`);
+  if(p.hops!=null) row('hops taken', p.hops + (p.hop_start!=null?` of ${p.hop_start}`:''));
+
+  // RF / PHY
+  if(p.sf!=null) row('SF / BW', `SF${p.sf}/BW${(p.bw||0)/1000}k`+(p.cr!=null?` · CR 4/${4+p.cr}`:''));
+  if(p.sync) row('sync', `<span class="mono">${esc(p.sync)}</span>`);
+  if(p.freq_mhz!=null) row('freq', `${p.freq_mhz} MHz`);
+  if(p.rssi!=null) row('RSSI', `${p.rssi} dB`);
+  if(p.ts!=null) row('received', `${fmtDateTime(p.ts)} <span class="muted">(${ago(p.ts)} ago)</span>`);
+
+  // Protocol-specific
+  if(pr==='meshtastic'){
+    if(p.port_name) row('port', `<span class="mono">${esc(p.port_name)}</span>`);
+    if(p.want_ack) row('flags', '<span class="pill">want_ack</span>');
+    if(p.via_mqtt) row('via', '<span class="pill" style="color:#c77dff">MQTT gateway</span>');
+    if(p.text) row('text', esc(p.text));
+    if(p.routing) row('routing', esc(p.routing));
+  } else if(pr==='lorawan'){
+    if(p.msg_type) row('msg type', esc(p.msg_type));
+    if(p.devaddr) row('DevAddr', `<span class="mono">${esc(p.devaddr)}</span>`);
+    if(p.fcnt!=null) row('FCnt', p.fcnt);
+    if(p.on_grid===false) row('grid', '<span class="tag" style="background:rgba(255,93,93,.16);color:var(--warn)">off-grid</span>');
+  } else if(pr==='meshcore'){
+    if(p.mc_route) row('route type', esc(p.mc_route));
+    if(p.mc_type) row('payload type', esc(p.mc_type));
+    if(p.mc_known_hops) row('via known hops', p.mc_known_hops);
+  } else if(pr==='loramesher'){
+    if(p.lm_type) row('message type', esc(p.lm_type));
+    if(p.lm_payload_size!=null) row('declared payload size', p.lm_payload_size);
+  } else if(pr==='unknown'){
+    if(p.hint) row('hint', `looks like ${esc(p.hint)}`);
+    if(p.summary) row('summary', esc(p.summary));
+    if(p.inferred_from){
+      const id = String(p.inferred_from);
+      const src = id.startsWith('mystery:')
+        ? 'recurring unknown transmitter (Mystery Devices promotion)'
+        : 'Meshtastic-labeled training';
+      row('hw fingerprint match',
+        `<span class="mono">${esc(id)}</span> (${Math.round((p.inferred_confidence||0)*100)}% confidence — calibrated from ${src})`);
+    }
+  }
+  if(p.confidence) row('confidence', esc(p.confidence));
+  // Alternatives — other parsers that ALSO claimed these bytes.  Important
+  // for transparency: shows when our top-tier choice had competitors.
+  if(p.alternatives && p.alternatives.length){
+    const alts = p.alternatives.map(a=>{
+      const lbl = a.proto==='unknown' ? `unknown (hint: ${esc(a.hint||'')})` : esc(a.proto);
+      return `<div>• <span class="mono">${lbl}</span> <span class="muted">[${esc(a.confidence||'candidate')}]</span> ${a.summary?'<span class="muted">— '+esc(a.summary)+'</span>':''}</div>`;
+    }).join('');
+    row('also matched', `<div style="margin-top:4px">${alts}</div>`);
+  }
+
+  // Decryption status
+  if(p.decrypted===true) row('decrypted', '<span class="tag dec">yes</span>');
+  else if(p.decrypted===false) row('decrypted', '<span class="tag enc">no</span>');
+
+  // RAW + RAW ASCII — always show whatever bytes we have, regardless of which
+  // parser (if any) claimed the packet.  Lets the user verify the decoder
+  // output independent of protocol labeling.  For decoded transmissions
+  // (e.g. Meshtastic AES-CTR), ALSO show the post-decode bytes so the user
+  // can compare on-the-wire vs decrypted.
+  const rawHex = p.raw_hex || p.enc_hex || '';
+  const decHex = p.decrypted_hex || p.payload_hex || '';
+  const truncAscii = a => a.length > 80 ? a.slice(0, 80) + '…' : a;
+  const truncHex   = h => {
+    const grouped = h.match(/.{1,2}/g) || [];
+    return grouped.length > 80 ? grouped.slice(0, 80).join(' ') + ' …' : grouped.join(' ');
+  };
+  if(rawHex){
+    row('RAW (hex)', `<span class="mono">${esc(truncHex(rawHex))}</span> <span class="muted" style="font-size:11px">(${rawHex.length/2} bytes)</span>`);
+    row('RAW ASCII', `<span class="mono">${esc(truncAscii(asciiOf(rawHex)))}</span>`);
+  } else {
+    row('RAW', '<span class="muted">(no raw bytes captured)</span>');
+  }
+  if(decHex){
+    row('post-decode (hex)', `<span class="mono">${esc(truncHex(decHex))}</span> <span class="muted" style="font-size:11px">(${decHex.length/2} bytes)</span>`);
+    row('post-decode ASCII', `<span class="mono">${esc(truncAscii(asciiOf(decHex)))}</span>`);
+  }
+
+  // Full byte-grid views at the bottom — RAW always, post-decode when present.
+  let bytes='';
+  if(rawHex){
+    bytes += `<h4 style="margin-top:10px">RAW bytes (${rawHex.length/2})</h4>`
+          + `<div class="mono" style="white-space:pre-wrap;background:rgba(0,0,0,.25);padding:6px 8px;border-radius:4px;font-size:.85em">${esc(fmtHex(rawHex))}</div>`
+          + `<h4 style="margin-top:8px">RAW ASCII</h4>`
+          + `<div class="mono" style="background:rgba(0,0,0,.25);padding:6px 8px;border-radius:4px;font-size:.9em">${esc(asciiOf(rawHex))}</div>`;
+  }
+  if(decHex){
+    bytes += `<h4 style="margin-top:10px">Post-decode bytes (${decHex.length/2})</h4>`
+          + `<div class="mono" style="white-space:pre-wrap;background:rgba(0,0,0,.25);padding:6px 8px;border-radius:4px;font-size:.85em">${esc(fmtHex(decHex))}</div>`
+          + `<h4 style="margin-top:8px">Post-decode ASCII</h4>`
+          + `<div class="mono" style="background:rgba(0,0,0,.25);padding:6px 8px;border-radius:4px;font-size:.9em">${esc(asciiOf(decHex))}</div>`;
+  }
+  return `<div class="pktdetailbox"><div>${rows.join('')}</div><div>${bytes}</div></div>`;
+}
 function sortRows(rows,k,dir){return rows.slice().sort((a,b)=>{let x=a[k],y=b[k];if(x==null)x=-Infinity;if(y==null)y=-Infinity;if(typeof x==='string'||typeof y==='string'){x=String(x);y=String(y);return x<y?-dir:x>y?dir:0;}return (x-y)*dir;});}
 function thead(cols,tab){const s=SORT[tab];return '<tr>'+cols.map(c=>`<th data-k="${c.k}" class="${s.k===c.k?'sorted '+(s.dir>0?'asc':''):''}">${c.t}</th>`).join('')+'</tr>';}
 function wireSort(el,tab,render){el.querySelectorAll('th[data-k]').forEach(th=>th.onclick=()=>{const k=th.dataset.k,s=SORT[tab];if(s.k===k)s.dir=-s.dir;else{s.k=k;s.dir=-1;}render();});}
 
 // ---------- PACKETS ----------
+// Mystery Devices panel — aggregated unknown-protocol fingerprints.  Visible
+// only when there are recurring unknowns; auto-refreshes alongside renderPkts.
+// Each row = ONE protocol family.  Expand to see the device-cluster breakdown
+// (greedy nearest-neighbor groups on the RF hardware fingerprint vector).
+let MYSTERY_COLLAPSED=false;
+const MYSTERY_EXPANDED=new Set();
+function fmtRssiRange(mn,mx){if(mn==null&&mx==null)return '';if(mn===mx)return mn+' dB';return mn+'..'+mx+' dB';}
+function fmtAgo(s){const d=Math.round(Date.now()/1000-s);return d<60?d+'s ago':d<3600?Math.round(d/60)+'m ago':Math.round(d/3600)+'h ago';}
+function refreshMystery(){
+  fetch('/api/mystery_devices?min=2').then(r=>r.json()).then(rows=>{
+    const box=$('#mysterybox'); const list=$('#mysterylist'); const cnt=$('#mysterycount');
+    if(!rows||!rows.length){box.style.display='none';return;}
+    box.style.display='block';
+    cnt.textContent='('+rows.length+(rows.length===1?' family':' families')+')';
+    if(MYSTERY_COLLAPSED){list.style.display='none';$('#mysterycaret').textContent='▸';return;}
+    list.style.display='block';$('#mysterycaret').textContent='▾';
+    let html='<table style="width:100%;font-size:12px"><thead><tr>'
+      +'<th style="text-align:left">prefix</th>'
+      +'<th style="text-align:right">sightings</th>'
+      +'<th style="text-align:right">≥ devices</th>'
+      +'<th style="text-align:left">ASCII pattern</th>'
+      +'<th style="text-align:left">last seen</th>'
+      +'</tr></thead><tbody>';
+    for(const r of rows){
+      const ap=r.ascii_pattern?esc(r.ascii_pattern.slice(0,24)):'';
+      const hint=r.hint?` <span class="tag" style="background:rgba(255,176,32,.12);color:#ffb020;font-size:10px">looks like ${esc(r.hint)}</span>`:'';
+      const exp=MYSTERY_EXPANDED.has(r.prefix);
+      html+=`<tr class="myrow" data-prefix="${esc(r.prefix)}" style="cursor:pointer">
+        <td class="mono"><span style="color:var(--mut)">${exp?'▾':'▸'}</span> ${esc(r.prefix)}…${hint}</td>
+        <td style="text-align:right"><b>${r.count}</b></td>
+        <td style="text-align:right" title="lower bound from RF hardware fingerprint clustering — actual device count may be higher if same-batch hardware merges"><b>${r.device_count}</b></td>
+        <td class="mono muted">${ap}</td>
+        <td class="muted">${fmtAgo(r.last_ts)}</td>
+      </tr>`;
+      if(exp&&r.devices&&r.devices.length){
+        html+=`<tr class="mydetail"><td colspan="5" style="padding:6px 12px;background:rgba(0,0,0,.18)">`
+          +`<div class="muted" style="font-size:11px;margin-bottom:4px">Device clusters (greedy nearest-neighbor on RF fingerprint — DC offset, I/Q imbalance, CFO):</div>`
+          +'<table style="width:100%;font-size:11px"><thead><tr>'
+          +'<th style="text-align:left">#</th><th style="text-align:right">sightings</th>'
+          +'<th style="text-align:right">TX carrier</th>'
+          +'<th style="text-align:left">first → last</th>'
+          +'</tr></thead><tbody>'
+          + r.devices.map((d,i)=>`<tr>
+            <td><b>${'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[i]||(i+1)}</b></td>
+            <td style="text-align:right">${d.count}</td>
+            <td style="text-align:right" class="mono">${d.tx_freq_mhz.toFixed(6)} MHz</td>
+            <td class="muted">${fmtAgo(d.first_ts)} → ${fmtAgo(d.last_ts)}</td>
+          </tr>`).join('')
+          +'</tbody></table></td></tr>';
+      }
+    }
+    html+='</tbody></table>';
+    list.innerHTML=html;
+    // Click a prefix row → expand/collapse the device breakdown
+    list.querySelectorAll('tr.myrow').forEach(tr=>tr.onclick=()=>{
+      const k=tr.dataset.prefix;
+      MYSTERY_EXPANDED.has(k)?MYSTERY_EXPANDED.delete(k):MYSTERY_EXPANDED.add(k);
+      refreshMystery();
+    });
+  }).catch(e=>{});
+}
+const _mtog=$('#mysterytoggle'); if(_mtog) _mtog.onclick=()=>{MYSTERY_COLLAPSED=!MYSTERY_COLLAPSED;refreshMystery();};
+setInterval(refreshMystery, 4000); refreshMystery();
+
 function renderPkts(){
   const cols=[{k:'ts',t:'time'},{k:'from',t:'from'},{k:'to',t:'to'},{k:'hops',t:'hops'},
               {k:'chan',t:'chan'},{k:'port_name',t:'type'},{k:'rssi',t:'rssi'},{k:'decrypted',t:'state'},{k:'text',t:'message / payload'}];
@@ -300,16 +525,26 @@ function renderPkts(){
   $('#shown').textContent=reps.length+' shown / '+PK.length+' packets';
   const body=reps.slice(0,3000).map(p=>{const ret=!p.decrypted&&p.enc_hex; const wm=NODEMETA[p.from]; const hi=wm&&wm.watch&&wm.watch_mode!=='alert';
     const hopcell=p._maxhop>0?`<span class="pill" title="received via up to ${p._maxhop} relay hop${p._maxhop===1?'':'s'}">↻ ${p._maxhop}</span>`:(p.hops??'');
-    return `<tr data-pktid="${esc(p.pktid)}" data-hops="${p.hops}"${ret?' class="encrow"':''}${hi?' style="background:rgba(255,93,93,.13);box-shadow:inset 3px 0 0 var(--warn)"':''}>
-    <td class="muted">${fmtTime(p.ts)}</td><td>${idCell(p.from)}</td><td>${idCell(p.to)}</td>
+    const key=pktKey(p); const op=PK_OPEN.has(key);
+    const cls=['pktrow', op?'open':'', ret?'encrow':''].filter(Boolean).join(' ');
+    const main=`<tr class="${cls}" data-pkey="${esc(key)}" data-pktid="${esc(p.pktid)}" data-hops="${p.hops}"${hi?' style="background:rgba(255,93,93,.13);box-shadow:inset 3px 0 0 var(--warn)"':''}>
+    <td class="muted"><span class="caret">${op?'▾':'▸'}</span> ${fmtTime(p.ts)}</td><td>${idCell(p.from)}</td><td>${idCell(p.to)}</td>
     <td>${hopcell}</td><td class="mono muted">${esc(p.chan||'')}</td>
     <td>${pktType(p)}</td><td class="rssi">${p.rssi==null?'':p.rssi}</td>
     <td>${pktState(p)}${ret?' <button class="rowbtn keytry" title="try decoding with a channel key">🔑 key</button>':''}</td>
-    <td>${pktMsg(p)}</td></tr>`}).join('');
+    <td>${pktMsg(p)}</td></tr>`;
+    const detail=op?`<tr class="detail"><td colspan="9">${pktDetail(p)}</td></tr>`:'';
+    return main+detail;}).join('');
   const el=$('#pktbody');
   el.innerHTML=`<table><thead>${thead(cols,'pkts')}</thead><tbody>${body||'<tr><td colspan=9 class=empty>no packets yet — press Start</td></tr>'}</tbody></table>`;
   wireSort(el,'pkts',renderPkts);
   wireRetryMenu(el);
+  // Click any packet row to expand/collapse its detail panel.  Skip clicks on
+  // interactive children (buttons) so they keep their own handlers.
+  el.querySelectorAll('tr.pktrow').forEach(tr=>tr.onclick=e=>{
+    if(e.target.closest('button,a,input,select')) return;
+    const k=tr.dataset.pkey; PK_OPEN.has(k)?PK_OPEN.delete(k):PK_OPEN.add(k); renderPkts();
+  });
   // Left-click 🔑 button → same decode menu (reliable everywhere; right-click also works).
   el.querySelectorAll('.keytry').forEach(b=>b.onclick=e=>{e.stopPropagation();
     const tr=b.closest('tr'), r=b.getBoundingClientRect();
@@ -719,7 +954,7 @@ function renderSdrConfig(box){
 }
 function renderAdvancedConfig(box){
   Promise.all([fetch('/api/settings').then(r=>r.json()),fetch('/api/unknown').then(r=>r.json())]).then(([s,u])=>{
-    const pr=s.protocols||{meshtastic:true,meshcore:true,lorawan:true};
+    const pr=s.protocols||{meshtastic:true,meshcore:true,lorawan:true,loramesher:true,lora_aprs:true,reticulum:true,disaster_radio:true,ebyte_lora:true,radiohead:true};
     const unk=!!s.unknown;
     const cb=(id,on,lbl)=>`<label style="display:flex;gap:8px;align-items:flex-start;margin:5px 0"><input type="checkbox" id="${id}"${on?' checked':''} style="margin-top:3px"> <span>${lbl}</span></label>`;
     box.innerHTML=`<details style="max-width:920px;margin-top:20px;border:1px solid var(--line);border-radius:6px;padding:6px 12px">
@@ -730,6 +965,12 @@ function renderAdvancedConfig(box){
         ${cb('pmesh',pr.meshtastic!==false,'Meshtastic')}
         ${cb('pmc',pr.meshcore!==false,'MeshCore')}
         ${cb('plw',pr.lorawan!==false,'LoRaWAN')}
+        ${cb('plm',pr.loramesher!==false,'LoRaMesher')}
+        ${cb('paprs',pr.lora_aprs!==false,'LoRa APRS <span class="muted" style="font-size:11px">(ham radio, 0x3c 0xff 0x01 prefix)</span>')}
+        ${cb('prns',pr.reticulum!==false,'Reticulum / RNode <span class="muted" style="font-size:11px">(RNS over raw LoRa)</span>')}
+        ${cb('pdr',pr.disaster_radio!==false,'disaster.radio <span class="muted" style="font-size:11px">(sudomesh recovery mesh)</span>')}
+        ${cb('peb',pr.ebyte_lora!==false,'EByte LoRa <span class="muted" style="font-size:11px">(E22/E220/E32 fixed-mode broadcast — xreef Arduino library)</span>')}
+        ${cb('prh',pr.radiohead!==false,'RadioHead RF95 <span class="muted" style="font-size:11px">(Adafruit/Sparkfun starter library)</span>')}
         <h4 style="margin:18px 0 2px">Unknown protocols</h4>
         ${cb('unk',unk,'<b>Unknown (Off / On)</b><br><span class="muted" style="font-size:11px">Surface intact LoRa frames (good CRC) that match no enabled protocol — a possible new/unsupported protocol. Off by default; off also lets the decoder skip them entirely to save compute.</span>')}
         <h4 style="margin:18px 0 2px">Unknown-protocol report</h4>
@@ -751,8 +992,14 @@ function renderAdvancedConfig(box){
     </details>`;
     const q=id=>box.querySelector(id);
     const post=b=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
-    const saveProtos=()=>post({protocols:{meshtastic:q('#pmesh').checked,meshcore:q('#pmc').checked,lorawan:q('#plw').checked}});
-    ['#pmesh','#pmc','#plw'].forEach(s=>q(s).onchange=saveProtos);
+    const saveProtos=()=>post({protocols:{
+      meshtastic:q('#pmesh').checked, meshcore:q('#pmc').checked,
+      lorawan:q('#plw').checked, loramesher:q('#plm').checked,
+      lora_aprs:q('#paprs').checked, reticulum:q('#prns').checked,
+      disaster_radio:q('#pdr').checked, ebyte_lora:q('#peb').checked,
+      radiohead:q('#prh').checked,
+    }});
+    ['#pmesh','#pmc','#plw','#plm','#paprs','#prns','#pdr','#peb','#prh'].forEach(s=>q(s).onchange=saveProtos);
     q('#unk').onchange=e=>post({unknown:e.target.checked});
     q('#scanmode').onchange=e=>post({wide_scan:e.target.value==='all'});
     q('#unkdl').onclick=()=>{window.location='/api/unknown?download=1';};
