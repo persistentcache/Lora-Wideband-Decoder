@@ -3896,15 +3896,7 @@ def process_file(fpath, relay_after=None, relay_before=None,
             # CFO-recovery attempt at a different shift is unaffected by what
             # happened at the previous shift.
             _consec_no_header_p2 = 0
-            # PASS 2 is recovery via re-centred carrier — the inner retry loop
-            # mostly finds time-separated packets via SIC masking.  At large N
-            # (SF≥10) each attempt is heavy (~3-5 s wall) and the PASS 2 outer
-            # loop iterates many CFO shifts; capping the inner retries to 2 at
-            # large N saves ~3 attempts × 3+ shifts = ~30 s on multi-packet
-            # SF12 captures.  SF7-9 keep the original 5 (FFT cost is tiny so
-            # the safety margin matters more than compute).
-            _p2_max = 2 if N >= 1024 else MAX_ATTEMPTS
-            for attempt in range(_p2_max):
+            for attempt in range(MAX_ATTEMPTS):
                 if _BUDGET_S > 0 and (time.process_time() - _process_start) > _BUDGET_S:
                     return
                 if _consec_no_header_p2 >= 3:
