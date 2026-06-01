@@ -5235,17 +5235,28 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             ))
 
         sp = 8
+        # slope==0: segments are contiguous in iq1; one reshape view replaces
+        # the per-symbol slice + np.stack copy.  Mathematically identical.
+        _base_p = data_start + int(ds_offset) if slope == 0.0 else None
         while sp + rdd <= nd and len(trial_nibs) // 2 < need_bytes:
-            _pay_segs = []
-            for i in range(rdd):
-                si = sp + i
-                seg = sym_seg(si)
-                if seg is None:
+            if slope == 0.0:
+                _p0 = _base_p + sp * N
+                _p1 = _p0 + rdd * N
+                if _p0 < 0 or _p1 > len(iq1):
                     break
-                _pay_segs.append(seg)
-            if len(_pay_segs) < rdd:
-                break
-            _P = soft_fft_demod_batch(np.stack(_pay_segs), dc, N, pay_levels,
+                _segs = iq1[_p0:_p1].reshape(rdd, N)
+            else:
+                _pay_segs = []
+                for i in range(rdd):
+                    si = sp + i
+                    seg = sym_seg(si)
+                    if seg is None:
+                        break
+                    _pay_segs.append(seg)
+                if len(_pay_segs) < rdd:
+                    break
+                _segs = np.stack(_pay_segs)
+            _P = soft_fft_demod_batch(_segs, dc, N, pay_levels,
                                       ppm_pay, pay_bin_group, cfo_shift=cfo_shift)
             pay_llrs = [_P[i] for i in range(rdd)]
             sp += rdd
