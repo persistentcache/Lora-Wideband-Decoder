@@ -1953,13 +1953,31 @@ class SignalRecorder:
                 # the BW/2 vs BW channel-spacing gap, so a real adjacent-
                 # channel signal at df ≈ BW cannot be misidentified as alias.
                 bin_hz = bw / N_sf
-                _alias_tol_hz = 5000.0
+                # BW/2 spectral-fold alias tolerance.  Widened from ±5 kHz to
+                # ±20 kHz on 2026-06-01 after histogramming residual SF10
+                # over-detections: the alias df scatters across 113-145 kHz
+                # (centered on BW/2=125 kHz but biased by carrier-centering
+                # noise + bin granularity).  ±20 kHz catches the full
+                # observed scatter while staying well inside the closest
+                # legitimate LoRa channel-grid spacing (LoRaWAN 200 kHz).
+                _alias_tol_hz = 20000.0
                 _bw2 = bw * 0.5
+                # BW chirp-edge artifact: a single LoRa chirp's up-slope and
+                # down-slope endpoints can register as separate detections
+                # at the same timestamp, separated by exactly BW.  SF10
+                # histogram showed 13 such pairs at df = 249-254 kHz.  Safe
+                # to dedup because (a) Meshtastic CSMA prevents simultaneous
+                # adjacent-channel transmits and (b) extra PMR-delta gate
+                # ensures we only fold near-identical-power pairs (real
+                # adjacent transmitters almost always have different RSSI).
+                _bw_edge_tol_hz = 10000.0
+                _bw_pmr_tol_db = 1.5
                 _dets_sorted = sorted(detections,
                                       key=lambda d: -d.get('peak_power_db', 0.0))
                 preambles = []
                 for d in _dets_sorted:
                     d_off = d['freq_hz'] - anchor['freq_hz']
+                    d_pwr = float(d.get('peak_power_db', 0.0))
                     if any(abs(d_off - p['offset_hz']) < bin_hz
                            for p in preambles):
                         if self.debug >= 1:
@@ -1980,10 +1998,24 @@ class SignalRecorder:
                                   f"abst={_ddt:.2f}s (BW/2 fold of stronger peak in batch)",
                                   flush=True)
                         continue
+                    # BW chirp-edge alias check: drop iff this offset is
+                    # within ±tol of (kept_offset ± BW) AND PMRs nearly match
+                    # (real adjacent transmitters have different power).
+                    if any(abs(abs(d_off - p['offset_hz']) - bw) < _bw_edge_tol_hz
+                           and abs(d_pwr - p.get('peak_pwr_db', d_pwr)) < _bw_pmr_tol_db
+                           for p in preambles):
+                        if self.debug >= 1:
+                            _ddt = (sample_pos / self.wb_fs) + d.get('preamble_t_s', 0.0)
+                            print(f"         [BWEDGE] drop {d['freq_hz']/1e6:.4f}MHz "
+                                  f"abst={_ddt:.2f}s pwr={d_pwr:.1f}dB "
+                                  f"(BW chirp-edge of stronger peak in batch)",
+                                  flush=True)
+                        continue
                     preambles.append({
                         'offset_hz':   float(d_off),
                         'time_sample': 0,
                         'pmr_db':      float(d.get('bw_quality_db', 0.0)),
+                        'peak_pwr_db': d_pwr,
                         'status':      'LOCK',
                         'preamble_t_s': float(d.get('preamble_t_s', 0.0)),
                     })
