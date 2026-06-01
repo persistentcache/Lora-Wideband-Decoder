@@ -1940,7 +1940,21 @@ class SignalRecorder:
                 sym_n = int(round(N_sf * nb_fs_int / bw))
                 # Build preamble list from gate detections, deduped by
                 # ±1 LoRa bin (same TX seen in adjacent Welch peaks).
+                # Also: suppress BW/2 spectral-fold aliases — a single LoRa
+                # chirp's autocorrelation produces a spurious twin peak at
+                # carrier ± BW/2 (see Robyns LoRa PHY).  Empirically (SF10
+                # BW250 30-msg test, 2026-06-01): 16/30 packets produced
+                # alias-paired captures at exactly df = BW/2 ± 5 kHz, same
+                # timestamp.  These aren't different real packets (Meshtastic
+                # / LoRaWAN channels are BW-spaced, not BW/2-spaced) — they
+                # double the decoder load for SF10 and drive worker pool
+                # saturation → gate sample drops.  Tolerance ±5 kHz is 10×
+                # the post-centering scatter (±12 kHz total) but well inside
+                # the BW/2 vs BW channel-spacing gap, so a real adjacent-
+                # channel signal at df ≈ BW cannot be misidentified as alias.
                 bin_hz = bw / N_sf
+                _alias_tol_hz = 5000.0
+                _bw2 = bw * 0.5
                 _dets_sorted = sorted(detections,
                                       key=lambda d: -d.get('peak_power_db', 0.0))
                 preambles = []
@@ -1953,6 +1967,17 @@ class SignalRecorder:
                             print(f"         [BATCHDEDUP] drop {d['freq_hz']/1e6:.4f}MHz "
                                   f"abst={_ddt:.2f}s (≈ kept {anchor['freq_hz']/1e6:.4f}+"
                                   f"{[round(p['offset_hz']/1e3) for p in preambles]}kHz in batch)",
+                                  flush=True)
+                        continue
+                    # BW/2 spectral-fold alias check: drop iff this offset is
+                    # within ±tol of (stronger_offset ± BW/2).  _dets_sorted is
+                    # power-descending, so any prior preamble was stronger.
+                    if any(abs(abs(d_off - p['offset_hz']) - _bw2) < _alias_tol_hz
+                           for p in preambles):
+                        if self.debug >= 1:
+                            _ddt = (sample_pos / self.wb_fs) + d.get('preamble_t_s', 0.0)
+                            print(f"         [BW2ALIAS] drop {d['freq_hz']/1e6:.4f}MHz "
+                                  f"abst={_ddt:.2f}s (BW/2 fold of stronger peak in batch)",
                                   flush=True)
                         continue
                     preambles.append({
