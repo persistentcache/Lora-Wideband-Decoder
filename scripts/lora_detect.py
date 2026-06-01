@@ -2250,6 +2250,20 @@ class BackgroundDecoder:
         self._active_count = 0          # decodes currently in flight (for pending())
         self._workers = []              # subprocess handles, for drain cleanup
         self._workers_lock = threading.Lock()
+        # Adaptive throttle: when the gate is actively dropping samples
+        # (reader.drops growing between STAT intervals), the main loop sets
+        # this event.  Workers then sleep briefly between jobs so memory
+        # bandwidth frees up for the gate's stdin reader.  Self-clears when
+        # the gate recovers.  Empirically (2026-06-01): SF10 BW250 30-msg
+        # bursts on 24-cpu host saturated 14 workers, dropped 24.5% of the
+        # 28 Msps stream.  6 static workers eliminate drops but regress SF12
+        # latency.  Adaptive throttle keeps SF7/11/12 fast in the common case
+        # AND backs off only when SF10's actual over-detection load arrives.
+        self._gate_stress = threading.Event()
+        # Pause duration when stressed — long enough to let the gate's reader
+        # thread complete a USB transfer (~3 ms at 28 Msps × 32768 samples)
+        # without starving steady-state SF12 throughput.
+        self._stress_pause_s = 0.05
         # Respect cgroup/taskset CPU affinity — `os.cpu_count()` returns the
         # SYSTEM count (e.g. 24) even when the process is pinned to 4 cores via
         # taskset / cgroup; on those hosts that would auto-scale to 16 decode
@@ -2530,6 +2544,13 @@ while True:
             # so these same blocking workers process the stragglers then, with
             # the big per-job budget carried in the job tuple.
             job = self._queue.get()
+            # Adaptive throttle: if the gate is actively dropping samples,
+            # delay this decode start to free memory bandwidth for the
+            # gate's reader thread.  Self-clearing event — once the gate
+            # recovers (main loop observes drops stable), it clears the
+            # flag and decoders resume full speed.
+            if self._gate_stress.is_set():
+                time.sleep(self._stress_pause_s)
             fpath, fname, relay_after_syms, relay_before_syms, job_budget = job
             if self._decoder_script is None:
                 self._queue.task_done()
@@ -3762,6 +3783,20 @@ def main():
                       f"-b {int(a.bandwidth/2e6)}000000), raise --buf-seconds, "
                       f"lower --detect-workers contention, or use a faster host. ***",
                       file=sys.stderr, flush=True)
+        # Adaptive worker throttle: runs every window regardless of debug.
+        # Sets _gate_stress when reader.drops grows between observations →
+        # workers sleep briefly before next decode → DRAM bandwidth eases →
+        # gate recovers.  Self-clearing when drops stop growing.
+        if (is_live and wc % 5 == 0 and recorder
+                and getattr(recorder, '_decoder', None)):
+            _drops_now = reader.drops
+            _dec = recorder._decoder
+            _prev_d = getattr(_dec, '_prev_drops_obs', 0)
+            if _drops_now > _prev_d:
+                _dec._gate_stress.set()
+            else:
+                _dec._gate_stress.clear()
+            _dec._prev_drops_obs = _drops_now
         if a.debug >= 1 and wc % 10 == 0:
             msps = tot_s / elapsed / 1e6 if elapsed > 0 else 0
             # save_queue: wideband batches waiting to be recentred + extracted.
