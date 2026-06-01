@@ -3783,10 +3783,11 @@ def main():
                       f"-b {int(a.bandwidth/2e6)}000000), raise --buf-seconds, "
                       f"lower --detect-workers contention, or use a faster host. ***",
                       file=sys.stderr, flush=True)
-        # Adaptive worker throttle: runs every window regardless of debug.
-        # Sets _gate_stress when reader.drops grows between observations →
-        # workers sleep briefly before next decode → DRAM bandwidth eases →
-        # gate recovers.  Self-clearing when drops stop growing.
+        # Adaptive worker throttle: every 5 windows (~2.5 s) check whether
+        # reader.drops grew.  If yes, set _gate_stress → workers sleep
+        # briefly before next decode → DRAM bandwidth eases → gate recovers.
+        # Self-clearing when drops stop growing.  Per-window checking made
+        # things worse (event thrashing on drop-counter jitter).
         if (is_live and wc % 5 == 0 and recorder
                 and getattr(recorder, '_decoder', None)):
             _drops_now = reader.drops
