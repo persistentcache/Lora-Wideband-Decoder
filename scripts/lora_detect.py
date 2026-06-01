@@ -1978,6 +1978,7 @@ class SignalRecorder:
                 for d in _dets_sorted:
                     d_off = d['freq_hz'] - anchor['freq_hz']
                     d_pwr = float(d.get('peak_power_db', 0.0))
+                    d_pmr = float(d.get('bw_quality_db', 0.0))
                     if any(abs(d_off - p['offset_hz']) < bin_hz
                            for p in preambles):
                         if self.debug >= 1:
@@ -2009,6 +2010,33 @@ class SignalRecorder:
                             print(f"         [BWEDGE] drop {d['freq_hz']/1e6:.4f}MHz "
                                   f"abst={_ddt:.2f}s pwr={d_pwr:.1f}dB "
                                   f"(BW chirp-edge of stronger peak in batch)",
+                                  flush=True)
+                        continue
+                    # 3×BW spectral artifact: observed at SF12 BW125 — 416
+                    # same-timestamp pairs at df ≈ 371-374 kHz (= 2.97-2.99 ×
+                    # BW), tightly clustered.  Likely 3rd-harmonic spectral
+                    # content of a SF12 chirp registering as a separate peak
+                    # in the gate's PSD.  Structural signature: the alias's
+                    # PMR (peak-to-mean-ratio, ≈ bw_quality_db in detection
+                    # output) is CONSISTENTLY 6-9 dB lower than the real
+                    # signal's PMR (verified at SF12: real pmr ≈ 33-35 dB,
+                    # alias pmr ≈ 25-27 dB).  Peak power can be similar but
+                    # PMR differentiates because the alias is spectrally
+                    # smeared whereas the real chirp has a tight peak.
+                    # Real adjacent-channel transmitters at df = 3·BW would
+                    # not exhibit this asymmetric PMR relationship (each is
+                    # a clean chirp).  Require: df ≈ 3·BW (±5 kHz) AND alias
+                    # PMR is 3-15 dB lower than the kept preamble's PMR.
+                    _bw3 = bw * 3.0
+                    _bw3_tol_hz = 5000.0
+                    if any(abs(abs(d_off - p['offset_hz']) - _bw3) < _bw3_tol_hz
+                           and 3.0 < (p.get('pmr_db', d_pmr) - d_pmr) < 15.0
+                           for p in preambles):
+                        if self.debug >= 1:
+                            _ddt = (sample_pos / self.wb_fs) + d.get('preamble_t_s', 0.0)
+                            print(f"         [BW3ALIAS] drop {d['freq_hz']/1e6:.4f}MHz "
+                                  f"abst={_ddt:.2f}s pwr={d_pwr:.1f}dB "
+                                  f"(3×BW spectral fold of stronger peak in batch)",
                                   flush=True)
                         continue
                     preambles.append({
