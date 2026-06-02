@@ -16,20 +16,33 @@ traffic in real time on a multi-core host. Heavy back-to-back SF10 / SF11
 bursts can outrun the receiver on hosts with limited memory bandwidth; see
 **Performance notes** below for the knobs that handle that.
 
+## Quick start
+
+```bash
+./install.sh                # Debian / Ubuntu
+python3 run/web.py          # opens http://127.0.0.1:5000
+```
+
+That's it. Point your browser at the URL it prints, hit **Start** in the UI,
+and intercepted packets stream in live. The pipeline (SDR capture + detector
++ decoder) is launched from the web UI based on your `lora.toml`.
+
+If your SDR is already plugged in and you've rebooted (or re-logged in) after
+the installer added you to `plugdev`, the UI's **Config → SDR/Radio →
+Detect** button finds it automatically.
+
 ## SDR support
 
-Two paths, picked automatically per device:
+Two capture paths, picked automatically per device:
 
 - **bladeRF** uses its native `bladeRF-cli` streamer. This is the only path
   that reliably sustains 28 Msps; SoapyBladeRF can't open a stream at that
   rate. Recommended SDR for the full bandwidth.
 - **Every other device** — HackRF, RTL-SDR, LimeSDR, USRP, PlutoSDR, Airspy,
   Sidekiq, and anything else with a SoapySDR module — streams through
-  `soapy_rx.py`, which emits raw CS16 IQ to stdout for the detector.
+  `src/soapy_rx.py`, which emits raw CS16 IQ to stdout for the detector.
 
-Named profiles live in `scripts/sdr_profiles.py`. The web UI's Config tab has
-a Detect button that probes connected devices and picks the right capture
-command for you.
+Named profiles live in `src/sdr_profiles.py`.
 
 ## What it identifies
 
@@ -69,53 +82,35 @@ pip install -r requirements.txt
 ```
 
 Python 3.11+ is recommended. Older Python needs `pip install tomli` to load
-`lora.toml`. Nothing is hardcoded — run from any directory.
-
-## Run
-
-Edit `lora.toml` to set your SDR, frequency, and sample rate, then launch
-the web UI. It starts the SDR → detector pipeline for you:
-
-```bash
-python3 lora_web/lora_web.py
-# Open the URL it prints — default http://127.0.0.1:5000
-```
-
-The UI lets you start and stop the receiver, watch the live packet feed,
-inspect decoded message content, view the node graph and waterfall, manage
-channel keys, and replay recorded captures offline.
-
-Headless? Pipe an SDR directly into the detector:
-
-```bash
-bladeRF-cli -e "set frequency rx 915000000; set samplerate rx 28000000;
-    set bandwidth rx 28000000; set agc rx on;
-    rx config file=/dev/stdout format=bin n=0; rx start; rx wait" \
-| python3 scripts/lora_detect.py -r 28000000 -b 28000000 -c 915.0 -t sc16 \
-    --decode --export-iq captures/
-```
-
-Or for non-bladeRF SDRs, use the SoapySDR streamer:
-
-```bash
-python3 scripts/soapy_rx.py --driver hackrf -f 915000000 -s 20000000 -b 20000000 \
-| python3 scripts/lora_detect.py -r 20000000 -b 20000000 -c 915.0 -t sc16 --decode
-```
-
-Replay a recorded file offline:
-
-```bash
-python3 scripts/lora_detect.py -f recording.sc16 \
-    -r 28000000 -b 28000000 -c 915.0 -t sc16 --decode
-```
+`lora.toml`.
 
 ## Channel keys
 
-Manage decryption keys in the web UI's **Config → Channel keys** tab, or
-edit `lora_keys.json` directly. The public default keys for Meshtastic
-(`AQ==`) and MeshCore (`8b33…`) are built in and value-locked. Add custom
-per-protocol keys as needed. LoRaWAN doesn't need a key — identification is
-structural and behavioral.
+Manage decryption keys in the web UI's **Config → Channel keys** tab. The
+public defaults for Meshtastic (`AQ==`) and MeshCore (`8b33…`) are built in
+and value-locked. Add custom per-protocol keys as needed. LoRaWAN doesn't
+need a key — identification is structural and behavioral.
+
+## Headless mode
+
+If you don't want the web UI, pipe the SDR directly into the detector:
+
+```bash
+# bladeRF + 28 Msps:
+bladeRF-cli -e "set frequency rx 915000000; set samplerate rx 28000000;
+    set bandwidth rx 28000000; set agc rx on;
+    rx config file=/dev/stdout format=bin n=0; rx start; rx wait" \
+| python3 run/headless.py -r 28000000 -b 28000000 -c 915.0 -t sc16 \
+    --decode --export-iq captures/
+
+# Or via SoapySDR (HackRF / RTL-SDR / LimeSDR / USRP / etc.):
+python3 src/soapy_rx.py --driver hackrf -f 915000000 -s 20000000 -b 20000000 \
+| python3 run/headless.py -r 20000000 -b 20000000 -c 915.0 -t sc16 --decode
+
+# Replay a recorded file:
+python3 run/headless.py -f recording.sc16 \
+    -r 28000000 -b 28000000 -c 915.0 -t sc16 --decode
+```
 
 ## Security & deployment
 
@@ -195,20 +190,28 @@ Common knobs in `lora.toml [detect]`, also exposed as CLI flags:
 
 ```
 lora_ml/
-├── install.sh          # one-command installer (Debian / Ubuntu)
-├── lora.toml           # all configuration
-├── .env.example        # environment-variable overrides
-├── requirements.txt    # Python dependencies
-├── scripts/            # core runtime
-│   ├── lora_detect.py       # gate + Schmidl-Cox + pipeline
-│   ├── decode_header_v3.py  # multi-pass soft decoder + protocol parsers
-│   ├── detect_pool.py       # multiprocess detection pool
+├── README.md
+├── LICENSE
+├── install.sh
+├── lora.toml          # all configuration (radio / detect / decode / web)
+├── .env.example       # environment-variable overrides
+├── requirements.txt
+├── run/               # what you run
+│   ├── web.py            # start the web UI
+│   └── headless.py       # detector pipeline, no UI
+├── src/               # backend
+│   ├── detector.py        # gate + Schmidl-Cox + pipeline
+│   ├── decoder.py         # multi-pass soft decoder + protocol parsers
+│   ├── detect_pool.py     # multiprocess detection pool
 │   ├── config.py / lora_config.py / sdr_profiles.py
-│   ├── soapy_rx.py          # SoapySDR → CS16 IQ on stdout
-│   └── sidekiq_rx.py        # Sidekiq native streamer
-├── lora_web/           # Flask web UI
-├── docs/               # reference papers
-└── captures/           # local capture output (gitignored)
+│   ├── soapy_rx.py        # SoapySDR → CS16 IQ on stdout
+│   ├── sidekiq_rx.py      # Sidekiq native streamer
+│   └── web/
+│       ├── app.py         # Flask web UI implementation
+│       └── templates/
+├── docs/              # reference papers
+├── lora_web/          # runtime state (settings, keys, autosave — gitignored)
+└── captures/          # local capture output (gitignored)
 ```
 
 ## License

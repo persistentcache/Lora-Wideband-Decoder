@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""LoRa wideband intercept — web UI backend (functionality-first rework).
+"""LoRa wideband intercept — web UI backend.
 
-Data model: the pipeline (lora_detect.py) writes one structured JSON record per
+Data model: the pipeline (src/detector.py) writes one structured JSON record per
 packet (decoded OR encrypted-header-only) to a JSONL log.  This backend TAILS
 that log, dedups by (pktid,hop), and aggregates:
   - packet feed       (every intercepted packet, sortable/filterable)
@@ -11,25 +11,33 @@ that log, dedups by (pktid,hop), and aggregates:
 Served over a small JSON API + Server-Sent Events; pipeline launched from
 lora.toml so there are no flags to pass.
 
-Usage:  python3 lora_web.py            # reads lora.toml, serves on [web] host:port
-        python3 lora_web.py --config /path/lora.toml --port 5000
+Don't invoke this directly — use `python3 run/web.py` from the repo root.
 """
 import os, sys, json, time, threading, queue, subprocess, argparse, shutil, signal
 from collections import deque, defaultdict
 from flask import Flask, jsonify, request, Response, render_template
 
-# --- locate scripts/ for the shared config loader ---
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_PROJECT = os.path.dirname(_HERE)
-for _p in (os.path.join(_PROJECT, 'scripts'), os.path.join(_HERE, 'scripts')):
-    if os.path.isdir(_p) and _p not in sys.path:
-        sys.path.insert(0, _p)
+# --- path resolution ---
+# app.py lives at src/web/app.py — walk up to find src/ (backend imports) and
+# the repo root (sibling modules + persistent state).
+_HERE = os.path.dirname(os.path.abspath(__file__))    # src/web/
+_SRC = os.path.dirname(_HERE)                          # src/
+_PROJECT = os.path.dirname(_SRC)                       # repo root
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+# Persistent runtime state (settings, keys, alerts, autosave) — kept in a
+# stable project-root location so it isn't co-mingled with the code.
+_DATA_DIR = os.path.join(_PROJECT, 'lora_web')
+try:
+    os.makedirs(_DATA_DIR, exist_ok=True)
+except OSError:
+    _DATA_DIR = _HERE
 try:
     from lora_config import load_config
 except Exception:
     load_config = None
 try:
-    import decode_header_v3 as dhv   # for web-side retry-decryption of stored packets
+    import decoder as dhv   # for web-side retry-decryption of stored packets
 except Exception:
     dhv = None
 try:
@@ -51,7 +59,7 @@ app = Flask(__name__)
 CFG = load_config()
 
 # ---------------------------------------------------------------- settings
-SETTINGS_PATH = os.path.join(_HERE, 'web_settings.json')
+SETTINGS_PATH = os.path.join(_DATA_DIR, "web_settings.json")
 def load_settings():
     _defaults = {'autosave': False, 'waterfall': True,
                  'wide_scan': True,
@@ -79,7 +87,7 @@ SETTINGS = load_settings()
 # ---------------------------------------------------------------- channel keys
 # Persistent key list (survives all sessions) the decoder reads via LORA_KEYS.
 # Format: {"try_default": bool, "keys": [{"id","label","key","scope":"all"|"node","node"}]}
-KEYS_PATH = os.path.join(_HERE, 'lora_keys.json')
+KEYS_PATH = os.path.join(_DATA_DIR, "lora_keys.json")
 import base64 as _b64
 
 
@@ -139,7 +147,7 @@ def save_keys(d):
 
 
 # Alert/trigger rules (persist across sessions).  Evaluated client-side; stored here.
-ALERTS_PATH = os.path.join(_HERE, 'lora_alerts.json')
+ALERTS_PATH = os.path.join(_DATA_DIR, "lora_alerts.json")
 
 
 def load_alerts():
@@ -161,7 +169,7 @@ def save_alerts(d):
 
 
 # Per-node user annotations (custom label, notes, watchlist) — persist across sessions.
-NODES_META_PATH = os.path.join(_HERE, 'lora_nodes.json')
+NODES_META_PATH = os.path.join(_DATA_DIR, "lora_nodes.json")
 
 
 def load_node_meta():
@@ -543,7 +551,7 @@ NODE_PROFILES_MIN_FOR_USE = 30    # Need enough samples to train ML model.
                                   # Random Forest needs ~30 samples per class
                                   # to reliably fit; fewer leads to overfitting.
 
-NODE_PROFILES_PATH = os.path.join(_HERE, 'lora_node_profiles.json')
+NODE_PROFILES_PATH = os.path.join(_DATA_DIR, "lora_node_profiles.json")
 
 
 def _broadcast(evt):
@@ -1518,7 +1526,7 @@ def _tail_psd():
             time.sleep(0.3)
 
 
-AUTOSAVE_PATH = os.path.join(_HERE, 'lora_autosave.jsonl')
+AUTOSAVE_PATH = os.path.join(_DATA_DIR, "lora_autosave.jsonl")
 
 
 def _autosave_loop():
@@ -1566,7 +1574,7 @@ def _radio_cfg():
 
 
 def _build_pipeline_cmd():
-    """Construct the <SDR capture> | lora_detect shell pipeline for the SELECTED SDR.
+    """Construct the <SDR capture> | detector shell pipeline for the SELECTED SDR.
     The capture half comes from the SDR profile registry (bladeRF's command is
     byte-identical to the long-validated one); the gate half is unchanged.  The
     gate path is shlex-quoted — the project dir can contain spaces (e.g.
@@ -1589,8 +1597,8 @@ def _build_pipeline_cmd():
                f'rx config file=/dev/stdout format=bin n=0 buffers=512 samples=32768 '
                f'xfers=64; rx start; rx wait"')
         fmt = r.get('format', 'sc16')
-    scripts = os.path.join(_PROJECT, 'scripts', 'lora_detect.py')
-    gate = (f'python3 {shlex.quote(scripts)} -r {rate} -b {bw} -c {r["center_mhz"]} '
+    detector_py = os.path.join(_SRC, 'detector.py')
+    gate = (f'python3 {shlex.quote(detector_py)} -r {rate} -b {bw} -c {r["center_mhz"]} '
             f'-t {fmt} --threshold {d["threshold"]} '
             f'--overlap {d["overlap"]} --energy-threshold {d["energy_threshold"]} '
             f'--detect-workers {d["detect_workers"]} --buf-seconds {d["buf_seconds"]} '
@@ -1604,8 +1612,8 @@ def _kill_stale_pipeline():
     the web does NOT auto-kill it — without this, an orphan keeps the bladeRF
     busy and the next Start launches a second pipeline that can't open the
     device and dies in ~1 s ('running' then 'stopped').  These pkill patterns
-    only match the gate/bladeRF, never this web process (python3 lora_web.py)."""
-    pats = ['lora_detect.py -r']
+    only match the gate/bladeRF, never this web process."""
+    pats = ['detector.py -r']
     if sdr_profiles is not None:   # kill ANY known SDR capture tool, not just bladeRF
         # Use each profile's kill_pat (script name for SoapySDR) — NEVER the bare
         # 'python3' interpreter, which would nuke the web server and the gate.
@@ -2245,7 +2253,7 @@ def api_node_meta_set(nid):
 
 
 # ---- Unknown-protocol developer report ----
-UNKNOWN_PATH = os.path.join(_HERE, 'lora_unknown.jsonl')
+UNKNOWN_PATH = os.path.join(_DATA_DIR, "lora_unknown.jsonl")
 UNKNOWN_OFF = UNKNOWN_PATH + '.off'
 
 

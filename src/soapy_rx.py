@@ -4,7 +4,7 @@
 Lets the 'soapy' SDR profile capture from HackRF / RTL-SDR / LimeSDR / USRP /
 PlutoSDR / Airspy etc. through one code path, without needing rx_tools — only the
 SoapySDR python bindings (apt: python3-soapysdr) plus the device's Soapy module.
-Output is CS16, which lora_detect reads with `-t sc16`.
+Output is CS16, which detector reads with `-t sc16`.
 
   python3 soapy_rx.py --driver hackrf -f 920e6 -s 20e6 -b 20e6 [-g 40]
 
@@ -13,7 +13,7 @@ instant it isn't read, so a dedicated reader thread does nothing but service
 readStream back-to-back (sized to the device's MTU), handing finished chunks to a
 large in-RAM queue.  A separate writer drains the queue to stdout.  This decouples
 device servicing from any downstream (pipe/disk) latency, so a transient stall in
-lora_detect or the OS pipe can't cost samples.  Overflows, if they ever occur, are
+detector or the OS pipe can't cost samples.  Overflows, if they ever occur, are
 counted and logged to stderr — never silently swallowed.
 """
 import sys

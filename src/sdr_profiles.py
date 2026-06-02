@@ -1,11 +1,11 @@
 """SDR device profiles — capture command, IQ format, and presence-probe per SDR.
 
 Adding support for a new SDR = add an entry here.  The capture template streams
-raw interleaved IQ to stdout (piped into lora_detect via -t {format}); the probe
+raw interleaved IQ to stdout (piped into detector via -t {format}); the probe
 command is run to validate the device is present and read its serial.
 
 Placeholders in `capture`: {bin} (resolved exe path), {freq_hz}, {rate}, {bw},
-{gain_cmd}/{gain}.  Only formats lora_detect understands are used: sc16 (int16)
+{gain_cmd}/{gain}.  Only formats detector understands are used: sc16 (int16)
 or sc8 (int8).  Devices that don't natively emit those (RTL-SDR cu8, LimeSDR,
 USRP, PlutoSDR, …) go through the SoapySDR 'rx_sdr' universal profile with
 -F CS16, so no special reader is needed.

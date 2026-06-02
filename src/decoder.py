@@ -7,9 +7,9 @@ Pipeline: dechirp → FFT → max-log LLR → soft gray map → soft deinterleav
 + Meshtastic packet decryption (AES-128-CTR) and protobuf decode
 
 Run on .cf32 captures:
-  python3 decode_header_v3.py captures/*.cf32
-  python3 decode_header_v3.py -k NOKEY captures/*.cf32       # HAM mode (no encryption)
-  python3 decode_header_v3.py -k '1PG7OiApB1nwvP+rz05pAQ==' captures/*.cf32  # custom key
+  python3 decoder.py captures/*.cf32
+  python3 decoder.py -k NOKEY captures/*.cf32       # HAM mode (no encryption)
+  python3 decoder.py -k '1PG7OiApB1nwvP+rz05pAQ==' captures/*.cf32  # custom key
 """
 import numpy as np
 import glob, sys, os, time

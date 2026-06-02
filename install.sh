@@ -115,7 +115,7 @@ PY
 cat <<EOF
 
 Done.
-  Run the receiver:   python3 lora_web/lora_web.py
+  Run the receiver:   python3 run/web.py
   Open the web UI, go to Config → SDR/Radio, pick your SDR, click Detect.
 
 If your SDR isn't found, re-plug it or log out/in once (so the 'plugdev' group

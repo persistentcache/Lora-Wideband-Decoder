@@ -2,16 +2,16 @@
 """sidekiq_rx.py — stream IQ from an Epiq Solutions SideKiq to stdout in sc16 format.
 
 Wraps the SDK's rx_samples binary and corrects the I/Q byte order so the output
-is compatible with lora_detect.py (and the rest of the pipeline).
+is compatible with detector.py (and the rest of the pipeline).
 
 rx_samples packs each IQ pair as a 32-bit little-endian word:
     bits 31:16 = I  (upper)
     bits 15:0  = Q  (lower)
 Reading as consecutive int16 LE gives: [Q, I, Q, I, ...]
-lora_detect expects:                   [I, Q, I, Q, ...] (s[0::2]=I, s[1::2]=Q)
+detector expects:                   [I, Q, I, Q, ...] (s[0::2]=I, s[1::2]=Q)
 So every pair must be swapped.
 
-Usage (mirrors soapy_rx.py interface so lora_detect can call it the same way):
+Usage (mirrors soapy_rx.py interface so detector can call it the same way):
     python3.10 sidekiq_rx.py -f 915000000 -s 28000000 -b 28000000 [-g 50] [-c 1]
 """
 
