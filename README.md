@@ -1,113 +1,168 @@
-# lora_ml — wideband LoRa / Meshtastic intercept receiver
+# lora_ml — wideband passive LoRa receiver
 
-A passive, wideband (up to 28 MHz) bladeRF receiver that detects, decodes, and
-**identifies** LoRa traffic — Meshtastic, LoRaWAN, and MeshCore — with a live
-web UI. Detection is **Schmidl-Cox** (no ML model needed at runtime); decoding is
-a multi-pass soft demod that reaches 100% on Meshtastic across SF7–SF12.
+A self-hosted, single-user **passive intercept receiver** for LoRa traffic.
+Connects to any SDR supported by SoapySDR (bladeRF, HackRF, RTL-SDR, LimeSDR,
+USRP, PlutoSDR, Airspy), demodulates the IQ in software, decodes the result,
+and shows it in a local web UI.
 
 ```
-bladeRF IQ → energy gate (Welch + max-hold) → Schmidl-Cox preamble lock
-           → dechirp + soft demod → CRC / decrypt / verify → web UI
+SDR IQ → energy gate (Welch + max-hold) → Schmidl-Cox preamble lock
+       → dechirp + soft demod → CRC / decrypt / verify → web UI
 ```
 
-## Protocol identification (no keys required)
+Detection is Schmidl-Cox (no ML at runtime). The decoder is a multi-pass
+soft demodulator that covers **SF7–SF12** at any **BW (62.5 / 125 / 250 /
+500 kHz)**. It handles typical Meshtastic / LoRaWAN / MeshCore traffic in
+real time on a multi-core host; very dense back-to-back bursts at slow SFs
+may exceed real-time on hosts with limited memory bandwidth (see
+**Performance notes** below).
 
-A protocol is only **named** when there's discriminating evidence — never on a
-structural guess. Confidence tiers:
+## What it identifies
+
+A protocol is **named** only when there's discriminating evidence — never on
+a structural guess. Confidence tiers:
 
 | Tier | Meaning |
 |---|---|
-| **verified** | cryptographic proof — Meshtastic AES decrypt, MeshCore ADVERT Ed25519 signature, or MeshCore public-channel decrypt+MAC |
+| **verified** | cryptographic proof — Meshtastic AES decrypt, MeshCore ADVERT Ed25519 signature, or MeshCore public-channel decrypt + MAC |
 | **confirmed** | behavioral proof — LoRaWAN DevAddr + monotonic FCnt over ≥2 frames, or a MeshCore frame routed through ≥2 verified nodes |
 | **unknown (+hint)** | structurally resembles a protocol but unconfirmed — shown honestly, never claimed |
 
-MeshCore verified nodes (from ADVERTs) are exposed at `/api/mc_nodes`.
+Meshtastic broadcasts on the public default channel decrypt with the
+built-in PSK. Meshtastic direct messages are PKI-encrypted and surface as
+header-only entries (the link is visible, payload content is not).
 
 ## Install
 
-**Debian/Ubuntu — one command:**
+**Debian / Ubuntu — one command:**
 ```bash
 ./install.sh
 ```
-Installs SoapySDR + per-device modules (universal SDR support — HackRF, RTL-SDR,
-LimeSDR, USRP, PlutoSDR, Airspy, bladeRF), the native bladeRF/HackRF/RTL tools,
-the Python requirements, and SDR device access (plugdev). Then run the web UI and
-pick your SDR in **Config → SDR/Radio → Detect**.
+Installs SoapySDR + every device module in the repo (universal SDR support),
+the native vendor tools (`bladeRF-cli`, `hackrf_transfer`, `rtl_sdr`), the
+Python dependencies, and SDR device access (`plugdev` group). Reboot or
+re-login after the group change so it takes effect.
 
-**Manual / other OSes:**
+**Other systems / manual:**
 ```bash
-pip install -r requirements.txt          # numpy, scipy, cryptography, flask
-# + SoapySDR with its python3 bindings and your SDR's Soapy module
-#   (or the native tool: bladeRF-cli / hackrf_transfer / rtl_sdr)
+pip install -r requirements.txt   # numpy, scipy, cryptography, flask
+# Plus, from your distro's package manager:
+#   - SoapySDR with its python3 bindings
+#   - your SDR's SoapySDR module (e.g. soapysdr-module-bladerf)
+#   - libusb-1.0
 ```
-Python 3.11+ recommended (reads `lora.toml` via the stdlib; older Python: `pip install tomli`).
-No paths are hardcoded — the program locates its own files relative to itself, so it
-runs from any directory on any machine.
+
+Python 3.11+ recommended (uses stdlib `tomllib` for `lora.toml`; older Python
+needs `pip install tomli`). No paths are hardcoded — run from any directory.
 
 ## Run
 
-Edit **`lora.toml`** (`[radio] [detect] [decode] [web]`), then start the web UI —
-it launches the bladeRF→detector pipeline for you:
+Edit **`lora.toml`** (`[radio] [detect] [decode] [web]`) — the example file
+is heavily commented and covers most use cases. Then start the web UI; it
+launches the SDR → detector pipeline for you:
 
 ```bash
-python3 lora_web/lora_web.py            # serves on [web] host:port, reads lora.toml
+python3 lora_web/lora_web.py
+# Open the URL it prints (default http://127.0.0.1:5000).
 ```
-Open the web UI to Start/Stop the receiver and watch the live feed, nodes,
-network graph, waterfall, channel keys, and decoded packets.
 
-**Manual pipeline (no web UI):**
+In the UI you can: start / stop the receiver, watch the live packet feed,
+inspect decoded message content, view the node graph and waterfall, manage
+channel keys, and replay recorded captures offline.
+
+**Headless / no web UI** — invoke the detector directly:
+
 ```bash
 bladeRF-cli -e "set frequency rx 915000000; set samplerate rx 28000000;
     set bandwidth rx 28000000; set agc rx on;
     rx config file=/dev/stdout format=bin n=0; rx start; rx wait" \
 | python3 scripts/lora_detect.py -r 28000000 -b 28000000 -c 915.0 -t sc16 \
     --decode --export-iq captures/
+```
 
-# Offline replay of a recording:
-python3 scripts/lora_detect.py -f recording.sc16 -r 28000000 -b 28000000 -c 915.0 -t sc16 --decode
+Or, **offline replay** of a recorded `.sc16` / `.cf32` file:
+
+```bash
+python3 scripts/lora_detect.py -f recording.sc16 \
+    -r 28000000 -b 28000000 -c 915.0 -t sc16 --decode
 ```
 
 ## Channel keys
 
-Manage decryption keys in the web **Config → Channel keys** tab (or `lora_keys.json`).
-The two **Public/Default** keys (Meshtastic `AQ==`, MeshCore `8b33…`) are built in
-and value-locked; add custom per-protocol keys as needed. LoRaWAN needs no key
-(identified structurally + behaviorally).
+The web UI's **Config → Channel keys** tab manages decryption keys (also
+editable as `lora_keys.json`). The two **Public / Default** keys
+(Meshtastic `AQ==`, MeshCore `8b33…`) are built in and value-locked. Add
+custom per-protocol keys as needed. LoRaWAN doesn't need a key —
+identification is structural + behavioral.
 
 ## Security & deployment
 
-This is a **self-hosted, single-user, local tool** — it needs a physical SDR
-attached, so you run your own instance and open it in your own browser. Treat it
-accordingly:
+This is a **self-hosted, single-user, local tool**. It requires a physical
+SDR, so you run your own instance and view it in your own browser.
 
-- **No authentication.** The web UI has no login. Anyone who can reach the port can
-  start/stop the receiver, change settings, and read intercepted traffic + keys.
-- **Binds to `127.0.0.1` (localhost) by default** — not reachable from other
-  machines. To allow LAN access set `lora.toml [web] host = "0.0.0.0"`, but **only
-  on a trusted network**, and ideally behind a reverse proxy (nginx/Caddy) that adds
-  authentication + TLS. The app prints a warning when bound to a non-localhost
-  address. Do **not** expose it directly to the public internet.
-- **It runs the local SDR via shell commands.** Don't run it as root; a normal user
-  in the `plugdev` (SDR) group is enough.
-- **Legal / privacy.** This passively intercepts RF. You are responsible for
-  complying with local laws on radio reception and privacy. Don't publish decoded
-  traffic, node identities, or channel keys you don't own the rights to.
+- **No authentication.** The web UI has no login. Anyone who can reach the
+  port can start / stop the receiver, change settings, read intercepted
+  traffic, and read keys.
+- **Localhost-only by default** (`127.0.0.1`). To allow LAN access set
+  `[web] host = "0.0.0.0"` in `lora.toml`, but only on a trusted network,
+  and ideally behind a reverse proxy (nginx, Caddy) that adds auth + TLS.
+  The app prints a warning when bound to a non-loopback address. Do not
+  expose it directly to the public internet.
+- **SDR access via the `plugdev` group** — don't run as root.
+- **Legal / privacy.** This passively intercepts RF. You are responsible
+  for complying with local laws on radio reception and privacy. Don't
+  publish decoded traffic, node identities, or channel keys you don't have
+  the right to share.
 
-The bundled `app.run()` (Werkzeug) server is fine for this local single-user use; a
-production WSGI server is only relevant if you deliberately host it for others.
+The bundled `app.run()` (Werkzeug) server is fine for local single-user use;
+a production WSGI server is only relevant if you deliberately host it for
+others.
 
-## Tuning (`lora.toml [detect]` / CLI flags)
+## Performance notes
+
+Performance scales with CPU bandwidth and core count. Reasonable
+expectations on a multi-core host with a USB-3 SDR:
+
+- **Normal traffic** (Meshtastic / LoRaWAN at typical message rates):
+  works in real time at 28 Msps wideband across all SF / BW combinations.
+- **Dense bursts** (many SF10 / SF11 messages back-to-back with no gap):
+  the gate's per-window detection work can momentarily exceed real time
+  on hosts with limited DRAM bandwidth. The receiver auto-throttles
+  workers when sample drops are detected, but extreme bursts on slow
+  hosts may still drop a fraction of samples — bursts on real-world
+  networks rarely approach this regime.
+- **CPU affinity** is auto-isolated: the first 4 cores of the available
+  affinity set are reserved for the gate's reader / detect pool; decode
+  workers are pinned to the remaining cores. If you explicitly wrap the
+  pipeline in `taskset -c …` it's respected and the workers share that
+  affinity.
+- **CPU governor.** On Linux, the `powersave` governor can introduce
+  noticeable latency variance. Set the `performance` governor for
+  consistent measurements: `sudo cpupower frequency-set -g performance`.
+
+If your host is too slow for the full 28 MHz, drop the sample rate in
+`lora.toml`:
+
+```toml
+[radio]
+rate_hz      = 14000000   # 14 Msps still covers half the US915 band
+bandwidth_hz = 14000000
+```
+
+## Tuning
+
+Common knobs in `lora.toml [detect]` (also available as CLI flags):
 
 | Problem | Fix |
 |---|---|
-| False positives | `--threshold 0.8` |
-| Missed detections | `--threshold 0.4` |
-| Weak short bursts missed | `--energy-threshold` (default 5.0; max-hold is on) |
-| LO-leak false peak at center | `--dc-notch 0.5` |
-| Duplicates / ADC saturation | `--spur-reject 10`, or lower RX gain |
-| Dropped samples on slow hosts | `--buf-seconds 16` |
+| False positives | raise `threshold` (e.g. `0.8`) |
+| Missed detections | lower `threshold` (e.g. `0.4`) |
+| Weak short bursts missed | lower `energy_threshold` (default 12.0; try 5.0) |
+| LO-leak false peak at center | add `--dc-notch 0.5` |
+| Adjacent-channel duplicates / saturation | lower SDR gain in `[radio]` |
+| Dropped samples on slow hosts | raise `buf_seconds` (default 16, try 32) |
 
-## Meshtastic presets
+## Meshtastic presets (reference)
 
 | Preset | SF | BW | CR |   | Preset | SF | BW | CR |
 |---|---|---|---|---|---|---|---|---|
@@ -121,22 +176,21 @@ production WSGI server is only relevant if you deliberately host it for others.
 
 ```
 lora_ml/
-├── install.sh             # one-command installer (Debian/Ubuntu)
-├── lora.toml              # all configuration (radio / detect / decode / web)
-├── requirements.txt       # Python runtime dependencies
-├── scripts/               # CORE RUNTIME
-│   ├── lora_detect.py        # energy gate + Schmidl-Cox detector + pipeline
-│   ├── decode_header_v3.py   # multi-pass soft decoder + protocol parsers/verification
-│   ├── detect_pool.py        # multiprocess detection pool
-│   ├── config.py             # SF/BW/preset parameter classes
-│   ├── lora_config.py        # lora.toml loader
-│   ├── sdr_profiles.py       # SDR registry (capture/probe/limits per device)
-│   └── soapy_rx.py           # SoapySDR → stdout IQ streamer (universal SDR capture)
-├── lora_web/              # Flask web UI (lora_web.py + templates/) + runtime state
-├── tools/                # preset_test.py (record→process→tally harness), sendtest.py
-├── ml/                   # LEGACY CNN training (superseded by Schmidl-Cox)
-├── dev/                  # dev/analysis scripts (analyze_capture.py, lora_watch.py)
-├── docs/                 # reference papers
-├── archive/              # old backups
-├── captures/  recordings/  # scratch capture output
+├── install.sh          # one-command installer (Debian / Ubuntu)
+├── lora.toml           # all configuration
+├── .env.example        # environment-variable overrides
+├── requirements.txt    # Python dependencies
+├── scripts/            # core runtime
+│   ├── lora_detect.py     # gate + Schmidl-Cox + pipeline
+│   ├── decode_header_v3.py # multi-pass soft decoder + parsers
+│   ├── detect_pool.py     # multiprocess detection pool
+│   ├── config.py / lora_config.py / sdr_profiles.py
+│   └── soapy_rx.py        # universal SoapySDR → stdout streamer
+├── lora_web/           # Flask web UI
+├── docs/               # reference papers
+└── captures/           # local capture output (gitignored)
 ```
+
+## License
+
+MIT — see `LICENSE`.
