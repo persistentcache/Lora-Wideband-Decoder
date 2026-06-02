@@ -2310,6 +2310,34 @@ class BackgroundDecoder:
         self._active_count = 0          # decodes currently in flight (for pending())
         self._workers = []              # subprocess handles, for drain cleanup
         self._workers_lock = threading.Lock()
+        # CPU-affinity isolation: on multi-core hosts, reserve the first 4
+        # cores for the GATE process (main, stdin-reader, save-worker, detect
+        # pool) and pin DECODE workers to the remaining cores.  Without this
+        # isolation, Linux's CFS scheduler co-locates decode workers and
+        # gate-reader on the same physical cores during burst (24-core host
+        # observed 2026-06-01: 14 decode workers preempt the gate's stdin
+        # reader → gate falls from 28 Msps to 19 Msps → USB ring buffer
+        # overflows → samples dropped).  With explicit affinity partitioning,
+        # decode workers cannot preempt the reader and the gate keeps full
+        # 28 Msps regardless of worker count.  If the user has externally
+        # restricted affinity (e.g. wrapped the gate in `taskset -c 0-3`),
+        # respect that and let workers share — the user's taskset implies
+        # they accept the trade-off of fewer worker cores.
+        try:
+            _affinity_now = os.sched_getaffinity(0)
+            _total = os.cpu_count() or 4
+            if len(_affinity_now) >= max(8, _total - 2):
+                # Essentially unrestricted: reserve cores for gate, pin
+                # workers to the rest.  Worker cores = affinity − first 4.
+                _gate_reserve = set(sorted(_affinity_now)[:4])
+                _worker_aff = _affinity_now - _gate_reserve
+                self._worker_affinity = (_worker_aff if _worker_aff
+                                          else _affinity_now)
+            else:
+                # User-restricted (e.g. taskset to a few cores): share.
+                self._worker_affinity = None
+        except (AttributeError, OSError):
+            self._worker_affinity = None
         # Adaptive throttle: when the gate is actively dropping samples
         # (reader.drops growing between STAT intervals), the main loop sets
         # this event.  Workers then sleep briefly between jobs so memory
@@ -2490,6 +2518,13 @@ while True:
                 text=True,
                 env=_env,
                 preexec_fn=self._lower_priority)
+            # Pin worker to the non-gate cores so it cannot preempt the
+            # gate's stdin-reader / detect-pool threads on cores 0-3.
+            if self._worker_affinity:
+                try:
+                    os.sched_setaffinity(proc.pid, self._worker_affinity)
+                except (AttributeError, OSError):
+                    pass
             with self._workers_lock:
                 self._workers.append(proc)
             return proc
