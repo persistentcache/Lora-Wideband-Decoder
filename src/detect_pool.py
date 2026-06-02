@@ -34,7 +34,7 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
     os.environ['LORA_DETECT_SERIAL'] = '1'
     import sys
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import lora_detect as L
+    import detector as L
 
     # Attach to every shared slot once; build a numpy view per slot.
     shms = [shared_memory.SharedMemory(name=nm) for nm in shm_names]
@@ -81,7 +81,7 @@ class DetectPool:
         self._free = list(range(n_slots))
         names = [s.name for s in self._shms]
 
-        # 'fork' so workers inherit the already-imported numpy/scipy/lora_detect
+        # 'fork' so workers inherit the already-imported numpy/scipy/detector
         # (fast startup).  CRITICAL: the caller must build this pool BEFORE
         # starting any other threads (recorder save-workers, decoder managers,
         # the stdin drainer) — forking a multithreaded process inherits their

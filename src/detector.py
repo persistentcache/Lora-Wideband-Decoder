@@ -1,5 +1,5 @@
 """
-lora_detect.py — Live LoRa detection from wideband SDR input.
+detector.py — Live LoRa detection from wideband SDR input.
 
 Pipeline:
   1. Welch PSD → find energy peaks
@@ -18,7 +18,7 @@ Usage:
   bladeRF-cli -e 'set frequency rx 915000000; set samplerate rx 40000000; \
     set bandwidth rx 28000000; set gain rx 40; \
     rx config file=/dev/stdout format=bin n=0; rx start; rx wait' \
-  | python lora_detect.py -r 40000000 -b 28000000 -c 915 -t sc16 -d 1
+  | python detector.py -r 40000000 -b 28000000 -c 915 -t sc16 -d 1
 """
 
 import sys, os, time, argparse, numpy as np
@@ -1714,7 +1714,7 @@ def estimate_and_correct_cfo(nb, nb_fs, sf, bw, debug=0):
     """CFO correction stub — intentionally disabled.
 
     Both the analysis script (analyze_capture.py) and the decoder
-    (decode_header_v3.py) measure the preamble bin and apply their own
+    (decoder.py) measure the preamble bin and apply their own
     CFO correction internally.  Pre-correcting here adds no value and
     has historically caused catastrophic bugs (wrong chirp convention,
     grid misalignment, autocorrelation failures).
@@ -2291,11 +2291,11 @@ class BackgroundDecoder:
         # allow up to _dedup_keep submissions per cluster.
         self._dedup_keep = int(os.environ.get('LORA_DEDUP_KEEP', '2'))
 
-        # Find decode_header_v3.py next to this script
+        # Find decoder.py next to this script
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        self._decoder_script = os.path.join(script_dir, 'decode_header_v3.py')
+        self._decoder_script = os.path.join(script_dir, 'decoder.py')
         if not os.path.isfile(self._decoder_script):
-            print("[DECODE] decode_header_v3.py not found — decoding disabled",
+            print("[DECODE] decoder.py not found — decoding disabled",
                   file=sys.stderr, flush=True)
             self._decoder_script = None
 
@@ -2431,18 +2431,18 @@ class BackgroundDecoder:
         key_setup = ""
         if self._no_key:
             key_setup = """
-import decode_header_v3 as _dec
+import decoder as _dec
 _dec._mesh_no_key = True
 _dec._mesh_aes_key = bytes(16)
 """
         elif self._aes_key:
             key_setup = f"""
-import decode_header_v3 as _dec
+import decoder as _dec
 _dec._mesh_aes_key = bytes.fromhex('{self._aes_key.hex()}')[:16]
 """
         else:
             key_setup = """
-import decode_header_v3 as _dec
+import decoder as _dec
 """
 
         # Persistent worker: import once, then loop reading paths from stdin

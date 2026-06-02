@@ -1,8 +1,8 @@
 """Central config loader for the LoRa receiver (lora.toml).
 
-Both lora_web.py and lora_detect.py use this so settings live in one file
+Both lora_web.py and detector.py use this so settings live in one file
 instead of long CLI flag strings.  Missing keys fall back to defaults; explicit
-CLI flags (in lora_detect) still override the config.
+CLI flags (in detector) still override the config.
 """
 import os
 try:
