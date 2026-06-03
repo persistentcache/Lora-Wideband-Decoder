@@ -4443,11 +4443,16 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         than the per-FFT loop.
 
         PERF (coarse pass): wide coarse search uses min(nscore_syms, 4)
-        symbols; fine pass at step=1 uses full nscore_syms.  Halves the
-        coarse-pass FFT count (the dominant cost — 28.86 s of 53.2 s in
-        the SF11 4-capture profile).  Provably-equivalent on the harness
-        reference: payload bytes identical, only intermediate margins
-        shift.
+        symbols; fine pass at step=1 uses full nscore_syms.
+
+        PERF (smaller-N coarse, SF≥10): The coarse pass FFTs only the
+        first N/COARSE_DIV samples of each dechirped symbol — a 4× FFT-
+        size reduction costs ~5× less per FFT (N log N scaling).  After
+        dechirp, the LoRa chirp's tone is a constant-frequency sinusoid;
+        truncating to N/4 samples drops SNR by 6 dB but PRESERVES the
+        peak bin's relative position vs other offsets (scaled by N/4 / N).
+        Only used for ranking; the fine pass re-evaluates the coarse
+        winner at full N so the final offset score is unbiased.
         """
         lo = max(0, pre_loc - N)
         hi = min(len(iq1) - N * max(1, nscore_syms), pre_loc + N)
@@ -4460,9 +4465,18 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         # into PASS 2, which regresses SF7 wall by ~17 %.  See the
         # twin gate in _refine_start above.
         nsc_coarse = min(nscore_syms, 4) if N >= 1024 else nscore_syms
+        # Smaller-N coarse FFT for SF≥10 — truncate dechirped segment to
+        # N/COARSE_DIV samples before FFT.  At SF12 N=4096: FFT at 1024
+        # is ~4.8× cheaper.  Disable at SF<10 where FFT is already cheap
+        # and the SNR loss matters more for borderline captures.
+        COARSE_DIV = 4
+        coarse_n = (N // COARSE_DIV) if N >= 1024 else None
         BATCH_BYTES = 16 * 1024 * 1024
 
-        def _batched_pass(offsets_iter, n_sc):
+        def _batched_pass(offsets_iter, n_sc, coarse_n=None):
+            """If coarse_n is set, FFT only the first coarse_n samples of
+            each dechirped symbol (cheaper, lower frequency resolution).
+            Otherwise FFT at full N."""
             offsets = [o for o in offsets_iter
                        if 0 <= o and o + n_sc * N <= len(iq1)]
             if not offsets:
@@ -4479,7 +4493,14 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     segs[oi*n_sc:(oi+1)*n_sc] = (
                         iq1[off:off + n_sc*N].reshape(n_sc, N))
                 segs *= downchirp
-                ff = np.abs(_fft(segs, axis=1)).astype(np.float32, copy=False)
+                # Truncate AFTER dechirp — the chirp's tone is constant-
+                # frequency for the symbol duration, so the first N/D
+                # samples carry the same bin information at lower SNR.
+                if coarse_n is not None and coarse_n < N:
+                    segs_for_fft = segs[:, :coarse_n]
+                else:
+                    segs_for_fft = segs
+                ff = np.abs(_fft(segs_for_fft, axis=1)).astype(np.float32, copy=False)
                 all_maxes[bs:bs+kb] = ff.max(axis=1).reshape(kb, n_sc)
                 all_arg[bs:bs+kb] = ff.argmax(axis=1).reshape(kb, n_sc)
             scores = all_maxes.sum(axis=1).astype(np.float64)
@@ -4497,11 +4518,12 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             return offsets[bi], float(scores[bi])
 
         best_off, best_score = pre_loc, -1.0
-        # Coarse pass: reduced n_score for speed.
-        off0, _ = _batched_pass(range(lo, hi + 1, coarse_step), nsc_coarse)
-        # Fine pass around coarse winner: full nscore_syms for fidelity.
-        # Compare against the coarse winner re-evaluated at full n_score so
-        # the score comparison is apples-to-apples.
+        # Coarse pass: reduced n_score AND truncated FFT for speed.
+        off0, _ = _batched_pass(range(lo, hi + 1, coarse_step), nsc_coarse,
+                                coarse_n=coarse_n)
+        # Fine pass around coarse winner: full nscore_syms AND full N for
+        # the final offset selection — the truncated coarse score is not
+        # directly comparable to the full-N fine score.
         _, s_coarse_full = _batched_pass([off0], nscore_syms)
         best_off, best_score = off0, s_coarse_full
         fine_lo = max(lo, best_off - coarse_step)
