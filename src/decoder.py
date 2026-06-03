@@ -4169,6 +4169,12 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         # win.  Threshold N=1024 chosen so SF7/8/9 use full n_score and
         # SF10/11/12 use the reduction.
         n_score_coarse = min(n_score, 4) if N >= 1024 else n_score
+        # Smaller-N coarse FFT for SF≥10: truncate dechirped segment to
+        # N/2 samples before FFT (conservative — N/4 caused ambiguous
+        # SF12 hop1 result in one live run; N/2 halves the SNR loss).
+        # Fine pass always re-evaluates at full N so final pick is unbiased.
+        COARSE_DIV = 2
+        coarse_n_fft = (N // COARSE_DIV) if N >= 1024 else None
 
         # Memory budget for the batched scratch: 16 MB worth of complex64.
         # `K` = how many offsets to stack per batched FFT call.  At small N
@@ -4176,7 +4182,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         # K shrinks so the scratch stays bounded (was 1.6 GB before this).
         BATCH_BYTES = 16 * 1024 * 1024
 
-        def _batched_pass(offsets_iter, n_sc):
+        def _batched_pass(offsets_iter, n_sc, coarse_n=None):
             offsets = [o for o in offsets_iter
                        if 0 <= o and o + n_sc * N <= len(iq_data)]
             if not offsets:
@@ -4193,7 +4199,11 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     segs[oi*n_sc:(oi+1)*n_sc] = (
                         iq_data[off:off + n_sc*N].reshape(n_sc, N))
                 segs *= downchirp
-                ff = np.abs(_fft(segs, axis=1)).astype(np.float32, copy=False)
+                if coarse_n is not None and coarse_n < N:
+                    segs_for_fft = segs[:, :coarse_n]
+                else:
+                    segs_for_fft = segs
+                ff = np.abs(_fft(segs_for_fft, axis=1)).astype(np.float32, copy=False)
                 all_maxes[bs:bs+kb] = ff.max(axis=1).reshape(kb, n_sc)
                 all_arg[bs:bs+kb] = ff.argmax(axis=1).reshape(kb, n_sc)
             scores = all_maxes.sum(axis=1).astype(np.float64)
@@ -4216,9 +4226,10 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             bi = int(np.argmax(scores))
             return offsets[bi], float(scores[bi])
 
-        # Coarse pass over the wide range — reduced n_score for speed.
+        # Coarse pass over the wide range — reduced n_score + truncated FFT.
         best_off, best_score = coarse, 0.0
-        off0, s0 = _batched_pass(range(lo, hi + 1, step), n_score_coarse)
+        off0, s0 = _batched_pass(range(lo, hi + 1, step), n_score_coarse,
+                                 coarse_n=coarse_n_fft)
         if s0 > best_score:
             best_off, best_score = off0, s0
         # Fine pass around the coarse winner — full n_score for fidelity.
