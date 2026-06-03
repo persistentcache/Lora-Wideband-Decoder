@@ -30,7 +30,7 @@ echo "==> Installing system packages (sudo required) ..."
 sudo apt-get update
 # Essentials — abort if these fail.
 sudo apt-get install -y python3 python3-pip build-essential libusb-1.0-0 \
-    soapysdr-tools python3-soapysdr
+    libfftw3-dev soapysdr-tools python3-soapysdr
 
 # SDR device modules + native tools.  Any package not present in this distro's
 # repo is skipped (not fatal) so the install still completes everywhere.
@@ -109,7 +109,13 @@ SoapySDRUtil --find 2>/dev/null | grep -iE "driver|serial" | sed 's/^/   /' \
 python3 - <<'PY'
 import numpy, scipy, flask
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-print("   python deps OK — numpy %s, scipy %s, flask %s" % (numpy.__version__, scipy.__version__, flask.__version__))
+try:
+    import pyfftw
+    fftw_msg = "pyfftw %s" % pyfftw.__version__
+except ImportError:
+    fftw_msg = "pyfftw MISSING (decoder will fall back to scipy.fft, slower)"
+print("   python deps OK — numpy %s, scipy %s, flask %s, %s" %
+      (numpy.__version__, scipy.__version__, flask.__version__, fftw_msg))
 PY
 
 cat <<EOF

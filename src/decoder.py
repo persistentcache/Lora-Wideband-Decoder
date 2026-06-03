@@ -15,12 +15,26 @@ import numpy as np
 import glob, sys, os, time
 from itertools import combinations
 try:
-    from scipy.fft import (fft as _fft, ifft as _ifft, rfft as _rfft,
-                           next_fast_len as _next_fast_len)
+    from scipy.fft import next_fast_len as _next_fast_len
 except ImportError:
-    from numpy.fft import fft as _fft, ifft as _ifft, rfft as _rfft
     def _next_fast_len(n):
         return n
+
+# pyfftw with persistent plan cache (kept alive 5 min) is materially faster than
+# scipy.fft across SF7..SF12 once a worker subprocess has warmed its plan cache.
+# Falls back to scipy.fft if pyfftw is unavailable, then numpy.fft as last resort.
+try:
+    import pyfftw
+    pyfftw.config.NUM_THREADS = 1
+    pyfftw.interfaces.cache.enable()
+    pyfftw.interfaces.cache.set_keepalive_time(300.0)
+    from pyfftw.interfaces.scipy_fft import (
+        fft as _fft, ifft as _ifft, rfft as _rfft)
+except ImportError:
+    try:
+        from scipy.fft import fft as _fft, ifft as _ifft, rfft as _rfft
+    except ImportError:
+        from numpy.fft import fft as _fft, ifft as _ifft, rfft as _rfft
 
 
 # ============================================================================
