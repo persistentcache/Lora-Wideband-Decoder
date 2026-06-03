@@ -952,29 +952,68 @@ function renderSdrConfig(box){
       }).catch(()=>{q('#sdrresult').innerHTML='<span style="color:var(--warn)">✗ detect failed</span>';}));};
   }).catch(()=>{box.innerHTML='';});
 }
+// Built-in defaults for the Advanced Options section.  Used by the "Reset to
+// defaults" button and as the canonical reference for everything you can tune.
+// Mirrored on the server (load_settings._defaults in src/web/app.py) — keep in
+// sync if you change either side.
+const ADV_DEFAULTS = {
+  protocols: {meshtastic:true, meshcore:true, lorawan:true, loramesher:true,
+              lora_aprs:true, reticulum:true, disaster_radio:true,
+              ebyte_lora:true, radiohead:true},
+  unknown: false,
+  fingerprint: true,
+  wide_scan: true,
+  tune: {threshold: 0.55, energy_threshold: 12.0, buf_seconds: 16}
+};
+// Tooltip text shared between the live UI and the Reset confirmation.  Long-
+// form on purpose — every advanced option gets a hover description that
+// explains what it does, when to change it, and the trade-off.
+const ADV_TIPS = {
+  meshtastic: "Meshtastic — the dominant consumer LoRa mesh protocol. AES-128 over a fixed channel grid, sync word 0x2B. The built-in public PSK decrypts broadcasts on the default channel; node-to-node direct messages are PKI-encrypted and surface as header-only entries (link visible, content hidden).",
+  meshcore: "MeshCore — newer mesh protocol with Ed25519-signed advertisements and AES channel encryption. Sync word 0x1F. Channel decrypt needs the channel's PSK; ADVERT verification needs no key.",
+  lorawan: "LoRaWAN — long-range IoT WAN protocol. Identified structurally via MHDR + a stable DevAddr with a monotonically-increasing FCnt across ≥2 frames. Payload decrypt would need the device's session keys, which aren't normally available to a passive receiver.",
+  loramesher: "LoRaMesher — academic / hobbyist multi-hop mesh routing protocol. Identified by its routing-header structure.",
+  lora_aprs: "LoRa APRS — ham radio packet relay over LoRa (callsigns, position beacons). Identified by the 0x3c 0xff 0x01 prefix.",
+  reticulum: "Reticulum (RNS) over raw LoRa, typically via RNode. Identified by RNode link-layer framing.",
+  disaster_radio: "disaster.radio — sudomesh's emergency / disaster-recovery mesh. Identified by sudomesh-specific frame structure.",
+  ebyte_lora: "EByte LoRa — fixed-mode P2P broadcasts from E22 / E220 / E32 modules using the xreef Arduino library. Common in low-cost hobby transmitters.",
+  radiohead: "RadioHead RF95 — packet format from the Adafruit / Sparkfun RH_RF95 library. Common in beginner LoRa projects.",
+  unknown: "Surface intact LoRa frames (good CRC) whose sync word doesn't match any enabled protocol. May reveal a new or unsupported protocol. Off by default — when off the decoder also skips them entirely to save compute. Turn on for protocol-research mode.",
+  fingerprint: "Extract per-packet UMOP features (CFO jitter, AM ripple, PLL phase noise, I/Q balance) from the LoRa preamble. Feeds the Mystery Devices panel and per-node device clustering — lets you tell two transmitters apart even when they're sending identical bytes. Costs roughly 10–15% extra decode CPU. Header decode coverage is unchanged.",
+  scan_all: "Detector scans every spreading-factor / bandwidth combination — SF7–SF12 at 62.5/125/250/500 kHz. Catches arbitrary LoRa traffic at the cost of more CPU. Recommended unless you specifically only care about Meshtastic.",
+  scan_presets: "Restrict the detector to the 10 standard Meshtastic preset SF/BW combinations only. Faster, lower false-positive rate, but won't catch LoRaWAN, MeshCore, or other-preset Meshtastic.",
+  threshold: "Schmidl-Cox preamble-lock confidence threshold. The detector measures how 'clean' a chirp autocorrelation looks; only candidates above this score get extracted for full decoding. Higher (e.g. 0.8) = stricter, fewer false positives at the cost of dropping weak real signals. Lower (e.g. 0.4) = catches faint distant signals at the cost of more spurious captures the decoder has to reject. Default 0.55 is balanced for typical use.",
+  energy_threshold: "Energy-gate threshold in dB above the noise floor. The energy gate filters which spectral peaks Schmidl-Cox even looks at — too low and CPU is wasted on noise, too high and weak real signals are filtered out before reaching the decoder. Default 12.0 dB is well-tuned for nearby and mid-range transmitters. Raise (e.g. 18.0) for strong-signal-only lab use. Lower (e.g. 5.0) to chase distant or low-power transmitters.",
+  buf_seconds: "Ring-buffer headroom in seconds. The detector reads from a circular IQ buffer that absorbs bursts faster than per-window processing. Larger = more headroom for traffic bursts (fewer dropped samples on slow hosts), at the cost of RAM (~120 MB per second at 28 Msps). Default 16 works for most hosts. Raise to 32 if you see KEEP-UP WARNINGS or sample drops. Lower to 8 on memory-constrained systems."
+};
 function renderAdvancedConfig(box){
   Promise.all([fetch('/api/settings').then(r=>r.json()),fetch('/api/unknown').then(r=>r.json())]).then(([s,u])=>{
-    const pr=s.protocols||{meshtastic:true,meshcore:true,lorawan:true,loramesher:true,lora_aprs:true,reticulum:true,disaster_radio:true,ebyte_lora:true,radiohead:true};
+    const pr=s.protocols||ADV_DEFAULTS.protocols;
     const unk=!!s.unknown;
-    const cb=(id,on,lbl)=>`<label style="display:flex;gap:8px;align-items:flex-start;margin:5px 0"><input type="checkbox" id="${id}"${on?' checked':''} style="margin-top:3px"> <span>${lbl}</span></label>`;
+    const tune=Object.assign({}, ADV_DEFAULTS.tune, s.tune||{});
+    // Checkbox with hover tooltip on the WHOLE label so users can hover anywhere.
+    const cb=(id,on,lbl,tip)=>`<label title="${esc(tip||'')}" style="display:flex;gap:8px;align-items:flex-start;margin:5px 0;cursor:help"><input type="checkbox" id="${id}"${on?' checked':''} style="margin-top:3px;cursor:pointer"> <span>${lbl}</span></label>`;
+    // Numeric input row with hover tooltip.
+    const num=(id,val,min,max,step,lbl,tip)=>`<label title="${esc(tip)}" style="display:flex;gap:10px;align-items:center;margin:6px 0;cursor:help"><span style="min-width:200px">${lbl}</span><input type="number" id="${id}" value="${val}" min="${min}" max="${max}" step="${step}" style="width:96px"><span class="muted" style="font-size:11px">range ${min}–${max}</span></label>`;
     box.innerHTML=`<details style="max-width:920px;margin-top:20px;border:1px solid var(--line);border-radius:6px;padding:6px 12px">
       <summary style="cursor:pointer;font-weight:600;font-size:15px;padding:4px 0">Advanced Options</summary>
       <div style="padding:8px 2px 4px">
+        <p class="muted" style="font-size:11px;margin:2px 0 12px;line-height:1.5">Hover any option for a detailed explanation. Most users never need to touch these — the defaults are tuned for typical use. If you mess something up, use <b>Reset to defaults</b> at the bottom of this section.</p>
         <h4 style="margin:10px 0 2px">Protocols</h4>
         <p class="muted" style="font-size:11px;margin:0 0 4px;line-height:1.5">Disable protocols you don't need. The decoder skips them — and when <b>Unknown</b> is off it also skips decoding frames whose sync word can't belong to any enabled protocol, saving compute. Applies on next Start.</p>
-        ${cb('pmesh',pr.meshtastic!==false,'Meshtastic')}
-        ${cb('pmc',pr.meshcore!==false,'MeshCore')}
-        ${cb('plw',pr.lorawan!==false,'LoRaWAN')}
-        ${cb('plm',pr.loramesher!==false,'LoRaMesher')}
-        ${cb('paprs',pr.lora_aprs!==false,'LoRa APRS <span class="muted" style="font-size:11px">(ham radio, 0x3c 0xff 0x01 prefix)</span>')}
-        ${cb('prns',pr.reticulum!==false,'Reticulum / RNode <span class="muted" style="font-size:11px">(RNS over raw LoRa)</span>')}
-        ${cb('pdr',pr.disaster_radio!==false,'disaster.radio <span class="muted" style="font-size:11px">(sudomesh recovery mesh)</span>')}
-        ${cb('peb',pr.ebyte_lora!==false,'EByte LoRa <span class="muted" style="font-size:11px">(E22/E220/E32 fixed-mode broadcast — xreef Arduino library)</span>')}
-        ${cb('prh',pr.radiohead!==false,'RadioHead RF95 <span class="muted" style="font-size:11px">(Adafruit/Sparkfun starter library)</span>')}
+        ${cb('pmesh',pr.meshtastic!==false,'Meshtastic',ADV_TIPS.meshtastic)}
+        ${cb('pmc',pr.meshcore!==false,'MeshCore',ADV_TIPS.meshcore)}
+        ${cb('plw',pr.lorawan!==false,'LoRaWAN',ADV_TIPS.lorawan)}
+        ${cb('plm',pr.loramesher!==false,'LoRaMesher',ADV_TIPS.loramesher)}
+        ${cb('paprs',pr.lora_aprs!==false,'LoRa APRS <span class="muted" style="font-size:11px">(ham radio, 0x3c 0xff 0x01 prefix)</span>',ADV_TIPS.lora_aprs)}
+        ${cb('prns',pr.reticulum!==false,'Reticulum / RNode <span class="muted" style="font-size:11px">(RNS over raw LoRa)</span>',ADV_TIPS.reticulum)}
+        ${cb('pdr',pr.disaster_radio!==false,'disaster.radio <span class="muted" style="font-size:11px">(sudomesh recovery mesh)</span>',ADV_TIPS.disaster_radio)}
+        ${cb('peb',pr.ebyte_lora!==false,'EByte LoRa <span class="muted" style="font-size:11px">(E22/E220/E32 fixed-mode broadcast — xreef Arduino library)</span>',ADV_TIPS.ebyte_lora)}
+        ${cb('prh',pr.radiohead!==false,'RadioHead RF95 <span class="muted" style="font-size:11px">(Adafruit/Sparkfun starter library)</span>',ADV_TIPS.radiohead)}
         <h4 style="margin:18px 0 2px">Unknown protocols</h4>
-        ${cb('unk',unk,'<b>Unknown (Off / On)</b><br><span class="muted" style="font-size:11px">Surface intact LoRa frames (good CRC) that match no enabled protocol — a possible new/unsupported protocol. Off by default; off also lets the decoder skip them entirely to save compute.</span>')}
+        ${cb('unk',unk,'<b>Unknown (Off / On)</b><br><span class="muted" style="font-size:11px">Surface intact LoRa frames (good CRC) that match no enabled protocol — a possible new/unsupported protocol. Off by default; off also lets the decoder skip them entirely to save compute.</span>',ADV_TIPS.unknown)}
         <h4 style="margin:18px 0 2px">RF hardware fingerprinting</h4>
-        ${cb('fp',s.fingerprint!==false,'<b>Fingerprint TX hardware (On / Off)</b><br><span class="muted" style="font-size:11px">Extract per-packet UMOP features (CFO jitter, AM ripple, PLL phase, I/Q balance) from the LoRa preamble. Feeds the <b>Mystery Devices</b> panel and per-node device clustering. On by default. Disable on low-core hosts to save ~10–15 % decode CPU — header decode coverage is unchanged.</span>')}
+        ${cb('fp',s.fingerprint!==false,'<b>Fingerprint TX hardware (On / Off)</b><br><span class="muted" style="font-size:11px">Extract per-packet UMOP features (CFO jitter, AM ripple, PLL phase, I/Q balance) from the LoRa preamble. Feeds the <b>Mystery Devices</b> panel and per-node device clustering. On by default. Disable on low-core hosts to save ~10–15 % decode CPU — header decode coverage is unchanged.</span>',ADV_TIPS.fingerprint)}
         <h4 style="margin:18px 0 2px">Unknown-protocol report</h4>
         <p class="muted" style="font-size:11px;margin:0 0 4px">Raw bytes + PHY params of captured unknown frames — hand to a developer to add support. Needs Unknown on.</p>
         <div style="display:flex;gap:8px;align-items:center">
@@ -984,11 +1023,20 @@ function renderAdvancedConfig(box){
         </div>
         <div style="display:flex;gap:8px;align-items:center;margin:18px 0 0">
           <span class="muted">LoRa SF/BW scan:</span>
-          <select id="scanmode">
-            <option value="all"${s.wide_scan?' selected':''}>All SF/BW combinations (recommended)</option>
-            <option value="presets"${!s.wide_scan?' selected':''}>Meshtastic presets only</option>
+          <select id="scanmode" title="${esc(s.wide_scan ? ADV_TIPS.scan_all : ADV_TIPS.scan_presets)}" style="cursor:help">
+            <option value="all"${s.wide_scan?' selected':''} title="${esc(ADV_TIPS.scan_all)}">All SF/BW combinations (recommended)</option>
+            <option value="presets"${!s.wide_scan?' selected':''} title="${esc(ADV_TIPS.scan_presets)}">Meshtastic presets only</option>
           </select>
           <span class="muted" style="font-size:11px">applies on next Start</span>
+        </div>
+        <h4 style="margin:18px 0 2px">Pipeline tuning</h4>
+        <p class="muted" style="font-size:11px;margin:0 0 6px;line-height:1.5">Detector sensitivity and buffer size. The defaults are tuned for typical Meshtastic / LoRaWAN traffic on a multi-core host. Hover each row for when to change it. Applies on next Start.</p>
+        ${num('tunethresh',tune.threshold,0.1,1.0,0.05,'Schmidl-Cox threshold',ADV_TIPS.threshold)}
+        ${num('tuneeth',tune.energy_threshold,0,40,0.5,'Energy threshold (dB)',ADV_TIPS.energy_threshold)}
+        ${num('tunebuf',tune.buf_seconds,2,128,1,'Buffer headroom (s)',ADV_TIPS.buf_seconds)}
+        <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--line);display:flex;gap:10px;align-items:center">
+          <button id="advreset" title="Restore every option in this Advanced Options section to its built-in default. Does NOT touch SDR/Radio or Channel keys.">Reset Advanced Options to defaults</button>
+          <span class="muted" style="font-size:11px">Restores everything in this panel (protocols, unknown, fingerprint, scan mode, tuning). Doesn't affect SDR/Radio or Channel keys.</span>
         </div>
       </div>
     </details>`;
@@ -1007,6 +1055,16 @@ function renderAdvancedConfig(box){
     q('#scanmode').onchange=e=>post({wide_scan:e.target.value==='all'});
     q('#unkdl').onclick=()=>{window.location='/api/unknown?download=1';};
     q('#unkclr').onclick=()=>{if(confirm('Clear the unknown-protocol report?'))fetch('/api/unknown',{method:'DELETE'}).then(()=>renderAdvancedConfig(box));};
+    const saveTune=()=>post({tune:{
+      threshold:parseFloat(q('#tunethresh').value),
+      energy_threshold:parseFloat(q('#tuneeth').value),
+      buf_seconds:parseInt(q('#tunebuf').value,10)
+    }});
+    ['#tunethresh','#tuneeth','#tunebuf'].forEach(s=>q(s).onchange=saveTune);
+    q('#advreset').onclick=()=>{
+      if(!confirm('Reset every Advanced Option in this panel (protocols, unknown, fingerprint, scan mode, tuning) to defaults? Channel keys and SDR/Radio settings are NOT touched.'))return;
+      post(ADV_DEFAULTS).then(()=>renderAdvancedConfig(box));
+    };
   }).catch(()=>{});
 }
 function renderAlertsConfig(box){

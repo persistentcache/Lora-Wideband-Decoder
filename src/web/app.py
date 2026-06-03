@@ -70,7 +70,11 @@ def load_settings():
                  'unknown': False,          # master: surface unidentified protocols (default OFF)
                  'fingerprint': True,       # RF hardware fingerprinting (Mystery Devices + clustering)
                  'sdr': 'bladerf',          # selected SDR profile (persists across sessions)
-                 'radio': {}}               # web overrides of lora.toml [radio] (rate/bw/center/gain)
+                 'radio': {},               # web overrides of lora.toml [radio] (rate/bw/center/gain)
+                 # Pipeline tuning — overrides lora.toml [detect] when set.  Defaults
+                 # match the well-tuned values; users only edit these to chase weak
+                 # signals, suppress false positives in noisy RF, or absorb bursts.
+                 'tune': {'threshold': 0.55, 'energy_threshold': 12.0, 'buf_seconds': 16}}
     try:
         with open(SETTINGS_PATH) as f:
             return {**_defaults, **json.load(f)}
@@ -1598,10 +1602,16 @@ def _build_pipeline_cmd():
                f'xfers=64; rx start; rx wait"')
         fmt = r.get('format', 'sc16')
     detector_py = os.path.join(_SRC, 'detector.py')
+    # Pipeline-tuning overrides from the web UI's Config tab.  Fall back on the
+    # lora.toml [detect] values for anything the user didn't touch.
+    _tune = SETTINGS.get('tune', {}) or {}
+    _thresh = float(_tune.get('threshold', d['threshold']))
+    _eth = float(_tune.get('energy_threshold', d['energy_threshold']))
+    _bufs = int(_tune.get('buf_seconds', d['buf_seconds']))
     gate = (f'python3 {shlex.quote(detector_py)} -r {rate} -b {bw} -c {r["center_mhz"]} '
-            f'-t {fmt} --threshold {d["threshold"]} '
-            f'--overlap {d["overlap"]} --energy-threshold {d["energy_threshold"]} '
-            f'--detect-workers {d["detect_workers"]} --buf-seconds {d["buf_seconds"]} '
+            f'-t {fmt} --threshold {_thresh} '
+            f'--overlap {d["overlap"]} --energy-threshold {_eth} '
+            f'--detect-workers {d["detect_workers"]} --buf-seconds {_bufs} '
             f'--decode --export-iq {shlex.quote(dec["export_dir"])} -d 1')
     return cap + ' | ' + gate
 
@@ -1921,8 +1931,25 @@ def api_settings():
             if sdr_profiles is not None:
                 rad = sdr_profiles.clamp_radio(SETTINGS.get('sdr', 'bladerf'), rad)
             SETTINGS['radio'] = rad
+        if 'tune' in d and isinstance(d['tune'], dict):
+            tune = dict(SETTINGS.get('tune') or {})
+            # Bounds match the CLI flag ranges and keep the pipeline numerically
+            # sane — out-of-range values get clamped, not rejected.
+            _bounds = {'threshold': (0.1, 1.0, 0.55),
+                       'energy_threshold': (0.0, 40.0, 12.0),
+                       'buf_seconds': (2, 128, 16)}
+            for k, (lo, hi, _def) in _bounds.items():
+                if k in d['tune']:
+                    try:
+                        v = float(d['tune'][k])
+                        if v < lo: v = lo
+                        if v > hi: v = hi
+                        tune[k] = int(v) if k == 'buf_seconds' else v
+                    except (TypeError, ValueError):
+                        pass
+            SETTINGS['tune'] = tune
         if any(k in d for k in ('autosave', 'waterfall', 'unknown', 'fingerprint',
-                                'protocols', 'wide_scan', 'sdr', 'radio')):
+                                'protocols', 'wide_scan', 'sdr', 'radio', 'tune')):
             save_settings(SETTINGS)
             _apply_waterfall_flag()
             _apply_unknown_flag()
