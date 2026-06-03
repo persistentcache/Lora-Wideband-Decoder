@@ -1288,14 +1288,20 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
     _nc = len(iq) // _NB_CHUNK
     _fftw = int(os.environ.get('LORA_FFT_WORKERS', '-1'))  # -1 = all cores
     if _nc > 0:
-        _iq_2d = iq[: _nc * _NB_CHUNK].reshape(_nc, _NB_CHUNK)
         try:
-            _ffts = _fft(_iq_2d, axis=1, workers=_fftw)
-        except TypeError:
-            # numpy.fft fallback: no `workers`, no batched FFT speedup
-            _ffts = _fft(_iq_2d, axis=1)
-        _ffts = np.fft.fftshift(_ffts, axes=1)
-        _nb_fft_cache = [_ffts[i] for i in range(_nc)]
+            _iq_2d = iq[: _nc * _NB_CHUNK].reshape(_nc, _NB_CHUNK)
+            try:
+                _ffts = _fft(_iq_2d, axis=1, workers=_fftw)
+            except TypeError:
+                # numpy.fft fallback: no `workers`, no batched FFT speedup
+                _ffts = _fft(_iq_2d, axis=1)
+            _ffts = np.fft.fftshift(_ffts, axes=1)
+            _nb_fft_cache = [_ffts[i] for i in range(_nc)]
+        except MemoryError:
+            # Heap-fragmented allocation failure (seen on 28Msps + buf-seconds=16
+            # ring buffers). Empty cache → per-peak FFTs computed on-demand;
+            # slower but correct, and we don't crash the pipeline.
+            _nb_fft_cache = []
     else:
         _nb_fft_cache = []
 
@@ -2655,7 +2661,7 @@ while True:
             if worker is None or worker.poll() is not None:
                 worker = self._start_worker()
                 if worker is None:
-                    src_queue.task_done()
+                    self._queue.task_done()
                     continue
 
             with self._lock:
