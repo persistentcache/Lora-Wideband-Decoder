@@ -24,22 +24,19 @@ Usage:
 import sys, os, time, argparse, numpy as np
 import threading, queue, io, subprocess, fcntl
 from config import BW_LIST
-# FFT library is core-count adaptive — measured on actual hardware, not guessed:
+# FFT library is core-count adaptive — measured on actual hardware:
 #   Pi 4 (4 cores, NEON FFTW):   pyfftw T=1 wins 4.40 ms vs scipy w=1 4.76 ms
 #                                 (scipy w=-1 is 6.58 ms — thread fan-out hurts)
 #   Laptop (24 cores, Intel):    scipy w=-1 wins ~3.4 ms vs pyfftw T=2 ~5.0 ms
 #                                 (per-call pyfftw dispatch costs more than
 #                                  scipy's pocketfft saves at this batch size)
-# Override via LORA_FFT_LIB env (set to "pyfftw" or "scipy" to force).
 try:
     from scipy.fft import next_fast_len as _next_fast_len
 except ImportError:
     def _next_fast_len(n):
         return n
 
-_FFT_LIB_CHOICE = (os.environ.get('LORA_FFT_LIB') or '').strip().lower()
-if _FFT_LIB_CHOICE not in ('pyfftw', 'scipy'):
-    _FFT_LIB_CHOICE = 'pyfftw' if (os.cpu_count() or 1) <= 4 else 'scipy'
+_FFT_LIB_CHOICE = 'pyfftw' if (os.cpu_count() or 1) <= 4 else 'scipy'
 
 if _FFT_LIB_CHOICE == 'pyfftw':
     try:
