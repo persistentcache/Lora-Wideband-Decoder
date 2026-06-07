@@ -24,62 +24,75 @@ Usage:
 import sys, os, time, argparse, numpy as np
 import threading, queue, io, subprocess, fcntl
 from config import BW_LIST
-# Prefer pyfftw — measured ~1.5x faster than scipy.fft on ARM (Pi 4 / NEON FFTW)
-# for the welch_psd workload (50 segs × 4096-pt complex64).  Persistent plan
-# cache + interfaces.scipy_fft API means callers don't change.  Falls back to
-# scipy.fft if pyfftw isn't installed.  scipy.fft is still imported for the
-# scalar utility next_fast_len.
+# FFT library is core-count adaptive — measured on actual hardware, not guessed:
+#   Pi 4 (4 cores, NEON FFTW):   pyfftw T=1 wins 4.40 ms vs scipy w=1 4.76 ms
+#                                 (scipy w=-1 is 6.58 ms — thread fan-out hurts)
+#   Laptop (24 cores, Intel):    scipy w=-1 wins ~3.4 ms vs pyfftw T=2 ~5.0 ms
+#                                 (per-call pyfftw dispatch costs more than
+#                                  scipy's pocketfft saves at this batch size)
+# Override via LORA_FFT_LIB env (set to "pyfftw" or "scipy" to force).
 try:
     from scipy.fft import next_fast_len as _next_fast_len
 except ImportError:
     def _next_fast_len(n):
         return n
-try:
-    import pyfftw
-    pyfftw.config.NUM_THREADS = 1   # per-call threading hurts on small batches
-    pyfftw.interfaces.cache.enable()
-    pyfftw.interfaces.cache.set_keepalive_time(300.0)
-    from pyfftw.interfaces.scipy_fft import fft as _fft, ifft as _ifft
 
-    # Persist FFTW wisdom across runs.  Same file decoder.py uses so the gate
-    # and decode workers share a single converging plan set.  Atomic rename
-    # makes concurrent writes safe (last writer wins, no corruption).
-    import atexit as _atexit
-    import pickle as _pickle
-    import tempfile as _tempfile
-    _WISDOM_PATH = os.path.expanduser('~/.lora_ml-fftw-wisdom.pkl')
+_FFT_LIB_CHOICE = (os.environ.get('LORA_FFT_LIB') or '').strip().lower()
+if _FFT_LIB_CHOICE not in ('pyfftw', 'scipy'):
+    _FFT_LIB_CHOICE = 'pyfftw' if (os.cpu_count() or 1) <= 4 else 'scipy'
 
-    def _load_wisdom():
-        try:
-            with open(_WISDOM_PATH, 'rb') as f:
-                pyfftw.import_wisdom(_pickle.load(f))
-        except (FileNotFoundError, EOFError, _pickle.UnpicklingError, OSError):
-            pass
+if _FFT_LIB_CHOICE == 'pyfftw':
+    try:
+        import pyfftw
+        pyfftw.config.NUM_THREADS = 1   # low-core: extra threads net-negative
+        pyfftw.interfaces.cache.enable()
+        pyfftw.interfaces.cache.set_keepalive_time(300.0)
+        from pyfftw.interfaces.scipy_fft import fft as _fft, ifft as _ifft
+        _FFT_WORKERS = 1
 
-    def _save_wisdom():
-        try:
+        # Persist FFTW wisdom across runs.  Same file decoder.py uses so the
+        # gate and decode workers share a single converging plan set.  Atomic
+        # rename makes concurrent writes safe (last writer wins).
+        import atexit as _atexit
+        import pickle as _pickle
+        import tempfile as _tempfile
+        _WISDOM_PATH = os.path.expanduser('~/.lora_ml-fftw-wisdom.pkl')
+
+        def _load_wisdom():
             try:
                 with open(_WISDOM_PATH, 'rb') as f:
                     pyfftw.import_wisdom(_pickle.load(f))
             except (FileNotFoundError, EOFError, _pickle.UnpicklingError, OSError):
                 pass
-            d = os.path.dirname(_WISDOM_PATH) or '.'
-            with _tempfile.NamedTemporaryFile(
-                    mode='wb', dir=d, delete=False,
-                    prefix='.lora_ml-wisdom-') as f:
-                _pickle.dump(pyfftw.export_wisdom(), f)
-                _tmp = f.name
-            os.replace(_tmp, _WISDOM_PATH)
-        except Exception:
-            pass
 
-    _load_wisdom()
-    _atexit.register(_save_wisdom)
-except ImportError:
+        def _save_wisdom():
+            try:
+                try:
+                    with open(_WISDOM_PATH, 'rb') as f:
+                        pyfftw.import_wisdom(_pickle.load(f))
+                except (FileNotFoundError, EOFError, _pickle.UnpicklingError, OSError):
+                    pass
+                d = os.path.dirname(_WISDOM_PATH) or '.'
+                with _tempfile.NamedTemporaryFile(
+                        mode='wb', dir=d, delete=False,
+                        prefix='.lora_ml-wisdom-') as f:
+                    _pickle.dump(pyfftw.export_wisdom(), f)
+                    _tmp = f.name
+                os.replace(_tmp, _WISDOM_PATH)
+            except Exception:
+                pass
+
+        _load_wisdom()
+        _atexit.register(_save_wisdom)
+    except ImportError:
+        _FFT_LIB_CHOICE = 'scipy'
+
+if _FFT_LIB_CHOICE == 'scipy':
     try:
         from scipy.fft import fft as _fft, ifft as _ifft
     except ImportError:
         from numpy.fft import fft as _fft, ifft as _ifft
+    _FFT_WORKERS = -1   # high-core hosts: scipy.fft fans out across cores well
 
 MAX_ENERGY_PEAKS = 10
 # Spur rejection: drop peaks more than N dB below the strongest peak.  Only
@@ -304,12 +317,11 @@ def welch_psd(iq, nfft=4096, n_avg=64, also_max=False):
     if n_segs > 0:
         segs -= segs.mean()
     segs *= win
-    # workers=1: pyfftw's per-call threading is net-negative for small batches
-    # (Pi 4 measured: workers=-1 = 6.6ms vs workers=1 = 4.4ms with scipy.fft).
-    # pyfftw with NUM_THREADS=1 (set at import time) and explicit workers=1
-    # consistently wins across ARM (Pi 4) and x86 for this 50×4096 batch.
+    # _FFT_WORKERS picked at import time to match the chosen FFT lib's sweet
+    # spot for this host: pyfftw=1 on low-core (per-call fan-out hurts),
+    # scipy=-1 on high-core (pocketfft scales).
     try:
-        F = _fft(segs, axis=1, workers=1)
+        F = _fft(segs, axis=1, workers=_FFT_WORKERS)
     except TypeError:
         F = _fft(segs, axis=1)
     F = np.fft.fftshift(F, axes=1)
