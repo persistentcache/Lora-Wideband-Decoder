@@ -30,6 +30,7 @@ SDR/Radio → Detect** finds it automatically.
   waterfall in a local Flask web UI.
 - Keeps up with real-world Meshtastic and LoRaWAN traffic in real time
   on a multi-core host at 28 Msps wideband.
+- Will attempt to give you as much information as possible for LORA protocols that has non-typical byte ordering to allow for custom protocol implementation.
 
 ## Supported SDRs
 
