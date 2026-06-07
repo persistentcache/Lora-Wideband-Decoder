@@ -210,6 +210,21 @@ class StreamBuffer:
 
 # ---- Energy detection ----
 
+# welch_psd runs ~21x per main-loop iteration (1 long pass + ~20 short multireso
+# slices) so caching the Hanning window saves that many small alloc+computes per
+# window.  The returned array is read-only by convention — welch_psd only does
+# `segs *= win` which mutates segs, never win.
+_HANNING_C64_CACHE = {}
+
+
+def _hanning_c64(nfft):
+    w = _HANNING_C64_CACHE.get(nfft)
+    if w is None:
+        w = np.hanning(nfft).astype(np.complex64)
+        _HANNING_C64_CACHE[nfft] = w
+    return w
+
+
 def welch_psd(iq, nfft=4096, n_avg=64, also_max=False):
     n = len(iq)
     step = max(nfft, n // n_avg)
@@ -217,7 +232,7 @@ def welch_psd(iq, nfft=4096, n_avg=64, also_max=False):
     if n_segs <= 0:
         z = np.zeros(nfft, dtype=np.float64)
         return (z, z) if also_max else z
-    win = np.hanning(nfft).astype(np.complex64)
+    win = _hanning_c64(nfft)
     # Vectorised: stack the segments and FFT them in one batched call so
     # scipy.fft's pocketfft can use multiple threads (workers=-1).
     starts = np.arange(n_segs) * step

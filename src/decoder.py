@@ -30,6 +30,43 @@ try:
     pyfftw.interfaces.cache.set_keepalive_time(300.0)
     from pyfftw.interfaces.scipy_fft import (
         fft as _fft, ifft as _ifft, rfft as _rfft)
+
+    # Persist FFTW wisdom across runs so decoder workers don't re-plan from
+    # scratch on every restart (slow on low-core hosts).  Each worker subprocess
+    # loads on import and saves on exit, merging with whatever another worker
+    # may have written since we started so the file converges to the union of
+    # plans, not a last-writer-wins overwrite.
+    import atexit as _atexit
+    import pickle as _pickle
+    import tempfile as _tempfile
+    _WISDOM_PATH = os.path.expanduser('~/.lora_ml-fftw-wisdom.pkl')
+
+    def _load_wisdom():
+        try:
+            with open(_WISDOM_PATH, 'rb') as f:
+                pyfftw.import_wisdom(_pickle.load(f))
+        except (FileNotFoundError, EOFError, _pickle.UnpicklingError, OSError):
+            pass
+
+    def _save_wisdom():
+        try:
+            try:
+                with open(_WISDOM_PATH, 'rb') as f:
+                    pyfftw.import_wisdom(_pickle.load(f))
+            except (FileNotFoundError, EOFError, _pickle.UnpicklingError, OSError):
+                pass
+            d = os.path.dirname(_WISDOM_PATH) or '.'
+            with _tempfile.NamedTemporaryFile(
+                    mode='wb', dir=d, delete=False,
+                    prefix='.lora_ml-wisdom-') as f:
+                _pickle.dump(pyfftw.export_wisdom(), f)
+                _tmp = f.name
+            os.replace(_tmp, _WISDOM_PATH)
+        except Exception:
+            pass
+
+    _load_wisdom()
+    _atexit.register(_save_wisdom)
 except ImportError:
     try:
         from scipy.fft import fft as _fft, ifft as _ifft, rfft as _rfft
