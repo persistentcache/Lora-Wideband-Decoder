@@ -3807,10 +3807,16 @@ def process_file(fpath, relay_after=None, relay_before=None,
     # SF/BW-agnostic: scales with signal bandwidth and N.
     if len(iq) > N * dec * 4:
         _burst_len = N * dec * 4   # ~4 symbols at narrowband rate
-        _pwrs = np.array([
-            float(np.mean(np.abs(iq[i:i+_burst_len])**2))
-            for i in range(0, len(iq) - _burst_len, _burst_len)
-        ])
+        # Vectorised: reshape into a (n_bursts, _burst_len) view and reduce
+        # in one numpy call.  Per-Pi-profile, the per-iter np.mean dispatch was
+        # the dominant decoder cost; the result is identical.
+        # Match range(0, len(iq) - _burst_len, _burst_len): len = max(0, (len(iq)-1)//_burst_len).
+        _n_bursts = max(0, (len(iq) - 1) // _burst_len)
+        if _n_bursts > 0:
+            _chunks = np.abs(iq[:_n_bursts * _burst_len]).reshape(_n_bursts, _burst_len)
+            _pwrs = (_chunks ** 2).mean(axis=1)
+        else:
+            _pwrs = np.empty(0, dtype=np.float64)
         if len(_pwrs) > 2:
             _burst_idx = int(np.argmax(_pwrs))
             _burst = iq[_burst_idx * _burst_len:(_burst_idx + 1) * _burst_len]
@@ -3842,12 +3848,13 @@ def process_file(fpath, relay_after=None, relay_before=None,
         if n_win_wb >= 6:
             win_sz = min(6, n_win_wb)
             # sliding-window sum of |autocorr| / power — normalized Schmidl-Cox
-            mag_wb = np.abs(
-                np.array([np.mean(auto_wb[i * lag_wb:(i + 1) * lag_wb])
-                          for i in range(n_win_wb)]))
-            pwr_wb = np.array([np.mean(np.abs(iq[lag_wb + i * lag_wb:
-                                                   lag_wb + (i + 1) * lag_wb]) ** 2)
-                               for i in range(n_win_wb)])
+            # Vectorised: reshape into (n_win_wb, lag_wb) and reduce once.
+            # Identical math to the per-i list comprehension; cuts ~13k np.mean
+            # dispatches per decoder attempt (Pi profile: 88% of total mean cost).
+            _aw = auto_wb[:n_win_wb * lag_wb].reshape(n_win_wb, lag_wb)
+            mag_wb = np.abs(_aw.mean(axis=1))
+            _iw = iq[lag_wb:lag_wb + n_win_wb * lag_wb].reshape(n_win_wb, lag_wb)
+            pwr_wb = (np.abs(_iw) ** 2).mean(axis=1)
             mag_wb_norm = np.where(pwr_wb > 1e-12, mag_wb / (pwr_wb + 1e-30), 0.0)
             cs = np.cumsum(mag_wb_norm)
             sums = cs[win_sz - 1:] - np.concatenate(([0.0], cs[:-win_sz]))
