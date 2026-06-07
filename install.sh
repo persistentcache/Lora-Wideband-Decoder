@@ -29,7 +29,7 @@ fi
 echo "==> Installing system packages (sudo required) ..."
 sudo apt-get update
 # Essentials — abort if these fail.
-sudo apt-get install -y python3 python3-pip build-essential libusb-1.0-0 \
+sudo apt-get install -y python3 python3-pip python3-dev build-essential libusb-1.0-0 \
     libfftw3-dev soapysdr-tools python3-soapysdr
 
 # SDR device modules + native tools.  Any package not present in this distro's
