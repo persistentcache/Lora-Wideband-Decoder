@@ -107,28 +107,6 @@ SDR_PROFILES = {
         limits={'rate_hz': (200000, 56000000),
                 'bandwidth_hz': (200000, 56000000),
                 'center_mhz': (70.0, 6000.0)}),
-    # ---- Epiq Solutions SideKiq — native SDK path via rx_samples prebuilt binary ----
-    # Card 0 is locked by the GW_MC process; this profile always targets card 1.
-    # rx_samples emits 32-bit LE words with I in the upper halfword, Q in the lower
-    # halfword — sidekiq_rx.py swaps them to produce standard sc16 [I,Q] output.
-    'sidekiq': {
-        'label': 'Epiq SideKiq (card 1)',
-        'bin': 'python3',
-        'format': 'sc16',
-        'tested': False,
-        'agc_ok': True,
-        'default_gain': 50,
-        'note': 'Epiq SideKiq mPCIe via libsidekiq rx_samples. Card 1 only (card 0 held by GW_MC). AGC when no gain set; manual gain in dB (0-76).',
-        'limits': {'rate_hz': (1_000_000, 50_000_000),
-                   'bandwidth_hz': (1_000_000, 50_000_000),
-                   'center_mhz': (300.0, 3800.0)},
-        'capture': '{bin} {sidekiq_rx} -f {freq_hz} -s {rate} -b {bw} {gain_cmd} -c 1',
-        'gain_auto_cmd': '',
-        'gain_manual_cmd': '-g {gain}',
-        'probe': 'ls /ro/home/sidekiq/sidekiq_sdk_current/prebuilt_apps/x86_64.gcc/rx_samples',
-        'serial_re': r'(.+)',
-        'kill_pat': 'sidekiq_rx.py',
-    },
     # ---- Generic SoapySDR — anything not named above (LimeSDR/USRP/Pluto/…) ----
     'soapy': {
         'label': 'SoapySDR — other device',
@@ -212,11 +190,10 @@ def build_capture(sdr, freq_hz, rate, bw, gain='auto', soapy_driver='hackrf'):
         gain = ui['default_gain']
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
     soapy_rx = os.path.join(scripts_dir, 'soapy_rx.py')
-    sidekiq_rx = os.path.join(scripts_dir, 'sidekiq_rx.py')
     return prof['capture'].format(
         bin=_which(prof['bin']), freq_hz=int(freq_hz), freq_mhz=freq_hz / 1e6,
         rate=int(rate), bw=int(bw), gain_cmd=_gain_clause(prof, gain),
-        soapy_driver=drv, soapy_rx=soapy_rx, sidekiq_rx=sidekiq_rx)
+        soapy_driver=drv, soapy_rx=soapy_rx)
 
 
 def limits_of(sdr):

@@ -39,8 +39,8 @@ Two capture paths, picked automatically per device:
   that reliably sustains 28 Msps; SoapyBladeRF can't open a stream at that
   rate. Recommended SDR for the full bandwidth.
 - **Every other device** — HackRF, RTL-SDR, LimeSDR, USRP, PlutoSDR, Airspy,
-  Sidekiq, and anything else with a SoapySDR module — streams through
-  `src/soapy_rx.py`, which emits raw CS16 IQ to stdout for the detector.
+  and anything else with a SoapySDR module — streams through `src/soapy_rx.py`,
+  which emits raw CS16 IQ to stdout for the detector.
 
 Named profiles live in `src/sdr_profiles.py`.
 
@@ -205,7 +205,6 @@ lora_ml/
 │   ├── detect_pool.py     # multiprocess detection pool
 │   ├── config.py / lora_config.py / sdr_profiles.py
 │   ├── soapy_rx.py        # SoapySDR → CS16 IQ on stdout
-│   ├── sidekiq_rx.py      # Sidekiq native streamer
 │   └── web/
 │       ├── app.py         # Flask web UI implementation
 │       └── templates/
