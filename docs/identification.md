@@ -1,28 +1,29 @@
 # Identification & protocols
 
-## Confidence tiers
+The receiver only labels a frame with a protocol name when it has
+evidence. There are three labels you'll see:
 
-The receiver names a protocol only when it has discriminating evidence:
-
-| Tier | Meaning |
-|---|---|
-| **verified** | cryptographic proof — Meshtastic AES decrypt, MeshCore ADVERT Ed25519 signature, or MeshCore public-channel decrypt + MAC |
-| **confirmed** | behavioral proof — LoRaWAN DevAddr with monotonic FCnt over ≥2 frames, or a MeshCore frame routed through ≥2 verified nodes |
-| **unknown + hint** | structurally resembles a protocol but unconfirmed — shown honestly, never claimed |
+- `verified` means cryptographic proof: a Meshtastic AES decrypt, a
+  MeshCore ADVERT with a valid Ed25519 signature, or a MeshCore
+  public-channel decrypt with passing MAC.
+- `confirmed` means behavioral proof. A LoRaWAN DevAddr with FCnt
+  going up across two or more frames, or a MeshCore frame that's been
+  routed through two or more nodes you've already verified.
+- `unknown + hint` means it looks like a protocol structurally but
+  nothing's been proven, so the hint is shown for what it is.
 
 Meshtastic broadcasts on the public default channel decrypt with the
-built-in PSK. Direct messages are PKI-encrypted, so they surface as
-header-only entries — the link is visible, the payload is not.
+built-in PSK. Direct messages use PKI, so all you see for those is the
+header — the link exists, but you can't read the payload.
 
 ## Channel keys
 
-Manage decryption keys in the web UI's **Config → Channel keys** tab.
-The public defaults for Meshtastic (`AQ==`) and MeshCore (`8b33…`) are
-built in and value-locked. Add custom per-protocol keys as needed.
-LoRaWAN doesn't need a key — identification is structural and
-behavioral.
+The web UI has a **Config → Channel keys** tab. The public defaults
+for Meshtastic (`AQ==`) and MeshCore (`8b33…`) are built in. Add your
+own keys there if you have them. LoRaWAN doesn't take a key at all —
+identification is structural and behavioral.
 
-## Meshtastic preset reference
+## Meshtastic presets
 
 | Preset | SF | BW | CR |   | Preset | SF | BW | CR |
 |---|---|---|---|---|---|---|---|---|
