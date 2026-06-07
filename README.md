@@ -71,4 +71,6 @@ runs fine but falls back to coded defaults from `src/lora_config.py`.
 
 ## License
 
-MIT. See `LICENSE`.
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0).
+Free for personal, research, educational, and other noncommercial use.
+Not for commercial use or resale. See `LICENSE`.
