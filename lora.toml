@@ -1,4 +1,4 @@
-# LoRa wideband receiver — central config.
+# LORA Wideband Decoder — central config.
 # Avoids passing long flag strings every run.  lora_web.py reads this to launch
 # the pipeline; lora_detect.py can load it with `--config lora.toml` (explicit
 # CLI flags still override).  All keys are optional; sane defaults apply.
