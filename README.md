@@ -64,6 +64,8 @@ runs fine but falls back to coded defaults from `src/lora_config.py`.
   pipe examples.
 - [Performance & tuning](docs/performance.md) — sample drops, CPU
   affinity, throughput knobs, `lora.toml` reference.
+- [Environment-variable overrides](docs/env-overrides.md) — optional
+  runtime knobs that override `lora.toml`.
 - [Security & deployment](docs/security.md) — what to expose, what to
   isolate, what not to do.
 

@@ -51,7 +51,6 @@ lora_ml/
 ├── LICENSE
 ├── install.sh
 ├── lora.toml          # all configuration (radio / detect / decode / web)
-├── .env.example       # environment-variable overrides
 ├── requirements.txt
 ├── run/               # what you run
 │   ├── web.py            # start the web UI
