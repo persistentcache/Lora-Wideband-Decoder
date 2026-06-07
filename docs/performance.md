@@ -46,7 +46,7 @@ Settings live in `lora.toml [detect]`; most are also CLI flags.
 ## Repo layout
 
 ```
-lora_ml/
+Lora-Wideband-Decoder/
 ├── README.md, LICENSE, install.sh, requirements.txt
 ├── lora.toml          # all configuration
 ├── run/
