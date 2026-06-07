@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LoRa wideband intercept — web UI backend.
+"""LORA Wideband Decoder — web UI backend.
 
 Data model: the pipeline (src/detector.py) writes one structured JSON record per
 packet (decoded OR encrypted-header-only) to a JSONL log.  This backend TAILS

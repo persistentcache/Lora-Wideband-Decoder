@@ -1,4 +1,4 @@
-# lora_ml — wideband passive LoRa receiver
+# LORA Wideband Decoder
 
 A self-hosted, single-user intercept receiver for LoRa traffic. Streams
 IQ from your SDR, demodulates and decodes in software, surfaces

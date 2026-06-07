@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# lora_ml installer — Debian/Ubuntu.
+# LORA Wideband Decoder installer — Debian/Ubuntu.
 #
 # Installs everything the receiver needs to run on a fresh machine:
 #   * SoapySDR + python bindings + per-device modules  (universal SDR support)
@@ -14,7 +14,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-echo "==> lora_ml installer"
+echo "==> LORA Wideband Decoder installer"
 
 if ! command -v apt-get >/dev/null 2>&1; then
     cat <<'EOF'

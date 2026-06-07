@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start the lora_ml web UI.
+"""Start the LORA Wideband Decoder web UI.
 
 Reads lora.toml, launches the SDR → detector pipeline, and serves the web UI on
 the host:port configured in [web].
