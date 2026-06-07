@@ -53,7 +53,7 @@ if _FFT_LIB_CHOICE == 'pyfftw':
         import atexit as _atexit
         import pickle as _pickle
         import tempfile as _tempfile
-        _WISDOM_PATH = os.path.expanduser('~/.lora_ml-fftw-wisdom.pkl')
+        _WISDOM_PATH = os.path.expanduser('~/.lora-wbd-fftw-wisdom.pkl')
 
         def _load_wisdom():
             try:
@@ -72,7 +72,7 @@ if _FFT_LIB_CHOICE == 'pyfftw':
                 d = os.path.dirname(_WISDOM_PATH) or '.'
                 with _tempfile.NamedTemporaryFile(
                         mode='wb', dir=d, delete=False,
-                        prefix='.lora_ml-wisdom-') as f:
+                        prefix='.lora-wbd-wisdom-') as f:
                     _pickle.dump(pyfftw.export_wisdom(), f)
                     _tmp = f.name
                 os.replace(_tmp, _WISDOM_PATH)
