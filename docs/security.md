@@ -7,8 +7,14 @@ your own instance and view it in your own browser.
 
 The web UI has **no authentication**. Anyone who can reach the port
 can start and stop the receiver, change settings, read decoded
-traffic, and read keys. For that reason it binds to `127.0.0.1` by
-default and prints a warning if you change that.
+traffic, and read keys. For that reason the shipped `lora.toml` binds
+to `127.0.0.1` by default and the UI prints a warning if you change
+that.
+
+> **Foot-gun**: if `lora.toml` is missing or `[web].host` is unset,
+> `src/lora_config.py:22` codes the fallback as `0.0.0.0` — the UI
+> would bind to every interface. Keep the file present and the host
+> line set.
 
 If you need LAN access, set `[web] host = "0.0.0.0"` in `lora.toml` —
 but only on a trusted network, and ideally behind a reverse proxy

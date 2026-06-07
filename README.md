@@ -35,15 +35,16 @@ SDR/Radio → Detect** finds it automatically.
 
 | Device | Path | Notes |
 |---|---|---|
-| **bladeRF** | native `bladeRF-cli` | Recommended — only path that sustains 28 Msps. |
-| HackRF, RTL-SDR, LimeSDR, USRP, PlutoSDR, Airspy, … | `src/soapy_rx.py` via SoapySDR | Any device with a SoapySDR module works. |
+| **bladeRF** | native `bladeRF-cli` | Validated default at 28 Msps. SoapyBladeRF fails at this rate; native CLI works. |
+| **USRP B210 / B205mini** | SoapyUHD | Rated ~30 Msps over USB 3.0. Not author-validated but should sustain 28 Msps. |
+| HackRF | SoapySDR | Capped at 20 Msps (hardware). |
+| RTL-SDR, Airspy, LimeSDR, PlutoSDR, … | SoapySDR | Varies — see device specs. |
 
-Named profiles live in `src/sdr_profiles.py`.
+Named profiles + live capability probing live in `src/sdr_profiles.py`.
 
 ## Building from source
 
-If `./install.sh` doesn't fit (non-Debian distro, custom Python), pull
-the deps yourself:
+If `./install.sh` doesn't fit (non-Debian distro, custom Python):
 
 ```bash
 pip install -r requirements.txt
@@ -52,8 +53,8 @@ pip install -r requirements.txt
 # libusb-1.0, libfftw3-dev, python3-dev
 ```
 
-Python 3.11+ recommended. Older Python needs `pip install tomli` for
-`lora.toml`.
+Requires Python 3.11+ for `lora.toml` (stdlib `tomllib`). Older Python
+runs fine but falls back to coded defaults from `src/lora_config.py`.
 
 ## Docs
 
