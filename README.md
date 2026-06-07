@@ -59,16 +59,15 @@ runs fine but falls back to coded defaults from `src/lora_config.py`.
 
 ## Docs
 
-- [Identification & protocols](docs/identification.md) — confidence
-  tiers, channel keys, Meshtastic preset reference.
-- [Headless mode](docs/headless.md) — running without the web UI; SDR
-  pipe examples.
-- [Performance & tuning](docs/performance.md) — sample drops, CPU
-  affinity, throughput knobs, `lora.toml` reference.
-- [Environment-variable overrides](docs/env-overrides.md) — optional
-  runtime knobs that override `lora.toml`.
-- [Security & deployment](docs/security.md) — what to expose, what to
-  isolate, what not to do.
+- [Identification & protocols](docs/identification.md): how protocols
+  are labeled, channel keys, Meshtastic preset list.
+- [Headless mode](docs/headless.md): running it without the web UI.
+- [Performance & tuning](docs/performance.md): throughput knobs and
+  what to change when things drop samples.
+- [Environment-variable overrides](docs/env-overrides.md): optional
+  runtime overrides for `lora.toml`.
+- [Security & deployment](docs/security.md): network exposure,
+  privileges, hosting.
 
 ## License
 
