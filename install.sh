@@ -97,7 +97,7 @@ fi
 pip3 install $PIP_FLAGS -r "$HERE/requirements.txt"
 
 echo "==> SDR device access ..."
-sudo usermod -aG plugdev "$USER" 2>/dev/null || true   # device packages add udev rules
+sudo usermod -aG plugdev "${USER:-$(whoami)}" 2>/dev/null || true   # device packages add udev rules
 
 echo "==> Verifying ..."
 echo "   SoapySDR device modules loaded:"
