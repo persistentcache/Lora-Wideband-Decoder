@@ -1,6 +1,6 @@
 # LORA Wideband Decoder
 
-A self-hosted, single-user intercept receiver for LoRa traffic. Streams
+A self-hosted, single-user intercept receiver for LoRa traffic on typical and non-typical frequencies. Streams
 IQ from your SDR, demodulates and decodes in software, surfaces
 everything in a local web UI.
 
