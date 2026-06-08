@@ -37,7 +37,7 @@ SDR/Radio → Detect** finds it automatically.
 | Device | Path | Notes |
 |---|---|---|
 | **bladeRF** | native `bladeRF-cli` | Validated default at 28 Msps. (SoapyBladeRF fails at this rate; native CLI works) |
-| **USRP B210 / B205mini** | SoapyUHD | Rated ~30 Msps over USB 3.0. |
+| **USRP B210 / B205mini** | SoapyUHD | Rated ~30 Msps over USB 3.0. (Tested at 28MHz)|
 | HackRF | SoapySDR | Capped at 20 Msps (hardware). |
 | RTL-SDR, Airspy, LimeSDR, PlutoSDR, … | SoapySDR | Varies — see device specs. |
 
