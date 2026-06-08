@@ -696,6 +696,8 @@ def _store(rec):
             n['channels'].add(rec['chan'])
         if rec.get('text') or rec.get('summary'):
             n['last_text'] = rec.get('text') or rec.get('summary')
+        if rec.get('lat') is not None:
+            n['lat'] = rec['lat']; n['lon'] = rec.get('lon')
         # "Avg RSSI by node" = average over the node's OWN transmissions only
         # (hops==0 → transmitted directly by this node, not relayed).
         if rec.get('hops') == 0 and rec.get('rssi') is not None:
@@ -1383,6 +1385,7 @@ def _node_view(n):
         'avg_rssi': round(n['rssi_sum'] / n['rssi_n'], 1) if n['rssi_n'] else None,
         'rssi_samples': n['rssi_n'], 'channels': sorted(n['channels']),
         'last_text': n['last_text'],
+        'lat': n.get('lat'), 'lon': n.get('lon'),
     }
 
 
