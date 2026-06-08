@@ -1,7 +1,7 @@
 # LORA Wideband Decoder
 
 A self-hosted, single-user intercept receiver for LoRa traffic on typical and non-typical frequencies. Streams
-IQ from your SDR, demodulates and decodes in software, surfaces
+IQ from your SDR, demodulates and decodes in software near-real-time, surfaces
 everything in a local web UI.
 
 ## I wanna use it!
@@ -13,7 +13,7 @@ Debian / Ubuntu:
 python3 run/web.py          # opens http://127.0.0.1:5000
 ```
 
-Open the URL it prints, hit **Start** in the UI, and intercepted
+Open the URL it prints, configure your SDR in the Config tab, hit **Start** in the UI, and intercepted
 packets stream in live. The pipeline (SDR capture + detector + decoder)
 is launched from the web UI based on `lora.toml`.
 
