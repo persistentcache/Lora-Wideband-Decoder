@@ -2531,31 +2531,59 @@ def api_stream():
                     headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
 
+DEBUG_BUNDLE_PATH = None        # set by main() when --debug is on
+
+
+def _debug_emit(line, prefix=''):
+    """Print to stderr AND append to the debug bundle file (when --debug)."""
+    print(prefix + line, file=sys.stderr, flush=True)
+    if DEBUG_BUNDLE_PATH:
+        try:
+            with open(DEBUG_BUNDLE_PATH, 'a') as f:
+                f.write(prefix + line + '\n')
+        except Exception:
+            pass                     # never let the bundle writer break the run
+
+
 def _print_debug_header():
     """`--debug`: dump scrubbed diagnostics so issue reporters get a one-paste
-    bundle. Output is the same shape as `run/collect_debug.py` so we can ask
-    users either to run with --debug, or to send the standalone bundle."""
+    bundle. The same content is ALSO written to DEBUG_BUNDLE_PATH so the user
+    has a single file they can attach to the issue — no terminal-scrollback
+    copy-paste needed."""
     try:
         import debug_collect
     except Exception as e:
         print(f'lora_web: --debug active but debug_collect unavailable: {e}',
               file=sys.stderr, flush=True)
         return
+    bundle = debug_collect.render_bundle(cfg=CFG, settings=SETTINGS,
+                                         include_pipeline_log=False)
+    if DEBUG_BUNDLE_PATH:
+        try:
+            with open(DEBUG_BUNDLE_PATH, 'w') as f:
+                f.write(bundle + '\n')
+        except Exception as e:
+            print(f'lora_web: --debug bundle file write failed: {e}',
+                  file=sys.stderr, flush=True)
     print('lora_web: --debug ON — diagnostics dump (PII-scrubbed) follows.',
           file=sys.stderr, flush=True)
-    print(debug_collect.render_bundle(cfg=CFG, settings=SETTINGS,
-                                      include_pipeline_log=False),
-          file=sys.stderr, flush=True)
+    print(bundle, file=sys.stderr, flush=True)
+    if DEBUG_BUNDLE_PATH:
+        print(f'\nlora_web: --debug — startup dump also written to '
+              f'{DEBUG_BUNDLE_PATH}\n'
+              f'    Live pipeline output will be appended there as it streams.\n'
+              f'    Attach that file to the GitHub issue.',
+              file=sys.stderr, flush=True)
     print('lora_web: --debug — end of startup dump. Pipeline stderr will be '
-          'tee\'d to this terminal once you click Start.',
+          'tee\'d to this terminal (and the bundle file) once you click Start.',
           file=sys.stderr, flush=True)
 
 
 def _tee_pipeline_log_to_stderr():
-    """`--debug`: stream PIPELINE_LOG to our stderr live so the user sees the
-    capture/detector subprocess output in the terminal — without this, those
-    lines only land in /tmp/lora_web_pipeline.log and reporters routinely
-    miss them."""
+    """`--debug`: stream PIPELINE_LOG to our stderr live AND append to the
+    debug bundle file so the user sees the capture/detector subprocess output
+    in the terminal — without this, those lines only land in
+    /tmp/lora_web_pipeline.log and reporters routinely miss them."""
     try:
         import debug_collect as _dc
     except Exception:
@@ -2579,7 +2607,7 @@ def _tee_pipeline_log_to_stderr():
                     text = _dc.scrub(text)
                 # Tag so the user can tell this came from the subprocess vs flask.
                 for line in text.splitlines():
-                    print('[pipe] ' + line, file=sys.stderr, flush=True)
+                    _debug_emit(line, prefix='[pipe] ')
         except Exception as e:
             print(f'[pipe-tee error: {e}]', file=sys.stderr, flush=True)
         time.sleep(0.5)
@@ -2592,13 +2620,20 @@ def main():
     ap.add_argument('--port', type=int, default=None)
     ap.add_argument('--debug', action='store_true',
                     help='Verbose mode for issue reports: dump scrubbed env/SDR/'
-                         'binary diagnostics on startup and tee pipeline stderr '
-                         'to this terminal (no PII).')
+                         'binary diagnostics on startup, tee pipeline stderr to '
+                         'this terminal, and write the same content to a single '
+                         '/tmp/lora_debug_<ts>.txt file you can attach to a '
+                         'GitHub issue (no PII).')
+    ap.add_argument('--debug-out', default=None,
+                    help='Override --debug bundle file path (default: '
+                         '/tmp/lora_debug_<ts>.txt).')
     a = ap.parse_args()
-    global CFG
+    global CFG, DEBUG_BUNDLE_PATH
     CFG = load_config(a.config)
     if a.debug:
         os.environ['LORA_DEBUG'] = '1'
+        DEBUG_BUNDLE_PATH = a.debug_out or (
+            '/tmp/lora_debug_%s.txt' % time.strftime('%Y%m%d_%H%M%S'))
         _print_debug_header()
         threading.Thread(target=_tee_pipeline_log_to_stderr, daemon=True).start()
     host = a.host or CFG['web'].get('host', '127.0.0.1')
