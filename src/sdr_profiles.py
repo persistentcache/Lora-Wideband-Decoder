@@ -178,7 +178,7 @@ def _gain_clause(prof, gain):
 
 def build_capture(sdr, freq_hz, rate, bw, gain='auto', soapy_driver='hackrf'):
     """Return the shell command that streams raw IQ to stdout for the chosen SDR."""
-    import os
+    import os, shlex
     prof = SDR_PROFILES.get(sdr, SDR_PROFILES[DEFAULT_SDR])
     # named profiles fix the driver; the generic 'soapy' one takes user input →
     # whitelist it (this string is interpolated into a shell=True command).
@@ -189,9 +189,13 @@ def build_capture(sdr, freq_hz, rate, bw, gain='auto', soapy_driver='hackrf'):
     if not ui['agc_ok'] and str(gain).strip().lower() in ('', 'auto', 'agc'):
         gain = ui['default_gain']
     scripts_dir = os.path.dirname(os.path.abspath(__file__))
-    soapy_rx = os.path.join(scripts_dir, 'soapy_rx.py')
+    # shell=True consumer → quote any path that may contain spaces (e.g. project
+    # under "LORA Project/"). Without this, the shell splits the word and python
+    # tries to open the prefix as the script.
+    soapy_rx = shlex.quote(os.path.join(scripts_dir, 'soapy_rx.py'))
     return prof['capture'].format(
-        bin=_which(prof['bin']), freq_hz=int(freq_hz), freq_mhz=freq_hz / 1e6,
+        bin=shlex.quote(_which(prof['bin'])), freq_hz=int(freq_hz),
+        freq_mhz=freq_hz / 1e6,
         rate=int(rate), bw=int(bw), gain_cmd=_gain_clause(prof, gain),
         soapy_driver=drv, soapy_rx=soapy_rx)
 
