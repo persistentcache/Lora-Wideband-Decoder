@@ -57,6 +57,34 @@ pip install -r requirements.txt
 Requires Python 3.11+ for `lora.toml` (stdlib `tomllib`). Older Python
 runs fine but falls back to coded defaults from `src/lora_config.py`.
 
+## Reporting issues
+
+If something doesn't work, please include a diagnostic bundle so the failure
+can be reproduced without guessing. Two ways to capture one:
+
+1. **Standalone collector** (works even if the web UI never starts):
+
+   ```bash
+   python3 run/collect_debug.py            # writes /tmp/lora_debug_<ts>.txt
+   python3 run/collect_debug.py --probe    # also runs a ~5 s capture test
+   ```
+
+   Attach the generated file to the GitHub issue.
+
+2. **Verbose server**:
+
+   ```bash
+   python3 run/web.py --debug
+   ```
+
+   Prints a diagnostic dump on startup and streams the SDR capture
+   subprocess output to the terminal (instead of only to
+   `/tmp/lora_web_pipeline.log`). Copy everything the terminal prints.
+
+Both modes scrub `$HOME` paths, hostname, IPs, and MAC addresses before
+output. SDR serials and SoapySDR module versions are kept because they're
+needed to diagnose hardware-specific bugs.
+
 ## Docs
 
 - [Identification & protocols](docs/identification.md): how protocols
