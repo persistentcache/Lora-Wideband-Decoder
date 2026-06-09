@@ -75,7 +75,7 @@
     <span>encrypted <b id="s_enc">0</b></span>
     <span>nodes <b id="s_nodes">0</b></span>
     <button class="go" id="btnStart">Start</button>
-    <button class="stop" id="btnStop">Stop</button>
+    <button class="stop" id="btnStop" style="display:none">Stop</button>
     <button id="btnImport">Import</button>
     <button id="btnSave">Save session</button>
     <label title="auto-save: continuously back the session up to an importable file (the toggle is remembered across restarts)"><input type="checkbox" id="autosave"> auto-save</label>
@@ -1367,7 +1367,7 @@ function renderAlertPanel(){const p=$('#alertpanel');if(!p)return;
 function postAlert(id,patch){fetch('/api/alerts/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(r=>r.json()).then(res=>{if(res.alerts)ALERTS=res.alerts;});}
 
 function renderCurrent(){ if(TAB==='pkts')renderPkts(); else if(TAB==='nodes')renderNodes(); else if(TAB==='net')startNet(); else if(TAB==='wf')renderWaterfall(); else if(TAB==='map')renderMap(); else if(TAB==='search')renderSearch(); else if(TAB==='stats')renderStatsTab(); else if(TAB==='config')renderConfig(); }
-function renderStats(s){$('#s_pkts').textContent=s.packets;$('#s_dec').textContent=s.decoded;$('#s_enc').textContent=s.encrypted;$('#s_nodes').textContent=s.nodes;$('#pipedot').className='dot '+(s.pipeline_running?'on':'off');$('#pipetxt').textContent=s.pipeline_running?'running':'stopped';}
+function renderStats(s){$('#s_pkts').textContent=s.packets;$('#s_dec').textContent=s.decoded;$('#s_enc').textContent=s.encrypted;$('#s_nodes').textContent=s.nodes;$('#pipedot').className='dot '+(s.pipeline_running?'on':'off');$('#pipetxt').textContent=s.pipeline_running?'running':'stopped';$('#btnStart').style.display=s.pipeline_running?'none':'';$('#btnStop').style.display=s.pipeline_running?'':'none';}
 
 const TABS=['pkts','nodes','net','wf','map','search','stats','config'];
 function activateTab(name){
