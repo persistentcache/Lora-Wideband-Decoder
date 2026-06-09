@@ -77,9 +77,11 @@ can be reproduced without guessing. Two ways to capture one:
    python3 run/web.py --debug
    ```
 
-   Prints a diagnostic dump on startup and streams the SDR capture
+   Prints a diagnostic dump on startup, streams the SDR capture
    subprocess output to the terminal (instead of only to
-   `/tmp/lora_web_pipeline.log`). Copy everything the terminal prints.
+   `/tmp/lora_web_pipeline.log`), AND writes the same content to a
+   single `/tmp/lora_debug_<ts>.txt` file. Reproduce the issue, then
+   attach that file to the GitHub issue.
 
 Both modes scrub `$HOME` paths, hostname, IPs, and MAC addresses before
 output. SDR serials and SoapySDR module versions are kept because they're
