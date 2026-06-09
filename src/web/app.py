@@ -2637,8 +2637,15 @@ def main():
     _apply_unknown_flag()
     threading.Thread(target=_tail_health, daemon=True).start()
     threading.Thread(target=_tail_psd, daemon=True).start()
-    print(f"lora_web: config={CFG.get('_path')}  tailing={log_path}  "
-          f"serving http://{host}:{port}", flush=True)
+    _startup_line = (f"lora_web: config={CFG.get('_path')}  tailing={log_path}  "
+                     f"serving http://{host}:{port}")
+    if os.environ.get('LORA_DEBUG') == '1':
+        try:
+            import debug_collect
+            _startup_line = debug_collect.scrub(_startup_line)
+        except Exception:
+            pass
+    print(_startup_line, flush=True)
     if host not in ('127.0.0.1', 'localhost', '::1'):
         print("lora_web: *** WARNING: bound to %s (non-localhost) and the UI has NO "
               "authentication. Anyone who can reach this port can control the SDR and "
