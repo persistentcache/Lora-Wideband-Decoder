@@ -1455,12 +1455,34 @@ _RE_AUTO = _re.compile(r'Detect workers: AUTO = (\d+)')
 
 
 def _tail_health():
-    """Follow the pipeline stderr log, parse [STAT]/warnings → HEALTH + SSE."""
+    """Follow the pipeline stderr log, parse [STAT]/warnings → HEALTH + SSE.
+    rate_msps is refreshed from the live radio config each iteration so a user
+    rate change shows up in the UI status bar immediately (instead of being
+    pinned to the lora.toml default forever).
+    The KEEP-UP warning is gated by a 30 s warm-up window and re-evaluated every
+    30 s thereafter against the latest observed msps — if the host catches up,
+    the warning clears on its own."""
     pos = 0
-    rate_msps = float(CFG['radio']['rate_hz']) / 1e6
-    HEALTH['rate_msps'] = rate_msps
+    pending_warn = None        # latest KEEP-UP line seen this run (or None)
+    last_check = 0.0           # last post-warmup re-evaluation timestamp
+    last_started_at = None     # detect pipeline restarts → reset warm-up state
+    WARMUP_S = 30.0
+    CHECK_S = 30.0
     while True:
         try:
+            now = time.time()
+            # Refresh declared rate from the LIVE radio cfg (so editing rate in
+            # the UI updates the gate's "/N Msps" display without a restart).
+            try:
+                HEALTH['rate_msps'] = float(_radio_cfg()['rate_hz']) / 1e6
+            except Exception:
+                pass
+            # Pipeline restart → forget any prior warning and re-enter warm-up.
+            started_at = PIPELINE.get('started_at')
+            if started_at != last_started_at:
+                pending_warn = None
+                last_check = 0.0
+                last_started_at = started_at
             if not os.path.exists(PIPELINE_LOG):
                 HEALTH.update(msps=None); time.sleep(0.5); continue
             if os.path.getsize(PIPELINE_LOG) < pos:
@@ -1480,7 +1502,26 @@ def _tail_health():
                 if a:
                     HEALTH['detect_workers'] = int(a.group(1))
                 if 'KEEP-UP WARNING' in ln:
-                    HEALTH['warn'] = ln.strip()[:200]; changed = True
+                    pending_warn = ln.strip()[:200]
+            # Keep-up banner logic: never surface during warm-up; after that,
+            # re-check on a 30 s cadence and clear if msps caught up.
+            if PIPELINE.get('running') and started_at:
+                since_start = now - started_at
+                if since_start < WARMUP_S:
+                    if HEALTH.get('warn') is not None:
+                        HEALTH['warn'] = None; changed = True
+                elif now - last_check >= CHECK_S:
+                    last_check = now
+                    msps = HEALTH.get('msps'); rate = HEALTH.get('rate_msps')
+                    keeping_up = (msps is not None and rate
+                                  and msps >= rate * 0.97)
+                    if keeping_up:
+                        if HEALTH.get('warn') is not None:
+                            HEALTH['warn'] = None; changed = True
+                    elif pending_warn and HEALTH.get('warn') != pending_warn:
+                        HEALTH['warn'] = pending_warn; changed = True
+            elif HEALTH.get('warn') is not None:
+                HEALTH['warn'] = None; changed = True
             if changed:
                 _broadcast({'type': 'health', 'data': HEALTH})
             time.sleep(0.6)
