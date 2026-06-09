@@ -136,6 +136,52 @@ def collect_soapy():
         timeout=10)
     out['python_import_numpy_rc'] = rc
     out['python_import_numpy'] = imp_np
+    # Does Python's SoapySDR binding ACTUALLY see devices? (The C++ SoapySDRUtil
+    # --find above can succeed while the SWIG binding silently enumerates zero —
+    # that's the discriminator between "kwargs filter bug" and "binding can't
+    # see anything". Also try Device.make() both with sparse kwargs and with the
+    # full enumerated args dict — tells us whether the enumerate-then-open
+    # workaround in soapy_rx.py would actually open the device on this stack.)
+    probe = (
+        'import SoapySDR, traceback\n'
+        'def show(label, fn):\n'
+        '    try:\n'
+        '        r = fn()\n'
+        '        print(label, "->", r)\n'
+        '    except Exception as e:\n'
+        '        print(label, "EXC", type(e).__name__, e)\n'
+        'show("enum_all", lambda: [dict(d) for d in SoapySDR.Device.enumerate({})])\n'
+        'for drv in ("hackrf","rtlsdr","airspy","bladerf","uhd","lime","plutosdr"):\n'
+        '    show("enum_"+drv, lambda d=drv: [dict(x) for x in SoapySDR.Device.enumerate({"driver":d})])\n'
+        'for drv in ("hackrf","rtlsdr"):\n'
+        '    try:\n'
+        '        found = SoapySDR.Device.enumerate({"driver":drv})\n'
+        '    except Exception:\n'
+        '        found = []\n'
+        '    if not found:\n'
+        '        print("open_"+drv+"_sparse SKIP (enumerate empty)")\n'
+        '        continue\n'
+        '    try:\n'
+        '        d = SoapySDR.Device({"driver":drv}); print("open_"+drv+"_sparse OK"); del d\n'
+        '    except Exception as e:\n'
+        '        print("open_"+drv+"_sparse EXC", type(e).__name__, e)\n'
+        '    try:\n'
+        '        d = SoapySDR.Device(dict(found[0])); print("open_"+drv+"_full OK"); del d\n'
+        '    except Exception as e:\n'
+        '        print("open_"+drv+"_full EXC", type(e).__name__, e)\n'
+    )
+    # Write to a temp file to avoid shell-quoting hell with embedded newlines.
+    import tempfile
+    with tempfile.NamedTemporaryFile('w', suffix='.py', delete=False) as tf:
+        tf.write(probe)
+        probe_path = tf.name
+    try:
+        rc, probe_out = _run('"%s" "%s" 2>&1' % (sys.executable, probe_path), timeout=30)
+    finally:
+        try: os.unlink(probe_path)
+        except Exception: pass
+    out['python_SoapySDR_probe_rc'] = rc
+    out['python_SoapySDR_probe'] = probe_out
     return out
 
 
