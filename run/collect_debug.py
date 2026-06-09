@@ -2,14 +2,14 @@
 """Standalone diagnostic collector — for issue reports.
 
 Runs every check (env / SoapySDR / SDR binaries / USB / config / pipeline log)
-and writes ONE PII-scrubbed text file to /tmp.  No web server needed — use this
-when the pipeline dies before you can interact with the UI.
+and writes ONE PII-scrubbed text file to the project root.  No web server
+needed — use this when the pipeline dies before you can interact with the UI.
 
   python3 run/collect_debug.py
   python3 run/collect_debug.py --probe     # also attempt a ~5 s pipeline test
                                             # for the currently configured SDR
 
-Output: /tmp/lora_debug_<timestamp>.txt   (attach this to the GitHub issue).
+Output: lora_debug_<timestamp>.txt in the project root (attach to the issue).
 PII policy: $HOME→~, hostname, IPs, MACs scrubbed; SDR serials / versions kept.
 """
 import os
@@ -92,7 +92,8 @@ def main():
                          'for the currently-configured SDR (~5 s).')
     ap.add_argument('--probe-seconds', type=int, default=5)
     ap.add_argument('-o', '--output', default=None,
-                    help='Output file path (default: /tmp/lora_debug_<ts>.txt)')
+                    help='Output file path (default: lora_debug_<ts>.txt in '
+                         'the project root)')
     a = ap.parse_args()
 
     import debug_collect
@@ -106,11 +107,14 @@ def main():
     bundle = debug_collect.render_bundle(cfg=cfg, settings=settings,
                                          include_pipeline_log=True,
                                          extra_sections=extras)
-    out_path = a.output or ('/tmp/lora_debug_%s.txt'
-                            % time.strftime('%Y%m%d_%H%M%S'))
+    out_path = a.output or os.path.join(
+        _ROOT, 'lora_debug_%s.txt' % time.strftime('%Y%m%d_%H%M%S'))
     with open(out_path, 'w') as f:
         f.write(bundle)
-    print('collect_debug: wrote %s  (%d bytes)' % (out_path, len(bundle)))
+    # Print just the basename so users can paste the script's own output into
+    # an issue without leaking their home-directory path.
+    print('collect_debug: wrote %s  (%d bytes, in the project root)'
+          % (os.path.basename(out_path), len(bundle)))
     print('Attach that file to your GitHub issue.')
 
 

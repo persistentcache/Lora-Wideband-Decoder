@@ -65,11 +65,11 @@ can be reproduced without guessing. Two ways to capture one:
 1. **Standalone collector** (works even if the web UI never starts):
 
    ```bash
-   python3 run/collect_debug.py            # writes /tmp/lora_debug_<ts>.txt
+   python3 run/collect_debug.py            # writes lora_debug_<ts>.txt
    python3 run/collect_debug.py --probe    # also runs a ~5 s capture test
    ```
 
-   Attach the generated file to the GitHub issue.
+   Attach the generated `lora_debug_*.txt` to the GitHub issue.
 
 2. **Verbose server**:
 
@@ -79,9 +79,9 @@ can be reproduced without guessing. Two ways to capture one:
 
    Prints a diagnostic dump on startup, streams the SDR capture
    subprocess output to the terminal (instead of only to
-   `/tmp/lora_web_pipeline.log`), AND writes the same content to a
-   single `/tmp/lora_debug_<ts>.txt` file. Reproduce the issue, then
-   attach that file to the GitHub issue.
+   `/tmp/lora_web_pipeline.log`), AND writes the same content to
+   `lora_debug_<ts>.txt` in the project root. Reproduce the issue,
+   then attach that file to the GitHub issue.
 
 Both modes scrub `$HOME` paths, hostname, IPs, and MAC addresses before
 output. SDR serials and SoapySDR module versions are kept because they're
