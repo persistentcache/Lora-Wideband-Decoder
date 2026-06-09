@@ -16,6 +16,7 @@ device servicing from any downstream (pipe/disk) latency, so a transient stall i
 detector or the OS pipe can't cost samples.  Overflows, if they ever occur, are
 counted and logged to stderr — never silently swallowed.
 """
+import os
 import sys
 import time
 import queue
@@ -33,18 +34,49 @@ def main():
     ap.add_argument('--queue-mb', type=float, default=512.0,
                     help='max in-RAM buffer (MB) that absorbs downstream stalls without dropping')
     a = ap.parse_args()
+    DBG = bool(int(os.environ.get('LORA_DEBUG', '0') or '0'))
+    if DBG:
+        sys.stderr.write('soapy_rx: --debug ON  driver=%s freq=%g rate=%g bw=%g gain=%s '
+                         'python=%s\n' % (a.driver, a.f, a.s, a.b, a.g, sys.executable))
+        sys.stderr.flush()
     try:
         import numpy as np
         import SoapySDR
         from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16, SOAPY_SDR_OVERFLOW
     except Exception as e:
         sys.stderr.write('soapy_rx: SoapySDR python bindings missing (%s). '
-                         'Install: sudo apt install python3-soapysdr\n' % e)
+                         'Install: sudo apt install python3-soapysdr  '
+                         '(python=%s — if this is a 3.13+/non-distro interpreter the '
+                         'apt SoapySDR is built against the system python, not this one)\n'
+                         % (e, sys.executable))
         return 2
+    if DBG:
+        sys.stderr.write('soapy_rx: SoapySDR=%s numpy=%s\n'
+                         % (getattr(SoapySDR, '__version__', '?'), np.__version__))
 
-    dev = SoapySDR.Device({'driver': a.driver})
+    try:
+        dev = SoapySDR.Device({'driver': a.driver})
+    except Exception as e:
+        sys.stderr.write('soapy_rx: SoapySDR.Device(driver=%s) failed: %s  '
+                         '(device absent / busy / driver module not installed)\n'
+                         % (a.driver, e))
+        return 3
+    if DBG:
+        try:
+            info = dev.getHardwareInfo()
+            sys.stderr.write('soapy_rx: device hw=%s driver=%s\n'
+                             % (dict(info), a.driver))
+        except Exception:
+            pass
     dev.setSampleRate(SOAPY_SDR_RX, 0, a.s)
     dev.setFrequency(SOAPY_SDR_RX, 0, a.f)
+    if DBG:
+        try:
+            sys.stderr.write('soapy_rx: actual rate=%g freq=%g\n'
+                             % (dev.getSampleRate(SOAPY_SDR_RX, 0),
+                                dev.getFrequency(SOAPY_SDR_RX, 0)))
+        except Exception:
+            pass
     if a.b > 0:
         try: dev.setBandwidth(SOAPY_SDR_RX, 0, a.b)
         except Exception: pass

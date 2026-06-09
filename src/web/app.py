@@ -2531,14 +2531,76 @@ def api_stream():
                     headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
 
+def _print_debug_header():
+    """`--debug`: dump scrubbed diagnostics so issue reporters get a one-paste
+    bundle. Output is the same shape as `run/collect_debug.py` so we can ask
+    users either to run with --debug, or to send the standalone bundle."""
+    try:
+        import debug_collect
+    except Exception as e:
+        print(f'lora_web: --debug active but debug_collect unavailable: {e}',
+              file=sys.stderr, flush=True)
+        return
+    print('lora_web: --debug ON — diagnostics dump (PII-scrubbed) follows.',
+          file=sys.stderr, flush=True)
+    print(debug_collect.render_bundle(cfg=CFG, settings=SETTINGS,
+                                      include_pipeline_log=False),
+          file=sys.stderr, flush=True)
+    print('lora_web: --debug — end of startup dump. Pipeline stderr will be '
+          'tee\'d to this terminal once you click Start.',
+          file=sys.stderr, flush=True)
+
+
+def _tee_pipeline_log_to_stderr():
+    """`--debug`: stream PIPELINE_LOG to our stderr live so the user sees the
+    capture/detector subprocess output in the terminal — without this, those
+    lines only land in /tmp/lora_web_pipeline.log and reporters routinely
+    miss them."""
+    try:
+        import debug_collect as _dc
+    except Exception:
+        _dc = None
+    pos = 0
+    while True:
+        try:
+            if not os.path.exists(PIPELINE_LOG):
+                time.sleep(0.5)
+                continue
+            sz = os.path.getsize(PIPELINE_LOG)
+            if sz < pos:                          # log was truncated on Start
+                pos = 0
+            if sz > pos:
+                with open(PIPELINE_LOG, 'rb') as f:
+                    f.seek(pos)
+                    data = f.read(sz - pos)
+                    pos = sz
+                text = data.decode('utf-8', errors='replace')
+                if _dc is not None:
+                    text = _dc.scrub(text)
+                # Tag so the user can tell this came from the subprocess vs flask.
+                for line in text.splitlines():
+                    print('[pipe] ' + line, file=sys.stderr, flush=True)
+        except Exception as e:
+            print(f'[pipe-tee error: {e}]', file=sys.stderr, flush=True)
+        time.sleep(0.5)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default=None)
     ap.add_argument('--host', default=None)
     ap.add_argument('--port', type=int, default=None)
+    ap.add_argument('--debug', action='store_true',
+                    help='Verbose mode for issue reports: dump scrubbed env/SDR/'
+                         'binary diagnostics on startup and tee pipeline stderr '
+                         'to this terminal (no PII).')
     a = ap.parse_args()
     global CFG
     CFG = load_config(a.config)
+    if a.debug:
+        os.environ['LORA_DEBUG'] = '1'
+        _print_debug_header()
+        threading.Thread(target=_tee_pipeline_log_to_stderr, daemon=True).start()
     host = a.host or CFG['web'].get('host', '127.0.0.1')
     port = a.port or int(CFG['web'].get('port', 5000))
     log_path = CFG['decode'].get('packet_log', '/tmp/lora_packets.jsonl')
