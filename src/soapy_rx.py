@@ -54,31 +54,23 @@ def main():
         sys.stderr.write('soapy_rx: SoapySDR=%s numpy=%s\n'
                          % (getattr(SoapySDR, '__version__', '?'), np.__version__))
 
-    # Enumerate first, then open by the FULL args dict the factory returned.
-    # On some distros (notably Ubuntu 26.04 / python3-soapysdr 0.8.1-7build1 with
-    # Python 3.14) Device({'driver': '<x>'}) fails with "no match" even when the
-    # C++ SoapySDRUtil --find sees the device. Passing the full enumerated args
-    # dict (driver + serial + label + ...) sidesteps the broken keyword-match path.
+    # Pass the args as a "key=val,key=val" string, NOT a dict. On
+    # Ubuntu 26.04 (python3-soapysdr 0.8.1-7build1, built with SWIG 4.4
+    # against Python 3.14), Device({'driver':'<x>'}) silently dispatches
+    # to a different C++ overload — Device_make({}) returns the empty
+    # tuple () and Device_make({'driver':'hackrf'}) throws "no match"
+    # while Device('driver=hackrf') opens the same device cleanly.
+    # Verified locally with the actual 26.04 binding loaded into Python
+    # 3.14.4 plus a real HackRF: dict broken, string works. Older stacks
+    # (e.g. 24.04 / Python 3.12 / SWIG 4.1) accept both.
+    args_str = 'driver=%s' % a.driver
     try:
-        found = SoapySDR.Device.enumerate({'driver': a.driver})
+        dev = SoapySDR.Device(args_str)
     except Exception as e:
-        sys.stderr.write('soapy_rx: SoapySDR.Device.enumerate(driver=%s) raised: %s\n'
-                         % (a.driver, e))
-        found = []
-    if DBG:
-        sys.stderr.write('soapy_rx: enumerate(driver=%s) -> %d device(s)\n'
-                         % (a.driver, len(found)))
-        for i, d in enumerate(found):
-            try: sys.stderr.write('soapy_rx:   [%d] %s\n' % (i, dict(d)))
-            except Exception: sys.stderr.write('soapy_rx:   [%d] %r\n' % (i, d))
-    open_args = dict(found[0]) if found else {'driver': a.driver}
-    try:
-        dev = SoapySDR.Device(open_args)
-    except Exception as e:
-        sys.stderr.write('soapy_rx: SoapySDR.Device(%s) failed: %s  '
-                         '(enumerate found %d; device absent / busy / driver module not installed; '
-                         'try: SoapySDRUtil --find  and  hackrf_info / rtl_test as the same user)\n'
-                         % (open_args, e, len(found)))
+        sys.stderr.write('soapy_rx: SoapySDR.Device(%r) failed: %s  '
+                         '(device absent / busy / driver module not installed; '
+                         'try: SoapySDRUtil --find  and  hackrf_info / rtl_test '
+                         'as the same user)\n' % (args_str, e))
         return 3
     if DBG:
         try:
