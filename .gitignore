@@ -18,6 +18,9 @@ recordings/
 *.log
 *.npz
 
+# --debug / collect_debug.py output (users run these to file issues)
+lora_debug_*.txt
+
 # User-specific runtime config + autosaved data
 web_settings.json
 lora_web/web_settings.json
