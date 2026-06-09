@@ -2569,8 +2569,9 @@ def _print_debug_header():
           file=sys.stderr, flush=True)
     print(bundle, file=sys.stderr, flush=True)
     if DEBUG_BUNDLE_PATH:
+        # Basename only — users may paste this terminal output into an issue.
         print(f'\nlora_web: --debug — startup dump also written to '
-              f'{DEBUG_BUNDLE_PATH}\n'
+              f'{os.path.basename(DEBUG_BUNDLE_PATH)} (in the project root)\n'
               f'    Live pipeline output will be appended there as it streams.\n'
               f'    Attach that file to the GitHub issue.',
               file=sys.stderr, flush=True)
@@ -2621,19 +2622,19 @@ def main():
     ap.add_argument('--debug', action='store_true',
                     help='Verbose mode for issue reports: dump scrubbed env/SDR/'
                          'binary diagnostics on startup, tee pipeline stderr to '
-                         'this terminal, and write the same content to a single '
-                         '/tmp/lora_debug_<ts>.txt file you can attach to a '
-                         'GitHub issue (no PII).')
+                         'this terminal, and write the same content to '
+                         'lora_debug_<ts>.txt in the project root for one-file '
+                         'attachment to a GitHub issue (no PII).')
     ap.add_argument('--debug-out', default=None,
                     help='Override --debug bundle file path (default: '
-                         '/tmp/lora_debug_<ts>.txt).')
+                         'lora_debug_<ts>.txt in the project root).')
     a = ap.parse_args()
     global CFG, DEBUG_BUNDLE_PATH
     CFG = load_config(a.config)
     if a.debug:
         os.environ['LORA_DEBUG'] = '1'
-        DEBUG_BUNDLE_PATH = a.debug_out or (
-            '/tmp/lora_debug_%s.txt' % time.strftime('%Y%m%d_%H%M%S'))
+        DEBUG_BUNDLE_PATH = a.debug_out or os.path.join(
+            _PROJECT, 'lora_debug_%s.txt' % time.strftime('%Y%m%d_%H%M%S'))
         _print_debug_header()
         threading.Thread(target=_tee_pipeline_log_to_stderr, daemon=True).start()
     host = a.host or CFG['web'].get('host', '127.0.0.1')
