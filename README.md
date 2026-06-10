@@ -65,11 +65,13 @@ can be reproduced without guessing. Two ways to capture one:
 1. **Standalone collector** (works even if the web UI never starts):
 
    ```bash
-   python3 run/collect_debug.py            # writes lora_debug_<ts>.txt
-   python3 run/collect_debug.py --probe    # also runs a ~5 s capture test
+   python3 run/collect_debug.py
    ```
 
-   Attach the generated `lora_debug_*.txt` to the GitHub issue.
+   Writes `lora_debug_<timestamp>.txt` to the project root — environment
+   info, SoapySDR/SDR state, USB inventory, your config, plus a brief
+   capture probe against your configured SDR. Attach that file to the
+   GitHub issue.
 
 2. **Verbose server**:
 

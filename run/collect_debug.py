@@ -2,12 +2,11 @@
 """Standalone diagnostic collector — for issue reports.
 
 Runs every check (env / SoapySDR / SDR binaries / USB / config / pipeline log)
-and writes ONE PII-scrubbed text file to the project root.  No web server
-needed — use this when the pipeline dies before you can interact with the UI.
+PLUS a ~5 s capture probe against the currently-configured SDR, and writes ONE
+PII-scrubbed text file to the project root.  No web server needed — use this
+when the pipeline dies before you can interact with the UI.
 
   python3 run/collect_debug.py
-  python3 run/collect_debug.py --probe     # also attempt a ~5 s pipeline test
-                                            # for the currently configured SDR
 
 Output: lora_debug_<timestamp>.txt in the project root (attach to the issue).
 PII policy: $HOME→~, hostname, IPs, MACs scrubbed; SDR serials / versions kept.
@@ -15,8 +14,6 @@ PII policy: $HOME→~, hostname, IPs, MACs scrubbed; SDR serials / versions kept
 import os
 import sys
 import time
-import shlex
-import argparse
 import subprocess
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -25,6 +22,8 @@ _SRC = os.path.join(_ROOT, 'src')
 for _p in (_SRC, os.path.join(_SRC, 'web')):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+_PROBE_SECONDS = 5
 
 
 def _load_state():
@@ -46,7 +45,7 @@ def _load_state():
     return cfg, settings
 
 
-def _probe_pipeline(cfg, settings, seconds=5):
+def _probe_pipeline(cfg, settings, seconds=_PROBE_SECONDS):
     """Run the actual capture|detector pipeline briefly and capture stderr.
     Uses the same builder the web UI does, so this surfaces THE exact failure
     the user would hit clicking Start."""
@@ -86,28 +85,16 @@ def _probe_pipeline(cfg, settings, seconds=5):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--probe', action='store_true',
-                    help='Also briefly launch the capture half of the pipeline '
-                         'for the currently-configured SDR (~5 s).')
-    ap.add_argument('--probe-seconds', type=int, default=5)
-    ap.add_argument('-o', '--output', default=None,
-                    help='Output file path (default: lora_debug_<ts>.txt in '
-                         'the project root)')
-    a = ap.parse_args()
-
     import debug_collect
     cfg, settings = _load_state()
-    extras = []
-    if a.probe:
-        print('collect_debug: running ~%ds pipeline probe…' % a.probe_seconds,
-              file=sys.stderr, flush=True)
-        extras.append(('PIPELINE PROBE (capture half, %ds)' % a.probe_seconds,
-                       _probe_pipeline(cfg, settings, a.probe_seconds)))
+    print('collect_debug: running ~%ds pipeline probe…' % _PROBE_SECONDS,
+          file=sys.stderr, flush=True)
+    extras = [('PIPELINE PROBE (capture half, %ds)' % _PROBE_SECONDS,
+               _probe_pipeline(cfg, settings, _PROBE_SECONDS))]
     bundle = debug_collect.render_bundle(cfg=cfg, settings=settings,
                                          include_pipeline_log=True,
                                          extra_sections=extras)
-    out_path = a.output or os.path.join(
+    out_path = os.path.join(
         _ROOT, 'lora_debug_%s.txt' % time.strftime('%Y%m%d_%H%M%S'))
     with open(out_path, 'w') as f:
         f.write(bundle)
