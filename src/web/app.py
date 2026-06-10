@@ -620,36 +620,11 @@ def _confirm(rec):
         return None
     # MeshCore corroboration: a 'looks like MeshCore' frame (proto='unknown',
     # hint='meshcore') routed through >=2 crypto-verified nodes is behaviorally
-    # confirmed — it can't be coincidence that two of its path hashes both match
-    # nodes whose ADVERT signatures we verified.  A single match is too weak
-    # (1-byte alias rate 1/256) so it only annotates; the frame stays 'unknown'
-    # until >=2 hop hashes match.
-    #
-    # Multi-byte path hashes: upstream supports 1/2/3-byte hop encoding.  mc_path
-    # entries are stored as big-endian INTs of length mc_hash_size.  MC_NODES is
-    # keyed by pubkey[0] (single byte, the upstream ADVERT identity).  To match,
-    # we (a) compare the HIGH byte of each hop against MC_NODES keys, and (b) for
-    # hash_size>1 also verify the remaining bytes against the matched node's full
-    # pubkey, eliminating same-pubkey[0] aliases on multi-byte networks.
+    # confirmed — it can't be coincidence that two of its 1-byte path hashes both
+    # match nodes whose ADVERT signatures we verified.  A single match is too weak
+    # (1-byte hash) so it only annotates; the frame stays 'unknown' until >=2.
     if rec.get('hint') == 'meshcore':
-        hash_size = int(rec.get('mc_hash_size') or 1)
-        matched = set()
-        for h_int in (rec.get('mc_path') or []):
-            try: h_int = int(h_int)
-            except Exception: continue
-            pubkey0 = (h_int >> ((hash_size - 1) * 8)) & 0xFF if hash_size > 0 else (h_int & 0xFF)
-            node = MC_NODES.get(pubkey0)
-            if node is None:
-                continue
-            if hash_size > 1 and node.get('pubkey'):
-                try:
-                    node_pk = bytes.fromhex(node['pubkey'])
-                    hop_b   = h_int.to_bytes(hash_size, 'big')
-                    if node_pk[:hash_size] != hop_b:
-                        continue   # same pubkey[0], different node → alias
-                except Exception:
-                    pass
-            matched.add(pubkey0)
+        matched = set(int(h) for h in (rec.get('mc_path') or []) if int(h) in MC_NODES)
         if matched:
             rec['mc_known_hops'] = len(matched)
         if len(matched) >= 2:
