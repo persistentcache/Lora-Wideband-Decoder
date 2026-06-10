@@ -59,35 +59,53 @@ runs fine but falls back to coded defaults from `src/lora_config.py`.
 
 ## Reporting issues
 
-If something doesn't work, please include a diagnostic bundle so the failure
-can be reproduced without guessing. Two commands; pick whichever fits:
+If something isn't working — pipeline failure, crash, or a protocol that
+isn't being recognised — please include the matching artifact below so the
+problem can be reproduced without guessing.
 
-1. **Standalone collector** — use when the web UI won't start at all:
-
-   ```bash
-   python3 run/collect_debug.py
-   ```
-
-   Writes `lora_debug_<timestamp>.txt` to the project root — environment
-   info, SoapySDR/SDR state, USB inventory, your config, plus a brief
-   capture probe against your configured SDR.
-
-2. **Verbose server** — use when the UI starts but the pipeline fails:
+1. **Verbose server (recommended for almost everything)**:
 
    ```bash
    python3 run/web.py --debug
    ```
 
-   Starts the server normally, but also writes
-   `lora_debug_<timestamp>.txt` to the project root and streams the SDR
-   capture subprocess output live to the terminal. Click **Start** in
-   the UI and reproduce the issue; the bundle grows as the pipeline
-   runs.
+   Starts the server normally and writes `lora_debug_<timestamp>.txt`
+   to the project root, while also streaming the SDR capture
+   subprocess output live to the terminal. Click **Start** in the UI
+   and reproduce the issue; the bundle grows as the pipeline runs.
+   Attach the file to the GitHub issue.
 
-Either way, attach the generated `lora_debug_*.txt` to the GitHub issue.
-Both modes scrub `$HOME` paths, hostname, IPs, and MAC addresses before
-output; SDR serials and SoapySDR module versions are kept because they
-are needed to diagnose hardware-specific bugs.
+2. **Standalone collector** — use when the web UI won't start at all:
+
+   ```bash
+   python3 run/collect_debug.py
+   ```
+
+   Writes the same `lora_debug_<timestamp>.txt` to the project root —
+   environment info, SoapySDR/SDR state, USB inventory, your config,
+   plus a brief capture probe against your configured SDR. Attach the
+   file to the GitHub issue.
+
+3. **Unknown-protocol report** — use when frames are being received but
+   not decoded (mystery devices, "no decodes" with traffic visible in
+   the waterfall, suspected new/unsupported protocol):
+
+   - In the web UI: open the **Advanced Options** panel and toggle
+     **Unknown** on.
+   - Click **Start** and let it run while the unknown traffic is
+     active — a few minutes is usually enough, longer is better.
+   - Scroll back to **Advanced Options → Unknown-protocol report**
+     and click **Download**. That saves
+     `lora_unknown_report.jsonl` — raw bytes plus PHY parameters
+     (SF, BW, sync word, frequency) for every captured frame the
+     decoder couldn't identify.
+   - Attach the file to the GitHub issue.
+
+All three modes scrub `$HOME` paths, hostname, IPs, and MAC addresses
+before output; SDR serials and SoapySDR module versions are kept
+because they are needed to diagnose hardware-specific bugs. The
+unknown-protocol report contains only on-air bytes and PHY parameters
+— no PII, no decoded content.
 
 ## Docs
 
