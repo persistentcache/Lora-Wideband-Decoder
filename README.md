@@ -60,9 +60,9 @@ runs fine but falls back to coded defaults from `src/lora_config.py`.
 ## Reporting issues
 
 If something doesn't work, please include a diagnostic bundle so the failure
-can be reproduced without guessing. Two ways to capture one:
+can be reproduced without guessing. Two commands; pick whichever fits:
 
-1. **Standalone collector** (works even if the web UI never starts):
+1. **Standalone collector** — use when the web UI won't start at all:
 
    ```bash
    python3 run/collect_debug.py
@@ -70,24 +70,24 @@ can be reproduced without guessing. Two ways to capture one:
 
    Writes `lora_debug_<timestamp>.txt` to the project root — environment
    info, SoapySDR/SDR state, USB inventory, your config, plus a brief
-   capture probe against your configured SDR. Attach that file to the
-   GitHub issue.
+   capture probe against your configured SDR.
 
-2. **Verbose server**:
+2. **Verbose server** — use when the UI starts but the pipeline fails:
 
    ```bash
    python3 run/web.py --debug
    ```
 
-   Prints a diagnostic dump on startup, streams the SDR capture
-   subprocess output to the terminal (instead of only to
-   `/tmp/lora_web_pipeline.log`), AND writes the same content to
-   `lora_debug_<ts>.txt` in the project root. Reproduce the issue,
-   then attach that file to the GitHub issue.
+   Starts the server normally, but also writes
+   `lora_debug_<timestamp>.txt` to the project root and streams the SDR
+   capture subprocess output live to the terminal. Click **Start** in
+   the UI and reproduce the issue; the bundle grows as the pipeline
+   runs.
 
+Either way, attach the generated `lora_debug_*.txt` to the GitHub issue.
 Both modes scrub `$HOME` paths, hostname, IPs, and MAC addresses before
-output. SDR serials and SoapySDR module versions are kept because they're
-needed to diagnose hardware-specific bugs.
+output; SDR serials and SoapySDR module versions are kept because they
+are needed to diagnose hardware-specific bugs.
 
 ## Docs
 
