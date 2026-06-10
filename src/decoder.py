@@ -1391,21 +1391,8 @@ _MESHCORE_ROUTE_TYPES   = {0: 'FLOOD', 1: 'DIRECT', 2: 'BACK', 3: 'DIRECT_OOB'}
 _MESHCORE_PAYLOAD_TYPES = {
     0x00: 'REQ',    0x01: 'RESPONSE', 0x02: 'TXT_MSG', 0x03: 'ACK',
     0x04: 'ADVERT', 0x05: 'GRP_TXT', 0x06: 'GRP_DATA', 0x07: 'ANON_REQ',
-    0x08: 'PATH',   0x09: 'TRACE',   0x0A: 'MULTIPART',
-    0x0B: 'CONTROL', 0x0F: 'RAW_CUSTOM',
+    0x09: 'TRACE',  0x0B: 'CONTROL',
 }
-
-
-def _mc_msg_hash(payload):
-    """djb2 32-bit message hash for app-layer dedup. Matches the convention used
-    by the upstream-aligned Python/TS reference decoders (meshcore-decoder-py,
-    michaelhart/meshcore-decoder). Cheap (~1 µs / 100 bytes pure Python) and
-    stable across hops, so the web layer can collapse duplicates of the same
-    frame received via multiple routes."""
-    h = 5381
-    for b in payload:
-        h = ((h << 5) - h + b) & 0xFFFFFFFF
-    return h
 
 _ED25519_VERIFY = None   # lazy cache: verify callable, or False if no crypto lib
 
@@ -1456,58 +1443,41 @@ def _verify_advert_sig(payload_rest):
 
 
 # --- MeshCore group-channel decryption ---------------------------------------
-# A channel is keyed by either a 16-byte AES-128 PSK (most common: the
-# well-known DEFAULT PUBLIC channel below) OR a true 32-byte channel secret
-# (upstream BaseChatMesh.cpp:874 accepts both `len == 32 || len == 16`).
+# A channel is keyed by a shared 16-byte AES-128 PSK; the well-known DEFAULT
+# PUBLIC channel key below is MeshCore's analogue of Meshtastic's 'AQ=='.
 # Decrypting a group message both recovers its text AND verifies it is real —
 # noise won't pass the HMAC and decrypt to valid text.  GRP_TXT/GRP_DATA body
-# layout: channel_hash(1) | mac(2) | ciphertext(16*n).
-# channel_hash = SHA256(channel.secret)[0] where channel.secret is the stored
-# 32-byte buffer (a 16-byte PSK is zero-extended to 32 before storage).
-# mac = HMAC-SHA256(channel.secret, ciphertext)[:2] — keyed with the full
-# 32-byte buffer, NOT the original PSK.
-# plaintext = AES-128-ECB(channel.secret[:16], ciphertext) (no padding) =
-#   ts(4 LE) | flags(1) | text.
+# layout: channel_hash(1) | mac(2) | ciphertext(16*n).  channel_hash =
+# SHA256(key)[0]; mac = HMAC-SHA256(key||16 zero bytes, ciphertext)[:2];
+# plaintext = AES-128-ECB(key, ciphertext) (no padding) = ts(4 LE) | flags(1) | text.
 _MC_PUBLIC_KEY = bytes.fromhex('8b3387e9c5cdea6ac9e5edbaa115cd72')   # default public channel
 import hashlib as _hashlib
-
-def _mc_secret_from_key(kb):
-    """Channel.secret is always 32 bytes upstream. 16-byte PSKs are zero-extended;
-    32-byte keys are used as-is. Returns a 32-byte secret buffer or None."""
-    if not kb: return None
-    if len(kb) == 16: return kb + b'\x00' * 16
-    if len(kb) == 32: return kb
-    return None
-
-_MC_PUBLIC_SECRET = _mc_secret_from_key(_MC_PUBLIC_KEY)
-_MC_PUBLIC_HASH   = _hashlib.sha256(_MC_PUBLIC_SECRET).digest()[0]   # 0x11
+_MC_PUBLIC_HASH = _hashlib.sha256(_MC_PUBLIC_KEY).digest()[0]        # 0x11
 _MC_ENV_KEYS = []                          # extra channel keys from env (legacy)
 for _k in os.environ.get('LORA_MC_CHANNEL_KEYS', '').replace(' ', '').split(','):
-    if len(_k) in (32, 64):                # hex of 16 or 32 raw bytes
+    if len(_k) == 32:
         try: _MC_ENV_KEYS.append(bytes.fromhex(_k))
         except ValueError: pass
 
 def _mc_channel_keys():
-    """channel_hash(int) -> 32-byte channel.secret for every ENABLED MeshCore
-    channel: the public default (unless disabled in the shared key list),
-    legacy env keys, and protocol='meshcore' custom keys from LORA_KEYS.
-    Always returns the FULL 32-byte channel.secret (16-byte PSKs are
-    zero-extended), so HMAC keying matches upstream Utils.cpp:63-72."""
+    """channel_hash(int) -> 16-byte AES key for every ENABLED MeshCore channel
+    key: the public default (unless disabled in the shared key list), legacy env
+    keys, and protocol='meshcore' custom keys from LORA_KEYS.  Sourced from the
+    same key store as Meshtastic (live mtime reload via _load_keys), so the web
+    UI's enable/disable applies without a restart."""
     import hashlib
     cfg = _load_keys() or {}
     m = {}
     if cfg.get('meshcore_default', {}).get('enabled', True):
-        m[_MC_PUBLIC_HASH] = _MC_PUBLIC_SECRET
+        m[_MC_PUBLIC_HASH] = _MC_PUBLIC_KEY
     for kb in _MC_ENV_KEYS:
-        sec = _mc_secret_from_key(kb)
-        if sec is not None:
-            m[hashlib.sha256(sec).digest()[0]] = sec
+        m[hashlib.sha256(kb).digest()[0]] = kb
     for k in cfg.get('keys', []):
         if k.get('protocol') != 'meshcore' or k.get('enabled') is False:
             continue
-        sec = _mc_secret_from_key(k.get('_bytes'))
-        if sec is not None:
-            m[hashlib.sha256(sec).digest()[0]] = sec
+        kb = k.get('_bytes')
+        if kb and len(kb) == 16:           # MeshCore channel crypto is AES-128
+            m[hashlib.sha256(kb).digest()[0]] = kb
     return m
 
 
@@ -1516,21 +1486,18 @@ def _decrypt_mc_channel(payload_rest):
     known key and the 2-byte HMAC verifies.  Returns {'text','ts'} or None."""
     if len(payload_rest) < 1 + 2 + 16:
         return None
-    secret = _mc_channel_keys().get(payload_rest[0])
-    if secret is None:
+    key = _mc_channel_keys().get(payload_rest[0])
+    if key is None:
         return None
     mac, ct = bytes(payload_rest[1:3]), bytes(payload_rest[3:])
     if not ct or len(ct) % 16:
         return None
     try:
         import hmac, hashlib
-        # HMAC key is the full 32-byte channel.secret (upstream Utils.cpp:67-69
-        # passes PUB_KEY_SIZE = 32 bytes regardless of original PSK length).
-        if hmac.new(secret, ct, hashlib.sha256).digest()[:2] != mac:
+        if hmac.new(key + b'\x00' * 16, ct, hashlib.sha256).digest()[:2] != mac:
             return None
-        # AES key is the FIRST 16 bytes of the channel.secret (CIPHER_KEY_SIZE).
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        pt = Cipher(algorithms.AES(secret[:16]), modes.ECB()).decryptor().update(ct)
+        pt = Cipher(algorithms.AES(key), modes.ECB()).decryptor().update(ct)
     except Exception:
         return None
     if len(pt) < 5:
@@ -1584,19 +1551,13 @@ def parse_meshcore_packet(payload):
     hash_count = path_byte & 0x3F
     hash_size  = ((path_byte >> 6) & 0x03) + 1
     offset    += 1
-    rec['mc_hash_size'] = hash_size            # so the web layer matches with the right width
-    _mc_path = []                              # routing path-hash of each hop, as INT (big-endian)
+    _mc_path = []                              # routing path-hash (pubkey[0]) of each hop
     if hash_count > 0:
         path_bytes_needed = hash_count * hash_size
         if len(payload) < offset + path_bytes_needed:
             return None     # declared path overruns the frame → not a real MeshCore packet
         rec['mc_hops'] = hash_count
-        # Preserve the FULL hash_size bytes of each hop. Upstream supports 1/2/3-byte
-        # hashes (packet_format.md), and a hash_size=2 network's two-byte hop gives
-        # 256× more discrimination than the high byte alone.  Stored big-endian so
-        # the high byte is always pubkey[0] (matches how ADVERTs key their identity).
-        _mc_path = [int.from_bytes(payload[offset + i*hash_size:offset + (i+1)*hash_size], 'big')
-                    for i in range(hash_count)]
+        _mc_path = [payload[offset + i*hash_size] for i in range(hash_count)]
         print("  HopCount: %d" % hash_count)
         hops = [payload[offset + i*hash_size:offset + (i+1)*hash_size].hex().upper()
                 for i in range(hash_count)]
@@ -1604,14 +1565,6 @@ def parse_meshcore_packet(payload):
         offset += path_bytes_needed
     rec['mc_path'] = _mc_path
     payload_rest = payload[offset:]
-    # MULTIPART (0x0A) sub-type discriminator: upstream Mesh.cpp:565 sets
-    # multipart's first payload byte to (remaining<<4)|inner_type, where
-    # inner_type must be a real PAYLOAD_TYPE.  Random noise that happened to
-    # land at payload_type=0x0A only passes this gate when its low nibble is
-    # also a valid type — free 13/16 → ~1-in-20 extra discrimination, no key.
-    if payload_type == 0x0A and len(payload_rest) >= 1:
-        if (payload_rest[0] & 0x0F) not in _MESHCORE_PAYLOAD_TYPES:
-            return None
     if payload_type in (0x05, 0x06) and len(payload_rest) >= 1:   # GRP_TXT / GRP_DATA
         print("  ChannelHash: 0x%02X" % payload_rest[0])
         _dec = _decrypt_mc_channel(payload_rest)
@@ -1650,19 +1603,12 @@ def parse_meshcore_packet(payload):
             if rec.get('mc_name'):
                 print("  Name: %s  Role: %s" % (rec['mc_name'], rec.get('mc_role', '?')))
         rec['from'] = 'MC:' + payload_rest[0:4].hex().upper()
-    # djb2 32-bit message hash for app-layer dedup (matches the convention used by
-    # upstream-aligned Python/TS reference decoders).  Stable across hops; web layer
-    # collapses duplicates of the same frame received via multiple routes.
-    _mc_hash = _mc_msg_hash(payload)
     # GENERAL-IDENTIFIER GATE: only CLAIM MeshCore when positively identified — a
     # valid ADVERT Ed25519 signature, or a channel message that decrypts +
-    # MAC-verifies.  MeshCore's header check is loose: with the current gate
-    # (valid payload-type AND version==0 AND path-byte HH!=3) random bytes pass
-    # at ~(13/64)(1/4)(3/4) ≈ 3.8 % ≈ 1 in 26.  A structurally-valid but
-    # unverified frame is therefore indistinguishable from a LoRa protocol we
-    # haven't implemented; return as 'unknown / hint=meshcore' so the web layer
-    # can promote it only when the path corroborates against ADVERT-verified
-    # nodes (≥2 hop matches → confirmed).
+    # MAC-verifies.  MeshCore's header check is loose (accepts ~1 in 5 random
+    # frames), so a structurally-valid but unverified frame is indistinguishable
+    # from a LoRa protocol we haven't implemented; return None so it surfaces as
+    # 'unknown' rather than being mislabeled MeshCore.
     if rec.get('confidence') != 'verified':
         # Not crypto-verified.  Surface as an UNKNOWN frame that *looks like*
         # MeshCore, carrying its path hashes so the web can corroborate it against
@@ -1671,13 +1617,10 @@ def parse_meshcore_packet(payload):
         return {'proto': 'unknown', 'hint': 'meshcore',
                 'confidence': 'candidate',
                 'mc_route': route_name,
-                'mc_type': ptype_name, 'mc_path': _mc_path,
-                'mc_hash_size': hash_size,
-                'mc_msg_hash': _mc_hash, 'decrypted': False,
+                'mc_type': ptype_name, 'mc_path': _mc_path, 'decrypted': False,
                 'summary': 'looks like MeshCore · %s/%s%s' % (
                     route_name, ptype_name,
                     (' · %d hops' % len(_mc_path)) if _mc_path else '')}
-    rec['mc_msg_hash'] = _mc_hash
     _id = ''
     if rec.get('mc_name'):
         _id = ' · ' + rec['mc_name'] + ((' (%s)' % rec['mc_role']) if rec.get('mc_role') else '')
