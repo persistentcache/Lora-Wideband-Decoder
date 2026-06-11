@@ -962,7 +962,7 @@ const ADV_DEFAULTS = {
               ebyte_lora:true, radiohead:true},
   unknown: false,
   fingerprint: true,
-  wide_scan: true,
+  wide_scan: false,
   tune: {threshold: 0.55, energy_threshold: 12.0, buf_seconds: 16}
 };
 // Hover-tooltip text for every advanced option.  Terse, fact-first — what it
@@ -979,8 +979,8 @@ const ADV_TIPS = {
   radiohead: "RadioHead RH_RF95 frame format. Common in Adafruit / Sparkfun starter projects.",
   unknown: "Surface good-CRC LoRa frames matching no enabled protocol. Off by default. When off, decoder skips them entirely (saves CPU).",
   fingerprint: "Extract UMOP features (CFO jitter, AM ripple, PLL phase, I/Q balance) from the preamble. Feeds Mystery Devices and per-node clustering. ~10–15 % extra decode CPU. Header decode coverage unchanged.",
-  scan_all: "Detect every SF (7–12) × BW (62.5 / 125 / 250 / 500 kHz). Higher CPU. Catches non-Meshtastic traffic.",
-  scan_presets: "Detect only the 10 Meshtastic preset SF/BW combinations. Lower CPU. Misses LoRaWAN and other-preset traffic.",
+  scan_all: "Adds SF11/500, SF12/500, SF12/250 and the 31.25 kHz set on top of Common. Catches niche signals at the cost of higher CPU and some spurious detections. Off by default.",
+  scan_presets: "Curated SF×BW set: every SF 7–12 at 62.5/125/250 kHz plus SF7-9/500 kHz. Covers all Meshtastic + MeshCore presets (including 62.5 kHz MeshCore) and common LoRaWAN. Recommended.",
   threshold: "Schmidl-Cox preamble-lock confidence. Default 0.55. Raise → 0.8 to suppress false positives in noisy RF. Lower → 0.4 to catch weak distant signals.",
   energy_threshold: "Energy gate, dB above noise floor. Below this, Schmidl-Cox is skipped. Default 12.0. Raise → 18 to filter spurs. Lower → 5 for weak / distant signals.",
   buf_seconds: "Ring-buffer headroom. ~120 MB/s at 28 Msps. Default 16. Raise to 32 if KEEP-UP warnings appear. Lower to 8 on RAM-constrained hosts."
@@ -1023,8 +1023,8 @@ function renderAdvancedConfig(box){
         <div style="display:flex;gap:8px;align-items:center;margin:18px 0 0">
           <span class="muted">LoRa SF/BW scan:</span>
           <select id="scanmode" title="${esc(s.wide_scan ? ADV_TIPS.scan_all : ADV_TIPS.scan_presets)}" style="cursor:help">
-            <option value="all"${s.wide_scan?' selected':''} title="${esc(ADV_TIPS.scan_all)}">All SF/BW combinations (recommended)</option>
-            <option value="presets"${!s.wide_scan?' selected':''} title="${esc(ADV_TIPS.scan_presets)}">Meshtastic presets only</option>
+            <option value="presets"${!s.wide_scan?' selected':''} title="${esc(ADV_TIPS.scan_presets)}">Common (recommended)</option>
+            <option value="all"${s.wide_scan?' selected':''} title="${esc(ADV_TIPS.scan_all)}">All SF/BW combinations</option>
           </select>
           <span class="muted" style="font-size:11px">applies on next Start</span>
         </div>
