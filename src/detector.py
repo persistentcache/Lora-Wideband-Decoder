@@ -1098,11 +1098,15 @@ def find_preamble_bin(iq, sf, bw, fs=None):
 # Ambiguous lags share a symbol duration across two different SF×BW presets;
 # dechirp quality resolves which one is present.
 _SC_LAGS_1M = {
+    # Curated SF×BW set — covers all Meshtastic + MeshCore presets AND every
+    # SF7-11 / 62.5k combination (added so MeshCore@62.5k traffic is detected
+    # by default — see issue #2).  SF11/500, SF12/500, SF12/250 are deliberately
+    # omitted from this default set (see notes below).  Same-lag candidates are
+    # resolved by dechirp quality in _resolve_sf_bw_ambig.
     256:   [(7, 500000)],
-    512:   [(7, 250000)],
-    1024:  [(8, 250000)],
-    2048:  [(8, 125000), (9, 250000)],    # ambiguous: SF8/125k vs SF9/250k
-    4096:  [(9, 125000), (10, 250000)],   # ambiguous: SF9/125k vs SF10/250k
+    512:   [(7, 250000), (8, 500000)],
+    1024:  [(7, 125000), (8, 250000), (9, 500000)],
+    2048:  [(7, 62500),  (8, 125000), (9, 250000), (10, 500000)],
     # NOTE: SF11/500 (LONG_TURBO) is ALSO lag 4096, but it is deliberately NOT
     # listed here: these radios transmit LONG_TURBO as SF11/250 on-air (verified
     # by measurement — config reads bw=500 but the signal is ~250 kHz), so no
@@ -1111,9 +1115,16 @@ _SC_LAGS_1M = {
     # detections per MEDIUM_FAST run (493 -> 878), bloating decode time. If a
     # genuine SF11/500 source is ever needed, re-add it AND tighten the dechirp
     # resolver so SF9 2-symbol content can't pass as SF11/500.
-    8192:  [(10, 125000), (11, 250000)],  # ambiguous: SF10/125k vs SF11/250k
-    16384: [(11, 125000)],
-    32768: [(12, 125000)],
+    4096:  [(8, 62500),  (9, 125000), (10, 250000)],
+    # SF12/500 omitted here for the same architectural reason as SF11/500: it
+    # would share lag 8192 with SF10/125 + SF11/250, and the resolver may
+    # mis-vote on 2-symbol harmonics of those fundamentals.  Re-add only after
+    # the resolver is hardened against same-lag fundamental-vs-harmonic confusion.
+    8192:  [(9, 62500),  (10, 125000), (11, 250000)],
+    # SF12/250 omitted on the same harmonic-confusion grounds (would share
+    # lag 16384 with SF11/125).
+    16384: [(10, 62500), (11, 125000)],
+    32768: [(11, 62500), (12, 125000)],
     65536: [(12, 62500)],
 }
 if os.environ.get('LORA_SCAN_FULL'):
@@ -1215,11 +1226,14 @@ def schmidl_cox_multi(iq_1m, lags=None, n_sym=8):
     return {lag: schmidl_cox_score(iq_1m, lag, n_sym) for lag in lags}
 
 
-def _resolve_sf_bw_ambig(iq_1m, candidates):
-    """Pick best (sf, bw) from ambiguous Schmidl-Cox candidates via dechirp quality."""
+def _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=None):
+    """Pick best (sf, bw) from ambiguous Schmidl-Cox candidates via dechirp quality.
+    fft_cache: reuses a single forward FFT across candidates with different BWs
+    (same buffer, different narrowband extraction).  ~25 % per-call speedup when
+    a bucket has 3+ candidates."""
     best_sf, best_bw, best_q = candidates[0][0], candidates[0][1], -99.0
     for sf, bw in candidates:
-        nb, _ = extract_narrowband_fft(iq_1m, 1_000_000, 0.0, bw)
+        nb, _ = extract_narrowband_fft(iq_1m, 1_000_000, 0.0, bw, fft_cache=fft_cache)
         if len(nb) < (2 ** sf) * 4:
             continue
         q, _ = dechirp_peak_quality(nb, sf, bw)
@@ -1473,7 +1487,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 if len(candidates) == 1:
                     sf, bw = candidates[0]
                 else:
-                    sf, bw, _ = _resolve_sf_bw_ambig(iq_1m, candidates)
+                    sf, bw, _ = _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=_ffc)
 
             # Find ALL time-separated preamble plateaus at this lag — so a
             # SECOND packet that shares this carrier + SF/BW (a relay hop1
