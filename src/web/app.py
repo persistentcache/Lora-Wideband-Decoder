@@ -62,7 +62,7 @@ CFG = load_config()
 SETTINGS_PATH = os.path.join(_DATA_DIR, "web_settings.json")
 def load_settings():
     _defaults = {'autosave': False, 'waterfall': True,
-                 'wide_scan': True,
+                 'wide_scan': False,
                  # Advanced Options (Config) — persist across sessions:
                  'protocols': {'meshtastic': True, 'meshcore': True, 'lorawan': True,
                                'loramesher': True, 'lora_aprs': True, 'reticulum': True,
