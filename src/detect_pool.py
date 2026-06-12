@@ -44,6 +44,14 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
     sc_thr = params['sc_threshold']; ethr = params['ethresh']
     dc_notch = params['dc_notch']; spur_notch = params['spur_notch']
     spur_default = params.get('spur_db_default', None)
+    # Honor LORA_DEBUG so users diagnosing detection issues actually see the
+    # per-peak energy / SC / dechirp output the gate already knows how to print.
+    # The hardcoded debug=0 here previously made --debug N on the parent silently
+    # a no-op in multi-worker mode (the default).
+    try:
+        _dbg = int(os.environ.get('LORA_DEBUG', '0') or '0')
+    except ValueError:
+        _dbg = 0
 
     while True:
         task = task_q.get()
@@ -54,7 +62,7 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
         try:
             kw = dict(sc_threshold=sc_thr, ethresh=ethr,
                       dc_notch_mhz=dc_notch, spur_notch_hz=spur_notch,
-                      debug=0, cached_psd=psd, cached_peaks=peaks)
+                      debug=_dbg, cached_psd=psd, cached_peaks=peaks)
             if spur_db is not None:
                 kw['spur_db'] = spur_db
             dets = L.detect_preamble(iq, wb_fs, wb_bw, center, **kw)
