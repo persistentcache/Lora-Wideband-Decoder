@@ -139,6 +139,17 @@ def load_keys():
         k.setdefault('protocol', 'meshtastic')
         k.setdefault('enabled', True)
         k.setdefault('notes', '')
+    # Node identity keypairs (for DM decrypt: MeshCore TXT_MSG + Meshtastic PKI DM).
+    # Each entry: {id, protocol, label, pub, priv, node_id?, enabled, notes}.  Stored
+    # as hex.  MeshCore priv is 64-byte (Ed25519 scalar||nonce_prefix); Meshtastic
+    # priv is 32-byte raw X25519.  node_id is the Meshtastic !xxxxxxxx address (only
+    # meaningful for meshtastic protocol).
+    d.setdefault('identities', [])
+    for k in d['identities']:
+        k.setdefault('protocol', 'meshcore')
+        k.setdefault('enabled', True)
+        k.setdefault('notes', '')
+        k.setdefault('node_id', '')
     return d
 
 
@@ -2199,6 +2210,116 @@ def api_keys_default():
         kc['default_notes'] = (d.get('default_notes') or '').strip()
     save_keys(kc)
     return jsonify({'ok': True, 'keys': kc})
+
+
+def _hex_bytes(s, expected_lens):
+    """Strip whitespace, decode hex OR base64, return bytes if length matches expected_lens (tuple)."""
+    s = (s or '').strip()
+    try:
+        b = bytes.fromhex(s)
+        if len(b) in expected_lens:
+            return b
+    except ValueError:
+        pass
+    try:
+        b = _b64.b64decode(s + '=' * (-len(s) % 4))
+        if len(b) in expected_lens:
+            return b
+    except Exception:
+        pass
+    return None
+
+
+def _validate_identity(proto, pub, priv):
+    """Return (pub_bytes, priv_bytes, error_str_or_None).
+
+    Verifies the priv-pub pair: for MeshCore, Ed25519 scalar (priv[0:32]) * base
+    must equal pub; for Meshtastic, X25519 scalar * base must equal pub.  Stops
+    the user from saving inconsistent pairs (typo, swapped, copy-paste errors)
+    which would otherwise produce undecryptable garbage at runtime."""
+    pub_b = _hex_bytes(pub, (32,))
+    if pub_b is None:
+        return None, None, 'pub must be 32 bytes (hex or base64)'
+    if proto == 'meshcore':
+        priv_b = _hex_bytes(priv, (64,))
+        if priv_b is None:
+            return None, None, 'meshcore priv must be 64 bytes (hex/base64)'
+        try:
+            from nacl.bindings import crypto_scalarmult_ed25519_base_noclamp
+            derived = crypto_scalarmult_ed25519_base_noclamp(priv_b[:32])
+            if derived != pub_b:
+                return None, None, 'priv does not derive to pub (Ed25519 base mismatch — check keys)'
+        except Exception as e:
+            return None, None, 'nacl error: %s' % e
+    elif proto == 'meshtastic':
+        priv_b = _hex_bytes(priv, (32,))
+        if priv_b is None:
+            return None, None, 'meshtastic priv must be 32 bytes (hex/base64)'
+        try:
+            from nacl.bindings import crypto_scalarmult_base
+            derived = crypto_scalarmult_base(priv_b)
+            if derived != pub_b:
+                return None, None, 'priv does not derive to pub (X25519 base mismatch — check keys)'
+        except Exception as e:
+            return None, None, 'nacl error: %s' % e
+    else:
+        return None, None, 'protocol must be meshcore or meshtastic'
+    return pub_b, priv_b, None
+
+
+@app.route('/api/identities', methods=['GET'])
+def api_identities_get():
+    return jsonify({'identities': load_keys().get('identities', [])})
+
+
+@app.route('/api/identities', methods=['POST'])
+def api_identities_add():
+    d = request.get_json(force=True, silent=True) or {}
+    proto = 'meshcore' if d.get('protocol') == 'meshcore' else 'meshtastic'
+    pub = (d.get('pub') or '').strip()
+    priv = (d.get('priv') or '').strip()
+    pub_b, priv_b, err = _validate_identity(proto, pub, priv)
+    if err:
+        return jsonify({'ok': False, 'error': err})
+    kc = load_keys()
+    kc['identities'].append({
+        'id': 'i%d' % int(time.time() * 1000),
+        'protocol': proto,
+        'label': (d.get('label') or 'identity').strip(),
+        'pub': pub_b.hex(),
+        'priv': priv_b.hex(),
+        'node_id': (d.get('node_id') or '').strip(),
+        'enabled': d.get('enabled') is not False,
+        'notes': (d.get('notes') or '').strip(),
+    })
+    save_keys(kc)
+    return jsonify({'ok': True, 'keys': kc})
+
+
+@app.route('/api/identities/<iid>', methods=['DELETE'])
+def api_identities_del(iid):
+    kc = load_keys()
+    kc['identities'] = [k for k in kc['identities'] if k.get('id') != iid]
+    save_keys(kc)
+    return jsonify({'ok': True, 'keys': kc})
+
+
+@app.route('/api/identities/<iid>/update', methods=['POST'])
+def api_identities_update(iid):
+    """Update an identity's mutable fields (enabled / label / notes / node_id).  Key
+    material (pub / priv) is never editable — delete and re-add to rotate."""
+    d = request.get_json(force=True, silent=True) or {}
+    kc = load_keys()
+    for k in kc['identities']:
+        if k.get('id') != iid:
+            continue
+        if 'enabled' in d: k['enabled'] = bool(d['enabled'])
+        if 'label' in d:   k['label'] = (d.get('label') or k.get('label') or 'identity').strip()
+        if 'notes' in d:   k['notes'] = (d.get('notes') or '').strip()
+        if 'node_id' in d: k['node_id'] = (d.get('node_id') or '').strip()
+        save_keys(kc)
+        return jsonify({'ok': True, 'keys': kc})
+    return jsonify({'ok': False, 'error': 'unknown identity id'})
 
 
 @app.route('/api/keys/export')
