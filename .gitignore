@@ -34,6 +34,10 @@ lora_web/dec_pkts.jsonl
 *.pem
 keys.json
 keystore.json
+# Per-node identity keys (Ed25519 / X25519 scalars for DM decrypt) — NEVER
+# commit; each operator generates their own via the Keys panel.
+lora_web/lora_keys.json
+lora_keys.json
 
 # Local env-var overrides (reference: docs/env-overrides.md)
 .env
