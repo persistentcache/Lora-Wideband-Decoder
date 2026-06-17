@@ -1506,6 +1506,189 @@ def _decrypt_mc_channel(payload_rest):
             'text': pt[5:].split(b'\x00')[0].decode('utf-8', 'replace')}
 
 
+# ============================================================================
+# Identity (DM) keyring.  Per-pair ECDH for MeshCore TXT_MSG (payload_type 0x02)
+# and Meshtastic PKI DMs.  Loaded from lora_keys.json `identities` list, hot-
+# reloaded on file mtime change (matches _load_keys behaviour).
+#
+# Schema (per entry):
+#   meshcore:   protocol='meshcore',   pub=32B Ed25519,  priv=64B (Ed25519 scalar||nonce_prefix)
+#   meshtastic: protocol='meshtastic', pub=32B X25519,   priv=32B raw X25519
+#
+# Registry of seen MeshCore pubkeys (routing_hash byte → set of full 32B pubs)
+# lets us look up the sender of a TXT_MSG given only the 1-byte src_hash that
+# the wire carries.  Seeded by configured identity pubs and every Ed25519-
+# verified ADVERT we decode.
+# ============================================================================
+_MC_PUBKEY_REG = {}     # int (pub[0]) -> set of 32B pubkeys
+_MC_IDENTITY_KEYS = []  # list of (pub_32, ed25519_scalar_32)
+_MT_IDENTITY_KEYS = []  # list of (x_pub_32, x_priv_32, node_id_u32_or_None)
+_IDENTITY_MTIME = [None]
+
+
+def _load_identities():
+    """Refresh _MC_IDENTITY_KEYS / _MT_IDENTITY_KEYS / _MC_PUBKEY_REG from the
+    lora_keys.json `identities` list.  Re-reads only when the file mtime changes
+    (the cfg cache inside _load_keys already gates that)."""
+    global _MC_IDENTITY_KEYS, _MT_IDENTITY_KEYS
+    cfg = _load_keys()
+    if cfg is None:
+        return
+    mt = _IDENTITY_MTIME[0]
+    if mt is _KEYS_CACHE['mtime']:
+        return
+    _IDENTITY_MTIME[0] = _KEYS_CACHE['mtime']
+    mc, mtt = [], []
+    for k in cfg.get('identities', []):
+        if k.get('enabled') is False:
+            continue
+        try:
+            pub = bytes.fromhex(k.get('pub', ''))
+            priv = bytes.fromhex(k.get('priv', ''))
+        except (ValueError, TypeError):
+            continue
+        proto = k.get('protocol')
+        if proto == 'meshcore' and len(pub) == 32 and len(priv) == 64:
+            mc.append((pub, priv[:32]))
+            _MC_PUBKEY_REG.setdefault(pub[0], set()).add(pub)
+        elif proto == 'meshtastic' and len(pub) == 32 and len(priv) == 32:
+            nid_raw = (k.get('node_id', '') or '').strip().lstrip('!')
+            try:
+                nid = int(nid_raw, 16) if nid_raw else None
+            except ValueError:
+                nid = None
+            mtt.append((pub, priv, nid))
+    _MC_IDENTITY_KEYS = mc
+    _MT_IDENTITY_KEYS = mtt
+
+
+def _register_mc_pubkey(pub_bytes):
+    """Add a 32B MeshCore Ed25519 pubkey to the routing-hash registry.  Called
+    from the ADVERT branch on Ed25519 sig verify, and from _load_identities()
+    for every configured identity key."""
+    if isinstance(pub_bytes, (bytes, bytearray)) and len(pub_bytes) == 32:
+        _MC_PUBKEY_REG.setdefault(pub_bytes[0], set()).add(bytes(pub_bytes))
+
+
+def _decrypt_mc_dm(payload_rest):
+    """Try to decrypt a MeshCore TXT_MSG (DM).  Wire format past the path:
+       [dest_hash:1][src_hash:1][MAC:2][ciphertext:16N]
+
+    For each enabled identity whose pub[0] == dest_hash, ECDH-derive a shared
+    secret against every registered pub with pub[0] == src_hash and try HMAC-
+    SHA256 (truncated to 2 bytes) + AES-128-ECB.  Returns dict on success."""
+    if len(payload_rest) < 4:
+        return None
+    _load_identities()
+    if not _MC_IDENTITY_KEYS:
+        return None
+    dest_hash = payload_rest[0]
+    src_hash = payload_rest[1]
+    mac = bytes(payload_rest[2:4])
+    ct = bytes(payload_rest[4:])
+    if not ct or len(ct) % 16:
+        return None
+    candidates = [(pub, priv) for (pub, priv) in _MC_IDENTITY_KEYS if pub[0] == dest_hash]
+    if not candidates:
+        return None
+    senders = list(_MC_PUBKEY_REG.get(src_hash, ()))
+    if not senders:
+        return None
+    try:
+        from nacl.bindings import (crypto_sign_ed25519_pk_to_curve25519,
+                                    crypto_scalarmult)
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        import hmac as _hmac
+        import hashlib as _hashlib
+    except ImportError:
+        return None
+    for our_pub, our_scalar in candidates:
+        for sender_pub in senders:
+            try:
+                sender_x = crypto_sign_ed25519_pk_to_curve25519(sender_pub)
+                shared = crypto_scalarmult(our_scalar, sender_x)
+            except Exception:
+                continue
+            if _hmac.new(shared, ct, _hashlib.sha256).digest()[:2] != mac:
+                continue
+            try:
+                pt = Cipher(algorithms.AES(shared[:16]), modes.ECB()).decryptor().update(ct)
+            except Exception:
+                continue
+            if len(pt) < 5:
+                continue
+            try:
+                text = pt[5:].split(b'\x00')[0].decode('utf-8')
+            except UnicodeDecodeError:
+                continue
+            return {'ts': int.from_bytes(pt[0:4], 'little'),
+                    'text': text,
+                    'sender_pub': sender_pub.hex(),
+                    'recipient_pub': our_pub.hex()}
+    return None
+
+
+def _decrypt_mt_pki_dm(packet_header16, enc_data, pkt_id):
+    """Try to decrypt a Meshtastic PKI DM.
+
+    Wire (from firmware src/mesh/CryptoEngine.cpp::decryptCurve25519):
+       enc_data = [ciphertext: N][tag: 8][extraNonce: 4 LE]
+    shared = SHA256(X25519(our_priv, peer_pub))
+    nonce  = [pkt_id LE u32][extraNonce LE u32]    (8 bytes)
+    AES-CCM-256, 8-byte nonce, 8-byte tag, empty AAD.
+
+    For each pair (own identity, other identity) in the configured set, try
+    decrypting in BOTH role assignments: (our=A, peer=B) and (our=B, peer=A).
+    Returns dict on success or None.  Peer pub here comes only from configured
+    identities — NODEINFO caching is not yet implemented, so DMs to/from third
+    parties stay encrypted."""
+    _load_identities()
+    if len(_MT_IDENTITY_KEYS) < 1 or len(enc_data) < 12 + 1:
+        return None
+    N = len(enc_data) - 12
+    ct = bytes(enc_data[:N])
+    tag = bytes(enc_data[N:N + 8])
+    extra_nonce = enc_data[N + 8:N + 12]
+    sender_id = packet_header16[4] | (packet_header16[5] << 8) | (packet_header16[6] << 16) | (packet_header16[7] << 24)
+    dest_id = packet_header16[0] | (packet_header16[1] << 8) | (packet_header16[2] << 16) | (packet_header16[3] << 24)
+    # Firmware's initNonce builds 13 bytes: [pkt_id LE u64 (8)][fromNode LE u32 (4)][0]
+    # then overlays extraNonce LE u32 at offset 4 (replacing the high u32 of the u64
+    # packetId).  AES-CCM uses the FULL 13-byte nonce (the `8` arg to aes_ccm_ad in
+    # CryptoEngine.cpp is the tag length, NOT the nonce length).
+    nb = bytearray(13)
+    nb[0:8]   = pkt_id.to_bytes(8, 'little')
+    nb[8:12]  = sender_id.to_bytes(4, 'little')
+    nb[4:8]   = bytes(extra_nonce)
+    nonce = bytes(nb)
+    try:
+        from nacl.bindings import crypto_scalarmult
+        from cryptography.hazmat.primitives.ciphers.aead import AESCCM
+        import hashlib as _hashlib
+    except ImportError:
+        return None
+    # Build candidate (our_priv, our_pub, our_nid) × (peer_priv, peer_pub, peer_nid)
+    # — sender must be peer, recipient must be us.  If node_ids are configured we
+    # use them to short-circuit; otherwise try every cross-pair (cheap).
+    for (our_pub, our_priv, our_nid) in _MT_IDENTITY_KEYS:
+        if our_nid is not None and our_nid != dest_id:
+            continue
+        for (peer_pub, _peer_priv, peer_nid) in _MT_IDENTITY_KEYS:
+            if peer_pub == our_pub:
+                continue        # can't DM yourself
+            if peer_nid is not None and peer_nid != sender_id:
+                continue
+            try:
+                shared_raw = crypto_scalarmult(our_priv, peer_pub)
+                shared = _hashlib.sha256(shared_raw).digest()
+                pt = AESCCM(shared, tag_length=8).decrypt(nonce, ct + tag, None)
+            except Exception:
+                continue
+            return {'plaintext': pt, 'label': 'pki',
+                    'sender_pub': peer_pub.hex(),
+                    'recipient_pub': our_pub.hex()}
+    return None
+
+
 def parse_meshcore_packet(payload):
     """Parse a MeshCore packet: print human-readable fields AND return a normalized
     record dict (proto='meshcore') for the [PKT] stream, or None."""
@@ -1575,6 +1758,21 @@ def parse_meshcore_packet(payload):
             if payload_type == 0x05 and _dec['text']:
                 rec['text'] = _dec['text']
             print("  [DECRYPTED %s] %s" % (rec['mc_channel'], _dec.get('text', '')))
+    elif payload_type == 0x02 and len(payload_rest) >= 4:         # TXT_MSG (DM)
+        print("  Dest: 0x%02X  Src: 0x%02X" % (payload_rest[0], payload_rest[1]))
+        _dm = _decrypt_mc_dm(payload_rest)
+        if _dm is not None:
+            rec['decrypted'] = True
+            rec['confidence'] = 'verified'
+            rec['mc_channel'] = 'dm'
+            rec['text'] = _dm['text']
+            rec['mc_dm_sender'] = _dm['sender_pub'][:8]   # 4-byte short id for display
+            rec['mc_dm_recipient'] = _dm['recipient_pub'][:8]
+            rec['from'] = 'MC:' + _dm['sender_pub'][:8].upper()
+            rec['to'] = 'MC:' + _dm['recipient_pub'][:8].upper()
+            print("  [DECRYPTED DM %s→%s] %s" % (
+                _dm['sender_pub'][:8].upper(),
+                _dm['recipient_pub'][:8].upper(), _dm['text']))
     elif payload_type == 0x04:                                    # ADVERT (Ed25519-signed)
         _sig_ok = _verify_advert_sig(payload_rest)
         if _sig_ok is False:
@@ -1589,6 +1787,8 @@ def parse_meshcore_packet(payload):
         # appdata (role / location / name).  appdata = flags | [lat,lon] | name.
         rec['mc_pubkey'] = payload_rest[0:32].hex()
         rec['mc_hash'] = payload_rest[0]
+        if _sig_ok:
+            _register_mc_pubkey(payload_rest[0:32])
         _ad = payload_rest[100:]
         if _ad:
             _flags = _ad[0]; _ao = 1
@@ -1610,6 +1810,19 @@ def parse_meshcore_packet(payload):
     # from a LoRa protocol we haven't implemented; return None so it surfaces as
     # 'unknown' rather than being mislabeled MeshCore.
     if rec.get('confidence') != 'verified':
+        # ACK (payload_type 0x03) carries no decryptable payload — just a 4-byte
+        # ACK CRC — so it can never reach 'verified'.  When the user has
+        # configured a MeshCore identity, on-air MeshCore activity is presumed
+        # legitimate, so promote ACKs to confidence='confirmed' and claim them
+        # as meshcore.  Without an identity, fall through to the unknown gate
+        # below (safer default for users not running MC nodes).
+        _load_identities()
+        if payload_type == 0x03 and _MC_IDENTITY_KEYS:
+            rec['confidence'] = 'confirmed'
+            rec['summary'] = '%s / %s%s · confirmed (ACK)' % (
+                route_name, ptype_name,
+                (' · %d hops' % rec['mc_hops']) if rec.get('mc_hops') else '')
+            return rec
         # Not crypto-verified.  Surface as an UNKNOWN frame that *looks like*
         # MeshCore, carrying its path hashes so the web can corroborate it against
         # the ADVERT-verified node registry (a frame routed through known nodes is
@@ -1924,7 +2137,14 @@ def parse_reticulum_packet(payload, rf=None):
     print("  Context: 0x%02X  AppData: %d bytes" % (context, len(app_data)))
     return {
         'proto': 'reticulum',
-        'confidence': 'verified',               # all crypto-field shapes match
+        # NOTE: 'verified' here is STRUCTURAL + entropy-gated only.  The Ed25519
+        # signature in the announce IS NOT verified by parse_reticulum_packet —
+        # the high-entropy distinct-byte counts on pubkey/sig/random_hash filter
+        # out random noise, but a random AES-CTR-style ciphertext of >=167B
+        # easily satisfies them (FP ~3% per round 1 analysis).  Until an actual
+        # Ed25519.verify() call is added, this parser is intentionally NOT in
+        # _CRYPTO_VERIFIED_PROTOS — it would steal real Meshtastic DMs.
+        'confidence': 'verified',
         'decrypted': False,
         'from': public_key[:8].hex(),           # first 8 bytes of pubkey as ID
         'to': destination_hash.hex(),
@@ -2838,6 +3058,37 @@ def parse_meshtastic_packet(payload, aes_key=None, no_key=False, _clean_crc=Fals
             _valid, _key_label = True, _klabel
             break
     if not _valid:
+        # Channel keys exhausted.  Try PKI (X25519 ECDH + AES-CCM) for unicast
+        # DMs against every (our_priv, peer_pub) pair we can form from configured
+        # identities.  Only attempted on unicast (no broadcast) and only when the
+        # payload carries the required tag+extraNonce trailer (≥12 bytes after
+        # the 16-byte header).
+        if (not is_broadcast) and len(enc_data) >= 12 + 1:
+            _pki = _decrypt_mt_pki_dm(p, enc_data, pkt_id)
+            if _pki is not None:
+                decrypted, _key_label = _pki['plaintext'], _pki['label']
+                fields = parse_protobuf(decrypted)
+                portnum, inner_payload = -1, None
+                want_response = request_id = reply_id = emoji = None
+                for fn, wt, val in fields:
+                    if fn == 1 and wt == 0: portnum = int(val)
+                    if fn == 2 and wt == 2: inner_payload = val
+                    if fn == 3 and wt == 0: want_response = bool(val)
+                    if fn == 6 and wt == 0: request_id = int(val)
+                    if fn == 7 and wt == 0: reply_id = int(val)
+                    if fn == 8 and wt == 0: emoji = int(val)
+                _v2 = (portnum >= 0) and (portnum in KNOWN_PORTNUMS)
+                if _v2 and portnum in _TEXT_PORTNUMS and inner_payload:
+                    try:
+                        inner_payload.decode('utf-8')
+                    except UnicodeDecodeError:
+                        _v2 = False
+                if _v2:
+                    _valid = True
+                    _rec['pki'] = True
+                    _rec['mt_dm_sender_pub'] = _pki['sender_pub'][:8]
+                    _rec['mt_dm_recipient_pub'] = _pki['recipient_pub'][:8]
+    if not _valid:
         print("  %s -> %s [decrypt failed — not a valid packet, suppressed]" % (sender, dest_str))
         # Clean (non-chase) CRC means the whole-packet CRC-16 matched WITHOUT
         # bit-flipping → a REAL on-air packet whose payload just won't decrypt
@@ -2988,6 +3239,143 @@ def _proto_candidates(sync):
                 ('meshcore', _h_meshcore)] + common_tail
     return [('meshcore', _h_meshcore), ('loramesher', _h_loramesher),
             ('lorawan', _h_lorawan)] + common_tail
+
+
+# Tier rank used by both dispatcher sites and the helper below.  Module-scope so
+# the helper, SITE 1 (early dispatch), and SITE 2 (post-chase) all agree.
+_TIER_RANK = {'verified': 3, 'confirmed': 2, 'candidate': 1}
+
+
+# Whitelist of parsers whose `confidence='verified'` is cryptographically
+# grounded — these may preempt the Meshtastic-shape match.  Mere structural or
+# entropy-only `verified` does NOT qualify (it would steal real Meshtastic DMs
+# whose ciphertext coincidentally satisfies the structural gates).
+#
+# A parser belongs here iff its `verified` tier is gated by one of:
+#   (a) successful AEAD/MAC decrypt with a stored key,
+#   (b) successful in-frame Ed25519/MIC verify,
+#   (c) >=24-bit fixed magic plus a structural grammar tight enough to bound
+#       random-bytes FP rate to < ~1e-6.
+#
+# Per-parser justification:
+#   meshcore   — verified set only after _decrypt_mc_channel HMAC-SHA256+AES
+#                check (decoder.py:1568-1577) OR _verify_advert_sig Ed25519
+#                pass (decoder.py:1578-1584).  Pure structural matches return
+#                proto='unknown' hint='meshcore' at 'candidate' tier.
+#   lora_aprs  — verified set only after 3-byte magic 0x3cff01 AND strict ASCII
+#                TNC2 grammar (decoder.py:1754-1801).  Magic alone is ~2^-24;
+#                grammar tightens it well below ~1e-6.
+#
+# Intentionally EXCLUDED:
+#   reticulum     — verified tier is structural + entropy only; Ed25519 NOT
+#                   verified (decoder.py:1916-1941).  ~3% FP on random >=167B.
+#   disaster_radio— verified tier is length sanity + ttl/hopcount only
+#                   (decoder.py:1965-2018).  ~3e-4 FP on random >=22B.
+#   lorawan       — parser never emits 'verified' (caps at 'candidate' at
+#                   decoder.py:1326).  Excluded to avoid signaling otherwise.
+#   loramesher / radiohead / ebyte — never emit 'verified' (cap at 'confirmed').
+_CRYPTO_VERIFIED_PROTOS = frozenset({'meshcore', 'lora_aprs'})
+
+
+def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
+                                  meshtastic_handler, meshtastic_shape_ok,
+                                  print_on_tie):
+    """Route a clean-CRC LoRa frame to a parser.  Single source of dispatch
+    truth shared by SITE 1 (early-dispatch, pre-chase) and SITE 2 (post-chase
+    / no-chase).  Returns (handled, winner_or_None, via_tag).
+
+    Order:
+      1. Try every enabled non-Meshtastic parser.  If any returns
+         confidence='verified' AND its name is in _CRYPTO_VERIFIED_PROTOS,
+         emit that record and stop.  This preempt is the fix for the MeshCore
+         vs Meshtastic-shape collision (~50% of MeshCore frames had byte[12]
+         satisfying _is_plausible_mesh_header_uni and were silently emitted
+         as encrypted-only Meshtastic).
+      2. Else if `meshtastic_shape_ok`, dispatch to `meshtastic_handler`.
+         Preserves the documented "encrypted-DM header-only surfacing"
+         invariant (decoder.py:5840-5844 historical comment).
+      3. Else if any non-Meshtastic candidate matched, emit the best by
+         confidence tier with same-tier ties flagged 'ambiguous' (existing
+         behavior).
+      4. Else return (False, None, None) — caller handles unknown emit.
+
+    The crypto-verified scan iterates ALL verified-tier matches looking for
+    the first whitelisted one, so a structurally-verified non-whitelisted
+    parser at matches[0] cannot block a crypto-verified whitelisted parser
+    later in the list.
+
+    The caller MUST set its own _early_handled / _handled flag from the
+    returned bool — SITE 1's flag triggers an immediate return with
+    via='early_dispatch'; SITE 2's flag only suppresses unknown emit and
+    falls through to packet-length compute, so the helper cannot conflate
+    them.
+
+    `print_on_tie` is True at SITE 1 (preserves the legacy 'AMBIGUOUS:'
+    stdout line) and False at SITE 2 (silent ambiguous flag only — preserves
+    SITE 2's existing behavior so the harness_ref jsonl does not drift).
+    """
+    matches = []
+    for pname, handler in _proto_candidates(sync_word):
+        if pname not in _PROTO_ENABLED:
+            continue
+        if len(payload) < 1:
+            break
+        try:
+            rec = handler(payload, ctx)
+        except Exception:
+            continue
+        if rec is not None:
+            matches.append((pname, rec))
+    if matches:
+        matches.sort(key=lambda m: -_TIER_RANK.get(m[1].get('confidence', 'candidate'), 0))
+
+    # Crypto-verified preempt: scan ALL verified-tier matches (matches is
+    # sorted desc, so verified entries are contiguous at the front).  Skip
+    # non-whitelisted verified entries so a structurally-verified parser
+    # cannot mask a crypto-verified whitelisted parser further down.
+    crypto_winner = None
+    for pname, rec in matches:
+        if rec.get('confidence') != 'verified':
+            break
+        if pname in _CRYPTO_VERIFIED_PROTOS:
+            crypto_winner = (pname, rec)
+            break
+
+    if crypto_winner is not None:
+        _pname, _rec = crypto_winner
+        if meshtastic_shape_ok:
+            # Audit-tag distinct from `ambiguous` (which means same-tier tie):
+            # this flag means "MeshCore bytes coincidentally satisfied the
+            # Meshtastic 16-byte header invariants but we routed correctly via
+            # crypto-verified preempt".
+            _rec['mesh_shape_collision'] = True
+        _emit_proto(_rec, payload, sf, bw, cr, sync_word, rf)
+        return True, _rec, 'verified_nonmt_preempt'
+
+    if meshtastic_shape_ok:
+        meshtastic_handler(payload, ctx)
+        return True, None, 'meshtastic_shape'
+
+    if matches:
+        _pname, _winner = matches[0]
+        if len(matches) > 1:
+            _winner['alternatives'] = [
+                {'proto': r.get('proto', n), 'hint': r.get('hint'),
+                 'confidence': r.get('confidence'), 'summary': r.get('summary')}
+                for n, r in matches[1:]]
+            _tier_top = _TIER_RANK.get(matches[0][1].get('confidence', 'candidate'), 0)
+            _tier_2nd = _TIER_RANK.get(matches[1][1].get('confidence', 'candidate'), 0)
+            if _tier_top == _tier_2nd:
+                _winner['ambiguous'] = True
+                if print_on_tie:
+                    print("  AMBIGUOUS: %d parsers claimed at tier '%s' — "
+                          "emitting %s, listing alternatives" % (
+                              len(matches), _winner.get('confidence', 'candidate'),
+                              _winner.get('proto', _pname)))
+        _emit_proto(_winner, payload, sf, bw, cr, sync_word, rf)
+        return True, _winner, 'nonmt_candidate'
+
+    return False, None, None
 
 
 # ============================================================================
@@ -3326,7 +3714,10 @@ def process_file(fpath, relay_after=None, relay_before=None,
     name = os.path.basename(fpath)
     parts = name.lstrip('.').split('_')
     sf = int(parts[0].replace('SF', ''))
-    bw = int(parts[1].replace('k', '')) * 1000
+    # Filename token is fmt_bw() output: "125k" for integer kHz, "62.50k" for
+    # fractional (MeshCore @ 62.5 kHz, sub-kHz LoRaWAN variants).  int() on a
+    # decimal string raises, so MeshCore captures used to silently never decode.
+    bw = int(round(float(parts[1].replace('k', '')) * 1000))
     N = 1 << sf
     ppm = sf - 2  # reduced rate bits for header
 
@@ -5519,55 +5910,24 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     if crc_ok:
         _early_ctx = {'aes_key': _mesh_aes_key, 'no_key': _mesh_no_key,
                       'clean_crc': True, 'rf': _rf, 'is_mesh': True}
-        # Meshtastic: precondition = shape + behavioral (same as the legacy
-        # primary gates).  Parser owns decrypt/protobuf validity downstream.
-        if ('meshtastic' in _PROTO_ENABLED and len(raw_bytes) >= 16
-                and _is_plausible_mesh_header_uni(raw_bytes)
-                and _is_chase_acceptable_uni(raw_bytes)):
-            _h_meshtastic(payload, _early_ctx)
-            _early_handled = True
-        # Non-Meshtastic parsers (MeshCore, LoRaWAN, LoRaMesher, ...).  Try-all-
-        # rank: run EVERY enabled parser, collect every match, then pick the
-        # highest-confidence one to emit.  This surfaces ambiguity instead of
-        # hiding it — if two parsers both claim the bytes at the same tier the
-        # winner is marked `ambiguous: true` and the runners-up are listed in
-        # `alternatives` so the UI can show "looked like X, also matched Y."
-        # Latency cost: a few microseconds per packet (parsers fail-fast on the
-        # first-byte mismatch), traded against the correctness win of never
-        # silently mis-attributing a frame that two protocols' validators both
-        # accepted.
-        if not _early_handled:
-            _matches = []
-            for _pname, _handler in _proto_candidates(_sync_word):
-                if _pname not in _PROTO_ENABLED:
-                    continue
-                try:
-                    _rec = _handler(payload, _early_ctx)
-                except Exception:
-                    continue
-                if _rec is not None:
-                    _matches.append((_pname, _rec))
-            if _matches:
-                # Rank by confidence tier (higher = stronger).
-                _TIER_RANK = {'verified': 3, 'confirmed': 2, 'candidate': 1}
-                def _tier(m): return _TIER_RANK.get(m[1].get('confidence', 'candidate'), 0)
-                _matches.sort(key=lambda m: -_tier(m))
-                _winner_pname, _winner = _matches[0]
-                if len(_matches) > 1:
-                    _alts = [{'proto': r.get('proto', n),
-                              'hint':  r.get('hint'),
-                              'confidence': r.get('confidence'),
-                              'summary': r.get('summary')} for n, r in _matches[1:]]
-                    _winner['alternatives'] = _alts
-                    # Same-tier runner-up → genuine ambiguity, flag it.
-                    if _tier(_matches[1]) == _tier(_matches[0]):
-                        _winner['ambiguous'] = True
-                        print("  AMBIGUOUS: %d parsers claimed at tier '%s' — "
-                              "emitting %s, listing alternatives" % (
-                                  len(_matches), _winner.get('confidence', 'candidate'),
-                                  _winner.get('proto', _winner_pname)))
-                _emit_proto(_winner, payload, sf, bw, cr, _sync_word, _rf)
-                _early_handled = True
+        # Single dispatch helper shared with SITE 2 (post-chase).  Order:
+        # crypto-verified non-mt preempt → Meshtastic shape-match → best non-mt
+        # candidate.  The crypto preempt is the fix for the MeshCore-vs-mt-shape
+        # collision: ~50 % of MeshCore frames have byte[12] that satisfies
+        # _is_plausible_mesh_header_uni and were silently mis-emitted as
+        # encrypted-only Meshtastic.  A whitelisted (_CRYPTO_VERIFIED_PROTOS),
+        # crypto-grounded 'verified' record now wins over the structural mt
+        # shape match.  The encrypted-DM surfacing invariant is preserved —
+        # frames where no non-mt parser verifies still fall through to
+        # _h_meshtastic exactly as before.
+        _mt_shape_ok = ('meshtastic' in _PROTO_ENABLED and len(raw_bytes) >= 16
+                        and _is_plausible_mesh_header_uni(raw_bytes)
+                        and _is_chase_acceptable_uni(raw_bytes))
+        _early_handled, _, _ = _dispatch_nonmt_or_meshtastic(
+            payload, _early_ctx, _sync_word, _rf, sf, bw, cr,
+            meshtastic_handler=_h_meshtastic,
+            meshtastic_shape_ok=_mt_shape_ok,
+            print_on_tie=True)
         # Unknown=ON: surface non-Meshtastic-shape bytes with no parser match.
         # (Meshtastic-shape unclaimed bytes fall through to chase for recovery,
         # matching today's "force chase, drop on fail" semantics.)
@@ -5855,45 +6215,18 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         print()
         return ('FAIL', preamble_start, 20 * N, preamble_bin)
 
-    # CRC passed (or not present) — route through the protocol parser registry.
+    # CRC passed (or not present) — route through the shared dispatch helper.
     # (_rf was hoisted to the early-dispatch block above; reuse it here.)
+    # print_on_tie=False preserves SITE 2's silent ambiguous behavior so the
+    # harness_ref jsonl does not drift (SITE 1 prints; SITE 2 does not).
     _ctx = {'aes_key': _mesh_aes_key, 'no_key': _mesh_no_key,
             'clean_crc': _clean_crc, 'rf': _rf, 'is_mesh': _is_meshtastic}
-    _handled = False
-    if _ctx['is_mesh'] and len(payload) >= 16:
-        _h_meshtastic(payload, _ctx)              # validates + emits its own [PKT]
-        _handled = True
-    else:
-        # Try-all-rank dispatch (same as the pre-chase early-dispatch above).
-        # Sync word only orders the candidates for deterministic tiebreaks;
-        # the content validators decide and the highest confidence tier wins,
-        # with same-tier ties flagged as 'ambiguous'.
-        _matches2 = []
-        for _pname, _handler in _proto_candidates(_sync_word):
-            if _pname not in _PROTO_ENABLED:
-                continue
-            if len(payload) < 1:
-                break
-            try:
-                _rec = _handler(payload, _ctx)
-            except Exception:
-                continue
-            if _rec is not None:
-                _matches2.append((_pname, _rec))
-        if _matches2:
-            _TIER_RANK = {'verified': 3, 'confirmed': 2, 'candidate': 1}
-            def _tier(m): return _TIER_RANK.get(m[1].get('confidence', 'candidate'), 0)
-            _matches2.sort(key=lambda m: -_tier(m))
-            _winner = _matches2[0][1]
-            if len(_matches2) > 1:
-                _winner['alternatives'] = [
-                    {'proto': r.get('proto', n), 'hint': r.get('hint'),
-                     'confidence': r.get('confidence'), 'summary': r.get('summary')}
-                    for n, r in _matches2[1:]]
-                if _tier(_matches2[1]) == _tier(_matches2[0]):
-                    _winner['ambiguous'] = True
-            _emit_proto(_winner, payload, sf, bw, cr, _sync_word, _rf)
-            _handled = True
+    _mt_shape_ok = bool(_ctx['is_mesh'] and len(payload) >= 16)
+    _handled, _, _ = _dispatch_nonmt_or_meshtastic(
+        payload, _ctx, _sync_word, _rf, sf, bw, cr,
+        meshtastic_handler=_h_meshtastic,
+        meshtastic_shape_ok=_mt_shape_ok,
+        print_on_tie=False)
     if not _handled and crc_ok and _PROTO_UNKNOWN:
         # Good CRC but no parser recognised it: a real frame of a protocol we
         # don't implement.  Surface it generically in the UI AND log it for the

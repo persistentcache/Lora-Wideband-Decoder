@@ -236,7 +236,7 @@ function nodeDetail(id){
 }
 const TYPEMAP={text:'TEXT_MESSAGE_APP',pos:'POSITION_APP',nodeinfo:'NODEINFO_APP',telem:'TELEMETRY_APP'};
 const PROTOS=['meshtastic','lorawan','meshcore','loramesher','lora_aprs','reticulum','disaster_radio','ebyte_lora','radiohead','unknown'];
-const PROTO_LABEL={lorawan:'LoRaWAN',meshcore:'MeshCore',loramesher:'LoRaMesher',lora_aprs:'LoRa APRS',reticulum:'Reticulum',disaster_radio:'disaster.radio',ebyte_lora:'EByte LoRa',radiohead:'RadioHead'};
+const PROTO_LABEL={meshtastic:'Meshtastic',lorawan:'LoRaWAN',meshcore:'MeshCore',loramesher:'LoRaMesher',lora_aprs:'LoRa APRS',reticulum:'Reticulum',disaster_radio:'disaster.radio',ebyte_lora:'EByte LoRa',radiohead:'RadioHead'};
 const PROTO_HINT_LABEL=PROTO_LABEL;   // same names for "looks like X" badges
 const proto=p=>p.proto||'meshtastic';
 function matchFilter(p){
@@ -287,7 +287,7 @@ function inferBadge(p){
     : `Hardware fingerprint matches the calibrated profile for ${id} (Meshtastic-labeled training).  Confidence: ${pct}%.`;
   return ` <span class="tag" title="${esc(tip)}" style="background:${bg};color:${color}">${esc(lbl)} (${pct}%)</span>`;}
 function pktState(p){const pr=proto(p);
-  if(pr==='meshtastic')return (p.decrypted?'<span class="tag dec">decoded</span>':'<span class="tag enc">encrypted'+(p.enc_hex?' ▸':'')+'</span>')+confBadge(p);
+  if(pr==='meshtastic')return '<span class="tag" style="background:rgba(63,167,255,.15);color:var(--acc)">Meshtastic</span>'+(p.decrypted?'<span class="tag dec">decoded</span>':'<span class="tag enc">encrypted'+(p.enc_hex?' ▸':'')+'</span>')+confBadge(p);
   if(pr==='unknown')return '<span class="tag" style="background:rgba(150,150,150,.16);color:#9aa6b2">unknown</span>'+hintBadge(p)+inferBadge(p)+confBadge(p);
   const lbl=PROTO_LABEL[pr]||esc(pr);
   return '<span class="tag" style="background:rgba(63,167,255,.15);color:var(--acc)">'+esc(lbl)+'</span>'+inferBadge(p)+confBadge(p);}
@@ -822,6 +822,33 @@ function _renderConfigBody(){
       <div class="muted" style="margin-top:6px;font-size:11px">MeshCore channel keys are 16 bytes (AES-128); Meshtastic accepts 16/24/32 (AES-128/192/256). Node-scope lists ids separated by commas/spaces. Priority defaults: node-specific 10, all-nodes 100, built-in defaults 50.</div>
       <div id="kerr" style="color:var(--warn);margin-top:8px;font-size:12px"></div>
     </div>
+    <div style="margin-top:24px;border-top:1px solid var(--line);padding-top:14px">
+      <h3 style="margin:0 0 4px">Node identities (for DM decrypt)</h3>
+      <p class="muted" style="line-height:1.5">Per-node X25519 keypairs unlock direct-message decryption: <b>MeshCore</b> TXT_MSG (per-pair ECDH + AES-128 + 2-byte HMAC) and <b>Meshtastic</b> PKI DMs (X25519 + AES-CCM-256). For our own nodes, export the private key via the device CLI (<code>meshcore-cli get private_key</code>, <code>meshtastic --export-config</code>) and add it here — DMs to/from those nodes will then decode to plaintext. Public-only contacts (no priv) are not yet supported. Persists across sessions; live mtime reload.</p>
+      <table style="margin:8px 0;width:100%"><thead><tr><th style="width:34px">on</th><th style="width:90px">protocol</th><th>label</th><th>pub (8B prefix)</th><th style="width:120px">node id</th><th style="width:160px">notes</th><th></th></tr></thead><tbody>${(KEYS.identities||[]).map((k,ii)=>'<tr>'
+        +'<td><input type="checkbox" class="itoggle" data-ii="'+ii+'"'+(k.enabled===false?'':' checked')+'></td>'
+        +'<td>'+ptag(k.protocol)+'</td>'
+        +'<td><input type="text" class="ilabel" data-ii="'+ii+'" value="'+esc(k.label||'')+'" style="width:160px"></td>'
+        +'<td class="mono" style="font-size:11px">'+esc((k.pub||'').slice(0,16))+'…</td>'
+        +'<td class="mono" style="font-size:11px">'+esc(k.node_id||'')+'</td>'
+        +'<td><input type="text" class="inotes" data-ii="'+ii+'" value="'+esc(k.notes||'')+'" style="width:150px"></td>'
+        +'<td class="right"><button class="rowbtn idel" data-ii="'+ii+'" title="remove this identity">✕</button></td>'
+        +'</tr>').join('')}</tbody></table>
+      <div class="nodecard" style="margin-top:12px">
+        <h4 style="margin:0 0 10px;color:var(--mut)">Add a node identity</h4>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <select id="iproto" title="which protocol this identity belongs to"><option value="meshcore">MeshCore</option><option value="meshtastic">Meshtastic</option></select>
+          <input type="text" id="ilabel" placeholder="label (e.g. MC_A or my Heltec)" style="width:200px">
+          <input type="text" id="ipub" placeholder="pub — 32B hex or base64" style="width:280px">
+          <input type="text" id="ipriv" placeholder="priv — 64B (MC) or 32B (MT), hex or base64" style="width:280px">
+          <input type="text" id="inid" placeholder="!a1b2c3d4 (MT only)" style="width:130px">
+          <input type="text" id="inotesadd" placeholder="notes (optional)" style="width:170px">
+          <button id="iadd" class="go">Add identity</button>
+        </div>
+        <div class="muted" style="margin-top:6px;font-size:11px">MeshCore priv = 64B Ed25519 expanded SK (<code>get private_key</code>); Meshtastic priv = 32B X25519 raw (privateKey in <code>--export-config</code>). The priv⇄pub pair is verified on save to catch typos.</div>
+        <div id="ierr" style="color:var(--warn);margin-top:8px;font-size:12px"></div>
+      </div>
+    </div>
     <div style="margin-top:14px;display:flex;gap:8px">
       <button id="kexport">Export key list</button>
       <button id="kimport">Import key list</button>
@@ -840,6 +867,19 @@ function _renderConfigBody(){
   $('#kadd').onclick=()=>{const body={protocol:$('#kproto').value,label:$('#klabel').value,key:$('#kkey').value,notes:$('#knotesadd').value,scope:sca.value,nodes:$('#knodeadd').value};
     if($('#kprioadd').value!=='')body.priority=$('#kprioadd').value;
     fetch('/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json()).then(res=>{if(res.ok){KEYS=res.keys;_renderConfigBody();}else{$('#kerr').textContent=res.error||'failed to add key';}});};
+  // Identity row handlers
+  const _iUpd=(ii,patch)=>{const it=(KEYS.identities||[])[ii]; if(!it)return;
+    fetch('/api/identities/'+it.id+'/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)})
+      .then(r=>r.json()).then(res=>{if(res.keys){KEYS=res.keys;_renderConfigBody();}});};
+  el.querySelectorAll('.itoggle').forEach(c=>c.onchange=()=>_iUpd(+c.dataset.ii,{enabled:c.checked}));
+  el.querySelectorAll('.ilabel').forEach(i=>i.onchange=()=>_iUpd(+i.dataset.ii,{label:i.value}));
+  el.querySelectorAll('.inotes').forEach(i=>i.onchange=()=>_iUpd(+i.dataset.ii,{notes:i.value}));
+  el.querySelectorAll('.idel').forEach(b=>b.onclick=()=>{const it=(KEYS.identities||[])[+b.dataset.ii]; if(!it)return;
+    if(!confirm('Remove identity "'+it.label+'"?'))return;
+    fetch('/api/identities/'+it.id,{method:'DELETE'}).then(r=>r.json()).then(res=>{if(res.keys){KEYS=res.keys;_renderConfigBody();}});});
+  $('#iadd').onclick=()=>{const body={protocol:$('#iproto').value,label:$('#ilabel').value,pub:$('#ipub').value,priv:$('#ipriv').value,node_id:$('#inid').value,notes:$('#inotesadd').value};
+    fetch('/api/identities',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(r=>r.json()).then(res=>{if(res.ok){KEYS=res.keys;_renderConfigBody();}else{$('#ierr').textContent=res.error||'failed to add identity';}});};
   $('#kexport').onclick=()=>{window.location='/api/keys/export';};
   $('#kimport').onclick=()=>$('#kfile').click();
   $('#kfile').onchange=e=>{const f=e.target.files[0]; if(!f)return; const rd=new FileReader();
