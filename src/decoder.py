@@ -1503,7 +1503,8 @@ def _decrypt_mc_channel(payload_rest):
     if len(pt) < 5:
         return None
     return {'ts': int.from_bytes(pt[0:4], 'little'),
-            'text': pt[5:].split(b'\x00')[0].decode('utf-8', 'replace')}
+            'text': pt[5:].split(b'\x00')[0].decode('utf-8', 'replace'),
+            'pt': bytes(pt)}
 
 
 # ============================================================================
@@ -1623,8 +1624,11 @@ def _decrypt_mc_dm(payload_rest):
                 continue
             return {'ts': int.from_bytes(pt[0:4], 'little'),
                     'text': text,
+                    'flags': pt[4],
+                    'pt': bytes(pt),
                     'sender_pub': sender_pub.hex(),
-                    'recipient_pub': our_pub.hex()}
+                    'recipient_pub': our_pub.hex(),
+                    'sender_pub_bytes': bytes(sender_pub)}
     return None
 
 
@@ -1687,6 +1691,49 @@ def _decrypt_mt_pki_dm(packet_header16, enc_data, pkt_id):
                     'sender_pub': peer_pub.hex(),
                     'recipient_pub': our_pub.hex()}
     return None
+
+
+def _mc_data_type_app(dt):
+    """Label a GRP_DATA data_type (u16) per upstream docs/number_allocations.md."""
+    if dt < 0x0100:
+        return 'reserved 0x%04x' % dt
+    if dt == 0x0100:
+        return 'MeshCore Open'
+    if 0x0110 <= dt <= 0x011F:
+        return 'Ripple 0x%04x' % dt
+    if 0xFF00 <= dt <= 0xFFFF:
+        return 'dev 0x%04x' % dt
+    return '0x%04x' % dt
+
+
+# Pending-ACK cache for TXT_MSG ↔ ACK correlation.  Receiver-side ACK formula
+# (BaseChatMesh.cpp:225-234): ack_hash = SHA256(ts(4 LE) || pt[4] || text(no NUL)
+# || sender_pub(32))[:4].  When we successfully decrypt a TXT_MSG we precompute
+# the expected ack_hash and remember it for ~5 minutes so the next matching ACK
+# frame can be annotated with the source TXT_MSG's text + sender.
+import collections as _collections
+_MC_PENDING_ACKS = _collections.OrderedDict()   # 4-byte ack_hash → (sender_pub_hex, text)
+_MC_PENDING_ACK_LIMIT = 256
+
+
+def _mc_register_pending_ack(ts, flags, text, sender_pub_bytes):
+    import hashlib
+    if isinstance(text, str):
+        text = text.encode('utf-8', 'replace')
+    h = hashlib.sha256(
+        ts.to_bytes(4, 'little') +
+        bytes([flags & 0xFF]) +
+        text +
+        sender_pub_bytes
+    ).digest()[:4]
+    _MC_PENDING_ACKS[h] = (sender_pub_bytes.hex(),
+                           text.decode('utf-8', 'replace'))
+    while len(_MC_PENDING_ACKS) > _MC_PENDING_ACK_LIMIT:
+        _MC_PENDING_ACKS.popitem(last=False)
+
+
+def _mc_lookup_ack(ack_crc_bytes):
+    return _MC_PENDING_ACKS.get(bytes(ack_crc_bytes))
 
 
 def parse_meshcore_packet(payload):
@@ -1757,6 +1804,28 @@ def parse_meshcore_packet(payload):
             rec['mc_channel'] = 'public' if payload_rest[0] == _MC_PUBLIC_HASH else ('ch:0x%02x' % payload_rest[0])
             if payload_type == 0x05 and _dec['text']:
                 rec['text'] = _dec['text']
+            elif payload_type == 0x06:
+                # GRP_DATA plaintext.  Upstream layout is ambiguous between
+                # bare `data_type(u16 LE) | data_len(u8) | data` and the
+                # GRP_TXT-style prefix `ts(4) | flags(1) | data_type | data_len
+                # | data`; pick the layout where data_len exactly consumes the
+                # remaining bytes.  Don't claim anything if neither fits.
+                _pt = _dec.get('pt') or b''
+                _dt = _data = None
+                if len(_pt) >= 3:
+                    _dt_a, _dl_a = int.from_bytes(_pt[0:2], 'little'), _pt[2]
+                    if 3 + _dl_a == len(_pt):
+                        _dt, _data = _dt_a, _pt[3:]
+                if _dt is None and len(_pt) >= 8:
+                    _dt_b, _dl_b = int.from_bytes(_pt[5:7], 'little'), _pt[7]
+                    if 8 + _dl_b == len(_pt):
+                        _dt, _data = _dt_b, _pt[8:]
+                if _dt is not None:
+                    rec['mc_data_type'] = _dt
+                    rec['mc_data_app'] = _mc_data_type_app(_dt)
+                    rec['mc_data'] = _data.hex()
+                    print("  [GRP_DATA %s] %s · %d bytes" % (
+                        rec['mc_channel'], rec['mc_data_app'], len(_data)))
             print("  [DECRYPTED %s] %s" % (rec['mc_channel'], _dec.get('text', '')))
     elif payload_type == 0x02 and len(payload_rest) >= 4:         # TXT_MSG (DM)
         print("  Dest: 0x%02X  Src: 0x%02X" % (payload_rest[0], payload_rest[1]))
@@ -1770,9 +1839,59 @@ def parse_meshcore_packet(payload):
             rec['mc_dm_recipient'] = _dm['recipient_pub'][:8]
             rec['from'] = 'MC:' + _dm['sender_pub'][:8].upper()
             rec['to'] = 'MC:' + _dm['recipient_pub'][:8].upper()
+            # Pre-compute the expected ack_hash so a subsequent ACK frame can
+            # be correlated back to this TXT_MSG (item 6 of the audit).  Cheap
+            # and lossy — if the sender retransmits with attempt!=0 the hash
+            # won't match, but the first-send case (the common one) does.
+            try:
+                _mc_register_pending_ack(
+                    ts=_dm['ts'], flags=_dm['flags'],
+                    text=_dm['text'], sender_pub_bytes=_dm['sender_pub_bytes'])
+            except Exception:
+                pass
             print("  [DECRYPTED DM %s→%s] %s" % (
                 _dm['sender_pub'][:8].upper(),
                 _dm['recipient_pub'][:8].upper(), _dm['text']))
+    elif payload_type == 0x09 and len(payload_rest) >= 9:         # TRACE (unencrypted)
+        # Body = tag(4 LE) | auth_code(4 LE) | flags(1) | hashes[N*entry] | snrs[N int8]
+        # flags bits[1:0] = path_sz; entry_size = 1 << path_sz (∈ {1,2,4,8}).
+        # SNRs are int8 with value = SNR_dB × 4 (Mesh.cpp:42-60).
+        _tag = int.from_bytes(payload_rest[0:4], 'little')
+        _flags = payload_rest[8]
+        _entry = 1 << (_flags & 0x03)
+        _body = payload_rest[9:]
+        if _body and len(_body) % (_entry + 1) == 0:
+            _n = len(_body) // (_entry + 1)
+            rec['mc_trace_tag']  = '%08x' % _tag
+            rec['mc_trace_path'] = [_body[i*_entry:(i+1)*_entry].hex() for i in range(_n)]
+            rec['mc_trace_snr']  = [int.from_bytes(_body[_n*_entry+i:_n*_entry+i+1],
+                                                    'little', signed=True) / 4.0
+                                    for i in range(_n)]
+            print("  [TRACE] tag=%s hops=%d entry=%d" % (
+                rec['mc_trace_tag'], _n, _entry))
+    elif payload_type == 0x0B and len(payload_rest) >= 1:         # CONTROL (unencrypted)
+        # flags byte: bit7 must be set (Mesh.cpp:69); upper-4 = sub_type, lower-4
+        # = node_type (for DISCOVER_RESP).  Only DISCOVER_REQ/RESP are defined
+        # upstream as of payloads.md:252-272.
+        _cflags = payload_rest[0]
+        if _cflags & 0x80:
+            _sub   = (_cflags >> 4) & 0x0F
+            _ntype = _cflags & 0x0F
+            rec['mc_ctrl_sub'] = {0x8: 'DISCOVER_REQ',
+                                   0x9: 'DISCOVER_RESP'}.get(_sub, 'ctrl%d' % _sub)
+            if _sub == 0x9 and len(payload_rest) >= 6:
+                _snr_dB = int.from_bytes(payload_rest[1:2], 'little', signed=True) / 4.0
+                _dtag   = payload_rest[2:6].hex()
+                _dpub   = payload_rest[6:]
+                rec['mc_disc_snr']   = _snr_dB
+                rec['mc_disc_tag']   = _dtag
+                rec['mc_disc_pub']   = _dpub.hex() if len(_dpub) in (8, 32) else None
+                rec['mc_disc_ntype'] = {1: 'ChatNode', 2: 'Repeater',
+                                         3: 'RoomServer', 4: 'Sensor'}.get(
+                                            _ntype, 'type%d' % _ntype)
+                print("  [DISCOVER_RESP] %s · SNR %.1f dB · pub %s" % (
+                    rec['mc_disc_ntype'], _snr_dB,
+                    rec.get('mc_disc_pub') or '?'))
     elif payload_type == 0x04:                                    # ADVERT (Ed25519-signed)
         _sig_ok = _verify_advert_sig(payload_rest)
         if _sig_ok is False:
@@ -1819,21 +1938,61 @@ def parse_meshcore_packet(payload):
         _load_identities()
         if payload_type == 0x03 and _MC_IDENTITY_KEYS:
             rec['confidence'] = 'confirmed'
-            rec['summary'] = '%s / %s%s · confirmed (ACK)' % (
+            # ACK→TXT_MSG correlation: receiver-side hash recipe is
+            #   SHA256(ts(4 LE) || pt[4] || text(no NUL) || sender_pub(32))[:4]
+            # We cached the expected hash when we decrypted the source TXT_MSG.
+            _ack_extra = ''
+            if len(payload_rest) >= 4:
+                rec['mc_ack_crc'] = bytes(payload_rest[:4]).hex()
+                _m = _mc_lookup_ack(payload_rest[:4])
+                if _m is not None:
+                    _sender_hex, _ack_text = _m
+                    rec['mc_ack_for_text']   = _ack_text
+                    rec['mc_ack_for_sender'] = _sender_hex[:16]
+                    rec['text'] = 'ack for "%s"' % _ack_text
+                    _ack_extra = ' → "%s"' % (_ack_text[:30] + ('…' if len(_ack_text) > 30 else ''))
+            rec['summary'] = '%s / %s%s · confirmed (ACK)%s' % (
                 route_name, ptype_name,
-                (' · %d hops' % rec['mc_hops']) if rec.get('mc_hops') else '')
+                (' · %d hops' % rec['mc_hops']) if rec.get('mc_hops') else '',
+                _ack_extra)
+            return rec
+        # TRACE (0x09) and CONTROL DISCOVER_RESP (0x0B sub 0x9) are unencrypted
+        # but structurally parseable.  Promote to 'confirmed' when an MC
+        # identity is configured (same behavioral-trust gate as ACK) so the
+        # decoded body is surfaced in the meshcore feed instead of hidden in
+        # the unknown bucket.
+        if (payload_type == 0x09 and rec.get('mc_trace_path') and _MC_IDENTITY_KEYS):
+            rec['confidence'] = 'confirmed'
+            _hops = ' → '.join(
+                '%s (%+.1f dB)' % (h.upper(), s)
+                for h, s in zip(rec['mc_trace_path'], rec['mc_trace_snr']))
+            rec['summary'] = '%s / TRACE · route: %s · confirmed' % (route_name, _hops)
+            return rec
+        if (payload_type == 0x0B and rec.get('mc_disc_pub') and _MC_IDENTITY_KEYS):
+            rec['confidence'] = 'confirmed'
+            rec['summary'] = '%s / CONTROL · %s · %s · SNR %+.1f dB · confirmed' % (
+                route_name, rec['mc_ctrl_sub'], rec['mc_disc_ntype'], rec['mc_disc_snr'])
             return rec
         # Not crypto-verified.  Surface as an UNKNOWN frame that *looks like*
         # MeshCore, carrying its path hashes so the web can corroborate it against
         # the ADVERT-verified node registry (a frame routed through known nodes is
         # behaviorally confirmed).  NOT a MeshCore claim until the web promotes it.
-        return {'proto': 'unknown', 'hint': 'meshcore',
+        _unk = {'proto': 'unknown', 'hint': 'meshcore',
                 'confidence': 'candidate',
                 'mc_route': route_name,
                 'mc_type': ptype_name, 'mc_path': _mc_path, 'decrypted': False,
                 'summary': 'looks like MeshCore · %s/%s%s' % (
                     route_name, ptype_name,
                     (' · %d hops' % len(_mc_path)) if _mc_path else '')}
+        # Carry any TRACE/CONTROL/ACK body fields into the unknown record so
+        # the UI dropdown can still show them when the frame can't be claimed
+        # as MeshCore (no identity loaded).
+        for _k in ('mc_trace_tag', 'mc_trace_path', 'mc_trace_snr',
+                   'mc_ctrl_sub', 'mc_disc_snr', 'mc_disc_tag',
+                   'mc_disc_pub', 'mc_disc_ntype', 'mc_ack_crc'):
+            if _k in rec:
+                _unk[_k] = rec[_k]
+        return _unk
     _id = ''
     if rec.get('mc_name'):
         _id = ' · ' + rec['mc_name'] + ((' (%s)' % rec['mc_role']) if rec.get('mc_role') else '')
