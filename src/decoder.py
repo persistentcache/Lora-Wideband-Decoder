@@ -1585,25 +1585,39 @@ def _decrypt_mc_dm(payload_rest):
     """Try to decrypt a MeshCore TXT_MSG (DM).  Wire format past the path:
        [dest_hash:1][src_hash:1][MAC:2][ciphertext:16N]
 
-    For each enabled identity whose pub[0] == dest_hash, ECDH-derive a shared
-    secret against every registered pub with pub[0] == src_hash and try HMAC-
-    SHA256 (truncated to 2 bytes) + AES-128-ECB.  Returns dict on success."""
+    ECDH is symmetric: shared = X25519(my_priv, peer_pub) is the same whether
+    my identity is the recipient (dest_hash matches) or the sender (src_hash
+    matches).  So we try BOTH directions — for each configured identity, if
+    its pub[0] matches either side, look up the OTHER side's pub in the
+    routing-hash registry and attempt HMAC-SHA256 (truncated to 2 bytes) +
+    AES-128-ECB.  Returns dict on success.
+
+    The peer pub may come from (a) an ADVERT we cryptographically verified
+    earlier in this session, (b) a configured full identity (other own
+    nodes), or (c) a pub-only contact entry.  All three paths feed the same
+    _MC_PUBKEY_REG."""
     if len(payload_rest) < 4:
         return None
     _load_identities()
     if not _MC_IDENTITY_KEYS:
         return None
     dest_hash = payload_rest[0]
-    src_hash = payload_rest[1]
+    src_hash  = payload_rest[1]
     mac = bytes(payload_rest[2:4])
-    ct = bytes(payload_rest[4:])
+    ct  = bytes(payload_rest[4:])
     if not ct or len(ct) % 16:
         return None
-    candidates = [(pub, priv) for (pub, priv) in _MC_IDENTITY_KEYS if pub[0] == dest_hash]
-    if not candidates:
-        return None
-    senders = list(_MC_PUBKEY_REG.get(src_hash, ()))
-    if not senders:
+    # Build (our_pub, our_scalar, peer_hash, we_are) tuples for every identity
+    # × matching direction.  An identity that happens to match BOTH sides
+    # (vanishingly unlikely — would require the same byte at pub[0] for two
+    # different roles in the same frame) gets two entries and tries both.
+    attempts = []
+    for our_pub, our_scalar in _MC_IDENTITY_KEYS:
+        if our_pub[0] == dest_hash:
+            attempts.append((our_pub, our_scalar, src_hash,  'recipient'))
+        if our_pub[0] == src_hash:
+            attempts.append((our_pub, our_scalar, dest_hash, 'sender'))
+    if not attempts:
         return None
     try:
         from nacl.bindings import (crypto_sign_ed25519_pk_to_curve25519,
@@ -1613,11 +1627,13 @@ def _decrypt_mc_dm(payload_rest):
         import hashlib as _hashlib
     except ImportError:
         return None
-    for our_pub, our_scalar in candidates:
-        for sender_pub in senders:
+    for our_pub, our_scalar, peer_hash, we_are in attempts:
+        for peer_pub in _MC_PUBKEY_REG.get(peer_hash, ()):
+            if peer_pub == our_pub:
+                continue   # never ECDH against yourself
             try:
-                sender_x = crypto_sign_ed25519_pk_to_curve25519(sender_pub)
-                shared = crypto_scalarmult(our_scalar, sender_x)
+                peer_x = crypto_sign_ed25519_pk_to_curve25519(peer_pub)
+                shared = crypto_scalarmult(our_scalar, peer_x)
             except Exception:
                 continue
             if _hmac.new(shared, ct, _hashlib.sha256).digest()[:2] != mac:
@@ -1632,13 +1648,19 @@ def _decrypt_mc_dm(payload_rest):
                 text = pt[5:].split(b'\x00')[0].decode('utf-8')
             except UnicodeDecodeError:
                 continue
+            # Label sender/recipient based on which role our identity played.
+            if we_are == 'recipient':
+                sender_pub, recipient_pub = peer_pub, our_pub
+            else:
+                sender_pub, recipient_pub = our_pub, peer_pub
             return {'ts': int.from_bytes(pt[0:4], 'little'),
                     'text': text,
                     'flags': pt[4],
                     'pt': bytes(pt),
                     'sender_pub': sender_pub.hex(),
-                    'recipient_pub': our_pub.hex(),
-                    'sender_pub_bytes': bytes(sender_pub)}
+                    'recipient_pub': recipient_pub.hex(),
+                    'sender_pub_bytes': bytes(sender_pub),
+                    'we_are': we_are}
     return None
 
 
