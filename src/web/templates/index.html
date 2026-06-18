@@ -846,29 +846,36 @@ function _renderConfigBody(){
       <div id="kerr" style="color:var(--warn);margin-top:8px;font-size:12px"></div>
     </div>
     <div style="margin-top:24px;border-top:1px solid var(--line);padding-top:14px">
-      <h3 style="margin:0 0 4px">Node identities <span class="muted" style="font-weight:400;font-size:13px">— your node's pub + priv keypair. Decrypts DMs to/from that node.</span></h3>
-      <p class="muted" style="line-height:1.5"><b style="color:var(--acc)">This is where your node's keypair goes</b> (32-byte pub + 64-byte priv for MeshCore, 32-byte pub + 32-byte priv for Meshtastic) — <b>not</b> the 16-byte channel PSK above. Export the private key via the device CLI (MeshCore: <code>meshcore-cli get private_key</code>; Meshtastic: <code>meshtastic --export-config</code>) and add it here — DMs to/from those nodes will then decode to plaintext. <b>Crypto:</b> MeshCore TXT_MSG (per-pair ECDH + AES-128 + 2-byte HMAC), Meshtastic PKI DMs (X25519 + AES-CCM-256). Public-only contacts (no priv) are not yet supported. <b>Requires <code>pip install pynacl</code></b>. Persists across sessions; live mtime reload.</p>
-      <table style="margin:8px 0;width:100%"><thead><tr><th style="width:34px">on</th><th style="width:90px">protocol</th><th>label</th><th>pub (8B prefix)</th><th style="width:120px">node id</th><th style="width:160px">notes</th><th></th></tr></thead><tbody>${(KEYS.identities||[]).map((k,ii)=>'<tr>'
-        +'<td><input type="checkbox" class="itoggle" data-ii="'+ii+'"'+(k.enabled===false?'':' checked')+'></td>'
-        +'<td>'+ptag(k.protocol)+'</td>'
-        +'<td><input type="text" class="ilabel" data-ii="'+ii+'" value="'+esc(k.label||'')+'" style="width:160px"></td>'
-        +'<td class="mono" style="font-size:11px">'+esc((k.pub||'').slice(0,16))+'…</td>'
-        +'<td class="mono" style="font-size:11px">'+esc(k.node_id||'')+'</td>'
-        +'<td><input type="text" class="inotes" data-ii="'+ii+'" value="'+esc(k.notes||'')+'" style="width:150px"></td>'
-        +'<td class="right"><button class="rowbtn idel" data-ii="'+ii+'" title="remove this identity">✕</button></td>'
-        +'</tr>').join('')}</tbody></table>
+      <h3 style="margin:0 0 4px">Node identities <span class="muted" style="font-weight:400;font-size:13px">— your node's pub + priv keypair (DM decrypt), or a peer's pub-only entry (decrypt DMs from that peer).</span></h3>
+      <p class="muted" style="line-height:1.5"><b style="color:var(--acc)">This is where your node's keypair goes</b> (32-byte pub + 64-byte priv for MeshCore, 32-byte pub + 32-byte priv for Meshtastic) — <b>not</b> the 16-byte channel PSK above. Export the private key via the device CLI (MeshCore: <code>meshcore-cli get private_key</code>; Meshtastic: <code>meshtastic --export-config</code>) and add it here — DMs to/from those nodes will then decode to plaintext. <b>Pub-only contacts:</b> leave <code>priv</code> blank to add a peer's 32-byte pubkey alone. This seeds the routing-hash registry so inbound DMs <i>from</i> that peer can be decrypted using your full identity, without waiting for the peer to broadcast an ADVERT. (Captured ADVERTs auto-populate the same registry, but only for the current session.) <b>Crypto:</b> MeshCore TXT_MSG (per-pair ECDH + AES-128 + 2-byte HMAC), Meshtastic PKI DMs (X25519 + AES-CCM-256). <b>Requires <code>pip install pynacl</code></b>. Persists across sessions; live mtime reload.</p>
+      <table style="margin:8px 0;width:100%"><thead><tr><th style="width:34px">on</th><th style="width:90px">protocol</th><th style="width:80px">kind</th><th>label</th><th>pub (8B prefix)</th><th style="width:120px">node id</th><th style="width:160px">notes</th><th></th></tr></thead><tbody>${(KEYS.identities||[]).map((k,ii)=>{
+          const isPubOnly = !(k.priv && k.priv.length);
+          const kindTag = isPubOnly
+            ? '<span class="tag" title="public-only contact — seeds the routing-hash registry so inbound DMs from this peer can be decrypted using a separate full identity" style="background:rgba(199,125,255,.16);color:#c77dff">pub only</span>'
+            : '<span class="tag" title="full identity — decrypts DMs addressed to this node" style="background:rgba(46,204,113,.18);color:#2ecc71">identity</span>';
+          return '<tr>'
+          +'<td><input type="checkbox" class="itoggle" data-ii="'+ii+'"'+(k.enabled===false?'':' checked')+'></td>'
+          +'<td>'+ptag(k.protocol)+'</td>'
+          +'<td>'+kindTag+'</td>'
+          +'<td><input type="text" class="ilabel" data-ii="'+ii+'" value="'+esc(k.label||'')+'" style="width:160px"></td>'
+          +'<td class="mono" style="font-size:11px">'+esc((k.pub||'').slice(0,16))+'…</td>'
+          +'<td class="mono" style="font-size:11px">'+esc(k.node_id||'')+'</td>'
+          +'<td><input type="text" class="inotes" data-ii="'+ii+'" value="'+esc(k.notes||'')+'" style="width:150px"></td>'
+          +'<td class="right"><button class="rowbtn idel" data-ii="'+ii+'" title="remove this identity">✕</button></td>'
+          +'</tr>';
+        }).join('')}</tbody></table>
       <div class="nodecard" style="margin-top:12px">
-        <h4 style="margin:0 0 10px;color:var(--mut)">Add a node identity</h4>
+        <h4 style="margin:0 0 10px;color:var(--mut)">Add a node identity or pub-only contact</h4>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <select id="iproto" title="which protocol this identity belongs to"><option value="meshcore">MeshCore</option><option value="meshtastic">Meshtastic</option></select>
           <input type="text" id="ilabel" placeholder="label (e.g. MC_A or my Heltec)" style="width:200px">
           <input type="text" id="ipub" placeholder="pub — 32B hex or base64" style="width:280px">
-          <input type="text" id="ipriv" placeholder="priv — 64B (MC) or 32B (MT), hex or base64" style="width:280px">
+          <input type="text" id="ipriv" placeholder="priv — 64B MC / 32B MT (leave blank = pub-only contact)" style="width:340px">
           <input type="text" id="inid" placeholder="!a1b2c3d4 (MT only)" style="width:130px">
           <input type="text" id="inotesadd" placeholder="notes (optional)" style="width:170px">
-          <button id="iadd" class="go">Add identity</button>
+          <button id="iadd" class="go">Add</button>
         </div>
-        <div class="muted" style="margin-top:6px;font-size:11px">MeshCore priv = 64B Ed25519 expanded SK (<code>get private_key</code>); Meshtastic priv = 32B X25519 raw (privateKey in <code>--export-config</code>). The priv⇄pub pair is verified on save to catch typos.</div>
+        <div class="muted" style="margin-top:6px;font-size:11px"><b>Full identity</b> (your own node): pub + priv. MeshCore priv = 64B Ed25519 expanded SK (<code>get private_key</code>); Meshtastic priv = 32B X25519 raw (privateKey in <code>--export-config</code>). The priv⇄pub pair is verified on save to catch typos. — <b>Pub-only contact</b> (a peer whose pub you know): paste the 32B pub and leave priv blank. Lets you decrypt inbound DMs from that peer without waiting for the SDR to catch one of their ADVERTs.</div>
         <div id="ierr" style="color:var(--warn);margin-top:8px;font-size:12px"></div>
       </div>
     </div>

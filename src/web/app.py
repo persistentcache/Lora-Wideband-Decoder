@@ -2239,10 +2239,18 @@ def _validate_identity(proto, pub, priv):
     Verifies the priv-pub pair: for MeshCore, Ed25519 scalar (priv[0:32]) * base
     must equal pub; for Meshtastic, X25519 scalar * base must equal pub.  Stops
     the user from saving inconsistent pairs (typo, swapped, copy-paste errors)
-    which would otherwise produce undecryptable garbage at runtime."""
+    which would otherwise produce undecryptable garbage at runtime.
+
+    Pub-only contacts: if `priv` is empty/None, validate only the pub (32B).
+    The entry seeds _MC_PUBKEY_REG so inbound DMs from this peer can be
+    decrypted using a separately-configured full identity (the recipient)."""
     pub_b = _hex_bytes(pub, (32,))
     if pub_b is None:
         return None, None, 'pub must be 32 bytes (hex or base64)'
+    if not (priv or '').strip():
+        if proto in ('meshcore', 'meshtastic'):
+            return pub_b, b'', None
+        return None, None, 'protocol must be meshcore or meshtastic'
     if proto == 'meshcore':
         priv_b = _hex_bytes(priv, (64,))
         if priv_b is None:
