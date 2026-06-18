@@ -367,6 +367,28 @@ function pktDetail(p){
     if(p.mc_route) row('route type', esc(p.mc_route));
     if(p.mc_type) row('payload type', esc(p.mc_type));
     if(p.mc_known_hops) row('via known hops', p.mc_known_hops);
+    // TRACE (0x09)
+    if(p.mc_trace_tag) row('trace tag', `<span class="mono">${esc(p.mc_trace_tag)}</span>`);
+    if(p.mc_trace_path && p.mc_trace_path.length){
+      const hops=p.mc_trace_path.map((h,i)=>{const snr=p.mc_trace_snr&&p.mc_trace_snr[i]!=null?` (${p.mc_trace_snr[i]>=0?'+':''}${p.mc_trace_snr[i].toFixed(1)} dB)`:'';return `<span class="mono">${esc(h.toUpperCase())}</span>${snr}`;}).join(' → ');
+      row('route', hops);
+    }
+    // CONTROL (0x0B)
+    if(p.mc_ctrl_sub) row('control sub-type', esc(p.mc_ctrl_sub));
+    if(p.mc_disc_ntype) row('discovered node type', esc(p.mc_disc_ntype));
+    if(p.mc_disc_snr!=null) row('discovered SNR', `${p.mc_disc_snr>=0?'+':''}${p.mc_disc_snr.toFixed(1)} dB`);
+    if(p.mc_disc_tag) row('discover tag', `<span class="mono">${esc(p.mc_disc_tag)}</span>`);
+    if(p.mc_disc_pub) row('discovered pubkey', `<span class="mono" style="font-size:11px">${esc(p.mc_disc_pub)}</span>`);
+    // GRP_DATA (0x06) data_type
+    if(p.mc_data_app) row('data app', esc(p.mc_data_app));
+    if(p.mc_data_type!=null) row('data type', `<span class="mono">0x${p.mc_data_type.toString(16).padStart(4,'0')}</span>`);
+    if(p.mc_data) row('data', `<span class="mono" style="font-size:11px">${esc(p.mc_data.slice(0,64))}${p.mc_data.length>64?'…':''}</span>`);
+    // ACK correlation (0x03)
+    if(p.mc_ack_for_text){
+      row('ack for', `"${esc(p.mc_ack_for_text)}"`);
+      if(p.mc_ack_for_sender) row('ack sender', `<span class="mono" style="font-size:11px">${esc(p.mc_ack_for_sender)}…</span>`);
+    }
+    if(p.mc_ack_crc) row('ack crc', `<span class="mono">${esc(p.mc_ack_crc)}</span>`);
   } else if(pr==='loramesher'){
     if(p.lm_type) row('message type', esc(p.lm_type));
     if(p.lm_payload_size!=null) row('declared payload size', p.lm_payload_size);
