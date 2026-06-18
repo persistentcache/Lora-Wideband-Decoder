@@ -318,6 +318,7 @@ function meshSummary(p){   // human one-liner for a decoded Meshtastic packet (n
   return '<span class="muted">'+esc(pn||'decoded')+'</span>';}
 function pktMsg(p){const pr=proto(p);
   if(pr==='meshtastic')return p.decrypted?meshSummary(p):'<span class="muted">— contents hidden —</span>';
+  if(p.decrypted&&p.text)return esc(p.text);
   if(p.summary)return esc(p.summary);
   if(p.raw_hex)return '<span class="mono muted">'+esc(p.raw_hex.slice(0,40))+(p.raw_hex.length>40?'…':'')+'</span>';
   return '';}

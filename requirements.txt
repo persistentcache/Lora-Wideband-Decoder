@@ -4,6 +4,7 @@ numpy
 scipy
 pyfftw                # FFTW with plan caching — ~5-20% faster decoder wall vs scipy.fft
 cryptography          # Ed25519 ADVERT verification + AES channel decrypt
+pynacl                # Ed25519↔Curve25519 conversion for MeshCore DM (TXT_MSG) + Meshtastic PKI DM decrypt
 flask                 # web UI (lora_web)
 # tomli               # ONLY needed on Python < 3.11 (3.11+ has stdlib tomllib for lora.toml)
 #

@@ -2246,6 +2246,9 @@ def _validate_identity(proto, pub, priv):
             return None, None, 'meshcore priv must be 64 bytes (hex/base64)'
         try:
             from nacl.bindings import crypto_scalarmult_ed25519_base_noclamp
+        except ImportError:
+            return None, None, 'pynacl not installed — run: pip install pynacl'
+        try:
             derived = crypto_scalarmult_ed25519_base_noclamp(priv_b[:32])
             if derived != pub_b:
                 return None, None, 'priv does not derive to pub (Ed25519 base mismatch — check keys)'
@@ -2257,6 +2260,9 @@ def _validate_identity(proto, pub, priv):
             return None, None, 'meshtastic priv must be 32 bytes (hex/base64)'
         try:
             from nacl.bindings import crypto_scalarmult_base
+        except ImportError:
+            return None, None, 'pynacl not installed — run: pip install pynacl'
+        try:
             derived = crypto_scalarmult_base(priv_b)
             if derived != pub_b:
                 return None, None, 'priv does not derive to pub (X25519 base mismatch — check keys)'
