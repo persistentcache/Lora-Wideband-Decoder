@@ -2100,11 +2100,14 @@ def api_keys_add():
     d = request.get_json(force=True, silent=True) or {}
     key = (d.get('key') or '').strip()
     proto = 'meshcore' if d.get('protocol') == 'meshcore' else 'meshtastic'
+    _NODE_HINT = ' — looks like a node pub/priv key; those go in "Node identities" below, not here'
     if proto == 'meshcore':
         if not _mc_bytes16(key):
-            return jsonify({'ok': False, 'error': 'MeshCore channel key must be 16 bytes (AES-128), hex or base64'})
+            hint = _NODE_HINT if _hex_bytes(key, (32, 64)) is not None else ''
+            return jsonify({'ok': False, 'error': 'MeshCore channel key must be 16 bytes (AES-128), hex or base64' + hint})
     elif not _key_valid(key):
-        return jsonify({'ok': False, 'error': 'key must be base64/hex for 16, 24 or 32 bytes'})
+        hint = _NODE_HINT if _hex_bytes(key, (64,)) is not None else ''
+        return jsonify({'ok': False, 'error': 'key must be base64/hex for 16, 24 or 32 bytes' + hint})
     nodes = _parse_nodes(d.get('nodes') if d.get('nodes') is not None else d.get('node'))
     scope = 'nodes' if (d.get('scope') in ('node', 'nodes') and nodes) else 'all'
     if d.get('scope') in ('node', 'nodes') and not nodes:
