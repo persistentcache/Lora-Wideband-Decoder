@@ -1389,9 +1389,10 @@ def parse_lorawan_packet(payload, rf=None):
 # ============================================================================
 _MESHCORE_ROUTE_TYPES   = {0: 'FLOOD', 1: 'DIRECT', 2: 'BACK', 3: 'DIRECT_OOB'}
 _MESHCORE_PAYLOAD_TYPES = {
-    0x00: 'REQ',    0x01: 'RESPONSE', 0x02: 'TXT_MSG', 0x03: 'ACK',
-    0x04: 'ADVERT', 0x05: 'GRP_TXT', 0x06: 'GRP_DATA', 0x07: 'ANON_REQ',
-    0x09: 'TRACE',  0x0B: 'CONTROL',
+    0x00: 'REQ',       0x01: 'RESPONSE',  0x02: 'TXT_MSG',  0x03: 'ACK',
+    0x04: 'ADVERT',    0x05: 'GRP_TXT',   0x06: 'GRP_DATA', 0x07: 'ANON_REQ',
+    0x08: 'PATH',      0x09: 'TRACE',     0x0A: 'MULTIPART',
+    0x0B: 'CONTROL',   0x0F: 'RAW_CUSTOM',
 }
 
 _ED25519_VERIFY = None   # lazy cache: verify callable, or False if no crypto lib
@@ -1545,10 +1546,19 @@ def _load_identities():
             continue
         try:
             pub = bytes.fromhex(k.get('pub', ''))
-            priv = bytes.fromhex(k.get('priv', ''))
         except (ValueError, TypeError):
             continue
+        try:
+            priv = bytes.fromhex(k.get('priv', '') or '')
+        except (ValueError, TypeError):
+            priv = b''
         proto = k.get('protocol')
+        # Pub-only contact: 32B pub, no priv.  Seeds the routing-hash registry
+        # so inbound DMs from this peer can be ECDH-decrypted using a separate
+        # full identity, but the contact itself can't act as a recipient.
+        if proto == 'meshcore' and len(pub) == 32 and not priv:
+            _MC_PUBKEY_REG.setdefault(pub[0], set()).add(pub)
+            continue
         if proto == 'meshcore' and len(pub) == 32 and len(priv) == 64:
             mc.append((pub, priv[:32]))
             _MC_PUBKEY_REG.setdefault(pub[0], set()).add(pub)
