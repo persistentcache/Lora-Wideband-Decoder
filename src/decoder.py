@@ -2314,9 +2314,37 @@ def parse_meshcore_packet(payload):
             if _matched:
                 rec['confidence'] = 'confirmed'
                 rec['mc_known_hops'] = len(_matched)
-                rec['summary'] = 'matches %d known node%s' % (
-                    len(_matched),
-                    '' if len(_matched) == 1 else 's')
+                # `hint='meshcore'` triggers the UI's per-type contextual
+                # badge ("encrypted DM (no key)" etc.) so the user sees WHY
+                # the message column isn't showing decoded text — without
+                # it the confirmed badge alone would suggest "we know what
+                # this is" while the ciphertext stays opaque.
+                rec['hint'] = 'meshcore'
+                # Summary should reflect CONTENT, not the identification
+                # method.  Path-hash promotion identifies the participants
+                # (via from/to) and credit (via the 'via N known' badge in
+                # the UI hint), but the wire body is still encrypted
+                # ciphertext we cannot decrypt.  For encrypted payload
+                # types, surface the ciphertext byte-count exactly like
+                # the _unk path does — so jumping tier doesn't HIDE
+                # information the candidate row was showing.  For
+                # unencrypted types (PATH/MULTIPART/TRACE etc.) that
+                # reached here via path-hash match, fall back to the
+                # generic "matches N known node(s)" since we don't have
+                # specific content semantics to surface.
+                if payload_type in (0x00, 0x01, 0x02) and len(payload_rest) >= 4:
+                    _ct = max(0, len(payload_rest) - 4)
+                    rec['summary'] = '%d bytes encrypted' % _ct if _ct else 'encrypted'
+                elif payload_type == 0x07 and len(payload_rest) >= 33:
+                    _ct = max(0, len(payload_rest) - 33)
+                    rec['summary'] = '%d bytes encrypted (anon)' % _ct if _ct else 'encrypted (anon)'
+                elif payload_type in (0x05, 0x06) and len(payload_rest) >= 3:
+                    _ct = max(0, len(payload_rest) - 3)
+                    rec['summary'] = '%d bytes encrypted' % _ct if _ct else 'encrypted'
+                else:
+                    rec['summary'] = 'matches %d known node%s' % (
+                        len(_matched),
+                        '' if len(_matched) == 1 else 's')
                 # Surface from/to with the full pubkey prefix WHEN the
                 # 1-byte routing hash unambiguously identifies a registered
                 # node (exactly one pubkey in the registry has that first
