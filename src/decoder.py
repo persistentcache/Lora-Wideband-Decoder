@@ -2109,11 +2109,11 @@ def parse_meshcore_packet(payload):
                     rec['mc_ack_for_sender'] = _sender_hex[:16]
                     rec['text'] = 'ack for "%s"' % _ack_text
                     _ack_extra = ' → "%s"' % (_ack_text[:30] + ('…' if len(_ack_text) > 30 else ''))
-            # Summary carries the per-frame technical detail; the proto +
-            # confidence tier are already in the state-column badge, and the
-            # payload type is in the type column, so don't restate either.
-            rec['summary'] = '%s%s%s' % (
-                route_name,
+            # Summary leads with the literal "ACK" word so the arrow notation
+            # (ACK → "original-text") reads naturally as "this ACK responds to
+            # the named message".  Leading with route_name produced confusing
+            # phrases like 'BACK → "..."' that read as direction-of-travel.
+            rec['summary'] = 'ACK%s%s' % (
                 (' · %d hops' % rec['mc_hops']) if rec.get('mc_hops') else '',
                 _ack_extra)
             return rec
