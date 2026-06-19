@@ -1835,6 +1835,14 @@ def _mc_lookup_ack(ack_crc_bytes):
 def parse_meshcore_packet(payload):
     """Parse a MeshCore packet: print human-readable fields AND return a normalized
     record dict (proto='meshcore') for the [PKT] stream, or None."""
+    # The live dispatcher passes `payload` as a Python list of ints (the
+    # demodulator emits byte-wide samples that way); standalone callers pass
+    # bytes.  Several parser paths slice and call .hex() — which works on
+    # bytes but raises AttributeError on a list, silently aborting through
+    # the dispatcher's try/except.  Normalize at the entry so every path
+    # below sees a consistent bytes object.
+    if not isinstance(payload, (bytes, bytearray)):
+        payload = bytes(payload)
     if len(payload) < 1:
         return None
     header       = payload[0]
