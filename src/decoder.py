@@ -2109,8 +2109,11 @@ def parse_meshcore_packet(payload):
                     rec['mc_ack_for_sender'] = _sender_hex[:16]
                     rec['text'] = 'ack for "%s"' % _ack_text
                     _ack_extra = ' → "%s"' % (_ack_text[:30] + ('…' if len(_ack_text) > 30 else ''))
-            rec['summary'] = '%s / %s%s · confirmed (ACK)%s' % (
-                route_name, ptype_name,
+            # Summary carries the per-frame technical detail; the proto +
+            # confidence tier are already in the state-column badge, and the
+            # payload type is in the type column, so don't restate either.
+            rec['summary'] = '%s%s%s' % (
+                route_name,
                 (' · %d hops' % rec['mc_hops']) if rec.get('mc_hops') else '',
                 _ack_extra)
             return rec
@@ -2124,11 +2127,11 @@ def parse_meshcore_packet(payload):
             _hops = ' → '.join(
                 '%s (%+.1f dB)' % (h.upper(), s)
                 for h, s in zip(rec['mc_trace_path'], rec['mc_trace_snr']))
-            rec['summary'] = '%s / TRACE · route: %s · confirmed' % (route_name, _hops)
+            rec['summary'] = '%s · route: %s' % (route_name, _hops)
             return rec
         if (payload_type == 0x0B and rec.get('mc_disc_pub') and _MC_IDENTITY_KEYS):
             rec['confidence'] = 'confirmed'
-            rec['summary'] = '%s / CONTROL · %s · %s · SNR %+.1f dB · confirmed' % (
+            rec['summary'] = '%s · %s · %s · SNR %+.1f dB' % (
                 route_name, rec['mc_ctrl_sub'], rec['mc_disc_ntype'], rec['mc_disc_snr'])
             return rec
         # PATH (0x08) is unencrypted route-discovery; once we've structurally
@@ -2136,7 +2139,7 @@ def parse_meshcore_packet(payload):
         # TRACE/CONTROL when an MC identity is configured.
         if (payload_type == 0x08 and rec.get('mc_path_advertised') and _MC_IDENTITY_KEYS):
             rec['confidence'] = 'confirmed'
-            rec['summary'] = '%s / PATH · adv: %s (%d hops) · confirmed' % (
+            rec['summary'] = '%s · adv: %s (%d hops)' % (
                 route_name, rec['mc_path_advertised'].upper(),
                 rec['mc_path_advertised_len'])
             return rec
@@ -2165,20 +2168,24 @@ def parse_meshcore_packet(payload):
             if _matched:
                 rec['confidence'] = 'confirmed'
                 rec['mc_known_hops'] = len(_matched)
-                rec['summary'] = '%s / %s · matches %d known node%s · confirmed' % (
-                    route_name, ptype_name, len(_matched),
+                rec['summary'] = '%s · matches %d known node%s' % (
+                    route_name, len(_matched),
                     '' if len(_matched) == 1 else 's')
                 return rec
         # Not crypto-verified.  Surface as an UNKNOWN frame that *looks like*
         # MeshCore, carrying its path hashes so the web can corroborate it against
         # the ADVERT-verified node registry (a frame routed through known nodes is
         # behaviorally confirmed).  NOT a MeshCore claim until the web promotes it.
+        # Summary is just the technical detail.  The state-column badge
+        # already says "encrypted MeshCore DM (no key)" / "MeshCore ACK
+        # (unverified)" etc., and the type-column already shows the payload
+        # type — no need to restate either in the message column.
         _unk = {'proto': 'unknown', 'hint': 'meshcore',
                 'confidence': 'candidate',
                 'mc_route': route_name,
                 'mc_type': ptype_name, 'mc_path': _mc_path, 'decrypted': False,
-                'summary': 'looks like MeshCore · %s/%s%s' % (
-                    route_name, ptype_name,
+                'summary': '%s%s' % (
+                    route_name,
                     (' · %d hops' % len(_mc_path)) if _mc_path else '')}
         # Carry any TRACE/CONTROL/ACK body fields into the unknown record so
         # the UI dropdown can still show them when the frame can't be claimed
@@ -2194,8 +2201,8 @@ def parse_meshcore_packet(payload):
     _id = ''
     if rec.get('mc_name'):
         _id = ' · ' + rec['mc_name'] + ((' (%s)' % rec['mc_role']) if rec.get('mc_role') else '')
-    rec['summary'] = '%s / %s%s%s · verified' % (
-        route_name, ptype_name,
+    rec['summary'] = '%s%s%s' % (
+        route_name,
         (' · %d hops' % rec['mc_hops']) if rec.get('mc_hops') else '', _id)
     return rec
 
