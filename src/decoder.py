@@ -2323,15 +2323,23 @@ def parse_meshcore_packet(payload):
                 # Summary should reflect CONTENT, not the identification
                 # method.  Path-hash promotion identifies the participants
                 # (via from/to) and credit (via the 'via N known' badge in
-                # the UI hint), but the wire body is still encrypted
-                # ciphertext we cannot decrypt.  For encrypted payload
-                # types, surface the ciphertext byte-count exactly like
-                # the _unk path does — so jumping tier doesn't HIDE
-                # information the candidate row was showing.  For
-                # unencrypted types (PATH/MULTIPART/TRACE etc.) that
-                # reached here via path-hash match, fall back to the
-                # generic "matches N known node(s)" since we don't have
-                # specific content semantics to surface.
+                # the UI hint), but the wire body is unchanged — we still
+                # surface the body byte-count for every payload type so a
+                # jump from candidate→confirmed doesn't HIDE info the
+                # candidate row was showing.  Per-type qualifier:
+                #
+                #   TXT_MSG/REQ/RESPONSE (0x00/0x01/0x02): definitely
+                #       AES-encrypted (4-byte hash+MAC prefix + ciphertext)
+                #   ANON_REQ (0x07): definitely AES-encrypted with an
+                #       ephemeral X25519 pubkey (33-byte prefix + ciphertext)
+                #   GRP_TXT/GRP_DATA (0x05/0x06): definitely AES-encrypted
+                #       (3-byte channel+MAC prefix + ciphertext)
+                #   MULTIPART (0x0A): typically an encrypted-DM
+                #       continuation, but COULD be plaintext — flag as
+                #       "likely encrypted" rather than asserting.
+                #   PATH (0x08) / TRACE (0x09) / CONTROL (0x0B): plaintext
+                #       protocol-level metadata (route/SNR/discovery).
+                #   RAW_CUSTOM (0x0F): app-defined payload — opaque to us.
                 if payload_type in (0x00, 0x01, 0x02) and len(payload_rest) >= 4:
                     _ct = max(0, len(payload_rest) - 4)
                     rec['summary'] = '%d bytes encrypted' % _ct if _ct else 'encrypted'
@@ -2341,10 +2349,14 @@ def parse_meshcore_packet(payload):
                 elif payload_type in (0x05, 0x06) and len(payload_rest) >= 3:
                     _ct = max(0, len(payload_rest) - 3)
                     rec['summary'] = '%d bytes encrypted' % _ct if _ct else 'encrypted'
+                elif payload_type == 0x0A:                       # MULTIPART
+                    rec['summary'] = '%d bytes (likely encrypted)' % len(payload_rest)
+                elif payload_type in (0x08, 0x09, 0x0B):         # PATH/TRACE/CONTROL
+                    rec['summary'] = '%d bytes plaintext' % len(payload_rest)
+                elif payload_type == 0x0F:                       # RAW_CUSTOM
+                    rec['summary'] = '%d bytes custom payload' % len(payload_rest)
                 else:
-                    rec['summary'] = 'matches %d known node%s' % (
-                        len(_matched),
-                        '' if len(_matched) == 1 else 's')
+                    rec['summary'] = '%d bytes' % len(payload_rest)
                 # Surface from/to with the full pubkey prefix WHEN the
                 # 1-byte routing hash unambiguously identifies a registered
                 # node (exactly one pubkey in the registry has that first
