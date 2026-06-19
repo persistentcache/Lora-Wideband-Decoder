@@ -1575,10 +1575,78 @@ def _load_identities():
 
 def _register_mc_pubkey(pub_bytes):
     """Add a 32B MeshCore Ed25519 pubkey to the routing-hash registry.  Called
-    from the ADVERT branch on Ed25519 sig verify, and from _load_identities()
-    for every configured identity key."""
+    from _load_identities() for every configured identity key.  ADVERT-verified
+    pubkeys go through _register_mc_advert_pubkey() instead, which ALSO writes
+    to a shared on-disk file so sibling worker processes pick it up."""
     if isinstance(pub_bytes, (bytes, bytearray)) and len(pub_bytes) == 32:
         _MC_PUBKEY_REG.setdefault(pub_bytes[0], set()).add(bytes(pub_bytes))
+
+
+# ============================================================================
+# Cross-process ADVERT pubkey registry — fixes the per-worker isolation bug
+# where Worker A verifies an ADVERT (registers MC_A's pubkey in its own
+# _MC_PUBKEY_REG) but Worker B handling a subsequent encrypted DM from MC_A
+# sees an empty registry and doesn't fire the path-hash promotion.
+#
+# Design: append-only JSONL file on /tmp.  The save side just appends one
+# hex line (atomic at the OS-write level for line-sized writes — no locking
+# needed for concurrent appends).  The load side caches by mtime: no I/O at
+# all unless a sibling worker has written something new, then a single read
+# re-populates the in-memory _MC_PUBKEY_REG.  Cost per parse call is one
+# fstat() (cache-hit branch) — negligible.
+#
+# Lifetime: the file persists across pipeline restarts so an established
+# mesh's pubkeys carry over.  The web /api/clear endpoint truncates it for
+# users who want a fresh-session view.
+# ============================================================================
+_MC_ADVERT_REG_PATH = os.environ.get(
+    'LORA_MC_ADVERT_REG', '/tmp/lora_mc_advert_registry.jsonl')
+_MC_ADVERT_REG_MTIME = [0.0]
+
+
+def _save_mc_advert_pubkey(pub_bytes):
+    """Append a verified-ADVERT pubkey to the shared on-disk registry.
+    Idempotent: duplicates are tolerated (read-side deduplicates via set)."""
+    if not (isinstance(pub_bytes, (bytes, bytearray)) and len(pub_bytes) == 32):
+        return
+    try:
+        with open(_MC_ADVERT_REG_PATH, 'a') as f:
+            f.write(bytes(pub_bytes).hex() + '\n')
+    except Exception:
+        pass     # registry is an optimization, not a hard requirement
+
+
+def _load_mc_advert_pubkeys():
+    """Refresh _MC_PUBKEY_REG from the shared on-disk registry.  Caches by
+    mtime — no I/O unless a sibling worker has written since the last load."""
+    try:
+        mt = os.path.getmtime(_MC_ADVERT_REG_PATH)
+    except OSError:
+        return
+    if mt <= _MC_ADVERT_REG_MTIME[0]:
+        return
+    _MC_ADVERT_REG_MTIME[0] = mt
+    try:
+        with open(_MC_ADVERT_REG_PATH) as f:
+            for line in f:
+                ph = line.strip()
+                if not ph:
+                    continue
+                try:
+                    pb = bytes.fromhex(ph)
+                except ValueError:
+                    continue
+                if len(pb) == 32:
+                    _MC_PUBKEY_REG.setdefault(pb[0], set()).add(pb)
+    except Exception:
+        pass
+
+
+def _register_mc_advert_pubkey(pub_bytes):
+    """In-memory register + persist to the shared registry so sibling worker
+    processes can promote subsequent frames from the same node."""
+    _register_mc_pubkey(pub_bytes)
+    _save_mc_advert_pubkey(pub_bytes)
 
 
 def _decrypt_mc_pair(payload_rest):
@@ -2127,7 +2195,12 @@ def parse_meshcore_packet(payload):
         rec['mc_pubkey'] = payload_rest[0:32].hex()
         rec['mc_hash'] = payload_rest[0]
         if _sig_ok:
-            _register_mc_pubkey(payload_rest[0:32])
+            # ADVERT-verified pubkey: persist to the shared on-disk registry
+            # so sibling worker processes can use it for path-hash promotion
+            # of subsequent encrypted frames from the same node (otherwise
+            # promotion would be confined to the worker that decoded the
+            # ADVERT, which usually isn't the worker that gets the next DM).
+            _register_mc_advert_pubkey(payload_rest[0:32])
         _ad = payload_rest[100:]
         if _ad:
             _flags = _ad[0]; _ao = 1
@@ -2161,6 +2234,12 @@ def parse_meshcore_packet(payload):
         # ~2 × 10⁻⁷ per frame; gating on a populated registry adds no
         # weakness because that registry is itself crypto-grounded.
         _load_identities()
+        # Also pick up ADVERT pubkeys persisted by sibling worker processes —
+        # the in-memory _MC_PUBKEY_REG is per-process, so without this we'd
+        # only promote frames that the SAME worker happened to decode an
+        # ADVERT for.  Reads are mtime-cached: zero I/O on the common no-new-
+        # ADVERTs path, one read when a sibling has written something new.
+        _load_mc_advert_pubkeys()
         if payload_type == 0x03 and (_MC_IDENTITY_KEYS or _MC_PUBKEY_REG):
             rec['confidence'] = 'confirmed'
             # ACK→TXT_MSG correlation: receiver-side hash recipe is
@@ -2238,6 +2317,16 @@ def parse_meshcore_packet(payload):
                 rec['summary'] = 'matches %d known node%s' % (
                     len(_matched),
                     '' if len(_matched) == 1 else 's')
+                # Populate from/to with the same short-hash format the _unk
+                # path uses for un-promoted DMs.  Without these the GUI's
+                # from/to columns are blank on confirmed rows, which makes
+                # them look LESS informative than the candidate rows they
+                # came from — backwards.
+                if payload_type in (0x00, 0x01, 0x02) and len(payload_rest) >= 2:
+                    rec['to']   = 'MC?:%02x' % payload_rest[0]
+                    rec['from'] = 'MC?:%02x' % payload_rest[1]
+                elif payload_type == 0x07 and len(payload_rest) >= 1:
+                    rec['to'] = 'MC?:%02x' % payload_rest[0]
                 return rec
         # Not crypto-verified.  Emit as MeshCore at 'candidate' tier — the
         # structural + sync-word gate is tight enough (~3% per random byte
