@@ -2637,13 +2637,16 @@ def api_clear():
     with STATE_LOCK:
         PACKETS.clear(); SEEN.clear(); NODES.clear(); EDGES.clear()
     # also truncate the persistent logs so cleared data doesn't reload on
-    # restart (the tailer detects the shrink and resets its read position),
-    # plus the cross-worker MeshCore ADVERT pubkey registry so a fresh
-    # session doesn't inherit prior ADVERT-promoted nodes.
-    _mc_adv_reg = os.environ.get(
-        'LORA_MC_ADVERT_REG', '/tmp/lora_mc_advert_registry.jsonl')
+    # restart (the tailer detects the shrink and resets its read position).
+    # DOES NOT truncate the cross-worker MeshCore ADVERT pubkey registry —
+    # that's accumulated cryptographic knowledge of the mesh, not session
+    # display state, and clearing it silently regresses path-hash promotion
+    # for all subsequent encrypted frames until each node re-advertises.
+    # Users who want a registry reset can delete the file manually
+    # (/tmp/lora_mc_advert_registry.jsonl) or pipeline-restart with the
+    # LORA_MC_ADVERT_REG env override pointing to a tmpfile.
     for _p in (CFG['decode'].get('packet_log', '/tmp/lora_packets.jsonl'),
-               AUTOSAVE_PATH, _mc_adv_reg):
+               AUTOSAVE_PATH):
         try:
             open(_p, 'w').close()
         except Exception:
