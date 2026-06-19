@@ -2317,16 +2317,25 @@ def parse_meshcore_packet(payload):
                 rec['summary'] = 'matches %d known node%s' % (
                     len(_matched),
                     '' if len(_matched) == 1 else 's')
-                # Populate from/to with the same short-hash format the _unk
-                # path uses for un-promoted DMs.  Without these the GUI's
-                # from/to columns are blank on confirmed rows, which makes
-                # them look LESS informative than the candidate rows they
-                # came from — backwards.
+                # Surface from/to with the full pubkey prefix WHEN the
+                # 1-byte routing hash unambiguously identifies a registered
+                # node (exactly one pubkey in the registry has that first
+                # byte).  Same format the verified DM path uses
+                # ('MC:XXXXXXXX'), so the GUI groups these rows with their
+                # decoded siblings instead of treating them as a separate
+                # unidentified short-hash column.  If the first byte is
+                # shared by multiple registered pubkeys, fall back to the
+                # short 'MC?:%02x' form to avoid guessing wrong.
+                def _hash_to_name(_b):
+                    _pubs = _MC_PUBKEY_REG.get(_b)
+                    if _pubs and len(_pubs) == 1:
+                        return 'MC:' + next(iter(_pubs))[:4].hex().upper()
+                    return 'MC?:%02x' % _b
                 if payload_type in (0x00, 0x01, 0x02) and len(payload_rest) >= 2:
-                    rec['to']   = 'MC?:%02x' % payload_rest[0]
-                    rec['from'] = 'MC?:%02x' % payload_rest[1]
+                    rec['to']   = _hash_to_name(payload_rest[0])
+                    rec['from'] = _hash_to_name(payload_rest[1])
                 elif payload_type == 0x07 and len(payload_rest) >= 1:
-                    rec['to'] = 'MC?:%02x' % payload_rest[0]
+                    rec['to'] = _hash_to_name(payload_rest[0])
                 return rec
         # Not crypto-verified.  Emit as MeshCore at 'candidate' tier — the
         # structural + sync-word gate is tight enough (~3% per random byte
