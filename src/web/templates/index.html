@@ -267,7 +267,32 @@ function hintBadge(p){if(!p.hint)return '';
   const nm=PROTO_LABEL[p.hint]||esc(p.hint);
   const og=(p.on_grid===false)?' <span class="tag" title="off the LoRaWAN channel grid for this region" style="background:rgba(255,93,93,.16);color:var(--warn)">off-grid</span>':'';
   const kh=(p.mc_known_hops)?' <span class="tag" title="routed through '+p.mc_known_hops+' crypto-verified MeshCore node(s) — needs 2 to confirm" style="background:rgba(63,167,255,.16);color:var(--acc)">via '+p.mc_known_hops+' known</span>':'';
-  return ' <span class="tag" title="structurally resembles '+nm+' but NOT identified — unconfirmed, could be an unimplemented protocol" style="background:rgba(255,176,32,.16);color:#ffb020">? looks like '+nm+'</span>'+og+kh;}
+  // Context-aware label: tell the user EXACTLY why this row couldn't reach
+  // 'verified', honestly per payload type.  No 'encrypted' claim on frames
+  // whose body isn't actually encrypted (ACK / TRACE / CONTROL / PATH /
+  // MULTIPART / RAW_CUSTOM); no 'no key' claim on frames where the wire-
+  // level protocol simply has no MAC to check.
+  let lbl, ttl;
+  if (p.hint === 'meshcore') {
+    const mt = p.mc_type;
+    if (mt === 'TXT_MSG' || mt === 'REQ' || mt === 'RESPONSE' || mt === 'ANON_REQ') {
+      lbl = 'encrypted MeshCore DM (no key)';
+      ttl = 'MeshCore per-pair encrypted payload (ECDH + AES-128 + HMAC) — neither the sender\'s nor the recipient\'s identity is loaded, so the shared key cannot be derived';
+    } else if (mt === 'GRP_TXT' || mt === 'GRP_DATA') {
+      lbl = 'encrypted MeshCore channel (no key)';
+      ttl = 'MeshCore group/channel message (AES-128 + HMAC) — the channel pre-shared key for this channel hash is not in the key store';
+    } else if (mt === 'ACK') {
+      lbl = 'MeshCore ACK (unverified)';
+      ttl = 'MeshCore acknowledgment — a 4-byte truncated SHA-256 of a source TXT_MSG we have not (yet) seen, so cannot be correlated';
+    } else {
+      lbl = 'MeshCore (unverified)';
+      ttl = 'MeshCore wire format matched but this payload type carries no wire-level authentication — could be legitimate MeshCore traffic or a structural false positive from another protocol';
+    }
+  } else {
+    lbl = '? looks like ' + nm;
+    ttl = 'structurally resembles ' + nm + ' but NOT identified — unconfirmed, could be an unimplemented protocol';
+  }
+  return ' <span class="tag" title="'+ttl+'" style="background:rgba(255,176,32,.16);color:#ffb020">'+lbl+'</span>'+og+kh;}
 // Inferred-from badge: when a packet matches the calibrated hardware profile
 // of a known node, surface that match.  Profile sources:
 //   - Real Meshtastic node IDs (e.g. !ba6a783c) — calibrated from labeled
