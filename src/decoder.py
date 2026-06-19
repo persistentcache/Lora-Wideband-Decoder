@@ -2083,13 +2083,18 @@ def parse_meshcore_packet(payload):
     # 'unknown' rather than being mislabeled MeshCore.
     if rec.get('confidence') != 'verified':
         # ACK (payload_type 0x03) carries no decryptable payload — just a 4-byte
-        # ACK CRC — so it can never reach 'verified'.  When the user has
-        # configured a MeshCore identity, on-air MeshCore activity is presumed
-        # legitimate, so promote ACKs to confidence='confirmed' and claim them
-        # as meshcore.  Without an identity, fall through to the unknown gate
-        # below (safer default for users not running MC nodes).
+        # ACK CRC — so it can never reach 'verified'.  Promote ACKs to
+        # 'confirmed' whenever we have ANY cryptographically-grounded evidence
+        # of MeshCore presence in this session: a configured full identity, a
+        # pub-only contact, or an ADVERT-verified pubkey (all three feed
+        # _MC_PUBKEY_REG).  This catches the K4KDR/tjswe pattern of "user has
+        # peers configured but ACKs from third-party traffic were stuck at
+        # candidate" without lowering the FP rate appreciably — random noise
+        # passing both the ACK structural shape AND a LoRa CRC is already
+        # ~2 × 10⁻⁷ per frame; gating on a populated registry adds no
+        # weakness because that registry is itself crypto-grounded.
         _load_identities()
-        if payload_type == 0x03 and _MC_IDENTITY_KEYS:
+        if payload_type == 0x03 and (_MC_IDENTITY_KEYS or _MC_PUBKEY_REG):
             rec['confidence'] = 'confirmed'
             # ACK→TXT_MSG correlation: receiver-side hash recipe is
             #   SHA256(ts(4 LE) || pt[4] || text(no NUL) || sender_pub(32))[:4]
@@ -2135,6 +2140,35 @@ def parse_meshcore_packet(payload):
                 route_name, rec['mc_path_advertised'].upper(),
                 rec['mc_path_advertised_len'])
             return rec
+        # Known-node corroboration: a frame whose routing path, dest_hash, or
+        # src_hash collides with a pubkey we've cryptographically verified
+        # (via ADVERT Ed25519 sig or configured identity) is behaviorally
+        # confirmed MeshCore.  Most real DMs are 0-hop direct (empty path),
+        # so checking the dest/src byte of the DM-like body is what catches
+        # them — path-only matching misses these.  The frame already passed
+        # the structural gate AND arrived on sync 0x12.  Joint random FP rate:
+        # (1/256 sync demod) × (~1/5 structural) × (K/256 hash match) ≈ K/3.3e5
+        # per random frame.  Stronger evidence than RadioHead's behavioral
+        # promotion (no crypto anchor) and Meshtastic-shape preempt (header
+        # coincidence), so the dispatcher's tier-sort places this 'confirmed'
+        # record above both.  Required threshold: >=1 match.
+        if _MC_PUBKEY_REG:
+            _matched = set(int(h) for h in _mc_path if int(h) in _MC_PUBKEY_REG)
+            # DM-like bodies start with dest_hash | src_hash (TXT_MSG=0x02,
+            # REQ=0x00, RESPONSE=0x01); ANON_REQ (0x07) starts with dest_hash
+            # only, then an ephemeral pubkey, not a known one.
+            if payload_type in (0x00, 0x01, 0x02) and len(payload_rest) >= 2:
+                if payload_rest[0] in _MC_PUBKEY_REG: _matched.add(payload_rest[0])
+                if payload_rest[1] in _MC_PUBKEY_REG: _matched.add(payload_rest[1])
+            elif payload_type == 0x07 and len(payload_rest) >= 1:
+                if payload_rest[0] in _MC_PUBKEY_REG: _matched.add(payload_rest[0])
+            if _matched:
+                rec['confidence'] = 'confirmed'
+                rec['mc_known_hops'] = len(_matched)
+                rec['summary'] = '%s / %s · matches %d known node%s · confirmed' % (
+                    route_name, ptype_name, len(_matched),
+                    '' if len(_matched) == 1 else 's')
+                return rec
         # Not crypto-verified.  Surface as an UNKNOWN frame that *looks like*
         # MeshCore, carrying its path hashes so the web can corroborate it against
         # the ADVERT-verified node registry (a frame routed through known nodes is
