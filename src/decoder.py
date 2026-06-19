@@ -2006,7 +2006,15 @@ def parse_meshcore_packet(payload):
         if _body_len < 19 or (_body_len - 3) % 16 != 0:
             return None
     elif payload_type == 0x03:                       # ACK
-        if _body_len != 4:
+        # The minimal documented ACK body is a 4-byte SHA256-truncated CRC,
+        # but live capture shows real MeshCore firmware emitting 8-byte ACK
+        # bodies — the wire format includes per-implementation trailing
+        # bytes (likely a delivery code / hop-survey field that isn't in
+        # the public spec).  Accept 4-16 bytes: keeps the strict 4-byte
+        # minimum that rules out noise, gives 12 bytes of headroom for
+        # protocol extensions, and bounds the upper end so runaway garbage
+        # can't satisfy the gate.
+        if _body_len < 4 or _body_len > 16:
             return None
     # ADVERT / TRACE / CONTROL / PATH / MULTIPART / RAW_CUSTOM are unencrypted
     # and have their own structural checks further down — no block-length gate
