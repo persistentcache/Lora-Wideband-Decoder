@@ -2211,12 +2211,27 @@ def parse_meshcore_packet(payload):
             # in plaintext (the AEAD only covers the ciphertext + MAC that
             # follow).  1-byte truncations don't uniquely ID a node, but they
             # let the UI distinguish different DMs and pair them with replies.
+            # Summary surfaces the ENCRYPTED-body size — telling the user "we
+            # see N bytes of ciphertext here" is more informative than dumping
+            # raw hex (which the GUI does as a fallback when summary is empty).
             _unk_to   = 'MC?:%02x' % payload_rest[0]
             _unk_from = 'MC?:%02x' % payload_rest[1]
+            # Ciphertext = body bytes after dest_hash + src_hash + 2-byte MAC.
+            _ct_bytes = max(0, len(payload_rest) - 4)
+            _unk_summary = '%d bytes encrypted' % _ct_bytes if _ct_bytes else 'encrypted'
         elif payload_type == 0x07 and len(payload_rest) >= 1:
-            # ANON_REQ — body[0] = dest_hash[0]; the sender is anonymous (an
-            # ephemeral X25519 pubkey follows, not a registry-known identity).
+            # ANON_REQ — body[0] = dest_hash[0], body[1:33] = ephemeral X25519
+            # pubkey (NOT a registry-known identity — sender is anonymous by
+            # design), body[33:] = ciphertext + MAC.
             _unk_to = 'MC?:%02x' % payload_rest[0]
+            _ct_bytes = max(0, len(payload_rest) - 33)
+            _unk_summary = '%d bytes encrypted (anon)' % _ct_bytes if _ct_bytes else 'encrypted (anon)'
+        elif payload_type in (0x05, 0x06) and len(payload_rest) >= 1:
+            # GRP_TXT / GRP_DATA candidate — body[0] = channel_hash, body[1:3]
+            # = MAC, body[3:] = ciphertext.  Channel hash is shown in the chan
+            # column; surface the ciphertext byte-count here.
+            _ct_bytes = max(0, len(payload_rest) - 3)
+            _unk_summary = '%d bytes encrypted' % _ct_bytes if _ct_bytes else 'encrypted'
         elif payload_type == 0x03 and len(payload_rest) >= 4:
             # ACK — body[0:4] = the 4-byte SHA256-truncated CRC.  Without keys
             # we can't compute the correlator hash, but the CRC alone is a
