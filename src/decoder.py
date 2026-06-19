@@ -2127,20 +2127,20 @@ def parse_meshcore_packet(payload):
             _hops = ' → '.join(
                 '%s (%+.1f dB)' % (h.upper(), s)
                 for h, s in zip(rec['mc_trace_path'], rec['mc_trace_snr']))
-            rec['summary'] = '%s · route: %s' % (route_name, _hops)
+            rec['summary'] = 'route: %s' % _hops
             return rec
         if (payload_type == 0x0B and rec.get('mc_disc_pub') and _MC_IDENTITY_KEYS):
             rec['confidence'] = 'confirmed'
-            rec['summary'] = '%s · %s · %s · SNR %+.1f dB' % (
-                route_name, rec['mc_ctrl_sub'], rec['mc_disc_ntype'], rec['mc_disc_snr'])
+            rec['summary'] = '%s · %s · SNR %+.1f dB' % (
+                rec['mc_ctrl_sub'], rec['mc_disc_ntype'], rec['mc_disc_snr'])
             return rec
         # PATH (0x08) is unencrypted route-discovery; once we've structurally
         # validated extra_path_len + bounds we can promote it the same way as
         # TRACE/CONTROL when an MC identity is configured.
         if (payload_type == 0x08 and rec.get('mc_path_advertised') and _MC_IDENTITY_KEYS):
             rec['confidence'] = 'confirmed'
-            rec['summary'] = '%s · adv: %s (%d hops)' % (
-                route_name, rec['mc_path_advertised'].upper(),
+            rec['summary'] = 'adv: %s (%d hops)' % (
+                rec['mc_path_advertised'].upper(),
                 rec['mc_path_advertised_len'])
             return rec
         # Known-node corroboration: a frame whose routing path, dest_hash, or
@@ -2168,25 +2168,50 @@ def parse_meshcore_packet(payload):
             if _matched:
                 rec['confidence'] = 'confirmed'
                 rec['mc_known_hops'] = len(_matched)
-                rec['summary'] = '%s · matches %d known node%s' % (
-                    route_name, len(_matched),
+                rec['summary'] = 'matches %d known node%s' % (
+                    len(_matched),
                     '' if len(_matched) == 1 else 's')
                 return rec
         # Not crypto-verified.  Surface as an UNKNOWN frame that *looks like*
         # MeshCore, carrying its path hashes so the web can corroborate it against
         # the ADVERT-verified node registry (a frame routed through known nodes is
         # behaviorally confirmed).  NOT a MeshCore claim until the web promotes it.
-        # Summary is just the technical detail.  The state-column badge
-        # already says "encrypted MeshCore DM (no key)" / "MeshCore ACK
-        # (unverified)" etc., and the type-column already shows the payload
-        # type — no need to restate either in the message column.
+        #
+        # Per-type from/to/summary extraction: MeshCore frame bodies have a few
+        # UNENCRYPTED leading bytes that identify the participants and (for ACK)
+        # the frame's unique CRC.  Even when we can't decrypt the ciphertext, we
+        # can still surface these so different encrypted DMs are distinguishable
+        # in the GUI, ACKs show their CRC (the unique frame id), and channel
+        # messages don't all collapse to the same row.  Route_name (BACK/DIRECT/
+        # FLOOD) carries no per-frame distinguishing info — most DMs use DIRECT,
+        # most replies use BACK — so it's dropped from the summary as redundant.
+        _unk_from = None
+        _unk_to   = None
+        _unk_summary = ''
+        if payload_type in (0x00, 0x01, 0x02) and len(payload_rest) >= 2:
+            # TXT_MSG / REQ / RESPONSE — body[0] = dest_hash[0], body[1] = src_hash[0]
+            # in plaintext (the AEAD only covers the ciphertext + MAC that
+            # follow).  1-byte truncations don't uniquely ID a node, but they
+            # let the UI distinguish different DMs and pair them with replies.
+            _unk_to   = 'MC?:%02x' % payload_rest[0]
+            _unk_from = 'MC?:%02x' % payload_rest[1]
+        elif payload_type == 0x07 and len(payload_rest) >= 1:
+            # ANON_REQ — body[0] = dest_hash[0]; the sender is anonymous (an
+            # ephemeral X25519 pubkey follows, not a registry-known identity).
+            _unk_to = 'MC?:%02x' % payload_rest[0]
+        elif payload_type == 0x03 and len(payload_rest) >= 4:
+            # ACK — body[0:4] = the 4-byte SHA256-truncated CRC.  Without keys
+            # we can't compute the correlator hash, but the CRC alone is a
+            # unique frame identifier — surface it so users can see different
+            # ACKs as distinct rows.
+            _unk_summary = 'ACK 0x' + bytes(payload_rest[:4]).hex()
         _unk = {'proto': 'unknown', 'hint': 'meshcore',
                 'confidence': 'candidate',
                 'mc_route': route_name,
                 'mc_type': ptype_name, 'mc_path': _mc_path, 'decrypted': False,
-                'summary': '%s%s' % (
-                    route_name,
-                    (' · %d hops' % len(_mc_path)) if _mc_path else '')}
+                'summary': _unk_summary,
+                'from': _unk_from,
+                'to':   _unk_to}
         # Carry any TRACE/CONTROL/ACK body fields into the unknown record so
         # the UI dropdown can still show them when the frame can't be claimed
         # as MeshCore (no identity loaded).
@@ -2198,12 +2223,17 @@ def parse_meshcore_packet(payload):
             if _k in rec:
                 _unk[_k] = rec[_k]
         return _unk
-    _id = ''
+    # Drop route_name from the verified-tier catch-all summary.  For frames
+    # with decoded text (TXT_MSG, GRP_TXT) the UI's pktMsg() shows `text`
+    # and ignores `summary` anyway.  For ADVERT (no text, has name + role)
+    # and unusual verified frames without text, summary is what shows —
+    # and the route prefix adds nothing useful here either.
+    _parts = []
     if rec.get('mc_name'):
-        _id = ' · ' + rec['mc_name'] + ((' (%s)' % rec['mc_role']) if rec.get('mc_role') else '')
-    rec['summary'] = '%s%s%s' % (
-        route_name,
-        (' · %d hops' % rec['mc_hops']) if rec.get('mc_hops') else '', _id)
+        _parts.append(rec['mc_name'] + ((' (%s)' % rec['mc_role']) if rec.get('mc_role') else ''))
+    if rec.get('mc_hops'):
+        _parts.append('%d hops' % rec['mc_hops'])
+    rec['summary'] = ' · '.join(_parts)
     return rec
 
 
