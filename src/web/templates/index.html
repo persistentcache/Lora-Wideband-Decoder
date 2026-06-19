@@ -382,7 +382,20 @@ function pktDetail(p){
     // GRP_DATA (0x06) data_type
     if(p.mc_data_app) row('data app', esc(p.mc_data_app));
     if(p.mc_data_type!=null) row('data type', `<span class="mono">0x${p.mc_data_type.toString(16).padStart(4,'0')}</span>`);
-    if(p.mc_data) row('data', `<span class="mono" style="font-size:11px">${esc(p.mc_data.slice(0,64))}${p.mc_data.length>64?'…':''}</span>`);
+    if(p.mc_data_len!=null) row('data length', `${p.mc_data_len} bytes`);
+    if(p.mc_data_ascii) row('data ascii', `<span class="mono" style="font-size:11px">${esc(p.mc_data_ascii)}</span>`);
+    if(p.mc_data) row('data hex', `<span class="mono" style="font-size:11px">${esc(p.mc_data.slice(0,64))}${p.mc_data.length>64?'…':''}</span>`);
+    // REQ / RESPONSE (0x00 / 0x01) — admin commands
+    if(p.mc_admin_sender) row('admin sender', `<span class="mono" style="font-size:11px">${esc(p.mc_admin_sender)}…</span>`);
+    if(p.mc_admin_recipient) row('admin recipient', `<span class="mono" style="font-size:11px">${esc(p.mc_admin_recipient)}…</span>`);
+    if(p.mc_admin_code!=null) row('admin code', `<span class="mono">0x${p.mc_admin_code.toString(16).padStart(2,'0')}</span>`);
+    if(p.mc_admin_ts) row('admin ts', new Date(p.mc_admin_ts*1000).toLocaleString());
+    if(p.mc_admin_len!=null) row('admin payload length', `${p.mc_admin_len} bytes`);
+    if(p.mc_admin_ascii) row('admin payload ascii', `<span class="mono" style="font-size:11px">${esc(p.mc_admin_ascii)}</span>`);
+    if(p.mc_admin_pt_hex) row('admin payload hex', `<span class="mono" style="font-size:11px">${esc(p.mc_admin_pt_hex.slice(0,128))}${p.mc_admin_pt_hex.length>128?'…':''}</span>`);
+    // PATH (0x08) — route advertisement
+    if(p.mc_path_advertised) row('path advertised', `<span class="mono">${esc(p.mc_path_advertised.toUpperCase())}</span> (${p.mc_path_advertised_len} hops)`);
+    if(p.mc_path_meta_hex) row('path metadata', `<span class="mono" style="font-size:11px">${esc(p.mc_path_meta_hex.slice(0,64))}${p.mc_path_meta_hex.length>64?'…':''}</span>`);
     // ACK correlation (0x03)
     if(p.mc_ack_for_text){
       row('ack for', `"${esc(p.mc_ack_for_text)}"`);

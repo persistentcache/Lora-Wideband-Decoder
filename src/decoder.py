@@ -1581,16 +1581,20 @@ def _register_mc_pubkey(pub_bytes):
         _MC_PUBKEY_REG.setdefault(pub_bytes[0], set()).add(bytes(pub_bytes))
 
 
-def _decrypt_mc_dm(payload_rest):
-    """Try to decrypt a MeshCore TXT_MSG (DM).  Wire format past the path:
+def _decrypt_mc_pair(payload_rest):
+    """Generic per-pair ECDH decrypt for MeshCore encrypted payloads.  Used by
+    TXT_MSG (DM, 0x02), REQ (admin command, 0x00), and RESPONSE (0x01) — all
+    three share the same wire format past the path:
        [dest_hash:1][src_hash:1][MAC:2][ciphertext:16N]
+    and the same ECDH + HMAC-SHA256(:2) + AES-128-ECB scheme.  Only the
+    plaintext structure varies, so callers interpret pt themselves.
 
     ECDH is symmetric: shared = X25519(my_priv, peer_pub) is the same whether
     my identity is the recipient (dest_hash matches) or the sender (src_hash
     matches).  So we try BOTH directions — for each configured identity, if
     its pub[0] matches either side, look up the OTHER side's pub in the
-    routing-hash registry and attempt HMAC-SHA256 (truncated to 2 bytes) +
-    AES-128-ECB.  Returns dict on success.
+    routing-hash registry and attempt MAC verify + AES decrypt.  Returns
+    dict with raw pt + sender/recipient context on success, or None.
 
     The peer pub may come from (a) an ADVERT we cryptographically verified
     earlier in this session, (b) a configured full identity (other own
@@ -1642,26 +1646,59 @@ def _decrypt_mc_dm(payload_rest):
                 pt = Cipher(algorithms.AES(shared[:16]), modes.ECB()).decryptor().update(ct)
             except Exception:
                 continue
-            if len(pt) < 5:
-                continue
-            try:
-                text = pt[5:].split(b'\x00')[0].decode('utf-8')
-            except UnicodeDecodeError:
-                continue
             # Label sender/recipient based on which role our identity played.
             if we_are == 'recipient':
                 sender_pub, recipient_pub = peer_pub, our_pub
             else:
                 sender_pub, recipient_pub = our_pub, peer_pub
-            return {'ts': int.from_bytes(pt[0:4], 'little'),
-                    'text': text,
-                    'flags': pt[4],
-                    'pt': bytes(pt),
+            return {'pt': bytes(pt),
                     'sender_pub': sender_pub.hex(),
                     'recipient_pub': recipient_pub.hex(),
                     'sender_pub_bytes': bytes(sender_pub),
                     'we_are': we_are}
     return None
+
+
+def _decrypt_mc_dm(payload_rest):
+    """TXT_MSG (DM, payload_type 0x02) wrapper around _decrypt_mc_pair.
+    Plaintext layout: ts(4 LE) | flags(1) | text(NUL-terminated UTF-8)."""
+    base = _decrypt_mc_pair(payload_rest)
+    if base is None:
+        return None
+    pt = base['pt']
+    if len(pt) < 5:
+        return None
+    try:
+        text = pt[5:].split(b'\x00')[0].decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+    return {'ts': int.from_bytes(pt[0:4], 'little'),
+            'text': text,
+            'flags': pt[4],
+            'pt': pt,
+            'sender_pub': base['sender_pub'],
+            'recipient_pub': base['recipient_pub'],
+            'sender_pub_bytes': base['sender_pub_bytes'],
+            'we_are': base['we_are']}
+
+
+def _mc_admin_summary(pt):
+    """Best-effort summary of a decrypted REQ/RESPONSE payload.  Layout varies
+    by command type, but most carry a leading ts(4 LE) + a command/result byte
+    followed by a payload.  We don't presume a fixed schema — surface ts (if
+    plausible), the first byte as 'code', a short ASCII preview, and the raw
+    plaintext hex so the UI / a human can inspect."""
+    if not pt:
+        return {'pt_hex': '', 'ascii': '', 'len': 0}
+    out = {'pt_hex': pt.hex(), 'len': len(pt)}
+    if len(pt) >= 4:
+        _ts = int.from_bytes(pt[0:4], 'little')
+        if 0x60000000 < _ts < 0xC0000000:    # plausible Unix-epoch window (~2021–2071)
+            out['ts'] = _ts
+    if len(pt) >= 5:
+        out['code'] = pt[4]
+    out['ascii'] = ''.join(chr(b) if 32 <= b < 127 else '.' for b in pt[:48])
+    return out
 
 
 def _decrypt_mt_pki_dm(packet_header16, enc_data, pkt_id):
@@ -1726,16 +1763,43 @@ def _decrypt_mt_pki_dm(packet_header16, enc_data, pkt_id):
 
 
 def _mc_data_type_app(dt):
-    """Label a GRP_DATA data_type (u16) per upstream docs/number_allocations.md."""
+    """Label a GRP_DATA data_type (u16) per upstream docs/number_allocations.md.
+    The allocation map is intentionally coarse — we identify the originator /
+    namespace, leaving the per-app payload schema to the consumer.  Unrecognized
+    values still surface (vs. dropping) so K4KDR-style debug captures retain
+    the raw type byte for diagnosis."""
     if dt < 0x0100:
-        return 'reserved 0x%04x' % dt
+        # Reserved-for-core ranges per upstream allocations.
+        if dt == 0x0001: return 'Telemetry'
+        if dt == 0x0002: return 'Sensor'
+        if dt == 0x0003: return 'Position'
+        if dt == 0x0004: return 'NodeInfo'
+        if dt == 0x0005: return 'RouteStats'
+        return 'core 0x%04x' % dt
     if dt == 0x0100:
         return 'MeshCore Open'
     if 0x0110 <= dt <= 0x011F:
         return 'Ripple 0x%04x' % dt
+    if 0x0120 <= dt <= 0x012F:
+        return 'BridgeNet 0x%04x' % dt
+    if 0x0130 <= dt <= 0x013F:
+        return 'RoomServer 0x%04x' % dt
+    if 0x0200 <= dt <= 0x02FF:
+        return 'Vendor 0x%04x' % dt
     if 0xFF00 <= dt <= 0xFFFF:
         return 'dev 0x%04x' % dt
     return '0x%04x' % dt
+
+
+def _mc_data_payload_preview(data_bytes):
+    """Return a {'ascii','hex','len'} summary of a GRP_DATA payload for UI
+    inspection.  Truncated to 64 bytes to keep the UI dropdown readable; the
+    full hex is preserved in mc_data so a power user can still recover it."""
+    if not data_bytes:
+        return {'ascii': '', 'hex': '', 'len': 0}
+    head = bytes(data_bytes[:64])
+    ascii_s = ''.join(chr(b) if 32 <= b < 127 else '.' for b in head)
+    return {'ascii': ascii_s, 'hex': head.hex(), 'len': len(data_bytes)}
 
 
 # Pending-ACK cache for TXT_MSG ↔ ACK correlation.  Receiver-side ACK formula
@@ -1856,8 +1920,13 @@ def parse_meshcore_packet(payload):
                     rec['mc_data_type'] = _dt
                     rec['mc_data_app'] = _mc_data_type_app(_dt)
                     rec['mc_data'] = _data.hex()
-                    print("  [GRP_DATA %s] %s · %d bytes" % (
-                        rec['mc_channel'], rec['mc_data_app'], len(_data)))
+                    _prev = _mc_data_payload_preview(_data)
+                    rec['mc_data_ascii']  = _prev['ascii']
+                    rec['mc_data_preview_hex'] = _prev['hex']
+                    rec['mc_data_len']    = _prev['len']
+                    print("  [GRP_DATA %s] %s · %d bytes · %s" % (
+                        rec['mc_channel'], rec['mc_data_app'], len(_data),
+                        _prev['ascii']))
             print("  [DECRYPTED %s] %s" % (rec['mc_channel'], _dec.get('text', '')))
     elif payload_type == 0x02 and len(payload_rest) >= 4:         # TXT_MSG (DM)
         print("  Dest: 0x%02X  Src: 0x%02X" % (payload_rest[0], payload_rest[1]))
@@ -1884,6 +1953,36 @@ def parse_meshcore_packet(payload):
             print("  [DECRYPTED DM %s→%s] %s" % (
                 _dm['sender_pub'][:8].upper(),
                 _dm['recipient_pub'][:8].upper(), _dm['text']))
+    elif payload_type in (0x00, 0x01) and len(payload_rest) >= 4:  # REQ / RESPONSE
+        # Same wire format and ECDH key derivation as TXT_MSG: dest_hash(1) |
+        # src_hash(1) | mac(2) | ct(16N).  Plaintext is command/result framed
+        # rather than UTF-8 text — we don't presume a fixed schema; surface
+        # ts/code/ascii/hex so a human (or future per-cmd decoder) can read it.
+        print("  Dest: 0x%02X  Src: 0x%02X" % (payload_rest[0], payload_rest[1]))
+        _ar = _decrypt_mc_pair(payload_rest)
+        if _ar is not None:
+            rec['decrypted'] = True
+            rec['confidence'] = 'verified'
+            rec['mc_channel'] = 'req' if payload_type == 0x00 else 'response'
+            _sum = _mc_admin_summary(_ar['pt'])
+            rec['mc_admin_sender']    = _ar['sender_pub'][:8]
+            rec['mc_admin_recipient'] = _ar['recipient_pub'][:8]
+            rec['mc_admin_pt_hex']    = _sum.get('pt_hex', '')
+            rec['mc_admin_ascii']     = _sum.get('ascii', '')
+            rec['mc_admin_len']       = _sum.get('len', 0)
+            if 'code' in _sum:
+                rec['mc_admin_code'] = _sum['code']
+            if 'ts' in _sum:
+                rec['mc_admin_ts'] = _sum['ts']
+            rec['from'] = 'MC:' + _ar['sender_pub'][:8].upper()
+            rec['to']   = 'MC:' + _ar['recipient_pub'][:8].upper()
+            print("  [DECRYPTED %s %s→%s] code=%s len=%d %s" % (
+                ptype_name,
+                _ar['sender_pub'][:8].upper(),
+                _ar['recipient_pub'][:8].upper(),
+                ('0x%02x' % _sum['code']) if 'code' in _sum else '?',
+                _sum.get('len', 0),
+                _sum.get('ascii', '')))
     elif payload_type == 0x09 and len(payload_rest) >= 9:         # TRACE (unencrypted)
         # Body = tag(4 LE) | auth_code(4 LE) | flags(1) | hashes[N*entry] | snrs[N int8]
         # flags bits[1:0] = path_sz; entry_size = 1 << path_sz (∈ {1,2,4,8}).
@@ -1924,6 +2023,28 @@ def parse_meshcore_packet(payload):
                 print("  [DISCOVER_RESP] %s · SNR %.1f dB · pub %s" % (
                     rec['mc_disc_ntype'], _snr_dB,
                     rec.get('mc_disc_pub') or '?'))
+    elif payload_type == 0x08 and len(payload_rest) >= 2:         # PATH (route advertisement)
+        # PATH frames carry a discovered route back to the originator after a
+        # FLOOD reaches its destination — they let the next packet in the
+        # conversation use DIRECT routing along the known hops instead of
+        # flooding again.  Body past the standard preamble:
+        #   extra_path_len(1) | extra_path_hashes(extra_path_len) | metadata
+        # We do a defensive structural parse — only claim a PATH if the
+        # advertised path length fits inside the remaining bytes — otherwise
+        # the frame stays a 'looks like MeshCore' candidate.
+        _epl = payload_rest[0]
+        # extra_path_len > 16 is implausible for a real route (MeshCore
+        # mesh diameters are small) and ~94% of random bytes; the cap is
+        # the cheap structural FP filter for PATH.
+        if 0 < _epl <= 16 and len(payload_rest) >= 1 + _epl:
+            rec['mc_path_advertised'] = payload_rest[1:1 + _epl].hex()
+            rec['mc_path_advertised_len'] = _epl
+            _meta = bytes(payload_rest[1 + _epl:])
+            if _meta:
+                rec['mc_path_meta_hex'] = _meta.hex()
+                rec['mc_path_meta_len'] = len(_meta)
+            print("  [PATH] adv=%s (%d hops) meta=%dB" % (
+                rec['mc_path_advertised'].upper(), _epl, len(_meta)))
     elif payload_type == 0x04:                                    # ADVERT (Ed25519-signed)
         _sig_ok = _verify_advert_sig(payload_rest)
         if _sig_ok is False:
@@ -2005,6 +2126,15 @@ def parse_meshcore_packet(payload):
             rec['summary'] = '%s / CONTROL · %s · %s · SNR %+.1f dB · confirmed' % (
                 route_name, rec['mc_ctrl_sub'], rec['mc_disc_ntype'], rec['mc_disc_snr'])
             return rec
+        # PATH (0x08) is unencrypted route-discovery; once we've structurally
+        # validated extra_path_len + bounds we can promote it the same way as
+        # TRACE/CONTROL when an MC identity is configured.
+        if (payload_type == 0x08 and rec.get('mc_path_advertised') and _MC_IDENTITY_KEYS):
+            rec['confidence'] = 'confirmed'
+            rec['summary'] = '%s / PATH · adv: %s (%d hops) · confirmed' % (
+                route_name, rec['mc_path_advertised'].upper(),
+                rec['mc_path_advertised_len'])
+            return rec
         # Not crypto-verified.  Surface as an UNKNOWN frame that *looks like*
         # MeshCore, carrying its path hashes so the web can corroborate it against
         # the ADVERT-verified node registry (a frame routed through known nodes is
@@ -2021,7 +2151,9 @@ def parse_meshcore_packet(payload):
         # as MeshCore (no identity loaded).
         for _k in ('mc_trace_tag', 'mc_trace_path', 'mc_trace_snr',
                    'mc_ctrl_sub', 'mc_disc_snr', 'mc_disc_tag',
-                   'mc_disc_pub', 'mc_disc_ntype', 'mc_ack_crc'):
+                   'mc_disc_pub', 'mc_disc_ntype', 'mc_ack_crc',
+                   'mc_path_advertised', 'mc_path_advertised_len',
+                   'mc_path_meta_hex', 'mc_path_meta_len'):
             if _k in rec:
                 _unk[_k] = rec[_k]
         return _unk
