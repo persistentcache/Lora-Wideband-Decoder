@@ -2483,6 +2483,31 @@ def parse_reticulum_packet(payload, rf=None):
         return None
     if not _high_entropy(random_hash, 5):       # 10 bytes → ~9 distinct expected
         return None
+    # ACTUAL Ed25519 verification — the announce body carries both an Ed25519
+    # signature AND the verifying pubkey (same self-contained scheme as
+    # MeshCore ADVERT).  Per RNS/Identity.py validate_announce: the 64-byte
+    # public_key is X25519(first 32) || Ed25519(last 32); the signature
+    # signs (destination_hash || public_key || name_hash || random_hash ||
+    # ratchet || app_data).  When this passes, the frame is CRYPTOGRAPHICALLY
+    # proven to be a real Reticulum announce from the holder of that pubkey;
+    # when it fails, it's noise (or a corrupted real frame) and we return
+    # None so it surfaces as 'unknown' rather than being mislabeled
+    # 'reticulum verified' on a ~3 % structural false-positive.
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError:
+        # cryptography unavailable — cannot verify; refuse to claim 'verified'.
+        return None
+    try:
+        sig_pub = Ed25519PublicKey.from_public_bytes(bytes(public_key[32:64]))
+        signed_data = (bytes(destination_hash) + bytes(public_key) + bytes(name_hash)
+                       + bytes(random_hash)
+                       + (bytes(ratchet) if ratchet else b'')
+                       + bytes(app_data))
+        sig_pub.verify(bytes(signature), signed_data)
+    except (InvalidSignature, ValueError, Exception):
+        return None
     print("\n  --- Reticulum ANNOUNCE ---")
     print("  Header: %d  DestType: %s  Hops: %d  Ratchet: %s" % (
         header_type + 1, _RNS_DEST_TYPES[destination_type], hops,
@@ -2494,13 +2519,13 @@ def parse_reticulum_packet(payload, rf=None):
     print("  Context: 0x%02X  AppData: %d bytes" % (context, len(app_data)))
     return {
         'proto': 'reticulum',
-        # NOTE: 'verified' here is STRUCTURAL + entropy-gated only.  The Ed25519
-        # signature in the announce IS NOT verified by parse_reticulum_packet —
-        # the high-entropy distinct-byte counts on pubkey/sig/random_hash filter
-        # out random noise, but a random AES-CTR-style ciphertext of >=167B
-        # easily satisfies them (FP ~3% per round 1 analysis).  Until an actual
-        # Ed25519.verify() call is added, this parser is intentionally NOT in
-        # _CRYPTO_VERIFIED_PROTOS — it would steal real Meshtastic DMs.
+        # 'verified' here is now CRYPTOGRAPHICALLY grounded: the Ed25519
+        # signature over (destination_hash || public_key || name_hash ||
+        # random_hash || ratchet || app_data) was verified against the
+        # Ed25519 pubkey embedded in the announce itself (same self-contained
+        # scheme as MeshCore ADVERT).  Random noise / bit-error-corrupted
+        # frames from other protocols cannot forge this without a colliding
+        # 64-byte Ed25519 signature, so the FP rate is effectively zero.
         'confidence': 'verified',
         'decrypted': False,
         'from': public_key[:8].hex(),           # first 8 bytes of pubkey as ID
