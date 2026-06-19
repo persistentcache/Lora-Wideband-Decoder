@@ -2444,6 +2444,30 @@ def parse_meshcore_packet(payload):
             # unique frame identifier — surface it so users can see different
             # ACKs as distinct rows.
             _unk_summary = 'ACK 0x' + bytes(payload_rest[:4]).hex()
+        elif payload_type == 0x08 and rec.get('mc_path_advertised'):
+            # PATH — earlier parsing populated mc_path_advertised regardless
+            # of whether identity-gated promotion fired; surface the same
+            # content the promotion paths use.
+            _unk_summary = 'adv: %s (%d hops)' % (
+                rec['mc_path_advertised'].upper(),
+                rec['mc_path_advertised_len'])
+        elif payload_type == 0x09 and rec.get('mc_trace_path'):
+            _unk_summary = 'route: ' + ' → '.join(
+                '%s (%+.1f dB)' % (h.upper(), s)
+                for h, s in zip(rec['mc_trace_path'], rec['mc_trace_snr']))
+        elif payload_type == 0x0B and rec.get('mc_disc_pub'):
+            _unk_summary = '%s · %s · SNR %+.1f dB' % (
+                rec.get('mc_ctrl_sub', '?'),
+                rec.get('mc_disc_ntype', '?'),
+                rec.get('mc_disc_snr', 0))
+        elif payload_type == 0x0A:                       # MULTIPART
+            _unk_summary = '%d bytes (likely encrypted)' % len(payload_rest)
+        elif payload_type == 0x0F:                       # RAW_CUSTOM
+            _unk_summary = '%d bytes custom payload' % len(payload_rest)
+        elif len(payload_rest) > 0 and not _unk_summary:
+            # Catch-all for any payload type not handled above — show body
+            # length so the GUI doesn't dump raw hex as a fallback.
+            _unk_summary = '%d bytes' % len(payload_rest)
         _unk = {'proto': 'meshcore', 'hint': 'meshcore',
                 'confidence': 'candidate',
                 'mc_route': route_name,
