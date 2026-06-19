@@ -316,11 +316,14 @@ function pktState(p){const pr=proto(p);
   if(pr==='meshtastic')return '<span class="tag" style="background:rgba(63,167,255,.15);color:var(--acc)">Meshtastic</span>'+(p.decrypted?'<span class="tag dec">decoded</span>':'<span class="tag enc">encrypted'+(p.enc_hex?' ▸':'')+'</span>')+confBadge(p);
   if(pr==='unknown')return '<span class="tag" style="background:rgba(150,150,150,.16);color:#9aa6b2">unknown</span>'+hintBadge(p)+inferBadge(p)+confBadge(p);
   const lbl=PROTO_LABEL[pr]||esc(pr);
-  // For named protocols at 'candidate' tier, also surface the per-type
-  // hint badge ("encrypted DM (no key)" / "ACK (unverified)" etc.) so the
-  // user sees WHY the row couldn't reach a higher tier — same explanatory
-  // text we already provided on unknown-tier candidate rows.
-  const hint=(p.confidence==='candidate' && p.hint)?hintBadge(p):'';
+  // For named protocols that haven't reached 'verified' (crypto-grounded)
+  // AND have NOT been decrypted, surface the per-type hint badge
+  // ("encrypted DM (no key)" etc.) so the user always sees WHY the
+  // payload column isn't showing decoded text.  Without this, a
+  // path-hash-confirmed encrypted DM looked like it had been decoded —
+  // the proto+confirmed badges suggested "we know what this is" but the
+  // body bytes are still ciphertext we never decrypted.
+  const hint=(p.confidence!=='verified' && !p.decrypted && p.hint)?hintBadge(p):'';
   return '<span class="tag" style="background:rgba(63,167,255,.15);color:var(--acc)">'+esc(lbl)+'</span>'+hint+inferBadge(p)+confBadge(p);}
 function pktType(p){const pr=proto(p);
   if(pr==='meshtastic')return esc(p.port_name||(p.decrypted?'':'—'));
