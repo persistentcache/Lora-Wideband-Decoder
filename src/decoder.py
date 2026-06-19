@@ -2349,10 +2349,25 @@ def parse_meshcore_packet(payload):
                 elif payload_type in (0x05, 0x06) and len(payload_rest) >= 3:
                     _ct = max(0, len(payload_rest) - 3)
                     rec['summary'] = '%d bytes encrypted' % _ct if _ct else 'encrypted'
+                elif payload_type == 0x08 and rec.get('mc_path_advertised'):
+                    # PATH — the earlier parsing already extracted the
+                    # advertised route hash + length; mirror the same
+                    # summary the identity-gated PATH path uses so a
+                    # registry-only promotion doesn't strip information.
+                    rec['summary'] = 'adv: %s (%d hops)' % (
+                        rec['mc_path_advertised'].upper(),
+                        rec['mc_path_advertised_len'])
+                elif payload_type == 0x09 and rec.get('mc_trace_path'):
+                    rec['summary'] = 'route: ' + ' → '.join(
+                        '%s (%+.1f dB)' % (h.upper(), s)
+                        for h, s in zip(rec['mc_trace_path'], rec['mc_trace_snr']))
+                elif payload_type == 0x0B and rec.get('mc_disc_pub'):
+                    rec['summary'] = '%s · %s · SNR %+.1f dB' % (
+                        rec.get('mc_ctrl_sub', '?'),
+                        rec.get('mc_disc_ntype', '?'),
+                        rec.get('mc_disc_snr', 0))
                 elif payload_type == 0x0A:                       # MULTIPART
                     rec['summary'] = '%d bytes (likely encrypted)' % len(payload_rest)
-                elif payload_type in (0x08, 0x09, 0x0B):         # PATH/TRACE/CONTROL
-                    rec['summary'] = '%d bytes plaintext' % len(payload_rest)
                 elif payload_type == 0x0F:                       # RAW_CUSTOM
                     rec['summary'] = '%d bytes custom payload' % len(payload_rest)
                 else:
