@@ -2610,7 +2610,7 @@ def parse_disaster_radio_packet(payload, rf=None):
         # 'verified' for cryptographically grounded claims (HMAC, AES decrypt+
         # MAC, Ed25519 sig).  Demoting to 'confirmed' matches the existing
         # invariant note at the bottom of the dispatcher comment block AND
-        # the codebase rule that disaster_radio is NOT in _CRYPTO_VERIFIED_PROTOS.
+        # the codebase rule that disaster_radio is NOT in _NONMT_PREEMPT_PROTOS.
         'confidence': 'confirmed',
         'decrypted': True,
         'from': src_orig_hex,                   # ORIGINAL source (not last-hop)
@@ -3635,16 +3635,24 @@ def _proto_candidates(sync):
 _TIER_RANK = {'verified': 3, 'confirmed': 2, 'candidate': 1}
 
 
-# Whitelist of parsers whose `confidence='verified'` is cryptographically
-# grounded — these may preempt the Meshtastic-shape match.  Mere structural or
-# entropy-only `verified` does NOT qualify (it would steal real Meshtastic DMs
-# whose ciphertext coincidentally satisfies the structural gates).
+# Whitelist of parsers whose `confidence='verified'` is trusted enough to
+# preempt the Meshtastic-shape collision fallback — i.e. when a frame's
+# byte 12 coincidentally satisfies Meshtastic's 16-byte unicast header check,
+# AND one of these parsers ALSO claims it as verified, the parser wins (the
+# frame is genuinely that protocol, not encrypted-only Meshtastic).  Mere
+# structural OR entropy-only `verified` from a non-whitelisted parser does
+# NOT qualify — it would steal real Meshtastic DMs whose ciphertext
+# coincidentally satisfies looser structural gates.
 #
 # A parser belongs here iff its `verified` tier is gated by one of:
 #   (a) successful AEAD/MAC decrypt with a stored key,
 #   (b) successful in-frame Ed25519/MIC verify,
 #   (c) >=24-bit fixed magic plus a structural grammar tight enough to bound
 #       random-bytes FP rate to < ~1e-6.
+#
+# The constant name reflects what the whitelist DOES (gate non-MT preempt),
+# not how each member achieves the FP bound.  Members may be cryptographic
+# (criteria a/b) or structural-with-very-tight-gates (criterion c).
 #
 # Per-parser justification:
 #   meshcore   — verified set only after _decrypt_mc_channel HMAC-SHA256+AES
@@ -3653,23 +3661,19 @@ _TIER_RANK = {'verified': 3, 'confirmed': 2, 'candidate': 1}
 #                proto='unknown' hint='meshcore' at 'candidate' tier.
 #   lora_aprs  — verified set only after 3-byte magic 0x3cff01 AND strict ASCII
 #                TNC2 grammar (decoder.py:1754-1801).  Magic alone is ~2^-24;
-#                grammar tightens it well below ~1e-6.
+#                grammar tightens it well below ~1e-6.  No wire-level crypto
+#                in the APRS protocol — this is criterion (c).
 #
 # Intentionally EXCLUDED:
-#   reticulum     — now emits 'verified' AFTER Ed25519 sig verify (the prior
-#                   structural+entropy-only 'verified' was demoted; the new
-#                   path is cryptographically grounded but kept out of this
-#                   whitelist because it has no Meshtastic-shape collision
+#   reticulum     — emits 'verified' AFTER Ed25519 sig verify (cryptographic)
+#                   but kept out because it has no Meshtastic-shape collision
 #                   pattern that needs preempting.
-#   disaster_radio— never emits 'verified' anymore; caps at 'confirmed' since
-#                   the protocol has no wire-level crypto.  The length-sanity
-#                   + TTL/hopcount gates remain very tight (~3e-4 FP on random
-#                   >=22B) but per codebase convention 'verified' is reserved
-#                   for crypto-grounded claims.
-#   lorawan       — parser never emits 'verified' (caps at 'candidate' at
-#                   decoder.py:1326).  Excluded to avoid signaling otherwise.
+#   disaster_radio— never emits 'verified' anymore (caps at 'confirmed'; the
+#                   protocol has no wire-level crypto and the structural gates
+#                   are too loose for criterion (c)).
+#   lorawan       — parser never emits 'verified' (caps at 'candidate').
 #   loramesher / radiohead / ebyte — never emit 'verified' (cap at 'confirmed').
-_CRYPTO_VERIFIED_PROTOS = frozenset({'meshcore', 'lora_aprs'})
+_NONMT_PREEMPT_PROTOS = frozenset({'meshcore', 'lora_aprs'})
 
 
 def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
@@ -3681,7 +3685,7 @@ def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
 
     Order:
       1. Try every enabled non-Meshtastic parser.  If any returns
-         confidence='verified' AND its name is in _CRYPTO_VERIFIED_PROTOS,
+         confidence='verified' AND its name is in _NONMT_PREEMPT_PROTOS,
          emit that record and stop.  This preempt is the fix for the MeshCore
          vs Meshtastic-shape collision (~50% of MeshCore frames had byte[12]
          satisfying _is_plausible_mesh_header_uni and were silently emitted
@@ -3694,10 +3698,10 @@ def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
          behavior).
       4. Else return (False, None, None) — caller handles unknown emit.
 
-    The crypto-verified scan iterates ALL verified-tier matches looking for
+    The non-MT-preempt scan iterates ALL verified-tier matches looking for
     the first whitelisted one, so a structurally-verified non-whitelisted
-    parser at matches[0] cannot block a crypto-verified whitelisted parser
-    later in the list.
+    parser at matches[0] cannot block a trusted whitelisted parser further
+    down the list.
 
     The caller MUST set its own _early_handled / _handled flag from the
     returned bool — SITE 1's flag triggers an immediate return with
@@ -3730,25 +3734,25 @@ def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
     if matches:
         matches.sort(key=lambda m: -_TIER_RANK.get(m[1].get('confidence', 'candidate'), 0))
 
-    # Crypto-verified preempt: scan ALL verified-tier matches (matches is
-    # sorted desc, so verified entries are contiguous at the front).  Skip
-    # non-whitelisted verified entries so a structurally-verified parser
-    # cannot mask a crypto-verified whitelisted parser further down.
-    crypto_winner = None
+    # Non-MT preempt: scan ALL verified-tier matches (matches is sorted desc,
+    # so verified entries are contiguous at the front).  Skip non-whitelisted
+    # verified entries so a structurally-verified non-whitelisted parser
+    # cannot mask a trusted whitelisted parser further down.
+    preempt_winner = None
     for pname, rec in matches:
         if rec.get('confidence') != 'verified':
             break
-        if pname in _CRYPTO_VERIFIED_PROTOS:
-            crypto_winner = (pname, rec)
+        if pname in _NONMT_PREEMPT_PROTOS:
+            preempt_winner = (pname, rec)
             break
 
-    if crypto_winner is not None:
-        _pname, _rec = crypto_winner
+    if preempt_winner is not None:
+        _pname, _rec = preempt_winner
         if meshtastic_shape_ok:
             # Audit-tag distinct from `ambiguous` (which means same-tier tie):
             # this flag means "MeshCore bytes coincidentally satisfied the
             # Meshtastic 16-byte header invariants but we routed correctly via
-            # crypto-verified preempt".
+            # the non-MT preempt".
             _rec['mesh_shape_collision'] = True
         _emit_proto(_rec, payload, sf, bw, cr, sync_word, rf)
         return True, _rec, 'verified_nonmt_preempt'
@@ -6312,15 +6316,16 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         _early_ctx = {'aes_key': _mesh_aes_key, 'no_key': _mesh_no_key,
                       'clean_crc': True, 'rf': _rf, 'is_mesh': True}
         # Single dispatch helper shared with SITE 2 (post-chase).  Order:
-        # crypto-verified non-mt preempt → Meshtastic shape-match → best non-mt
-        # candidate.  The crypto preempt is the fix for the MeshCore-vs-mt-shape
-        # collision: ~50 % of MeshCore frames have byte[12] that satisfies
+        # non-MT preempt → Meshtastic shape-match → best non-mt candidate.
+        # The preempt is the fix for the MeshCore-vs-mt-shape collision: ~50 %
+        # of MeshCore frames have byte[12] that satisfies
         # _is_plausible_mesh_header_uni and were silently mis-emitted as
-        # encrypted-only Meshtastic.  A whitelisted (_CRYPTO_VERIFIED_PROTOS),
-        # crypto-grounded 'verified' record now wins over the structural mt
-        # shape match.  The encrypted-DM surfacing invariant is preserved —
-        # frames where no non-mt parser verifies still fall through to
-        # _h_meshtastic exactly as before.
+        # encrypted-only Meshtastic.  A whitelisted (_NONMT_PREEMPT_PROTOS)
+        # 'verified' record — backed either by cryptographic verification or
+        # a >=24-bit magic + tight structural grammar (FP < ~1e-6) — now wins
+        # over the structural mt shape match.  The encrypted-DM surfacing
+        # invariant is preserved — frames where no non-mt parser verifies
+        # still fall through to _h_meshtastic exactly as before.
         _mt_shape_ok = ('meshtastic' in _PROTO_ENABLED and len(raw_bytes) >= 16
                         and _is_plausible_mesh_header_uni(raw_bytes)
                         and _is_chase_acceptable_uni(raw_bytes))
