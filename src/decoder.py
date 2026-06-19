@@ -2186,10 +2186,14 @@ def parse_meshcore_packet(payload):
                     len(_matched),
                     '' if len(_matched) == 1 else 's')
                 return rec
-        # Not crypto-verified.  Surface as an UNKNOWN frame that *looks like*
-        # MeshCore, carrying its path hashes so the web can corroborate it against
-        # the ADVERT-verified node registry (a frame routed through known nodes is
-        # behaviorally confirmed).  NOT a MeshCore claim until the web promotes it.
+        # Not crypto-verified.  Emit as MeshCore at 'candidate' tier — the
+        # structural + sync-word gate is tight enough (~3% per random byte
+        # sequence) and we already tell the user "encrypted MeshCore DM (no
+        # key)" in the state-badge, so emitting proto='unknown' alongside
+        # that was self-contradictory.  The 'candidate' confidence is what
+        # signals uncertainty; proto names the wire format we recognised.
+        # If the frame routes through ADVERT-known nodes, the path-hash
+        # promotion above already upgraded it to 'confirmed'.
         #
         # Per-type from/to/summary extraction: MeshCore frame bodies have a few
         # UNENCRYPTED leading bytes that identify the participants and (for ACK)
@@ -2219,7 +2223,7 @@ def parse_meshcore_packet(payload):
             # unique frame identifier — surface it so users can see different
             # ACKs as distinct rows.
             _unk_summary = 'ACK 0x' + bytes(payload_rest[:4]).hex()
-        _unk = {'proto': 'unknown', 'hint': 'meshcore',
+        _unk = {'proto': 'meshcore', 'hint': 'meshcore',
                 'confidence': 'candidate',
                 'mc_route': route_name,
                 'mc_type': ptype_name, 'mc_path': _mc_path, 'decrypted': False,
