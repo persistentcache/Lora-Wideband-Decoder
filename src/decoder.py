@@ -3645,7 +3645,13 @@ def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
             break
         try:
             rec = handler(payload, ctx)
-        except Exception:
+        except Exception as _exc:
+            # Diagnostic: handlers can fail on transient state issues (keys file
+            # mid-rewrite, malformed config entry, etc.) and the swallow used to
+            # erase them silently — frames then fell to unknown with no clue why.
+            # Log type+message so the failure surfaces in the pipeline log.
+            print("  [DISPATCH EXC] %s: %s: %s" % (
+                pname, type(_exc).__name__, _exc))
             continue
         if rec is not None:
             matches.append((pname, rec))
