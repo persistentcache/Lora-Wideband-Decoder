@@ -1843,6 +1843,22 @@ class SignalRecorder:
         self.hop_n = hop_n
         self.debug = debug
         os.makedirs(export_dir, exist_ok=True)
+        # Reap orphan captures from a previous crashed run.  The pipeline holds
+        # captures live in /dev/shm only as long as the decoder refcount is
+        # non-zero; if the prior process was killed (OOM, Ctrl-C, etc.) those
+        # files have no live refcount and are dead weight on tmpfs.  At a fresh
+        # start nothing is in flight, so any pre-existing file is by definition
+        # orphaned and safe to unlink.
+        try:
+            for _f in os.listdir(export_dir):
+                _p = os.path.join(export_dir, _f)
+                if os.path.isfile(_p):
+                    try:
+                        os.unlink(_p)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
         self._decoder = None
         # BOUNDED queue: each item carries a full wideband gate window (~300 MB
@@ -2389,6 +2405,17 @@ class BackgroundDecoder:
         # allow up to _dedup_keep submissions per cluster.
         self._dedup_keep = int(os.environ.get('LORA_DEDUP_KEEP', '2'))
 
+        # Per-fpath reference counter for capture-file cleanup.  A single
+        # capture can be processed by up to four worker jobs (primary, primary-
+        # slow-requeue, relay-after, relay-before) and we cannot delete the file
+        # until ALL of them are done — but we also must NOT leak it indefinitely
+        # (its tmpfs backing fills /dev/shm and OOM-kills the pipeline; see
+        # issue #3).  Refcount: increment at every enqueue site (submit + slow
+        # re-queue), decrement after each worker job, unlink when count hits 0.
+        # Deterministic — no time-based reaper guessing safe intervals.
+        self._refs = {}
+        self._refs_lock = threading.Lock()
+
         # Find decoder.py next to this script
         script_dir = os.path.dirname(os.path.abspath(__file__))
         self._decoder_script = os.path.join(script_dir, 'decoder.py')
@@ -2631,6 +2658,29 @@ while True:
                   file=sys.stderr, flush=True)
             return None
 
+    def _ref_inc(self, fpath):
+        """Increment outstanding-job count for `fpath`.  Called on every
+        enqueue (submit() + slow re-queue) so the file is held until every
+        queued worker has finished with it."""
+        with self._refs_lock:
+            self._refs[fpath] = self._refs.get(fpath, 0) + 1
+
+    def _ref_dec_and_maybe_unlink(self, fpath):
+        """Decrement outstanding-job count and, if zero, unlink the capture
+        file.  Called once per worker job completion (success, failure, or
+        crash) from the manager thread's `finally` block, so the count is
+        guaranteed to wind down even on exceptions."""
+        with self._refs_lock:
+            n = self._refs.get(fpath, 1) - 1
+            if n > 0:
+                self._refs[fpath] = n
+                return
+            self._refs.pop(fpath, None)
+        try:
+            os.unlink(fpath)
+        except OSError:
+            pass        # file already gone (manual delete / startup reap)
+
     def submit(self, fpath, fname, relay_after_syms=None, relay_before_syms=None):
         """Queue a capture file for background decoding.
 
@@ -2652,6 +2702,7 @@ while True:
         # get here the captures are already keep-N-limited per true RF cluster.
         # The post-decode _packet_dedup collapses any duplicate RESULTS, so
         # submitting them all is safe (no FP / no double-count).
+        self._ref_inc(fpath)
         self._queue.put((fpath, fname, relay_after_syms, relay_before_syms, None))
 
     def pending(self):
@@ -2859,6 +2910,7 @@ while True:
                 if (job_budget is None and output and '[BUDGET]' in output
                         and relay_after_syms is None
                         and relay_before_syms is None):
+                    self._ref_inc(fpath)
                     self._slow_queue.put((fpath, fname, None, None,
                                           self._slow_budget))
 
@@ -2908,6 +2960,10 @@ while True:
                 with self._lock:
                     self._active_count -= 1
                 self._queue.task_done()
+                # Reference count for capture-file cleanup.  ALWAYS run, even
+                # on exception / timeout / worker crash — those decrement paths
+                # are exactly when leaks would otherwise accumulate.
+                self._ref_dec_and_maybe_unlink(fpath)
 
     @staticmethod
     def _payload_fingerprint(payload_bytes):
