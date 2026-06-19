@@ -2267,6 +2267,13 @@ def parse_meshcore_packet(payload):
             # (ACK → "original-text") reads naturally as "this ACK responds to
             # the named message".  Leading with route_name produced confusing
             # phrases like 'BACK → "..."' that read as direction-of-travel.
+            # When correlation hits, _ack_extra carries the " → \"text\"" tag.
+            # When it doesn't, surface the 4-byte CRC instead — it's the
+            # unique frame ID and lets the user distinguish different ACKs
+            # in the GUI (otherwise every confirmed ACK row would say only
+            # "ACK" and look identical).
+            if not _ack_extra and rec.get('mc_ack_crc'):
+                _ack_extra = ' 0x' + rec['mc_ack_crc']
             rec['summary'] = 'ACK%s%s' % (
                 (' · %d hops' % rec['mc_hops']) if rec.get('mc_hops') else '',
                 _ack_extra)
