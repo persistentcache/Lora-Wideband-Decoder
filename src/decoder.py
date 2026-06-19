@@ -1900,19 +1900,20 @@ def parse_meshcore_packet(payload):
             rec['mc_channel'] = 'public' if payload_rest[0] == _MC_PUBLIC_HASH else ('ch:0x%02x' % payload_rest[0])
             # Surface the channel hash + channel name in the dedicated GUI
             # columns (previously only embedded in mc_channel — chan/to were
-            # blank in the UI).  Also extract the sender prefix from the
-            # decoded text into the from column so different senders are
-            # visually distinguishable.  Text itself keeps the "NAME: msg"
-            # prefix for compatibility with downstream consumers (test
-            # harnesses and exports assert the full plaintext form).
+            # blank in the UI).  Split the "NAME: message" wire convention
+            # into separate `from` and `text` fields so the GUI's from
+            # column AND its message column don't show the same sender
+            # name twice (the prior format put the prefix in both places).
             rec['chan'] = '0x%02x' % payload_rest[0]
             rec['to']   = rec['mc_channel']
             if payload_type == 0x05 and _dec['text']:
-                rec['text'] = _dec['text']
                 _t = _dec['text']
                 _sep = _t.find(': ')
                 if 0 < _sep <= 16:                    # sender names cap at 16 chars
                     rec['from'] = 'MC:' + _t[:_sep].upper()
+                    rec['text'] = _t[_sep + 2:]
+                else:
+                    rec['text'] = _t
             elif payload_type == 0x06:
                 # GRP_DATA plaintext.  Upstream layout is ambiguous between
                 # bare `data_type(u16 LE) | data_len(u8) | data` and the
