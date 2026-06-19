@@ -1891,6 +1891,51 @@ def parse_meshcore_packet(payload):
         offset += path_bytes_needed
     rec['mc_path'] = _mc_path
     payload_rest = payload[offset:]
+    # ---- Per-payload-type wire-format validity gate ------------------------
+    # MeshCore's encrypted payload types (TXT_MSG/REQ/RESPONSE/ANON_REQ/
+    # GRP_TXT/GRP_DATA) ALL use AES-ECB ciphertext + a 2-byte HMAC truncation,
+    # so their body length is DETERMINISTIC:
+    #
+    #   TXT_MSG / REQ / RESPONSE (0x02/0x00/0x01):
+    #       dest_hash[0](1) | src_hash[0](1) | MAC(2) | ct(16k, k>=1)
+    #       => body_len in {20, 36, 52, ...}
+    #
+    #   ANON_REQ (0x07):
+    #       dest_hash[0](1) | ephemeral_pubkey(32) | MAC(2) | ct(16k, k>=1)
+    #       => body_len in {51, 67, 83, ...}
+    #
+    #   GRP_TXT / GRP_DATA (0x05/0x06):
+    #       channel_hash(1) | MAC(2) | ct(16k, k>=1)
+    #       => body_len in {19, 35, 51, ...}
+    #
+    #   ACK (0x03):
+    #       4-byte SHA256-truncated CRC, exact.
+    #       => body_len == 4
+    #
+    # Reject bodies that violate the protocol's block-aligned length.  This
+    # eliminates a wide class of false positives where random LoRa noise (or
+    # bit-error-corrupted frames from other protocols) demodulates to bytes
+    # that pass the header gate but have a non-multiple-of-16 ciphertext
+    # length — which a real AES-ECB encryptor literally cannot produce.
+    # Joint random FP rate after this gate: structural (~3%) × length-fit
+    # (~1/16 ≈ 6%) × ciphertext-min (≥16B) → << 0.2 % per random frame.
+    _body_len = len(payload_rest)
+    if payload_type in (0x00, 0x01, 0x02):           # REQ / RESPONSE / TXT_MSG
+        if _body_len < 20 or (_body_len - 4) % 16 != 0:
+            return None
+    elif payload_type == 0x07:                       # ANON_REQ
+        if _body_len < 51 or (_body_len - 35) % 16 != 0:
+            return None
+    elif payload_type in (0x05, 0x06):               # GRP_TXT / GRP_DATA
+        if _body_len < 19 or (_body_len - 3) % 16 != 0:
+            return None
+    elif payload_type == 0x03:                       # ACK
+        if _body_len != 4:
+            return None
+    # ADVERT / TRACE / CONTROL / PATH / MULTIPART / RAW_CUSTOM are unencrypted
+    # and have their own structural checks further down — no block-length gate
+    # applies.
+
     if payload_type in (0x05, 0x06) and len(payload_rest) >= 1:   # GRP_TXT / GRP_DATA
         print("  ChannelHash: 0x%02X" % payload_rest[0])
         _dec = _decrypt_mc_channel(payload_rest)
