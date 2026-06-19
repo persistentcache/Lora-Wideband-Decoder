@@ -1952,6 +1952,14 @@ def parse_meshcore_packet(payload):
         return None
     hash_count = path_byte & 0x3F
     hash_size  = ((path_byte >> 6) & 0x03) + 1
+    # Implausibility cap on hop_count: real MeshCore meshes have diameters
+    # of 3-8 hops in practice, max_hops protocol-config tops out at 32 even
+    # for the largest deployments.  Anything beyond 16 is overwhelmingly
+    # likely to be a structural false positive — random bytes whose
+    # path_byte coincidentally encodes a huge hop_count.  Live capture
+    # caught a noise frame claiming 39 hops; this gate would reject it.
+    if hash_count > 16:
+        return None
     offset    += 1
     _mc_path = []                              # routing path-hash (pubkey[0]) of each hop
     if hash_count > 0:
