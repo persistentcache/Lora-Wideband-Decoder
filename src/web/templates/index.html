@@ -274,18 +274,19 @@ function hintBadge(p){if(!p.hint)return '';
   // level protocol simply has no MAC to check.
   let lbl, ttl;
   if (p.hint === 'meshcore') {
+    // Labels drop the redundant "MeshCore" word — proto badge already says it.
     const mt = p.mc_type;
     if (mt === 'TXT_MSG' || mt === 'REQ' || mt === 'RESPONSE' || mt === 'ANON_REQ') {
-      lbl = 'encrypted MeshCore DM (no key)';
+      lbl = 'encrypted DM (no key)';
       ttl = 'MeshCore per-pair encrypted payload (ECDH + AES-128 + HMAC) — neither the sender\'s nor the recipient\'s identity is loaded, so the shared key cannot be derived';
     } else if (mt === 'GRP_TXT' || mt === 'GRP_DATA') {
-      lbl = 'encrypted MeshCore channel (no key)';
+      lbl = 'encrypted channel (no key)';
       ttl = 'MeshCore group/channel message (AES-128 + HMAC) — the channel pre-shared key for this channel hash is not in the key store';
     } else if (mt === 'ACK') {
-      lbl = 'MeshCore ACK (unverified)';
+      lbl = 'ACK (unverified)';
       ttl = 'MeshCore acknowledgment — a 4-byte truncated SHA-256 of a source TXT_MSG we have not (yet) seen, so cannot be correlated';
     } else {
-      lbl = 'MeshCore (unverified)';
+      lbl = 'unverified';
       ttl = 'MeshCore wire format matched but this payload type carries no wire-level authentication — could be legitimate MeshCore traffic or a structural false positive from another protocol';
     }
   } else {
@@ -315,7 +316,12 @@ function pktState(p){const pr=proto(p);
   if(pr==='meshtastic')return '<span class="tag" style="background:rgba(63,167,255,.15);color:var(--acc)">Meshtastic</span>'+(p.decrypted?'<span class="tag dec">decoded</span>':'<span class="tag enc">encrypted'+(p.enc_hex?' ▸':'')+'</span>')+confBadge(p);
   if(pr==='unknown')return '<span class="tag" style="background:rgba(150,150,150,.16);color:#9aa6b2">unknown</span>'+hintBadge(p)+inferBadge(p)+confBadge(p);
   const lbl=PROTO_LABEL[pr]||esc(pr);
-  return '<span class="tag" style="background:rgba(63,167,255,.15);color:var(--acc)">'+esc(lbl)+'</span>'+inferBadge(p)+confBadge(p);}
+  // For named protocols at 'candidate' tier, also surface the per-type
+  // hint badge ("encrypted DM (no key)" / "ACK (unverified)" etc.) so the
+  // user sees WHY the row couldn't reach a higher tier — same explanatory
+  // text we already provided on unknown-tier candidate rows.
+  const hint=(p.confidence==='candidate' && p.hint)?hintBadge(p):'';
+  return '<span class="tag" style="background:rgba(63,167,255,.15);color:var(--acc)">'+esc(lbl)+'</span>'+hint+inferBadge(p)+confBadge(p);}
 function pktType(p){const pr=proto(p);
   if(pr==='meshtastic')return esc(p.port_name||(p.decrypted?'':'—'));
   if(pr==='lorawan')return esc(p.msg_type||'LoRaWAN');
