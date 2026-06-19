@@ -2636,9 +2636,14 @@ def api_stop():
 def api_clear():
     with STATE_LOCK:
         PACKETS.clear(); SEEN.clear(); NODES.clear(); EDGES.clear()
-    # also truncate the persistent log so cleared data doesn't reload on restart
-    # (the tailer detects the shrink and resets its read position)
-    for _p in (CFG['decode'].get('packet_log', '/tmp/lora_packets.jsonl'), AUTOSAVE_PATH):
+    # also truncate the persistent logs so cleared data doesn't reload on
+    # restart (the tailer detects the shrink and resets its read position),
+    # plus the cross-worker MeshCore ADVERT pubkey registry so a fresh
+    # session doesn't inherit prior ADVERT-promoted nodes.
+    _mc_adv_reg = os.environ.get(
+        'LORA_MC_ADVERT_REG', '/tmp/lora_mc_advert_registry.jsonl')
+    for _p in (CFG['decode'].get('packet_log', '/tmp/lora_packets.jsonl'),
+               AUTOSAVE_PATH, _mc_adv_reg):
         try:
             open(_p, 'w').close()
         except Exception:
