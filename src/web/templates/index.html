@@ -590,7 +590,7 @@ const _mtog=$('#mysterytoggle'); if(_mtog) _mtog.onclick=()=>{MYSTERY_COLLAPSED=
 setInterval(refreshMystery, 4000); refreshMystery();
 
 function renderPkts(){
-  const cols=[{k:'ts',t:'time'},{k:'from',t:'from'},{k:'to',t:'to'},{k:'hops',t:'hops'},
+  const cols=[{k:'ts',t:'time'},{k:'freq_mhz',t:'freq'},{k:'from',t:'from'},{k:'to',t:'to'},{k:'hops',t:'hops'},
               {k:'chan',t:'chan'},{k:'port_name',t:'type'},{k:'rssi',t:'rssi'},{k:'decrypted',t:'state'},{k:'text',t:'message / payload'}];
   // Conjoin a message's hop copies (same pktid received at hop0, hop1, …) into ONE
   // row.  Representative = the best reception (decoded first, then fewest hops);
@@ -613,15 +613,17 @@ function renderPkts(){
     const key=pktKey(p); const op=PK_OPEN.has(key);
     const cls=['pktrow', op?'open':'', ret?'encrow':''].filter(Boolean).join(' ');
     const main=`<tr class="${cls}" data-pkey="${esc(key)}" data-pktid="${esc(p.pktid)}" data-hops="${p.hops}"${hi?' style="background:rgba(255,93,93,.13);box-shadow:inset 3px 0 0 var(--warn)"':''}>
-    <td class="muted"><span class="caret">${op?'▾':'▸'}</span> ${fmtTime(p.ts)}</td><td>${idCell(p.from)}</td><td>${idCell(p.to)}</td>
+    <td class="muted"><span class="caret">${op?'▾':'▸'}</span> ${fmtTime(p.ts)}</td>
+    <td class="mono muted">${p.freq_mhz!=null?p.freq_mhz.toFixed(3)+'MHz':''}</td>
+    <td>${idCell(p.from)}</td><td>${idCell(p.to)}</td>
     <td>${hopcell}</td><td class="mono muted">${esc(p.chan||'')}</td>
     <td>${pktType(p)}</td><td class="rssi">${p.rssi==null?'':p.rssi}</td>
     <td>${pktState(p)}${ret?' <button class="rowbtn keytry" title="try decoding with a channel key">🔑 key</button>':''}</td>
     <td>${pktMsg(p)}</td></tr>`;
-    const detail=op?`<tr class="detail"><td colspan="9">${pktDetail(p)}</td></tr>`:'';
+    const detail=op?`<tr class="detail"><td colspan="10">${pktDetail(p)}</td></tr>`:'';
     return main+detail;}).join('');
   const el=$('#pktbody');
-  el.innerHTML=`<table><thead>${thead(cols,'pkts')}</thead><tbody>${body||'<tr><td colspan=9 class=empty>no packets yet — press Start</td></tr>'}</tbody></table>`;
+  el.innerHTML=`<table><thead>${thead(cols,'pkts')}</thead><tbody>${body||'<tr><td colspan=10 class=empty>no packets yet — press Start</td></tr>'}</tbody></table>`;
   wireSort(el,'pkts',renderPkts);
   wireRetryMenu(el);
   // Click any packet row to expand/collapse its detail panel.  Skip clicks on
