@@ -285,6 +285,21 @@ function hintBadge(p){if(!p.hint)return '';
     } else if (mt === 'ACK') {
       lbl = 'ACK (unverified)';
       ttl = 'MeshCore acknowledgment — a 4-byte truncated SHA-256 of a source TXT_MSG we have not (yet) seen, so cannot be correlated';
+    } else if (mt === 'MULTIPART') {
+      lbl = 'multipart continuation';
+      ttl = 'MeshCore multipart frame — a continuation of a previous payload that was split for size; typically encrypted but the format depends on the original payload type';
+    } else if (mt === 'PATH') {
+      lbl = 'path advertisement';
+      ttl = 'MeshCore PATH frame — plaintext route-discovery metadata published by a node to inform neighbors of a known route back to the originator';
+    } else if (mt === 'TRACE') {
+      lbl = 'trace response';
+      ttl = 'MeshCore TRACE frame — plaintext route response with per-hop SNR/RSSI back to the originator of a traceroute request';
+    } else if (mt === 'CONTROL') {
+      lbl = 'control message';
+      ttl = 'MeshCore CONTROL frame — plaintext node-discovery / network-control messaging (DISCOVER_REQ/RESP, etc.)';
+    } else if (mt === 'RAW_CUSTOM') {
+      lbl = 'custom payload';
+      ttl = 'MeshCore RAW_CUSTOM frame — application-defined payload format; opaque to this parser';
     } else {
       lbl = 'unverified';
       ttl = 'MeshCore wire format matched but this payload type carries no wire-level authentication — could be legitimate MeshCore traffic or a structural false positive from another protocol';
