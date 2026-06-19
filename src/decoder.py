@@ -2604,7 +2604,14 @@ def parse_disaster_radio_packet(payload, rf=None):
         dgram_type, len(message)))
     return {
         'proto': 'disaster_radio',
-        'confidence': 'verified',               # totalLength check is very tight
+        # 'confirmed' rather than 'verified': the totalLength + TTL + hop-count
+        # gates make a structurally CONFIDENT identification, but the protocol
+        # carries no wire-level MAC or signature.  Our convention reserves
+        # 'verified' for cryptographically grounded claims (HMAC, AES decrypt+
+        # MAC, Ed25519 sig).  Demoting to 'confirmed' matches the existing
+        # invariant note at the bottom of the dispatcher comment block AND
+        # the codebase rule that disaster_radio is NOT in _CRYPTO_VERIFIED_PROTOS.
+        'confidence': 'confirmed',
         'decrypted': True,
         'from': src_orig_hex,                   # ORIGINAL source (not last-hop)
         'to': 'BROADCAST' if is_bcast_l3 else dst_hex,
@@ -3649,10 +3656,16 @@ _TIER_RANK = {'verified': 3, 'confirmed': 2, 'candidate': 1}
 #                grammar tightens it well below ~1e-6.
 #
 # Intentionally EXCLUDED:
-#   reticulum     — verified tier is structural + entropy only; Ed25519 NOT
-#                   verified (decoder.py:1916-1941).  ~3% FP on random >=167B.
-#   disaster_radio— verified tier is length sanity + ttl/hopcount only
-#                   (decoder.py:1965-2018).  ~3e-4 FP on random >=22B.
+#   reticulum     — now emits 'verified' AFTER Ed25519 sig verify (the prior
+#                   structural+entropy-only 'verified' was demoted; the new
+#                   path is cryptographically grounded but kept out of this
+#                   whitelist because it has no Meshtastic-shape collision
+#                   pattern that needs preempting.
+#   disaster_radio— never emits 'verified' anymore; caps at 'confirmed' since
+#                   the protocol has no wire-level crypto.  The length-sanity
+#                   + TTL/hopcount gates remain very tight (~3e-4 FP on random
+#                   >=22B) but per codebase convention 'verified' is reserved
+#                   for crypto-grounded claims.
 #   lorawan       — parser never emits 'verified' (caps at 'candidate' at
 #                   decoder.py:1326).  Excluded to avoid signaling otherwise.
 #   loramesher / radiohead / ebyte — never emit 'verified' (cap at 'confirmed').
