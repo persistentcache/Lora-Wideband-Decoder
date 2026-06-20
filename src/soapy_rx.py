@@ -44,11 +44,37 @@ def main():
         import SoapySDR
         from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16, SOAPY_SDR_OVERFLOW
     except Exception as e:
-        sys.stderr.write('soapy_rx: SoapySDR python bindings missing (%s). '
-                         'Install: sudo apt install python3-soapysdr  '
-                         '(python=%s — if this is a 3.13+/non-distro interpreter the '
-                         'apt SoapySDR is built against the system python, not this one)\n'
-                         % (e, sys.executable))
+        # The apt python3-soapysdr package ships SoapySDR as a SWIG-generated
+        # C extension bound to the SYSTEM python interpreter — not pip-
+        # installable into a venv.  Detect which scenario this is and point
+        # the user at the correct fix.
+        _in_venv = (hasattr(sys, 'real_prefix')
+                    or sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+                    or bool(os.environ.get('VIRTUAL_ENV')))
+        if _in_venv:
+            sys.stderr.write(
+                'soapy_rx: SoapySDR Python bindings not importable (%s).\n'
+                '  python=%s  (running inside a venv)\n'
+                '  The apt python3-soapysdr package ships as a C extension\n'
+                '  bound to the system python — it is NOT pip-installable.\n'
+                '  Fix: recreate the venv with --system-site-packages so\n'
+                '  it can fall back to the apt-installed SoapySDR:\n'
+                '    deactivate\n'
+                '    rm -rf "$VIRTUAL_ENV"\n'
+                '    python3 -m venv --system-site-packages "$VIRTUAL_ENV"\n'
+                '    "$VIRTUAL_ENV/bin/pip" install -r requirements.txt\n'
+                % (e, sys.executable))
+        else:
+            sys.stderr.write(
+                'soapy_rx: SoapySDR Python bindings not importable (%s).\n'
+                '  python=%s\n'
+                '  Fix: sudo apt install python3-soapysdr\n'
+                '  If python=%s is a non-distro interpreter (e.g. /opt/python3.14\n'
+                '  or pyenv), the apt SoapySDR is built against the SYSTEM\n'
+                '  python and your interpreter cannot see it.  Either switch\n'
+                '  to /usr/bin/python3 or build SoapySDR Python bindings from\n'
+                '  source against your interpreter.\n'
+                % (e, sys.executable, sys.executable))
         return 2
     if DBG:
         sys.stderr.write('soapy_rx: SoapySDR=%s numpy=%s\n'
