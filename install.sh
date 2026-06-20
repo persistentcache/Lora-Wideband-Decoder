@@ -16,22 +16,34 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 echo "==> LORA Wideband Decoder installer"
 
-# Detect venv usage early.  The apt python3-soapysdr package ships SoapySDR
-# as a C extension bound to /usr/bin/python3 — it is NOT pip-installable
-# into a venv.  Users running this installer from inside an activated venv
-# without --system-site-packages will end up unable to import SoapySDR at
-# runtime, even though apt reports it installed.  Warn before we spend time
-# installing system packages they can't reach from their venv.
+# Detect venv setup.  Recommended path is a venv created with
+# --system-site-packages so the apt-installed SoapySDR is reachable.
+# Three scenarios to handle:
+#   (1) In a venv WITH --system-site-packages → ideal, proceed silently
+#   (2) In a venv WITHOUT --system-site-packages → SoapySDR will fail at
+#       runtime; warn with the recreate command
+#   (3) NOT in a venv → recommend creating one (PEP 668 makes
+#       --break-system-packages increasingly fragile), but proceed if
+#       the user wants the --user fallback
 if [ -n "${VIRTUAL_ENV:-}" ]; then
-    cat <<EOF >&2
+    # In a venv — pyvenv.cfg is the canonical source of truth for whether
+    # the venv was created with --system-site-packages (line reads
+    # `include-system-site-packages = true|false`).  sys.path-based
+    # detection is unreliable because different python interpreters have
+    # different default search paths.
+    _cfg="$VIRTUAL_ENV/pyvenv.cfg"
+    if [ -f "$_cfg" ] && grep -q "^include-system-site-packages[[:space:]]*=[[:space:]]*true" "$_cfg"; then
+        echo "==> venv detected with --system-site-packages (good)."
+    else
+        cat <<EOF >&2
 
-==> WARNING: You appear to be running inside a Python venv:
+==> WARNING: You're in a venv that lacks --system-site-packages:
        VIRTUAL_ENV=$VIRTUAL_ENV
 
     The apt python3-soapysdr package is a C extension bound to the
-    SYSTEM python interpreter, not pip-installable into a venv.  If
-    this venv was created WITHOUT --system-site-packages, the project
-    will not be able to import SoapySDR at runtime.
+    system python and is NOT pip-installable.  Without
+    --system-site-packages, the project won't be able to import
+    SoapySDR at runtime even though apt reports it installed.
 
     Recommended fix BEFORE continuing:
         deactivate
@@ -39,10 +51,30 @@ if [ -n "${VIRTUAL_ENV:-}" ]; then
         python3 -m venv --system-site-packages "\$VIRTUAL_ENV"
         source "\$VIRTUAL_ENV/bin/activate"
 
-    Then re-run this installer.  Continuing in 8 seconds (Ctrl-C to abort)…
+    Then re-run this installer.  Continuing in 10 seconds (Ctrl-C to abort)…
 
 EOF
-    sleep 8
+        sleep 10
+    fi
+else
+    cat <<'EOF' >&2
+
+==> NOTE: You're not in a Python venv.
+
+    Recommended (cleaner, works on modern Debian/Ubuntu with PEP 668):
+        sudo apt install -y python3-venv python3-soapysdr
+        python3 -m venv --system-site-packages ~/lwd-venv
+        source ~/lwd-venv/bin/activate
+        ./install.sh
+
+    Without a venv this installer uses 'pip install --user
+    --break-system-packages', which still works but is increasingly
+    fragile as distros tighten PEP 668 enforcement.
+
+    Continuing in 5 seconds (Ctrl-C to abort and switch to a venv)…
+
+EOF
+    sleep 5
 fi
 
 if ! command -v apt-get >/dev/null 2>&1; then
