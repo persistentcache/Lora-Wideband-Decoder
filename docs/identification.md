@@ -69,27 +69,35 @@ rate, longer range, more sensitivity.
 
 ## Bandwidths
 
-The detection pipeline probes 6 of the 10 standard Semtech-defined
-LoRa bandwidths by default:
+There are two layers:
 
-| BW (kHz) | In default probe list | Common use |
-|---|---|---|
-| 7.81 | ❌ | extreme-range / FSK-style hobby apps |
-| 10.42 | ❌ | extreme-range / FSK-style hobby apps |
-| 15.63 | ❌ | extreme-range / FSK-style hobby apps |
-| 20.83 | ❌ | extreme-range / FSK-style hobby apps |
-| **31.25** | ✅ | LoRaWAN narrow regional plans |
-| **41.67** | ✅ | custom long-range / non-mesh deployments |
-| **62.5** | ✅ | Meshtastic VERY_LONG_SLOW, MeshCore typical |
-| **125** | ✅ | LoRaWAN default, Meshtastic LONG_MODERATE / LONG_SLOW |
-| **250** | ✅ | Meshtastic LongFast / MediumFast / ShortFast |
-| **500** | ✅ | Meshtastic SHORT_TURBO |
+- **Default scan** — the curated `_SC_LAGS_1M` table in
+  `src/detector.py` defines which (SF, BW) combinations the
+  Schmidl-Cox preamble detector tests every window. Tightly scoped to
+  combinations standard mesh protocols actually use, to keep
+  per-window compute minimal and avoid harmonic mis-resolution on
+  shared lag buckets.
+- **Wide scan (opt-in)** — toggle **Wide LoRa scan** in the web UI
+  (or `LORA_SCAN_FULL=1` env var) to extend the lag table with every
+  (SF × BW) combination from `BW_LIST` in `src/config.py`. Covers
+  more deployments at the cost of more per-window compute and some
+  increased risk of mis-resolution on shared lag buckets.
 
-The 4 smallest bandwidths (< 31 kHz) are valid LoRa but no standard
-mesh protocol uses them — they're for extreme-range FSK-style hobby
-apps. Each additional BW in the probe list multiplies the per-window
-Schmidl-Cox lag scan, so the detector compute scales linearly with the
-list. To enable them, edit `BW_LIST` in `src/config.py`.
+| BW (kHz) | Default scan | Wide scan | Common use |
+|---|---|---|---|
+| 7.81 | ❌ | ❌ | extreme-range / FSK-style hobby apps |
+| 10.42 | ❌ | ❌ | extreme-range / FSK-style hobby apps |
+| 15.63 | ❌ | ❌ | extreme-range / FSK-style hobby apps |
+| 20.83 | ❌ | ❌ | extreme-range / FSK-style hobby apps |
+| **31.25** | ❌ | ✅ | LoRaWAN narrow regional plans |
+| **41.67** | ✅ | ✅ | tinyGS / satellite TT&C, long-range hobby |
+| **62.5** | ✅ | ✅ | Meshtastic VERY_LONG_SLOW, MeshCore typical |
+| **125** | ✅ | ✅ | LoRaWAN default, Meshtastic LONG_MODERATE / LONG_SLOW |
+| **250** | ✅ | ✅ | Meshtastic LongFast / MediumFast / ShortFast |
+| **500** | ✅ | ✅ | Meshtastic SHORT_TURBO |
+
+To probe for any of the four smallest BWs (< 31 kHz), add them to
+`BW_LIST` in `src/config.py` AND enable wide scan.
 
 ## Meshtastic presets
 
