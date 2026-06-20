@@ -24,85 +24,13 @@ SDR/Radio → Detect** finds it automatically.
 ## What it does
 
 - Captures wideband IQ from any SoapySDR-compatible SDR or bladeRF.
-- Decodes 9 LoRa protocols across SF7–SF12 at 6 standard bandwidths
-  (see [Supported protocols](#supported-protocols-bandwidths--spreading-factors) below).
+- Decodes Meshtastic, LoRaWAN, and MeshCore across SF7–SF12 at every
+  standard bandwidth (62.5, 125, 250, 500 kHz).
 - Surfaces decoded packets, node identities, and a live spectrum
   waterfall in a local Flask web UI.
 - Keeps up with real-world Meshtastic and LoRaWAN traffic in real time
   on a multi-core host at 28 Msps wideband.
-- Will attempt to give you as much information as possible for LoRa protocols that have non-typical byte ordering, to allow for custom protocol implementation.
-
-## Supported protocols, bandwidths & spreading factors
-
-### Protocols
-
-| Protocol | Highest tier reachable | How identified | Notes |
-|---|---|---|---|
-| **Meshtastic** | verified (with channel key) | AES-CCM decrypt + valid protobuf portnum | LongFast PSK (`AQ==`) bundled by default; supports PKI DMs |
-| **MeshCore** | verified (with key) / confirmed (path-hash) / candidate | ADVERT Ed25519 sig OR HMAC-AES channel decrypt OR ECDH per-pair DM decrypt | Cross-worker ADVERT pubkey registry persists across pipeline restarts |
-| **LoRaWAN** | candidate | MHDR + on-grid frequency check; MIC verify not implemented | Identifies type, DevAddr, FCnt for the UI |
-| **LoRa APRS** | verified (structural) | 24-bit magic `0x3CFF01` + strict ASCII TNC2 grammar | Plaintext — no wire crypto |
-| **Reticulum** | verified | Ed25519 ANNOUNCE signature verification | Full PKI announce decode |
-| **disaster.radio** | confirmed | totalLength + TTL/hopcount sanity | Plaintext mesh, sudomesh recovery network |
-| **LoRaMesher** | confirmed | type whitelist + payload_size match | 14 valid msg types, src/dst behavioral track |
-| **EByte LoRa** | confirmed | fixed-format broadcast detection | Common Chinese E22/E220/E32 modules |
-| **RadioHead** | confirmed | structural + repeat-sighting promotion | Hobby/research projects |
-| **(other)** | unknown | falls through as `unknown · N bytes · sync 0xXX` | Surfaces if `LORA_UNKNOWN=1` env set |
-
-Tier semantics:
-- **verified** — cryptographically proven (AEAD/MAC decrypt OR in-frame signature verify) OR structural match so tight the FP rate is < ~1e-6 (LoRa APRS).
-- **confirmed** — behavioral / structural identification with very low FP rate but no wire-level crypto check.
-- **candidate** — structurally valid but unproven; treat with caution.
-
-Each protocol can be enabled/disabled via the `LORA_PROTOCOLS` env var (default: all). Unknown-frame surfacing is opt-in via `LORA_UNKNOWN=1`.
-
-### Spreading factors
-
-| SF | Symbol rate (at 125 kHz) | Range trade-off |
-|---|---|---|
-| **SF7** | 6.83 kbps | fastest, shortest range |
-| **SF8** | 3.91 kbps | |
-| **SF9** | 2.20 kbps | |
-| **SF10** | 1.22 kbps | |
-| **SF11** | 0.67 kbps | |
-| **SF12** | 0.37 kbps | slowest, longest range |
-
-All six SFs are probed every detection window. The pipeline is SF-agnostic — adding or removing SFs is a one-line config change in `src/detector.py`.
-
-### Bandwidths
-
-| BW (kHz) | In default probe list | Common use |
-|---|---|---|
-| 7.81 | ❌ | extreme-range / FSK-style hobby apps |
-| 10.42 | ❌ | extreme-range / FSK-style hobby apps |
-| 15.63 | ❌ | extreme-range / FSK-style hobby apps |
-| 20.83 | ❌ | extreme-range / FSK-style hobby apps |
-| **31.25** | ✅ | LoRaWAN narrow regional plans |
-| **41.67** | ✅ | custom long-range / non-mesh deployments |
-| **62.5** | ✅ | Meshtastic VERY_LONG_SLOW, MeshCore typical |
-| **125** | ✅ | LoRaWAN default, Meshtastic LONG_MODERATE / LONG_SLOW |
-| **250** | ✅ | Meshtastic LongFast / MediumFast / ShortFast |
-| **500** | ✅ | Meshtastic SHORT_TURBO |
-
-The 4 smallest bandwidths (< 31 kHz) are valid Semtech-defined LoRa but no standard mesh protocol uses them. Enable them by editing `BW_LIST` in `src/config.py` — each additional BW multiplies the per-window Schmidl-Cox lag scan, so the detector compute scales linearly with the BW probe list.
-
-### Wire-format presets recognized by name
-
-When a frame matches a Meshtastic preset, the UI surfaces the preset name:
-
-| Preset | SF | BW | CR |
-|---|---|---|---|
-| SHORT_TURBO | 7 | 500 kHz | 4/5 |
-| SHORT_FAST | 7 | 250 kHz | 4/5 |
-| SHORT_SLOW | 8 | 250 kHz | 4/5 |
-| MEDIUM_FAST | 9 | 250 kHz | 4/5 |
-| MEDIUM_SLOW | 10 | 250 kHz | 4/5 |
-| LONG_FAST | 11 | 250 kHz | 4/5 |
-| LONG_MODERATE | 11 | 125 kHz | 4/8 |
-| LONG_SLOW | 12 | 125 kHz | 4/8 |
-| VERY_LONG_SLOW | 12 | 62.5 kHz | 4/8 |
-
-Other protocols (MeshCore / LoRaWAN / etc.) have their own SF/BW configurations the parser identifies by content rather than by named preset.
+- Will attempt to give you as much information as possible for LORA protocols that has non-typical byte ordering to allow for custom protocol implementation.
 
 ## Supported SDRs
 
