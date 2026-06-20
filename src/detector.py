@@ -1126,6 +1126,20 @@ _SC_LAGS_1M = {
     16384: [(10, 62500), (11, 125000)],
     32768: [(11, 62500), (12, 125000)],
     65536: [(12, 62500)],
+    # 41.67 kHz LoRa (Semtech-defined BW=0110) — used by long-range hobby
+    # deployments + satellite TT&C (e.g. tinyGS).  Each SF lands on its own
+    # unique lag bucket (no collision with the Meshtastic/MeshCore-focused
+    # buckets above), so adding these costs only the per-bucket SC compute
+    # for the new lags and creates ZERO risk of harmonic mis-resolution.
+    # Added in response to Issue #4 — K4KDR reported 41.7k signals visible
+    # on waterfall but no decodes; root cause was this curated table not
+    # including 41.67 kHz combinations.
+    3072:  [(7, 41667)],
+    6144:  [(8, 41667)],
+    12288: [(9, 41667)],
+    24576: [(10, 41667)],
+    49152: [(11, 41667)],
+    98303: [(12, 41667)],
 }
 if os.environ.get('LORA_SCAN_FULL'):
     # General LoRa scan (opt-in): add EVERY SF×BW combination to its Schmidl-Cox
