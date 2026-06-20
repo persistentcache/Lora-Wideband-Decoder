@@ -6,12 +6,19 @@ everything in a local web UI.
 
 ## I wanna use it!
 
-Debian / Ubuntu:
+Debian / Ubuntu — venv install (recommended):
 
 ```bash
+sudo apt install -y python3-venv python3-soapysdr
+python3 -m venv --system-site-packages ~/lwd-venv
+source ~/lwd-venv/bin/activate
 ./install.sh
 python3 run/web.py          # opens http://127.0.0.1:5000
 ```
+
+The `--system-site-packages` flag is required so the venv can reach
+the apt-installed SoapySDR (which ships as a system-bound C extension,
+not a pip wheel). All other Python deps stay pinned in the venv.
 
 Open the URL it prints, configure your SDR in the Config tab, hit **Start** in the UI, and intercepted
 packets stream in live. The pipeline (SDR capture + detector + decoder)
@@ -20,6 +27,24 @@ is launched from the web UI based on `lora.toml`.
 If your SDR is already plugged in and you've rebooted (or re-logged in)
 after the installer added you to `plugdev`, the UI's **Config →
 SDR/Radio → Detect** finds it automatically.
+
+**Subsequent runs**: re-activate the venv before launching:
+
+```bash
+source ~/lwd-venv/bin/activate
+python3 run/web.py
+```
+
+### Why a venv?
+
+Modern Debian/Ubuntu enforce [PEP 668](https://peps.python.org/pep-0668/)
+(externally-managed environments), which blocks system-wide pip installs
+to protect the distro's apt-managed Python. A venv sidesteps that cleanly,
+keeps deps isolated per-project, and makes uninstall a single `rm -rf`.
+
+If you'd rather not use a venv, see [Without a venv](#without-a-venv)
+below — `./install.sh` still works and uses `pip --user --break-system-packages`,
+but that path is increasingly fragile as distros tighten PEP 668 enforcement.
 
 ## What it does
 
@@ -45,41 +70,46 @@ Named profiles + live capability probing live in `src/sdr_profiles.py`.
 
 ## Building from source
 
-If `./install.sh` doesn't fit (non-Debian distro, custom Python):
+If `./install.sh` doesn't fit (non-Debian distro, custom Python), the
+manual steps are:
 
 ```bash
+# 1. distro packages (Debian/Ubuntu shown — adapt for your distro):
+sudo apt install -y python3-venv python3-soapysdr soapysdr-tools \
+    soapysdr-module-all libusb-1.0-0 libfftw3-dev python3-dev
+
+# 2. venv with --system-site-packages so SoapySDR is reachable:
+python3 -m venv --system-site-packages ~/lwd-venv
+source ~/lwd-venv/bin/activate
+
+# 3. Python deps:
 pip install -r requirements.txt
-# distro packages: soapysdr-tools, python3-soapysdr,
-# soapysdr-module-{bladerf,hackrf,rtlsdr,...},
-# libusb-1.0, libfftw3-dev, python3-dev
 ```
 
 Requires Python 3.11+ for `lora.toml` (stdlib `tomllib`). Older Python
 runs fine but falls back to coded defaults from `src/lora_config.py`.
 
-### Running in a Python venv
-
-If you prefer an isolated install (e.g. at `/opt/lwd/`), create the
-venv with `--system-site-packages` so it can reach the apt-installed
-SoapySDR:
-
-```bash
-python3 -m venv --system-site-packages /opt/lwd/virtenv
-source /opt/lwd/virtenv/bin/activate
-pip install -r requirements.txt
-```
-
-**Why this flag is required**: `python3-soapysdr` ships as a SWIG-
-generated C extension bound to the system python interpreter — it is
-NOT pip-installable. Without `--system-site-packages`, `import SoapySDR`
-from inside the venv fails even though `apt` reports it installed.
-Other Python deps (numpy, scipy, flask, etc.) still pin cleanly inside
-the venv; the flag only adds a fallback to system `dist-packages` for
-modules the venv itself doesn't provide.
+**Why `--system-site-packages` is required**: `python3-soapysdr` ships
+as a SWIG-generated C extension bound to the system python interpreter
+— it is NOT pip-installable. Without the flag, `import SoapySDR` from
+inside the venv fails even though `apt` reports it installed. The flag
+only adds a fallback to system `dist-packages` for modules the venv
+itself doesn't provide — your pip-installed deps (numpy, scipy, flask,
+etc.) still pin cleanly inside the venv.
 
 A venv created without the flag can't be retrofitted — delete and
 recreate it. If `install.sh` detects an active venv missing this flag,
 it prints a warning before continuing.
+
+### Without a venv
+
+`./install.sh` also works without a venv — it falls back to
+`pip install --user --break-system-packages` (the latter flag only
+when supported and needed). This used to be the recommended path on
+older distros, but PEP 668 enforcement on Debian 12+ / Ubuntu 23.04+
+makes it increasingly fragile (system pip is blocked from touching
+the apt-managed Python). Use a venv unless you have a specific reason
+not to.
 
 ## Reporting issues
 
