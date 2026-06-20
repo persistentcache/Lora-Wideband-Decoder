@@ -1900,6 +1900,20 @@ def _mc_lookup_ack(ack_crc_bytes):
     return _MC_PENDING_ACKS.get(bytes(ack_crc_bytes))
 
 
+def _shannon_entropy(data):
+    """Shannon entropy of a byte buffer in bits/byte.  Max is 8.0 (uniform
+    random); ciphertext typically lands at 7.5-7.9.  English text is around
+    4.5.  Repeating / periodic noise is typically below 4.  Returns 0 for
+    empty input."""
+    if not data:
+        return 0.0
+    from collections import Counter
+    import math
+    counts = Counter(data)
+    n = len(data)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
 def parse_meshcore_packet(payload):
     """Parse a MeshCore packet: print human-readable fields AND return a normalized
     record dict (proto='meshcore') for the [PKT] stream, or None."""
@@ -2024,8 +2038,35 @@ def parse_meshcore_packet(payload):
         # can't satisfy the gate.
         if _body_len < 4 or _body_len > 16:
             return None
-    # ADVERT / TRACE / CONTROL / PATH / MULTIPART / RAW_CUSTOM are unencrypted
-    # and have their own structural checks further down — no block-length gate
+    elif payload_type in (0x0A, 0x0F):                # MULTIPART / RAW_CUSTOM
+        # These two have NO protocol-level body format we can validate
+        # against — MULTIPART is "continuation of whatever the original
+        # was" and RAW_CUSTOM is "application-defined opaque payload".
+        # That makes them the structural gate's weakest point: noise that
+        # passes the header bits has nowhere else to be checked, and we
+        # saw exactly this in live capture (the same noise pattern at
+        # multiple sync words showing up as fake RAW_CUSTOM frames).
+        #
+        # Heuristic content gate: real bodies are EITHER opaque ciphertext
+        # (entropy at ≥ 60 % of the theoretical max for that length) OR
+        # plaintext ASCII (≥ 70 % printable chars for sensor readings,
+        # telemetry strings, custom protocol text).  Bodies that match
+        # NEITHER — structured noise, periodic interference, repeating
+        # low-entropy patterns — are almost certainly not real MeshCore.
+        # Uses entropy RATIO (H / log2(N)) rather than an absolute value
+        # so short bodies aren't penalised by the impossibility of high
+        # absolute entropy with few bytes.  Skip the check below 8 bytes
+        # — there's just not enough data to distinguish noise from real.
+        if _body_len >= 8:
+            import math
+            _max_h = math.log2(min(_body_len, 256))
+            _h = _shannon_entropy(payload_rest)
+            _h_ratio = _h / _max_h if _max_h > 0 else 0
+            _pr = sum(1 for b in payload_rest if 32 <= b < 127) / _body_len
+            if _h_ratio < 0.6 and _pr < 0.7:
+                return None
+    # ADVERT / TRACE / CONTROL / PATH are unencrypted and have their own
+    # structural checks further down — no block-length gate
     # applies.
 
     if payload_type in (0x05, 0x06) and len(payload_rest) >= 1:   # GRP_TXT / GRP_DATA
