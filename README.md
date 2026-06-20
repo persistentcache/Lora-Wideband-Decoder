@@ -57,6 +57,30 @@ pip install -r requirements.txt
 Requires Python 3.11+ for `lora.toml` (stdlib `tomllib`). Older Python
 runs fine but falls back to coded defaults from `src/lora_config.py`.
 
+### Running in a Python venv
+
+If you prefer an isolated install (e.g. at `/opt/lwd/`), create the
+venv with `--system-site-packages` so it can reach the apt-installed
+SoapySDR:
+
+```bash
+python3 -m venv --system-site-packages /opt/lwd/virtenv
+source /opt/lwd/virtenv/bin/activate
+pip install -r requirements.txt
+```
+
+**Why this flag is required**: `python3-soapysdr` ships as a SWIG-
+generated C extension bound to the system python interpreter — it is
+NOT pip-installable. Without `--system-site-packages`, `import SoapySDR`
+from inside the venv fails even though `apt` reports it installed.
+Other Python deps (numpy, scipy, flask, etc.) still pin cleanly inside
+the venv; the flag only adds a fallback to system `dist-packages` for
+modules the venv itself doesn't provide.
+
+A venv created without the flag can't be retrofitted — delete and
+recreate it. If `install.sh` detects an active venv missing this flag,
+it prints a warning before continuing.
+
 ## Reporting issues
 
 If something isn't working — pipeline failure, crash, or a protocol that
