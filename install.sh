@@ -16,6 +16,35 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 echo "==> LORA Wideband Decoder installer"
 
+# Detect venv usage early.  The apt python3-soapysdr package ships SoapySDR
+# as a C extension bound to /usr/bin/python3 — it is NOT pip-installable
+# into a venv.  Users running this installer from inside an activated venv
+# without --system-site-packages will end up unable to import SoapySDR at
+# runtime, even though apt reports it installed.  Warn before we spend time
+# installing system packages they can't reach from their venv.
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+    cat <<EOF >&2
+
+==> WARNING: You appear to be running inside a Python venv:
+       VIRTUAL_ENV=$VIRTUAL_ENV
+
+    The apt python3-soapysdr package is a C extension bound to the
+    SYSTEM python interpreter, not pip-installable into a venv.  If
+    this venv was created WITHOUT --system-site-packages, the project
+    will not be able to import SoapySDR at runtime.
+
+    Recommended fix BEFORE continuing:
+        deactivate
+        rm -rf "\$VIRTUAL_ENV"
+        python3 -m venv --system-site-packages "\$VIRTUAL_ENV"
+        source "\$VIRTUAL_ENV/bin/activate"
+
+    Then re-run this installer.  Continuing in 8 seconds (Ctrl-C to abort)…
+
+EOF
+    sleep 8
+fi
+
 if ! command -v apt-get >/dev/null 2>&1; then
     cat <<'EOF'
 This installer targets Debian/Ubuntu (apt).  On other systems, install manually:
