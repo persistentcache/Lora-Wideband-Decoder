@@ -16,21 +16,16 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 echo "==> LORA Wideband Decoder installer"
 
-# Detect venv setup.  Recommended path is a venv created with
-# --system-site-packages so the apt-installed SoapySDR is reachable.
-# Three scenarios to handle:
-#   (1) In a venv WITH --system-site-packages → ideal, proceed silently
-#   (2) In a venv WITHOUT --system-site-packages → SoapySDR will fail at
-#       runtime; warn with the recreate command
-#   (3) NOT in a venv → recommend creating one (PEP 668 makes
-#       --break-system-packages increasingly fragile), but proceed if
-#       the user wants the --user fallback
+# If the user chose to run this installer from inside a venv, check
+# whether the venv was created with --system-site-packages.  The apt
+# python3-soapysdr package ships SoapySDR as a C extension bound to
+# /usr/bin/python3 — it is NOT pip-installable into a venv.  Without
+# the flag, the project won't be able to import SoapySDR at runtime
+# even though apt reports it installed.  pyvenv.cfg is the canonical
+# source of truth (line reads `include-system-site-packages = true|false`).
+# Not-in-a-venv is the COMMON path — the installer's default
+# `pip install --user` works fine there; no warning needed.
 if [ -n "${VIRTUAL_ENV:-}" ]; then
-    # In a venv — pyvenv.cfg is the canonical source of truth for whether
-    # the venv was created with --system-site-packages (line reads
-    # `include-system-site-packages = true|false`).  sys.path-based
-    # detection is unreliable because different python interpreters have
-    # different default search paths.
     _cfg="$VIRTUAL_ENV/pyvenv.cfg"
     if [ -f "$_cfg" ] && grep -q "^include-system-site-packages[[:space:]]*=[[:space:]]*true" "$_cfg"; then
         echo "==> venv detected with --system-site-packages (good)."
@@ -56,25 +51,6 @@ if [ -n "${VIRTUAL_ENV:-}" ]; then
 EOF
         sleep 10
     fi
-else
-    cat <<'EOF' >&2
-
-==> NOTE: You're not in a Python venv.
-
-    Recommended (cleaner, works on modern Debian/Ubuntu with PEP 668):
-        sudo apt install -y python3-venv python3-soapysdr
-        python3 -m venv --system-site-packages ~/lwd-venv
-        source ~/lwd-venv/bin/activate
-        ./install.sh
-
-    Without a venv this installer uses 'pip install --user
-    --break-system-packages', which still works but is increasingly
-    fragile as distros tighten PEP 668 enforcement.
-
-    Continuing in 5 seconds (Ctrl-C to abort and switch to a venv)…
-
-EOF
-    sleep 5
 fi
 
 if ! command -v apt-get >/dev/null 2>&1; then
