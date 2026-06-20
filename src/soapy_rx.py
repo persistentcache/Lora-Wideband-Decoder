@@ -39,8 +39,32 @@ def main():
         sys.stderr.write('soapy_rx: --debug ON  driver=%s freq=%g rate=%g bw=%g gain=%s '
                          'python=%s\n' % (a.driver, a.f, a.s, a.b, a.g, sys.executable))
         sys.stderr.flush()
+    # Separate the import attempts so the error message correctly attributes
+    # the failure.  Importing numpy + SoapySDR in one try-block produces
+    # misleading diagnostics (e.g. "SoapySDR bindings not importable
+    # (No module named 'numpy')") when the actual culprit is a different
+    # module — this confuses users about what to install.
+    _in_venv = (hasattr(sys, 'real_prefix')
+                or sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+                or bool(os.environ.get('VIRTUAL_ENV')))
     try:
         import numpy as np
+    except Exception as e:
+        if _in_venv:
+            sys.stderr.write(
+                'soapy_rx: project Python dependency missing (%s).\n'
+                '  python=%s  (running inside a venv)\n'
+                '  Fix: pip install -r requirements.txt\n'
+                % (e, sys.executable))
+        else:
+            sys.stderr.write(
+                'soapy_rx: project Python dependency missing (%s).\n'
+                '  python=%s\n'
+                '  Fix: pip install --user -r requirements.txt\n'
+                '       (or sudo apt install python3-numpy python3-scipy ...)\n'
+                % (e, sys.executable))
+        return 2
+    try:
         import SoapySDR
         from SoapySDR import SOAPY_SDR_RX, SOAPY_SDR_CS16, SOAPY_SDR_OVERFLOW
     except Exception as e:
@@ -48,9 +72,6 @@ def main():
         # C extension bound to the SYSTEM python interpreter — not pip-
         # installable into a venv.  Detect which scenario this is and point
         # the user at the correct fix.
-        _in_venv = (hasattr(sys, 'real_prefix')
-                    or sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
-                    or bool(os.environ.get('VIRTUAL_ENV')))
         if _in_venv:
             sys.stderr.write(
                 'soapy_rx: SoapySDR Python bindings not importable (%s).\n'
