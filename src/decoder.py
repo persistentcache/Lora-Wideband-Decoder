@@ -3564,11 +3564,24 @@ def _compute_hw_fingerprint(iq, sf=None, bw=None, fs=None):
 # ============================================================================
 # Structured packet emission (machine-readable, consumed by the web UI / log)
 # ============================================================================
+# Phase-1 chase optimization: process-local counter of emitted records, used
+# by the PASS-2 and burst-sweep early-exit predicates as a universal "we got
+# at least one frame from this capture" signal.  Unlike _DECODED_SET (which
+# is Meshtastic-only, populated only after a successful AES decrypt + valid
+# protobuf), this counter increments for EVERY protocol's emit (Meshtastic
+# decoded, MeshCore decoded/candidate, LoRaWAN, MeshCore ADVERT, etc.) so
+# the early-exit works for MeshCore-only traffic too.  Reset to 0 at each
+# top-level process_file entry so per-capture deltas are meaningful.
+_EMIT_COUNT = 0
+
+
 def _emit_pkt(rec):
     """Emit one structured packet record as a single `[PKT] {json}` line.  The
     gate's BackgroundDecoder enriches it (freq/sf/bw/rssi from the capture name),
     dedups by (pktid,hop), and writes it to the JSONL log + the web UI.  Kept as
     a plain stdout line so it rides the existing decoder→gate→web stdout path."""
+    global _EMIT_COUNT
+    _EMIT_COUNT += 1
     try:
         import json as _json
         print("[PKT] " + _json.dumps(rec, separators=(',', ':'), default=str))
@@ -4480,6 +4493,13 @@ def process_file(fpath, relay_after=None, relay_before=None,
             iq = (iq - _dc).astype(np.complex64)
     if _allow_rescue:
         _DECODED_SET.clear()   # top-level call: start fresh decode tracking
+        # Phase-1: also reset the universal-protocol emit counter at top
+        # level so per-capture deltas are meaningful (recursive carrier-
+        # rescue / burst-sweep calls run with _allow_rescue=False and
+        # inherit the parent's counter — they're counted as part of the
+        # parent's emit total, which is exactly what we want).
+        global _EMIT_COUNT
+        _EMIT_COUNT = 0
     name = os.path.basename(fpath)
     parts = name.lstrip('.').split('_')
     sf = int(parts[0].replace('SF', ''))
@@ -4951,7 +4971,17 @@ def process_file(fpath, relay_after=None, relay_before=None,
     # residual — that keeps the attempt loop going (result != None) and
     # clears _residual_clear, preventing this skip.  Only fires on captures
     # whose in-window signal is fully accounted for.
-    if _allow_rescue and _DECODED_SET and _residual_clear and not _need_rescue:
+    # Phase-1 chase optimization: extend the fast-path predicate from
+    # "_DECODED_SET non-empty" (Meshtastic-only — populated only on
+    # successful AES decrypt + protobuf validate at line 3861) to "any
+    # emit happened" via _EMIT_COUNT.  Makes the skip fire for MeshCore /
+    # LoRaWAN / Reticulum / etc. captures too, not just Meshtastic.  Same
+    # _residual_clear + not _need_rescue gates, so the multi-packet-in-
+    # window case the existing predicate preserved is still preserved (a
+    # real concurrent hop leaves residual signal → _residual_clear=False
+    # → skip doesn't fire → recovery passes still run).
+    if _allow_rescue and (_DECODED_SET or _EMIT_COUNT > 0) \
+            and _residual_clear and not _need_rescue:
         return
 
     # ---- Spectrum-based CFO fallback ----
@@ -5087,7 +5117,24 @@ def process_file(fpath, relay_after=None, relay_before=None,
     # (the fast-path skip returns before here).  SF/BW-agnostic.
     found_cfos_hz = [bw / 2.0, -bw / 2.0, bw, -bw] + list(found_cfos_hz)
     tried_shifts = set()
+    # Phase-1 chase optimization: short-circuit PASS 2 once a shift has
+    # emitted a record.  PASS 2's shift list is alias-resolve candidates
+    # for the SAME signal (±BW/2, ±BW + spectrum/wideband estimates), not
+    # multi-carrier search — once one shift decoded the packet, subsequent
+    # shifts at this capture would mostly either fail demod (wrong CFO)
+    # or produce duplicate records caught by the post-decode
+    # `_packet_dedup` / `_fp_dedup` AT THE COST of a full `_decode_attempt`
+    # run each (~hundreds of ms).  The MASK loop inside ONE shift still
+    # finds time-separated packets at the SAME carrier (the
+    # multi-packet-per-window case the original design accounts for); only
+    # cross-shift redundancy is eliminated.  Uses _EMIT_COUNT (universal
+    # across protocols) rather than _DECODED_SET (Meshtastic-only), so the
+    # optimization applies to MeshCore / LoRaWAN / Reticulum / etc. too.
+    _pass2_emit_baseline = _EMIT_COUNT
+    _pass2_done = False
     for cfo_hz_raw in found_cfos_hz:
+        if _pass2_done:
+            break
         # Two possible interpretations of the bin
         shifts_to_try = [cfo_hz_raw]
         if cfo_hz_raw > bw / 2:
@@ -5096,6 +5143,15 @@ def process_file(fpath, relay_after=None, relay_before=None,
             shifts_to_try.append(cfo_hz_raw + bw)
 
         for shift_hz in shifts_to_try:
+            if _EMIT_COUNT > _pass2_emit_baseline:
+                # A record landed for THIS capture from a prior PASS-2 shift
+                # (or from PASS-1 if it ran first and the baseline already
+                # included that emit, this fires zero times — which is the
+                # correct semantic: PASS-1 done + emit means PASS-2 had no
+                # work to do yet, but its first shift is still allowed).
+                # Same admission as post-decode dedup → no real packet lost.
+                _pass2_done = True
+                break
             if _BUDGET_S > 0 and (time.process_time() - _process_start) > _BUDGET_S:
                 print(f"\n  [BUDGET] decode budget {_BUDGET_S:.1f}s exhausted before PASS 2 — bail")
                 return
@@ -5160,6 +5216,17 @@ def process_file(fpath, relay_after=None, relay_before=None,
     # _allow_rescue=False so it can't re-enter itself; _DECODED_SET dedups, and
     # the AES decrypt-validity gate keeps an isolated noise blip from becoming a
     # false positive.
+    #
+    # Phase-1 chase optimization: if PASS 2 produced a new emit AND PASS-1's
+    # residual was clean, the capture is accounted for — skip burst sweep.
+    # Without this skip, even single-packet captures rerun the entire
+    # pipeline per envelope burst (recursive process_file call, full
+    # preamble+demod+PASS-1+PASS-2 stack) at ~hundreds of ms each.  Predicate
+    # mirrors the fast-path at line 4954 but uses _EMIT_COUNT (universal
+    # across protocols) and accepts decodes from PASS 2 too.
+    if _allow_rescue and len(iq) > 0 \
+            and _EMIT_COUNT > _pass2_emit_baseline and _residual_clear:
+        return
     if _allow_rescue and len(iq) > 0:
         _ew = max(1, int(0.005 * fs))               # 5 ms envelope window
         _ne = len(iq) // _ew
