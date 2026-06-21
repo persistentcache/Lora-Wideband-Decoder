@@ -1959,6 +1959,21 @@ class SignalRecorder:
             self._save_threads.append(t)
         # Keep self._save_thread for legacy code paths that .join() it.
         self._save_thread = self._save_threads[0]
+
+        # ---- Phase 1 of save-subprocess scaffolding (env-flag gated) ----
+        # When LORA_SAVE_SUBPROC=1, spin up a child process that mirrors the
+        # save pipeline structure for testing the IPC plumbing — the actual
+        # save work still runs in the in-master threads above.  Phase 2 will
+        # move the real work into the subprocess and disconnect the in-
+        # master threads.  See src/save_subproc.py for the subproc body.
+        self._save_subproc = None
+        self._save_subproc_save_q = None
+        self._save_subproc_submit_q = None
+        self._save_subproc_free_q = None
+        self._save_subproc_shm = []
+        self._save_subproc_callback_thread = None
+        if os.environ.get('LORA_SAVE_SUBPROC', '0') == '1':
+            self._setup_save_subproc()
         # Post-CFO global carrier registry: keyed by (freq_bucket, sf, bw),
         # value = timestamp of last save.  Persists across batches so that
         # cross-window duplicates (same packet detected in two consecutive
@@ -2026,6 +2041,103 @@ class SignalRecorder:
         self._save_queue.put((extended_full, list(detections), dt_str,
                               pre_hop_n, len(wideband_buf), sample_pos))
         return []  # file paths reported asynchronously by the save thread
+
+    def _setup_save_subproc(self):
+        """Spin up the save subprocess + shared-memory IQ-transfer pool.
+
+        Architecture: a single child process (forked from master) runs the
+        save_worker_main loop in src/save_subproc.py.  Communication:
+          - shm pool: 4 × 256MB pre-allocated mp.shared_memory blocks for
+            the extended_full IQ chunk (sized for the SF12 worst case of
+            ~5s × 5Msps × 8B = 200MB).  Master picks a free block from
+            free_q, copies the IQ into it, sends the index + metadata
+            via save_q.  Subproc processes, returns the block index to
+            free_q.  free_q.get() on master blocks naturally when the
+            subproc can't keep up — backpressure without OOM risk.
+          - save_q (master → subproc): batched save events
+          - submit_q (subproc → master): decode-submit requests
+            (file paths to enqueue with self._decoder.submit)
+          - callback thread (in master): consumes submit_q and calls
+            self._decoder.submit(...).  Tiny, holds GIL only briefly.
+
+        Phase 1 (current): infrastructure only.  The subproc's stub
+        consumes save events and acks them without doing real work,
+        while the in-master _save_worker threads continue to do the
+        actual saves.  This lets us validate IPC overhead and fork
+        behaviour before committing to the behaviour-change refactor.
+        """
+        import multiprocessing as mp
+        from multiprocessing import shared_memory
+        # Use the explicit 'fork' context — matches detect_pool.py and
+        # avoids the forkserver issues we hit during the forked-pool
+        # experiment.  Save subproc is spawned exactly once at startup
+        # so the multi-threaded fork concerns from the decode-worker
+        # work don't apply (only one fork event, not lazy-on-demand).
+        ctx = mp.get_context('fork')
+
+        # 4 blocks × 256MB = 1GB shared.  Sized for SF12 max packet:
+        # 5s × 5Msps × 8B = 200MB; 256MB leaves headroom.  4 blocks
+        # let the subproc fall behind by ~3 events before backpressure.
+        SHM_COUNT = 4
+        SHM_BYTES = 256 * 1024 * 1024
+        self._save_subproc_shm = []
+        shm_names = []
+        for _i in range(SHM_COUNT):
+            shm = shared_memory.SharedMemory(create=True, size=SHM_BYTES)
+            self._save_subproc_shm.append(shm)
+            shm_names.append(shm.name)
+
+        self._save_subproc_save_q = ctx.Queue(maxsize=SHM_COUNT + 2)
+        self._save_subproc_submit_q = ctx.Queue()
+        self._save_subproc_free_q = ctx.Queue()
+        # Pre-load all block indices as free.
+        for _i in range(SHM_COUNT):
+            self._save_subproc_free_q.put(_i)
+
+        from save_subproc import save_worker_main
+        self._save_subproc = ctx.Process(
+            target=save_worker_main,
+            args=(self._save_subproc_save_q,
+                  self._save_subproc_submit_q,
+                  self._save_subproc_free_q,
+                  shm_names, SHM_BYTES, self.debug),
+            daemon=True, name='save-subproc')
+        self._save_subproc.start()
+
+        # Callback thread: consumes submit_q from subproc and calls into
+        # the master's BackgroundDecoder.  This is the only IPC-related
+        # GIL load in master.  Tiny per-message work (just decoder.submit)
+        # so it doesn't reintroduce the GIL pressure the move was meant
+        # to eliminate.
+        def _submit_callback_loop():
+            while True:
+                try:
+                    msg = self._save_subproc_submit_q.get()
+                except (EOFError, BrokenPipeError):
+                    break
+                if msg is None:
+                    break
+                try:
+                    if self._decoder:
+                        self._decoder.submit(
+                            msg['fpath'], msg['fname'],
+                            relay_after_syms=msg.get('relay_after_syms'),
+                            relay_before_syms=msg.get('relay_before_syms'),
+                            bucket_key=msg.get('bucket_key'))
+                except Exception as _e:
+                    if self.debug >= 1:
+                        print(f"[save_subproc callback] submit failed: {_e}",
+                              file=sys.stderr, flush=True)
+
+        self._save_subproc_callback_thread = threading.Thread(
+            target=_submit_callback_loop, daemon=True,
+            name='save-subproc-cb')
+        self._save_subproc_callback_thread.start()
+
+        if self.debug >= 1:
+            print(f"[save-subproc] up: pid={self._save_subproc.pid}, "
+                  f"{SHM_COUNT} shm blocks × {SHM_BYTES/1024/1024:.0f}MB",
+                  file=sys.stderr, flush=True)
 
     def _save_worker(self):
         """Background thread: FFT-extract → write file → notify decoder."""
