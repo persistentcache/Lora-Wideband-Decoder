@@ -23,6 +23,26 @@ Usage:
 
 import sys, os, time, argparse, numpy as np
 import threading, queue, io, subprocess, fcntl
+
+# Make the GIL hand off 5× more often.  Default 5ms means a Python-only
+# thread (MainThread doing numpy bookkeeping, _save_worker thread building
+# capture extents, manager threads dispatching jobs) can hold the GIL for
+# a full 5 ms before yielding — and during that hold window the iq-reader
+# thread can't acquire the GIL to drain its kernel pipe.  At 5 Msps wire
+# speed the kernel pipe fills in ~1.6 ms (8MB pipe / 20MB/s = 400 µs even
+# at the SDR sample width); a 5ms GIL stall is enough to back-pressure
+# soapy_rx and overflow the HackRF's internal buffer, dropping samples.
+# Live diagnostics caught iq-reader at 0 / 20 GIL-active snapshots during
+# burst — it was being shut out by MainThread (40%) and recorder threads
+# (60%).  1ms hand-off lets iq-reader interleave 5× more often.  Cost:
+# slightly more context-switch overhead for pure-Python loops, negligible
+# because most of master's time is in numpy/scipy that releases GIL on
+# C-call boundaries (the switchinterval only governs voluntary yield in
+# pure Python).
+try:
+    sys.setswitchinterval(0.001)
+except (AttributeError, ValueError):
+    pass
 from config import BW_LIST
 # FFT library is core-count adaptive — measured on actual hardware:
 #   Pi 4 (4 cores, NEON FFTW):   pyfftw T=1 wins 4.40 ms vs scipy w=1 4.76 ms
@@ -164,7 +184,48 @@ class StreamBuffer:
         self._thread.start()
 
     def _reader_loop(self):
-        """Reader thread — runs at full wire speed, never blocks on consumer."""
+        """Reader thread — runs at full wire speed, never blocks on consumer.
+
+        Self-prioritises at thread start: pins to a dedicated core so it is
+        never preempted by master-side gate threads (MainThread / recorders /
+        manager threads all share a small affinity), and requests SCHED_FIFO
+        priority so the OS schedules it ahead of every other Python thread
+        when its read() returns.
+
+        Why this matters: live diagnostics (mpstat + py-spy GIL holder
+        snapshots) showed iq-reader holding the GIL ~0% of burst windows
+        while master threads held it ~100%.  Sample drops measured at the
+        SDR (5.0 → 4.4 Msps during burst) were tracking iq-reader's GIL
+        starvation, not actual decode load.  Master's `top` shows cores
+        0-7 at 100% during burst (gate + first decode workers + detect
+        pool overflow); without explicit pinning Linux had nowhere to
+        schedule iq-reader except by preempting another thread on those
+        same cores, and SCHED_OTHER doesn't preempt in time at 5Msps wire
+        speed.  Pinning to its own otherwise-idle core + SCHED_FIFO makes
+        iq-reader's `read() → ring_write` cycle deterministic and removes
+        the back-pressure that was overflowing the kernel pipe to soapy_rx
+        and dropping samples (MT packets at 200-400ms windows are bigger
+        targets for the drop windows than ~100ms MC packets — measured as
+        ~14% MT_unique loss in 4×4 vs subprocess baseline).
+        """
+        # Pin to a dedicated core, distinct from where master's other
+        # gate threads tend to run.  Use core 0 — first physical core,
+        # claimed exclusively for iq-reader.  Linux's CFS scheduler
+        # naturally keeps the other gate threads on whichever cores they
+        # were spawned on, so taking core 0 here removes iq-reader from
+        # the OS-level run queue that MainThread / recorders / manager
+        # threads compete for.
+        try: os.sched_setaffinity(0, {0})
+        except (AttributeError, OSError): pass
+        # Try to raise to SCHED_FIFO real-time scheduling.  Needs
+        # CAP_SYS_NICE; if denied (most non-root setups) fall back to
+        # the default and rely on affinity isolation alone.
+        try:
+            param = os.sched_param(50)
+            os.sched_setscheduler(0, os.SCHED_FIFO, param)
+        except (AttributeError, OSError, PermissionError):
+            pass
+
         while not self._eof:
             try:
                 raw = self._fp.read(self._chunk_bytes)
