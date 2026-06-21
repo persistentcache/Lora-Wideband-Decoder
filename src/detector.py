@@ -2316,12 +2316,21 @@ class SignalRecorder:
                           f"({dur_ms:.0f}ms, {len(nb)} samples "
                           f"@ {nb_fs/1000:.0f}kHz) abst={_abs_t_s:.2f}s", flush=True)
                     if self._decoder:
+                        # Phase-2 bucket key: (cand_freq, abs_t_s, ftol, ttol)
+                        # — same tuple + tolerances the save-side RFDEDUP
+                        # uses at lines 2216-2228, so cross-worker dedup
+                        # matches save-side cluster definition exactly.
+                        # ttol scales with airtime (24 symbols, floor 30 ms)
+                        # so ACK at +50 ms from DM at SAME carrier stays in
+                        # a SEPARATE bucket on SF7 (ttol=49 ms) — exactly
+                        # the case a global 0.35 s ceiling would have merged.
+                        _bkey = (_cand_freq, _abs_t_s, _ftol, _dt_win)
                         # Pass 1 — full-file primary with SIC: SC-scans the
                         # buffer, decodes the strongest preamble, subtracts
                         # its reconstructed signal, and re-searches the
                         # residual.  Catches multi-packet files when SIC
                         # cancellation is clean (per-symbol amplitude OK).
-                        self._decoder.submit(fpath, fname)
+                        self._decoder.submit(fpath, fname, bucket_key=_bkey)
                         # Pass 2 — TIME-ISOLATED on this preamble.  Useful at
                         # FAST SF where the hop1 relay arrives ~50-200 ms
                         # after hop0 and they share a single capture file;
@@ -2342,7 +2351,8 @@ class SignalRecorder:
                             self._decoder.submit(
                                 fpath, fname,
                                 relay_after_syms=_iso_after,
-                                relay_before_syms=_iso_before)
+                                relay_before_syms=_iso_before,
+                                bucket_key=_bkey)
             except Exception as e:
                 print(f"[RECORDER] save error: {e}", file=sys.stderr, flush=True)
             finally:
@@ -2391,6 +2401,37 @@ class BackgroundDecoder:
         # (Algorithm ported from meshtastic-sniffer main.c fingerprint ring.)
         self._fp_dedup = {}              # fingerprint (int) -> last_seen_time
         self._fp_dedup_lock = threading.Lock()
+
+        # Phase-2 chase optimization: cross-worker bucket dedup + in-flight
+        # tracking with dispatch deferral.
+        # PROBLEM: when KEEP-2 + PASS-2-iso both fire for one RF cluster, up
+        # to 4 worker jobs queue up for the same frame.  The original
+        # dispatch-time dedup checked only `_decoded_buckets` (admitted
+        # emits) — but sibling jobs are pulled from the queue back-to-back
+        # before the first worker has time to emit, so the check fires
+        # ZERO times in practice (race: sibling B dispatches before sibling
+        # A's emit lands).  Result: optimization didn't help Meshtastic.
+        # FIX: add in-flight tracking.  When worker A starts processing
+        # bucket X, mark X as in-flight; when sibling B's dispatch comes
+        # up, wait briefly (poll every 100 ms up to 2 s) for A to either
+        # admit or finish.  If A admits → B skips entirely.  If A finishes
+        # without admitting → B dispatches normally.  Workers waiting on
+        # bucket X don't block other workers from bucket Y (each worker
+        # thread runs an independent dispatch loop), so total throughput
+        # is preserved.  Stale in-flight entries (age > max_age) are auto-
+        # GC'd so a crashed/stuck worker can't deadlock siblings forever.
+        # Bucket tolerance matches save-side RFDEDUP per-frame ftol/dt_win,
+        # so it's proven not to merge hop0/hop1.
+        self._fname_bucket = {}          # fpath -> bucket_key tuple
+        self._decoded_buckets = []       # list of bucket_key tuples (admitted)
+        self._inflight_buckets = {}      # bucket_key -> dispatch_timestamp
+        self._bucket_lock = threading.Lock()
+        # Diagnostic counters — printed periodically via _diag_print
+        self._diag_marks = 0
+        self._diag_already_decoded_hits = 0
+        self._diag_inflight_hits = 0
+        self._diag_wait_skip = 0
+        self._diag_wait_dispatch = 0
 
         # Pre-decode dedup: multi-res Welch finds the same LoRa packet at
         # 2-3 different center frequencies (peak candidates within the LoRa
@@ -2695,14 +2736,118 @@ while True:
         except OSError:
             pass        # file already gone (manual delete / startup reap)
 
-    def submit(self, fpath, fname, relay_after_syms=None, relay_before_syms=None):
+    def _bucket_already_decoded(self, fpath):
+        """Phase-2 check: has any capture in the same RF bucket already
+        produced a verified emit?  Linear-scan the decoded_buckets list
+        using PER-FRAME tolerances stored at submit time so the cross-worker
+        dedup matches the save-side RFDEDUP definition exactly (per-SF
+        dt_win is critical: ACK arrives ~50 ms after a DM at the SAME
+        carrier, and a global ceiling like 0.35 s would incorrectly merge
+        ACK + DM into the same bucket and suppress the ACK capture)."""
+        with self._bucket_lock:
+            bkey = self._fname_bucket.get(fpath)
+            if bkey is None:
+                return False
+            cand_freq, abs_t_s, _, _ = bkey
+            for (df, dt, ftol, ttol) in self._decoded_buckets:
+                if (abs(cand_freq - df) < ftol
+                        and abs(abs_t_s - dt) < ttol):
+                    return True
+        return False
+
+    def _mark_bucket_decoded(self, fname):
+        """Phase-2 admit: a worker just produced a verified emit for this
+        fname (admitted by _packet_dedup or _fp_dedup).  Look up the bucket
+        we recorded at submit() time and add it to _decoded_buckets so
+        sibling captures in the same cluster skip decode entirely."""
+        with self._bucket_lock:
+            for fpath, bkey in self._fname_bucket.items():
+                if fpath.endswith(fname) or fname.endswith(os.path.basename(fpath)):
+                    self._decoded_buckets.append(bkey)
+                    if len(self._decoded_buckets) > 200:
+                        self._decoded_buckets = self._decoded_buckets[-100:]
+                    self._diag_marks += 1
+                    return
+
+    # Phase-2 in-flight tracking — closes the race window between sibling
+    # dispatches.  Without this, sibling B's dispatch-time check sees the
+    # bucket as "not admitted" because sibling A's worker hasn't finished
+    # yet → both run in parallel → optimization is bypassed entirely (we
+    # observed 0 bucket-skips on real Meshtastic burst traffic before this
+    # was added).
+
+    # Max age for an in-flight entry before it's considered stale and GC'd.
+    # 5.0 s covers SF12 LONG_SLOW decodes (the slowest standard preset) with
+    # margin.  If a worker has been holding a bucket longer than this it's
+    # presumed crashed/wedged and sibling dispatches proceed normally.
+    _INFLIGHT_MAX_AGE_S = 5.0
+
+    def _is_bucket_inflight(self, fpath):
+        """True if another worker is currently processing a sibling capture
+        in the same RF bucket as `fpath`.  Auto-GCs entries older than
+        _INFLIGHT_MAX_AGE_S so a crashed worker can't deadlock siblings."""
+        with self._bucket_lock:
+            bkey = self._fname_bucket.get(fpath)
+            if bkey is None:
+                return False
+            cand_freq, abs_t_s, _, _ = bkey
+            now = time.time()
+            stale = []
+            hit = False
+            for key, dispatch_ts in self._inflight_buckets.items():
+                if now - dispatch_ts > self._INFLIGHT_MAX_AGE_S:
+                    stale.append(key)
+                    continue
+                df, dt, ftol, ttol = key
+                if (abs(cand_freq - df) < ftol
+                        and abs(abs_t_s - dt) < ttol):
+                    hit = True
+                    break
+            for k in stale:
+                self._inflight_buckets.pop(k, None)
+            return hit
+
+    def _mark_bucket_inflight(self, fpath):
+        """Mark this fpath's bucket as in-flight (a worker is about to start
+        decoding it).  No-op if fpath has no bucket key."""
+        with self._bucket_lock:
+            bkey = self._fname_bucket.get(fpath)
+            if bkey is None:
+                return
+            self._inflight_buckets[bkey] = time.time()
+
+    def _clear_bucket_inflight(self, fpath):
+        """Worker is done with this fpath (success or fail) — release the
+        in-flight entry so a future capture for the same bucket can dispatch
+        without waiting.  No-op if fpath has no bucket key."""
+        with self._bucket_lock:
+            bkey = self._fname_bucket.get(fpath)
+            if bkey is None:
+                return
+            self._inflight_buckets.pop(bkey, None)
+
+    def submit(self, fpath, fname, relay_after_syms=None, relay_before_syms=None,
+               bucket_key=None):
         """Queue a capture file for background decoding.
 
         relay_after_syms:  blank first N BW-rate symbols → find hop AFTER primary.
         relay_before_syms: blank from symbol N onward   → find hop BEFORE primary.
+        bucket_key:        (cand_freq_hz, abs_t_s) for Phase-2 cross-worker
+                           bucket dedup; None disables the dedup for this job.
         """
         if not self._decoder_script:
             return
+
+        # Phase-2: remember which RF bucket this fpath belongs to so the
+        # dispatch loop can later skip captures whose bucket already produced
+        # a verified emit.  Cap the dict to avoid growth on stale fnames.
+        if bucket_key is not None:
+            with self._bucket_lock:
+                self._fname_bucket[fpath] = bucket_key
+                if len(self._fname_bucket) > 4000:
+                    # Drop the oldest ~half by insertion order (dict preserves it).
+                    _keep = list(self._fname_bucket.items())[-2000:]
+                    self._fname_bucket = dict(_keep)
 
         # NO pre-decode dedup here.  It used to skip captures within
         # Δfreq<0.15 MHz AND Δt<0.6 s of a recent submission — but it keyed on
@@ -2813,6 +2958,63 @@ while True:
             if self._decoder_script is None:
                 self._queue.task_done()
                 continue
+
+            # Phase-2 chase optimization: skip dispatch if a sibling capture
+            # in the same RF bucket has already produced a verified emit.
+            # The same admission predicate as the post-decode dedup — only
+            # fires AFTER the frame reached the GUI — so no real packet is
+            # lost; we just avoid running a full _decode_attempt to produce
+            # a record the post-decode dedup would discard anyway.  Skipping
+            # at dispatch is the biggest possible win: the worker never
+            # imports the IQ, never builds FFT plans, never allocates the
+            # (n_sym, N) symbol matrices.
+            if self._bucket_already_decoded(fpath):
+                self._ref_dec_and_maybe_unlink(fpath)
+                self._queue.task_done()
+                if self._verbose:
+                    print(f"         [BUCKET-DEDUP] skip {os.path.basename(fpath)} "
+                          f"— sibling already emitted", file=sys.stderr, flush=True)
+                continue
+
+            # Phase-2 in-flight wait: if a sibling worker is CURRENTLY
+            # processing the same bucket, wait briefly (up to 2 s, polling
+            # every 100 ms) for it to either admit or finish.  Closes the
+            # race window where sibling B's dispatch fires before sibling
+            # A's emit lands.  Without this wait, the simple "already
+            # decoded" check above returns False for B because A hasn't
+            # finished yet, and we end up doing the full decode twice in
+            # parallel.  Worker thread blocking here doesn't reduce overall
+            # throughput because each worker thread runs an independent
+            # dispatch loop — threads waiting on bucket X stay idle, while
+            # threads pulling jobs from bucket Y keep running.  2 s is well
+            # above typical decode time (SF7-SF11 finish in 0.5-1.5 s); the
+            # in-flight entry also has a 5 s GC timeout so a crashed worker
+            # can never deadlock siblings indefinitely.
+            if self._is_bucket_inflight(fpath):
+                _wait_deadline = time.time() + 2.0
+                _skipped = False
+                while time.time() < _wait_deadline:
+                    time.sleep(0.1)
+                    if self._bucket_already_decoded(fpath):
+                        # Sibling admitted while we waited — skip cleanly.
+                        self._ref_dec_and_maybe_unlink(fpath)
+                        self._queue.task_done()
+                        if self._verbose:
+                            print(f"         [BUCKET-DEDUP] skip {os.path.basename(fpath)} "
+                                  f"— sibling admitted during wait",
+                                  file=sys.stderr, flush=True)
+                        _skipped = True
+                        break
+                    if not self._is_bucket_inflight(fpath):
+                        # Sibling finished without admitting — dispatch
+                        # normally (we may have better luck at this offset).
+                        break
+                if _skipped:
+                    continue
+
+            # Mark this bucket in-flight BEFORE writing to the worker stdin
+            # so siblings see the in-flight state immediately.
+            self._mark_bucket_inflight(fpath)
 
             # Start this thread's worker if not running
             if worker is None or worker.poll() is not None:
@@ -2974,6 +3176,13 @@ while True:
                 with self._lock:
                     self._active_count -= 1
                 self._queue.task_done()
+                # Phase-2: clear the in-flight bucket entry so waiting
+                # sibling workers can proceed (either they'll see the bucket
+                # as admitted and skip, or they'll dispatch normally if the
+                # admit didn't happen).  ALWAYS run, even on exception /
+                # timeout / worker crash — otherwise siblings deadlock until
+                # the 5 s GC timeout.
+                self._clear_bucket_inflight(fpath)
                 # Reference count for capture-file cleanup.  ALWAYS run, even
                 # on exception / timeout / worker crash — those decrement paths
                 # are exactly when leaks would otherwise accumulate.
@@ -3209,6 +3418,10 @@ while True:
                             f"[DUP] {_pkt_id} hop{_hops_taken} — "
                             f"same hop already decoded recently\n")
                 self._packet_dedup[_pkey] = _now_pkt
+                # Phase-2: tell the dispatch loop that this RF bucket is
+                # covered so sibling captures (KEEP-2 second save + PASS-2-iso
+                # resubmit) skip their decode at dispatch time.
+                self._mark_bucket_decoded(fname)
 
         # Payload fingerprint dedup: suppress same raw payload within 30s.
         # Targets non-Meshtastic frames (LoRaWAN, MeshCore, CRC-only) that have no
@@ -3243,6 +3456,10 @@ while True:
                                         f"[FP-DEDUP] duplicate payload suppressed\n")
                             if len(self._fp_dedup) < 512:
                                 self._fp_dedup[_fp] = _now_fp
+                                # Phase-2: same as for _packet_dedup admit —
+                                # bucket is now covered; sibling captures
+                                # skip decode at dispatch.
+                                self._mark_bucket_decoded(fname)
                 except Exception:
                     pass
 
