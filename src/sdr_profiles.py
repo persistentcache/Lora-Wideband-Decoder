@@ -154,6 +154,48 @@ def _which(name):
     return shutil.which(name) or name
 
 
+_SOAPY_PY = None
+
+def soapy_python():
+    """Return a Python interpreter path that can actually `import SoapySDR`.
+
+    SoapySDR's Python bindings ship as a SWIG C-extension installed by the distro
+    (apt `python3-soapysdr`) and bound to the SYSTEM interpreter.  They are NOT
+    pip-installable, so a user whose `python3` is Homebrew / pyenv / conda has a
+    `python3` that CANNOT import them — and the capture subprocess dies a second
+    after Start with `No module named 'SoapySDR'`.  Resolving the capture exe with
+    a bare PATH lookup (`shutil.which('python3')`) hits exactly that interpreter.
+
+    So probe for one that works, preferring the interpreter running THIS process
+    (parent/child match), then the distro python, then PATH.  Cached.  Falls back
+    to `sys.executable` so the caller still gets soapy_rx.py's clear SoapySDR
+    guidance in the log rather than a silent interpreter mismatch."""
+    global _SOAPY_PY
+    if _SOAPY_PY is not None:
+        return _SOAPY_PY
+    import sys, shutil, subprocess
+    for cand in (sys.executable, '/usr/bin/python3', shutil.which('python3'),
+                 '/usr/bin/python3.12', '/usr/bin/python3.11'):
+        if not cand:
+            continue
+        try:
+            if subprocess.run([cand, '-c', 'import SoapySDR'], timeout=10,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0:
+                _SOAPY_PY = cand
+                return cand
+        except Exception:
+            continue
+    _SOAPY_PY = sys.executable
+    return _SOAPY_PY
+
+
+def _resolve_bin(prof):
+    """Path to the profile's capture binary.  For SoapySDR profiles (bin=python3)
+    that means an interpreter that can import SoapySDR, NOT just any PATH python3."""
+    return soapy_python() if prof.get('bin') == 'python3' else _which(prof['bin'])
+
+
 def safe_soapy_driver(drv, default='hackrf'):
     """Whitelist the SoapySDR driver to a bare identifier.  It's interpolated into a
     shell=True command, so anything with shell metacharacters (`;`, `|`, `$`, space,
@@ -194,7 +236,7 @@ def build_capture(sdr, freq_hz, rate, bw, gain='auto', soapy_driver='hackrf'):
     # tries to open the prefix as the script.
     soapy_rx = shlex.quote(os.path.join(scripts_dir, 'soapy_rx.py'))
     return prof['capture'].format(
-        bin=shlex.quote(_which(prof['bin'])), freq_hz=int(freq_hz),
+        bin=shlex.quote(_resolve_bin(prof)), freq_hz=int(freq_hz),
         freq_mhz=freq_hz / 1e6,
         rate=int(rate), bw=int(bw), gain_cmd=_gain_clause(prof, gain),
         soapy_driver=drv, soapy_rx=soapy_rx)
@@ -224,7 +266,7 @@ def clamp_radio(sdr, radio):
 
 def build_probe(sdr):
     prof = SDR_PROFILES.get(sdr, SDR_PROFILES[DEFAULT_SDR])
-    return prof['probe'].format(bin=_which(prof['bin']))
+    return prof['probe'].format(bin=_resolve_bin(prof))
 
 
 def _cli_limits(cmd):
@@ -295,7 +337,7 @@ def query_limits(sdr, soapy_driver='hackrf'):
     prof = SDR_PROFILES.get(sdr, SDR_PROFILES[DEFAULT_SDR])
     probe = prof.get('limits_probe')
     if probe:                                   # native CLI range probe (bladeRF)
-        res = _cli_limits(probe.format(bin=_which(prof['bin'])))
+        res = _cli_limits(probe.format(bin=_resolve_bin(prof)))
         if res:
             return res
     drv = soapy_driver if sdr == 'soapy' else prof.get('soapy_query_driver')
