@@ -1630,10 +1630,11 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         if not hit_lags:
             return _ld
 
+        _wide = bool(os.environ.get('LORA_SCAN_FULL'))
+
         hit_lags.sort(key=lambda x: x[1], reverse=True)
 
         seen = set()
-        _wide = bool(os.environ.get('LORA_SCAN_FULL'))
         _ffc = []   # one forward-FFT cache shared by all candidate extractions
         for lag, sc_score_best, _pos_best in hit_lags[:4]:
             # Resolve SF/BW.  Presets: the curated per-lag vote (validated, byte-
@@ -1838,6 +1839,39 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             if _b is None or _d['bw_quality_db'] > _b['bw_quality_db']:
                 _hb[_g] = _d
         out = list(_hb.values())
+
+    # ---- Harmonic collapse (preset mode) ----
+    # A LoRa preamble autocorrelates at its symbol period AND at every power-of-2
+    # multiple/divisor of it, and the chirp slope BW²/2^SF is INVARIANT along that
+    # chain (SF±2, BW×/÷2).  So one packet fires Schmidl-Cox at several lags with
+    # the SAME slope — SF7/62.5 (lag 2048) also throws SF9/125 (4096) and SF11/250
+    # (8192); a genuine SF11/250 (8192) also throws an SF9/125 (4096) ghost.  These
+    # can land in SEPARATE energy peaks, so they only meet here, with every peak's
+    # detections pooled.  All pass the dechirp gate — and the ghosts even score
+    # HIGHER on raw dechirp quality (peak-to-mean grows with FFT size 2^SF), which
+    # is why bw_quality must NOT be the selector.  Group by carrier + preamble time
+    # + chirp-rate family and keep the strongest-SCHMIDL-COX detection (the true
+    # fundamental; harmonics autocorrelate weaker).  Only same-family, same-carrier,
+    # same-time detections merge, so genuinely distinct signals are never collapsed.
+    # Wide-scan already collapses harmonics at the lag stage, so preset-mode only.
+    if not os.environ.get('LORA_SCAN_FULL') and len(out) > 1:
+        # Time tolerance is WIDE (0.25 s) on purpose: a signal's harmonic
+        # detections localize their preamble ~10-30 ms apart (the SC peak sits at
+        # a different sample for each lag), so a tight bucket would split them and
+        # miss the collapse.  This does NOT risk merging genuine close packets: the
+        # (sf,bw,freq) dedup above already collapsed same-(sf,bw) clusters (incl.
+        # DM/ack handshakes ~50-400 ms apart) to one entry each, so the only things
+        # that can share a (carrier, chirp-family) bucket here are DIFFERENT-(sf,bw)
+        # harmonics of one signal — exactly what we want to fold together.
+        _fam = {}
+        for _d in out:
+            _g = (round(_d['freq_hz'] / 15000.0),
+                  round(_d.get('preamble_t_s', 0.0) / 0.25),
+                  round(_d['bw'] * _d['bw'] / (2 ** _d['sf'])))   # chirp slope key
+            _b = _fam.get(_g)
+            if _b is None or _d.get('detect_conf', 0.0) > _b.get('detect_conf', 0.0):
+                _fam[_g] = _d
+        out = list(_fam.values())
 
     # ---- IQ-image rejection ----
     # bladeRF IQ imbalance mirrors EVERY signal to its conjugate frequency
