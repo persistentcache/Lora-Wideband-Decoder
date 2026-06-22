@@ -865,7 +865,15 @@ function renderHealth(h){
         (h.drops_m?` · <span style="color:#ff8c8c">drops ${h.drops_m}M</span>`:'')+
         (h.detect_workers?` · ${h.detect_workers}w`:'');}
   }
-  const wb=$('#warnbar'); if(wb){ if(h.warn){wb.style.display='';wb.textContent='⚠ '+h.warn;} else {wb.style.display='none';} }
+  // Two banner sources, both feed #warnbar.  preflight_note (set when the
+  // ring buffer was auto-capped to fit in RAM) is informational; the
+  // KEEP-UP warning is more severe.  Show whichever is set; if both are
+  // set, KEEP-UP wins (it indicates active data loss).
+  const wb=$('#warnbar'); if(wb){
+    if(h.warn){ wb.style.display=''; wb.textContent='⚠ '+h.warn; }
+    else if(h.preflight_note){ wb.style.display=''; wb.textContent='ℹ '+h.preflight_note; }
+    else { wb.style.display='none'; }
+  }
 }
 
 // ---------- CONFIG (decryption keys) ----------

@@ -1457,12 +1457,17 @@ def tail_packet_log(path):
 PIPELINE_LOG = '/tmp/lora_web_pipeline.log'
 HEALTH = {'msps': None, 'rate_msps': None, 'drops_m': 0.0, 'save_q': None,
           'dec_q': None, 'det': None, 'pipe_ms': None, 'elapsed': None,
-          'warn': None, 'detect_workers': None}
+          'warn': None, 'detect_workers': None, 'preflight_note': None}
 import re as _re
 _RE_STAT = _re.compile(r'\[STAT\]\s+([\d.]+)s\s+\|\s+([\d.]+)Msps\s+\|\s+win=(\d+)\s+'
                        r'det=(\d+)\s+save_q=(\d+)\s+dec_q=(\d+)\s+active=(\d+)\s+'
                        r'pipe=(\d+)ms(?:\s+drops=([\d.]+)M)?')
 _RE_AUTO = _re.compile(r'Detect workers: AUTO = (\d+)')
+# CATCHUP appears when the detector falls so far behind the ring buffer it has
+# to skip ahead to avoid wrapping past unread data.  Each occurrence is hard,
+# IMMEDIATE evidence the host can't sustain the configured rate — surface it
+# without waiting for the keep-up warmup window.
+_RE_CATCHUP = _re.compile(r'CATCHUP skip\s+([\d.]+)M samples\s+\(([\d.]+)s\)')
 
 
 def _tail_health():
@@ -1479,6 +1484,14 @@ def _tail_health():
     last_started_at = None     # detect pipeline restarts → reset warm-up state
     WARMUP_S = 30.0
     CHECK_S = 30.0
+    NO_TELEMETRY_S = 15.0   # if pipeline running this long with NO [STAT] line,
+                            # surface a "no telemetry — overloaded or stuck" warn.
+                            # Normal STAT cadence is every 5 s, so 15 s = three
+                            # missed; anything beyond that is hard evidence the
+                            # detector loop is stalled, not a transient hiccup.
+    last_stat_at = None     # timestamp of the most recent successful [STAT] parse
+    immediate_warn = None   # CATCHUP / no-telemetry warnings (bypass keep-up
+                            # warmup gating — they're deterministic, not statistical)
     while True:
         try:
             now = time.time()
@@ -1492,6 +1505,8 @@ def _tail_health():
             started_at = PIPELINE.get('started_at')
             if started_at != last_started_at:
                 pending_warn = None
+                immediate_warn = None
+                last_stat_at = None
                 last_check = 0.0
                 last_started_at = started_at
             if not os.path.exists(PIPELINE_LOG):
@@ -1520,28 +1535,68 @@ def _tail_health():
                                   dec_q=int(m.group(6)), pipe_ms=int(m.group(8)),
                                   drops_m=float(m.group(9)) if m.group(9) else HEALTH['drops_m'])
                     changed = True
+                    last_stat_at = now
+                    # A fresh STAT line means we got telemetry — clear any
+                    # immediate "no telemetry" warning we may have raised.  We
+                    # do NOT clear a CATCHUP warning here: a fresh STAT doesn't
+                    # mean the host is now keeping up; the next CATCHUP or the
+                    # 30 s keep-up reevaluation should govern that.
+                    if immediate_warn and immediate_warn.startswith('Pipeline running '):
+                        immediate_warn = None
                 a = _RE_AUTO.search(ln)
                 if a:
                     HEALTH['detect_workers'] = int(a.group(1))
                 if 'KEEP-UP WARNING' in ln:
                     pending_warn = ln.strip()[:200]
+                # CATCHUP: detector fell so far behind it had to skip ahead.
+                # Surface IMMEDIATELY (no warmup gate) — this is deterministic
+                # evidence the host can't sustain the configured rate, not a
+                # statistical inference from msps.
+                c = _RE_CATCHUP.search(ln)
+                if c:
+                    immediate_warn = (
+                        f"Detector fell {float(c.group(2)):.0f}s behind and had to skip "
+                        f"{float(c.group(1)):.0f}M samples — host can't sustain "
+                        f"{(HEALTH.get('rate_msps') or 0):.0f} Msps. Lower the rate."
+                    )
+                    changed = True
+            # NO-TELEMETRY watchdog: pipeline marked running but no [STAT] line
+            # has arrived within NO_TELEMETRY_S seconds.  Usually means the
+            # detector loop is CPU-bound to the point where windows aren't
+            # completing.  Different from CATCHUP (which is when the loop IS
+            # completing but losing ground); fires when nothing's coming through
+            # at all.
+            if pipeline_live and started_at:
+                since_start = now - started_at
+                seconds_since_stat = (now - last_stat_at) if last_stat_at else since_start
+                if since_start > NO_TELEMETRY_S and seconds_since_stat > NO_TELEMETRY_S:
+                    new_w = (f"Pipeline running {since_start:.0f}s with no telemetry — "
+                             f"detector is likely overloaded. Check pipeline log; "
+                             f"consider lowering the sample rate.")
+                    if immediate_warn != new_w:
+                        immediate_warn = new_w
+                        changed = True
             # Keep-up banner logic: never surface during warm-up; after that,
             # re-check on a 30 s cadence and clear if msps caught up.
+            # Priority: immediate_warn (deterministic) > pending_warn (statistical
+            # keep-up).
             if PIPELINE.get('running') and started_at:
                 since_start = now - started_at
-                if since_start < WARMUP_S:
-                    if HEALTH.get('warn') is not None:
-                        HEALTH['warn'] = None; changed = True
-                elif now - last_check >= CHECK_S:
-                    last_check = now
-                    msps = HEALTH.get('msps'); rate = HEALTH.get('rate_msps')
-                    keeping_up = (msps is not None and rate
-                                  and msps >= rate * 0.97)
-                    if keeping_up:
-                        if HEALTH.get('warn') is not None:
-                            HEALTH['warn'] = None; changed = True
-                    elif pending_warn and HEALTH.get('warn') != pending_warn:
-                        HEALTH['warn'] = pending_warn; changed = True
+                want_warn = immediate_warn
+                if not want_warn:
+                    if since_start < WARMUP_S:
+                        want_warn = None
+                    else:
+                        if now - last_check >= CHECK_S:
+                            last_check = now
+                            msps = HEALTH.get('msps'); rate = HEALTH.get('rate_msps')
+                            keeping_up = (msps is not None and rate
+                                          and msps >= rate * 0.97)
+                            if keeping_up:
+                                pending_warn = None
+                        want_warn = pending_warn
+                if HEALTH.get('warn') != want_warn:
+                    HEALTH['warn'] = want_warn; changed = True
             elif HEALTH.get('warn') is not None:
                 HEALTH['warn'] = None; changed = True
             if changed:
@@ -1643,6 +1698,66 @@ def _radio_cfg():
     return r
 
 
+# Bytes per IQ sample for each stream format the SDR profiles can emit.
+# Used by _safe_buf_seconds() to model ring-buffer memory cost.  Unknown
+# formats fall back to 4 (= sc16, the common case) so the cap stays
+# conservative rather than silently underestimating.
+_BYTES_PER_SAMPLE = {'cs8': 2, 'sc8': 2, 'sc16': 4, 'complex64': 8}
+
+
+def _safe_buf_seconds(rate_hz, fmt, requested_s):
+    """Cap requested buf_seconds so the ring buffer fits in available RAM.
+
+    Background: the detector's ring buffer is `buf_seconds * rate * BPS`
+    bytes of pinned RAM, allocated at startup.  On RAM-constrained hosts
+    (e.g. Raspberry Pi 4 with 1.8 GB total) the default 16 s buffer at
+    20 Msps sc16 wants 1.28 GB — which the OOM killer reaps within ~10 s,
+    BEFORE the existing 30 s keep-up warmup can produce a warning.  The
+    user sees a silent death.
+
+    This cap reads /proc/meminfo's MemAvailable (Linux only; non-Linux
+    hosts skip the check), reserves 40 % of it as headroom for the
+    detector workers, OS, web process, and /dev/shm capture writes, and
+    returns the largest buf_seconds whose buffer fits in the remaining
+    60 %.  When the cap activates, the chosen value is recorded in
+    HEALTH['preflight_note'] so the GUI can surface it; on hosts with
+    plenty of RAM the requested value is returned unchanged.
+
+    The cap deliberately does NOT modify rate_hz — that's the user's
+    choice and a CPU-bound overload is correctly reported by the existing
+    KEEP-UP WARNING (which now has a chance to fire because the system
+    is no longer OOM-killed in the first 10 s)."""
+    bps = _BYTES_PER_SAMPLE.get((fmt or 'sc16').lower(), 4)
+    avail = None
+    try:
+        with open('/proc/meminfo') as _mi:
+            for _ln in _mi:
+                if _ln.startswith('MemAvailable:'):
+                    avail = int(_ln.split()[1]) * 1024
+                    break
+    except Exception:
+        pass
+    if not avail or rate_hz <= 0:
+        return max(1, int(requested_s))
+    # Allow at most 60 % of MemAvailable for the ring buffer.
+    max_buf_bytes = int(avail * 0.6)
+    per_second = rate_hz * bps
+    max_buf_s = max_buf_bytes // per_second
+    requested_s = max(1, int(requested_s))
+    capped = max(1, min(requested_s, int(max_buf_s)))
+    if capped < requested_s:
+        # Surface in HEALTH so the GUI can show it next to the keep-up banner.
+        HEALTH['preflight_note'] = (
+            f"buf_seconds reduced from {requested_s}s to {capped}s "
+            f"({capped * per_second / 1e6:.0f} MB) to fit in "
+            f"{avail / 1e9:.1f} GB available RAM "
+            f"(at {rate_hz/1e6:.0f} Msps {fmt}, {bps}B/sample)"
+        )
+    else:
+        HEALTH['preflight_note'] = None
+    return capped
+
+
 def _build_pipeline_cmd():
     """Construct the <SDR capture> | detector shell pipeline for the SELECTED SDR.
     The capture half comes from the SDR profile registry (bladeRF's command is
@@ -1673,7 +1788,10 @@ def _build_pipeline_cmd():
     _tune = SETTINGS.get('tune', {}) or {}
     _thresh = float(_tune.get('threshold', d['threshold']))
     _eth = float(_tune.get('energy_threshold', d['energy_threshold']))
-    _bufs = int(_tune.get('buf_seconds', d['buf_seconds']))
+    _bufs_requested = int(_tune.get('buf_seconds', d['buf_seconds']))
+    # RAM-safety cap: see _safe_buf_seconds for rationale.  No-op on hosts
+    # with plenty of memory.
+    _bufs = _safe_buf_seconds(rate, fmt, _bufs_requested)
     gate = (f'python3 {shlex.quote(detector_py)} -r {rate} -b {bw} -c {r["center_mhz"]} '
             f'-t {fmt} --threshold {_thresh} '
             f'--overlap {d["overlap"]} --energy-threshold {_eth} '
