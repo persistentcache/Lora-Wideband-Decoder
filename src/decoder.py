@@ -2617,12 +2617,21 @@ def parse_loramesher_packet(payload, rf=None):
     # 2. src must be nonzero (real node); dst==0xFFFF means broadcast
     if src == 0 or src == 0xFFFF:
         return None
-    # 3. payload_size byte must match actual remaining payload within ±4 bytes
-    #    (LoRaMesher's payload_size is "message-specific fields + payload" so
-    #    it should equal len(payload) - 6 exactly, but allow tiny slack for
-    #    captures with PHY padding artifacts).
+    # 3. payload_size byte must match actual remaining payload EXACTLY.
+    #    LoRaMesher defines payload_size as "message-specific fields +
+    #    payload" — by spec it equals len(payload) - 6 with no slack.
+    #    Earlier versions allowed ±4 bytes "for PHY padding artifacts",
+    #    but the LoRa PHY's whitening / interleave / CRC stripping happens
+    #    BEFORE this parser sees bytes, so application-layer payload_size
+    #    cannot differ from remaining by any amount in a real frame.
+    #    Observed 2026-06-22: 6 of 7 single-shot "loramesher" mystery
+    #    devices in this session had off-by-1-to-4 mismatches (random
+    #    bytes drifting inside the old ±4 tolerance); the 7th matched
+    #    exactly and may or may not be real.  Tightening to exact-match
+    #    drops the structural FP rate by ~5x (3.5% -> 0.4%) without
+    #    affecting any real LoRaMesher frame.
     remaining = len(payload) - 6
-    if not (abs(payload_size - remaining) <= 4):
+    if payload_size != remaining:
         return None
     # 4. dst != src (a node addressing itself is nonsensical at this layer)
     if dst == src:
