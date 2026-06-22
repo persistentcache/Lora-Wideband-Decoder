@@ -391,7 +391,15 @@ function pktDetail(p){
   if(p.to) row('to', idCell(p.to));
   if(p.pktid!=null) row('pktid', `<span class="mono">${esc(p.pktid)}</span>`);
   if(p.chan) row('chan', `<span class="mono">${esc(p.chan)}</span>`);
-  if(p.hops!=null) row('hops taken', p.hops + (p.hop_start!=null?` of ${p.hop_start}`:''));
+  // Two simple fields, matching the column:
+  //   max hops:   the TTL the sender set (hop_start in the packet)
+  //   hops taken: how many relays the packet actually went through to reach
+  //               us.  For a grouped row this is _maxhop — the highest
+  //               relay count we observed for this packet — which is also
+  //               what the "↻ N" column displays.
+  if(p.hop_start != null) row('max hops', p.hop_start);
+  const hopsTaken = (p._maxhop != null) ? p._maxhop : p.hops;
+  if(hopsTaken != null) row('hops taken', hopsTaken);
 
   // RF / PHY
   if(p.sf!=null) row('SF / BW', `SF${p.sf}/BW${(p.bw||0)/1000}k`+(p.cr!=null?` · CR 4/${4+p.cr}`:''));
@@ -477,45 +485,51 @@ function pktDetail(p){
     row('also matched', `<div style="margin-top:4px">${alts}</div>`);
   }
 
-  // Decryption status
-  if(p.decrypted===true) row('decrypted', '<span class="tag dec">yes</span>');
-  else if(p.decrypted===false) row('decrypted', '<span class="tag enc">no</span>');
-
-  // RAW + RAW ASCII — always show whatever bytes we have, regardless of which
-  // parser (if any) claimed the packet.  Lets the user verify the decoder
-  // output independent of protocol labeling.  For decoded transmissions
-  // (e.g. Meshtastic AES-CTR), ALSO show the post-decode bytes so the user
-  // can compare on-the-wire vs decrypted.
+  // Decryption status.  When decrypted=yes, also surface the actual decrypted
+  // bytes here next to the status tag so the user can confirm WHAT was decrypted
+  // without scrolling down to the byte-grid panel.  The full 16-byte-row view
+  // still lives in the right panel; this is a compact preview adjacent to the
+  // status.
   const rawHex = p.raw_hex || p.enc_hex || '';
   const decHex = p.decrypted_hex || p.payload_hex || '';
-  const truncAscii = a => a.length > 80 ? a.slice(0, 80) + '…' : a;
-  const truncHex   = h => {
-    const grouped = h.match(/.{1,2}/g) || [];
-    return grouped.length > 80 ? grouped.slice(0, 80).join(' ') + ' …' : grouped.join(' ');
-  };
-  if(rawHex){
-    row('RAW (hex)', `<span class="mono">${esc(truncHex(rawHex))}</span> <span class="muted" style="font-size:11px">(${rawHex.length/2} bytes)</span>`);
-    row('RAW ASCII', `<span class="mono">${esc(truncAscii(asciiOf(rawHex)))}</span>`);
-  } else {
-    row('RAW', '<span class="muted">(no raw bytes captured)</span>');
-  }
-  if(decHex){
-    row('post-decode (hex)', `<span class="mono">${esc(truncHex(decHex))}</span> <span class="muted" style="font-size:11px">(${decHex.length/2} bytes)</span>`);
-    row('post-decode ASCII', `<span class="mono">${esc(truncAscii(asciiOf(decHex)))}</span>`);
+  if(p.decrypted===true){
+    let extra='';
+    // Prefer the decoded text payload (Meshtastic TEXT_MESSAGE_APP etc); if no
+    // textual payload, show a hex+ASCII preview of the decrypted bytes.
+    if(p.text){
+      extra = `<div style="margin-top:3px;padding:4px 8px;background:rgba(55,214,122,.08);border-left:2px solid var(--ok,#37d67a);border-radius:3px"><span class="muted" style="font-size:11px">text:</span> ${esc(p.text)}</div>`;
+    } else if(decHex){
+      const previewBytes = decHex.length > 96 ? decHex.slice(0, 96) + '…' : decHex;
+      const previewAscii = (() => { const a = asciiOf(decHex); return a.length > 48 ? a.slice(0, 48) + '…' : a; })();
+      extra = `<div style="margin-top:3px;padding:4px 8px;background:rgba(55,214,122,.08);border-left:2px solid var(--ok,#37d67a);border-radius:3px;font-size:11px">`
+            + `<div><span class="muted">hex:</span> <span class="mono">${esc(previewBytes)}</span></div>`
+            + `<div><span class="muted">ascii:</span> <span class="mono">${esc(previewAscii)}</span></div>`
+            + `<div class="muted" style="font-size:10px;margin-top:2px">(full grid in right panel)</div></div>`;
+    }
+    row('decrypted', '<span class="tag dec">yes</span>' + extra);
+  } else if(p.decrypted===false){
+    row('decrypted', '<span class="tag enc">no</span>');
   }
 
-  // Full byte-grid views at the bottom — RAW always, post-decode when present.
+  // Full byte-grid views in the right panel — RAW always, decrypted when
+  // present.  The left panel used to mirror these as truncated single-line
+  // rows ("RAW (hex)", "RAW ASCII", "post-decode (hex)", "post-decode ASCII")
+  // which duplicated the same info shown more legibly in the grid here, so
+  // those redundant rows were removed.
   let bytes='';
   if(rawHex){
     bytes += `<h4 style="margin-top:10px">RAW bytes (${rawHex.length/2})</h4>`
           + `<div class="mono" style="white-space:pre-wrap;background:rgba(0,0,0,.25);padding:6px 8px;border-radius:4px;font-size:.85em">${esc(fmtHex(rawHex))}</div>`
           + `<h4 style="margin-top:8px">RAW ASCII</h4>`
           + `<div class="mono" style="background:rgba(0,0,0,.25);padding:6px 8px;border-radius:4px;font-size:.9em">${esc(asciiOf(rawHex))}</div>`;
+  } else {
+    bytes += `<div class="muted">(no raw bytes captured)</div>`;
   }
   if(decHex){
-    bytes += `<h4 style="margin-top:10px">Post-decode bytes (${decHex.length/2})</h4>`
+    const decLabel = p.decrypted ? 'Decrypted' : 'Post-decode';
+    bytes += `<h4 style="margin-top:10px">${decLabel} bytes (${decHex.length/2})</h4>`
           + `<div class="mono" style="white-space:pre-wrap;background:rgba(0,0,0,.25);padding:6px 8px;border-radius:4px;font-size:.85em">${esc(fmtHex(decHex))}</div>`
-          + `<h4 style="margin-top:8px">Post-decode ASCII</h4>`
+          + `<h4 style="margin-top:8px">${decLabel} ASCII</h4>`
           + `<div class="mono" style="background:rgba(0,0,0,.25);padding:6px 8px;border-radius:4px;font-size:.9em">${esc(asciiOf(decHex))}</div>`;
   }
   return `<div class="pktdetailbox"><div>${rows.join('')}</div><div>${bytes}</div></div>`;
