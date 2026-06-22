@@ -2636,6 +2636,19 @@ def api_stop():
 def api_clear():
     with STATE_LOCK:
         PACKETS.clear(); SEEN.clear(); NODES.clear(); EDGES.clear()
+        # Also wipe the in-memory session-display dictionaries that the
+        # original /api/clear missed.  The GUI button reads "Clear all
+        # captured packets (also clears the saved log)" — user expectation
+        # is a clean slate, but mystery_devices kept showing entries from
+        # before the clear because UNKNOWN_FP and PENDING_ENC were never
+        # touched.  Both are pure session-display state; they get rebuilt
+        # from incoming packets.  Persisted ACCUMULATED knowledge
+        # (DEVICE_CLUSTERS, MC pubkey registry, KNOWN_MESH, NODE_PROFILES,
+        # LW_DEVICES) stays — that's cross-session learning, not session
+        # display, same rationale as the existing MC ADVERT registry note.
+        UNKNOWN_FP.clear()
+        PENDING_ENC.clear()
+        _FP_CANDIDATES.clear()
     # also truncate the persistent logs so cleared data doesn't reload on
     # restart (the tailer detects the shrink and resets its read position).
     # DOES NOT truncate the cross-worker MeshCore ADVERT pubkey registry —
