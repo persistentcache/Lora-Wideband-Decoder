@@ -655,7 +655,10 @@ function renderPkts(){
     const detail=op?`<tr class="detail"><td colspan="10">${pktDetail(p)}</td></tr>`:'';
     return main+detail;}).join('');
   const el=$('#pktbody');
-  el.innerHTML=`<table><thead>${thead(cols,'pkts')}</thead><tbody>${body||'<tr><td colspan=10 class=empty>no packets yet — press Start</td></tr>'}</tbody></table>`;
+  // Empty-state hint adapts to pipeline state: don't tell the user to press
+  // Start if the pipeline is already running.
+  const emptyMsg = PIPE_RUNNING ? 'no packets yet' : 'no packets yet — press Start';
+  el.innerHTML=`<table><thead>${thead(cols,'pkts')}</thead><tbody>${body||`<tr><td colspan=10 class=empty>${emptyMsg}</td></tr>`}</tbody></table>`;
   wireSort(el,'pkts',renderPkts);
   wireRetryMenu(el);
   // Click any packet row to expand/collapse its detail panel.  Skip clicks on
@@ -1569,7 +1572,8 @@ function renderAlertPanel(){const p=$('#alertpanel');if(!p)return;
 function postAlert(id,patch){fetch('/api/alerts/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(r=>r.json()).then(res=>{if(res.alerts)ALERTS=res.alerts;});}
 
 function renderCurrent(){ if(TAB==='pkts')renderPkts(); else if(TAB==='nodes')renderNodes(); else if(TAB==='net')startNet(); else if(TAB==='wf')renderWaterfall(); else if(TAB==='map')renderMap(); else if(TAB==='search')renderSearch(); else if(TAB==='stats')renderStatsTab(); else if(TAB==='config')renderConfig(); }
-function renderStats(s){$('#s_pkts').textContent=s.packets;$('#s_dec').textContent=s.decoded;$('#s_enc').textContent=s.encrypted;$('#s_nodes').textContent=s.nodes;$('#pipedot').className='dot '+(s.pipeline_running?'on':'off');$('#pipetxt').textContent=s.pipeline_running?'running':'stopped';$('#btnStart').style.display=s.pipeline_running?'none':'';$('#btnStop').style.display=s.pipeline_running?'':'none';}
+let PIPE_RUNNING=false;
+function renderStats(s){PIPE_RUNNING=!!s.pipeline_running;$('#s_pkts').textContent=s.packets;$('#s_dec').textContent=s.decoded;$('#s_enc').textContent=s.encrypted;$('#s_nodes').textContent=s.nodes;$('#pipedot').className='dot '+(s.pipeline_running?'on':'off');$('#pipetxt').textContent=s.pipeline_running?'running':'stopped';$('#btnStart').style.display=s.pipeline_running?'none':'';$('#btnStop').style.display=s.pipeline_running?'':'none';}
 
 const TABS=['pkts','nodes','net','wf','map','search','stats','config'];
 function activateTab(name){
