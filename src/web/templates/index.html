@@ -1621,7 +1621,7 @@ fetch('/api/nodes/meta').then(r=>r.json()).then(m=>{NODEMETA=m||{}; if(TAB!=='ne
 {const b=$('#bell'); if(b)b.onclick=toggleAlertPanel;}
 if(!STATIC){
   const es=new EventSource('/api/stream');
-  es.addEventListener('packet',e=>{const p=JSON.parse(e.data);evalAlerts(p);PK.push(p);noteName(p); if(TAB==='pkts'&&!$('#follow').checked)return; if(TAB!=='net'&&TAB!=='config')renderCurrent();});
+  es.addEventListener('packet',e=>{const p=JSON.parse(e.data);evalAlerts(p);PK.push(p);noteName(p); if(TAB!=='net'&&TAB!=='config')renderCurrent();});
   es.addEventListener('update',e=>{const p=JSON.parse(e.data);evalAlerts(p);const i=PK.findIndex(x=>x.pktid===p.pktid&&x.hops===p.hops); if(i>=0)PK[i]=p; else PK.push(p); noteName(p); if(TAB!=='net'&&TAB!=='config')renderCurrent();});
   es.addEventListener('confirm',e=>{const d=JSON.parse(e.data); if(d&&d.devaddr){let ch=false; for(const p of PK){if(p.devaddr===d.devaddr&&p.proto==='unknown'){p.proto='lorawan';p.confidence='confirmed';p.from='LW:'+d.devaddr;delete p.hint;ch=true;}} if(ch&&TAB!=='net'&&TAB!=='config')renderCurrent();}});
   es.addEventListener('stats',e=>renderStats(JSON.parse(e.data)));
