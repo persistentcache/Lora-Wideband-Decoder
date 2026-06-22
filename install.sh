@@ -79,11 +79,18 @@ sudo apt-get install -y python3 python3-pip python3-dev build-essential libusb-1
 #   * libiio/libad9361 so a from-source SoapyPlutoSDR build works later.
 # NOTE: SoapyPlutoSDR (ADALM-Pluto) and SoapyAirspyHF are NOT packaged in
 # Debian/Ubuntu — for those, build the Soapy module from source.
-# Most SDR tools live in the 'universe' component.  Make sure it's enabled —
-# without it `apt-cache show bladerf` returns nothing and every device package
-# below will skip.  Idempotent: if universe is already in sources.list this is
-# a no-op.
-if ! grep -qhE '(^|[[:space:]])universe([[:space:]]|$)' \
+# 'universe' is an UBUNTU component (not present on Debian / Raspberry Pi OS,
+# where SDR packages live in main).  Only try to enable it on Ubuntu-family
+# distros — guarding by /etc/os-release prevents the script from calling
+# `add-apt-repository universe` on Debian, where the tool isn't installed by
+# default and the component doesn't exist anyway (set -e otherwise bails the
+# whole install on a non-issue).  Tested: Pi 4 / Raspberry Pi OS bookworm/trixie
+# now finish the install; behaviour on Ubuntu 22.04 unchanged.
+_is_ubuntu_family=false
+if [ -r /etc/os-release ] && grep -qE '^ID(_LIKE)?=.*\bubuntu\b' /etc/os-release; then
+    _is_ubuntu_family=true
+fi
+if $_is_ubuntu_family && ! grep -qhE '(^|[[:space:]])universe([[:space:]]|$)' \
         /etc/apt/sources.list /etc/apt/sources.list.d/*.list \
         /etc/apt/sources.list.d/*.sources 2>/dev/null; then
     echo "==> Enabling 'universe' apt component (needed for SDR packages) ..."
