@@ -912,6 +912,7 @@ def decode_position(data):
     fields = parse_protobuf(data)
     lat, lon, alt = None, None, None
     speed, track, sats, ts = None, None, None, None
+    precision_bits = None
     for fn, wt, val in fields:
         if fn == 1 and wt == 5:   # latitude_i (sfixed32)
             lat = struct.unpack('<i', struct.pack('<I', val & 0xFFFFFFFF))[0] * 1e-7
@@ -927,6 +928,15 @@ def decode_position(data):
             track = int(val) * 1e-5
         elif fn == 17 and wt == 5: # gps_timestamp (unix epoch, fixed32)
             ts = val
+        elif fn == 23 and wt == 0: # precision_bits (Meshtastic position privacy)
+            # 0-32: how many high bits of latitude_i / longitude_i the sender
+            # PRESERVED — the lower (32 - precision_bits) bits are zeroed by the
+            # firmware before transmit so a receiver only knows the position to
+            # a bounded uncertainty box.  32 = full precision, 0 = no privacy
+            # field present.  Clamp to the protocol's documented [0, 32] range.
+            pv = int(val)
+            if 0 <= pv <= 32:
+                precision_bits = pv
     if lat is not None and lon is not None:
         s = "    Position: %.6f, %.6f" % (lat, lon)
         if alt is not None: s += " alt=%dm" % alt
@@ -934,9 +944,25 @@ def decode_position(data):
         if track is not None: s += " heading=%.1f°" % track
         if sats is not None: s += " sats=%d" % sats
         if ts: s += " gps_time=%d" % ts
+        if precision_bits is not None: s += " prec=%dbit" % precision_bits
         print(s)
-        return {'lat': round(lat, 6), 'lon': round(lon, 6),
-                **({'alt': alt} if alt is not None else {})}
+        out = {'lat': round(lat, 6), 'lon': round(lon, 6)}
+        if alt is not None: out['alt'] = alt
+        if precision_bits is not None:
+            # Convert precision_bits to an uncertainty radius in METERS so
+            # the GUI doesn't need to know the formula.  Each unit of
+            # latitude_i = 1e-7 degrees; precision_bits=N zeroes the low
+            # (32-N) bits, so the box side at the equator (worst-case for
+            # longitude; latitude is uniform) is 2^(32-N) * 1e-7 degrees.
+            # One degree of latitude ~ 111320 m, so radius ~ side/2 m.
+            # Examples: 32 bits ~ 0.006 m (negligible), 24 ~ 1.4 m,
+            # 16 ~ 365 m, 13 ~ 3 km, 10 ~ 23 km.  Above 28-30 the radius
+            # is sub-meter and not worth drawing.
+            out['pos_precision_bits'] = precision_bits
+            if precision_bits < 30:
+                radius_m = (1 << (32 - precision_bits)) * 1e-7 * 111320.0 / 2.0
+                out['pos_uncertainty_m'] = int(round(radius_m))
+        return out
     return None
 
 
