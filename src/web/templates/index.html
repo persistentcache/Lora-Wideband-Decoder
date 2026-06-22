@@ -411,6 +411,26 @@ function pktDetail(p){
     if(p.want_ack) row('flags', '<span class="pill">want_ack</span>');
     if(p.via_mqtt) row('via', '<span class="pill" style="color:#c77dff">MQTT gateway</span>');
     if(p.text) row('text', esc(p.text));
+    // Decoded payload — the same parsed fields the message column shows, broken
+    // out as their own rows so position accuracy / telemetry values are visible
+    // in the detail panel instead of only raw hex.
+    if(p.lat!=null){
+      row('location', `📍 ${p.lat}, ${p.lon}`+(p.alt!=null?` · ${p.alt} m`:''));
+      if(p.pos_uncertainty_m!=null) row('accuracy', `±${p.pos_uncertainty_m} m`+(p.pos_precision_bits!=null?` · ${p.pos_precision_bits}-bit precision`:''));
+      else if(p.pos_precision_bits!=null) row('accuracy', `${p.pos_precision_bits}-bit (full precision)`);
+    }
+    if(p.port_name==='TELEMETRY_APP'){
+      const t=[];
+      if(p.battery!=null)t.push(`🔋 ${p.battery}%`);
+      if(p.voltage!=null)t.push(`${p.voltage} V`);
+      if(p.chutil!=null)t.push(`ch util ${p.chutil}%`);
+      if(p.airutil!=null)t.push(`air TX ${p.airutil}%`);
+      if(t.length) row('telemetry', t.join(' · '));
+    }
+    if(p.port_name==='NODEINFO_APP'){
+      const ni=[p.node_long||p.node_short,p.hw,p.role].filter(Boolean).map(esc).join(' · ');
+      if(ni) row('node', ni);
+    }
     if(p.routing) row('routing', esc(p.routing));
   } else if(pr==='lorawan'){
     if(p.msg_type) row('msg type', esc(p.msg_type));
@@ -491,10 +511,17 @@ function pktDetail(p){
   const decHex = p.decrypted_hex || p.payload_hex || '';
   if(p.decrypted===true){
     let extra='';
-    // Prefer the decoded text payload (Meshtastic TEXT_MESSAGE_APP etc); if no
-    // textual payload, show a hex+ASCII preview of the decrypted bytes.
+    // Prefer the decoded text payload (Meshtastic TEXT_MESSAGE_APP etc).  If
+    // there's no text but the payload parsed into structured fields (position,
+    // telemetry, nodeinfo, …), show the same human-readable summary as the
+    // message column instead of raw bytes.  Only fall back to a hex+ASCII
+    // preview when nothing was parsed.
+    const mSum = pr==='meshtastic' ? meshSummary(p) : '';
+    const mMeaningful = mSum && !/^<span class="muted"/.test(mSum);
     if(p.text){
       extra = `<div style="margin-top:3px;padding:4px 8px;background:rgba(55,214,122,.08);border-left:2px solid var(--ok,#37d67a);border-radius:3px"><span class="muted" style="font-size:11px">text:</span> ${esc(p.text)}</div>`;
+    } else if(mMeaningful){
+      extra = `<div style="margin-top:3px;padding:4px 8px;background:rgba(55,214,122,.08);border-left:2px solid var(--ok,#37d67a);border-radius:3px">${mSum}</div>`;
     } else if(decHex){
       const previewBytes = decHex.length > 96 ? decHex.slice(0, 96) + '…' : decHex;
       const previewAscii = (() => { const a = asciiOf(decHex); return a.length > 48 ? a.slice(0, 48) + '…' : a; })();
@@ -638,10 +665,14 @@ function renderPkts(){
     // packet record.  Add the relay icon when hops>0 so the user can
     // quickly tell at a glance whether this row is the direct receive
     // (hops=0) or a relay rebroadcast (hops>=1).
-    const hopcell = p.hops==null ? ''
-      : p.hops > 0
-        ? `<span class="pill" title="this reception travelled through ${p.hops} relay hop${p.hops===1?'':'s'}">↻ ${p.hops}</span>`
-        : `<span title="received direct from sender (no relay)">0</span>`;
+    // hops is absent for non-Meshtastic frames (e.g. MeshCore carries no hop
+    // count). Treat unknown as 0 so the column stays consistent whether or not
+    // "Merge relays" is on — merged mode already coerces null→0, so an
+    // unmerged row must not blank out the same reception.
+    const _h = p.hops==null ? 0 : p.hops;
+    const hopcell = _h > 0
+      ? `<span class="pill" title="this reception travelled through ${_h} relay hop${_h===1?'':'s'}">↻ ${_h}</span>`
+      : `<span title="received direct from sender (no relay)">0</span>`;
     const key=pktKey(p); const op=PK_OPEN.has(key);
     const cls=['pktrow', op?'open':'', ret?'encrow':''].filter(Boolean).join(' ');
     const main=`<tr class="${cls}" data-pkey="${esc(key)}" data-pktid="${esc(p.pktid)}" data-hops="${p.hops}"${hi?' style="background:rgba(255,93,93,.13);box-shadow:inset 3px 0 0 var(--warn)"':''}>
