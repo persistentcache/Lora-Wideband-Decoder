@@ -441,6 +441,13 @@ function pktDetail(p){
     if(p.mc_route) row('route type', esc(p.mc_route));
     if(p.mc_type) row('payload type', esc(p.mc_type));
     if(p.mc_known_hops) row('via known hops', p.mc_known_hops);
+    // ADVERT (0x04) — Ed25519-signed node identity, carried in the clear.
+    // Surface the plaintext name / role / location / pubkey the decoder
+    // extracts (these frames are signed, not encrypted, so it's all readable).
+    if(p.mc_name) row('node name', esc(p.mc_name));
+    if(p.mc_role) row('role', esc(p.mc_role));
+    if(p.mc_type==='ADVERT' && p.lat!=null) row('location', `📍 ${p.lat}, ${p.lon}`);
+    if(p.mc_pubkey) row('public key', `<span class="mono" style="font-size:11px;word-break:break-all">${esc(p.mc_pubkey)}</span>`);
     // TRACE (0x09)
     if(p.mc_trace_tag) row('trace tag', `<span class="mono">${esc(p.mc_trace_tag)}</span>`);
     if(p.mc_trace_path && p.mc_trace_path.length){
