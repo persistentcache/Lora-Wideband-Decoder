@@ -1639,7 +1639,17 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
 
             # Narrowband extraction depends only on bw (not the plateau
             # position), so compute it ONCE per hit lag instead of per plateau.
-            nb, _nbfs = extract_narrowband_fft(iq_1m, 1_000_000, 0.0, bw)
+            # Pass `_ffc` so the 1Msps forward FFT computed by an earlier
+            # `_resolve_sf_bw_ambig` / `_resolve_sf_bw_global` call (or by a
+            # prior hit_lag iteration) is REUSED here.  Each fresh FFT of
+            # a 1Msps signal is 8-25 ms; on a peak with 2+ hit_lags this
+            # reuse cuts the per-call cost from ~14 ms (cold) to ~3 ms
+            # (cached) at bw=125k.  Profiling on 2026-06-21 measured
+            # nb_extract at ~130 ms / peak after the v2.2 sc_curve fix —
+            # the dominant cost was these redundant forward FFTs across
+            # the hit_lags loop.
+            nb, _nbfs = extract_narrowband_fft(iq_1m, 1_000_000, 0.0, bw,
+                                                fft_cache=_ffc)
 
             for sc_score, _pos in _positions:
                 # Merge the SAME packet re-found at another lag (≈20 ms time
