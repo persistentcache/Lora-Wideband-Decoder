@@ -714,16 +714,25 @@ def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
     lo = center_bin - half
     hi = lo + n_out
 
-    # Handle edge cases
-    cropped = np.zeros(n_out, dtype=np.complex128)
+    # Handle edge cases.  cropped used to be complex128, which forced an
+    # upcast from F (complex64) on the slice assignment and then a
+    # complex128 IFFT (~2x slower than complex64) and a final downcast
+    # back to complex64.  All three were pure waste — F is already
+    # complex64, and the downstream pipeline only needs complex64
+    # precision.  Staying in complex64 throughout halves IFFT cost and
+    # eliminates two array conversions.
+    cropped = np.zeros(n_out, dtype=np.complex64)
     src_lo = max(0, lo)
     src_hi = min(N, hi)
     dst_lo = src_lo - lo
     dst_hi = dst_lo + (src_hi - src_lo)
     cropped[dst_lo:dst_hi] = F[src_lo:src_hi]
 
-    # IFFT back to time domain — signal is now centered at DC
-    result = _ifft(np.fft.ifftshift(cropped)).astype(np.complex64)
+    # IFFT back to time domain — signal is now centered at DC.
+    # _ifft preserves complex64 dtype when given complex64 input.
+    result = _ifft(np.fft.ifftshift(cropped))
+    if result.dtype != np.complex64:
+        result = result.astype(np.complex64)
 
     # Scale to preserve amplitude (fewer bins → need to scale)
     result *= (n_out / N)
@@ -734,14 +743,35 @@ def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
 
 # ---- Dechirp ----
 
+# Downchirp template cache.  generate_downchirp(sf, bw, fs) is deterministic
+# in its three integer args, and gets called repeatedly with the same
+# arguments — e.g. dechirp_peak_quality regenerates the template every
+# invocation, and the resolver iterates several (sf, bw) candidates per
+# hit_lag.  Profile measurements (2026-06-22): SF7 = 6.5us per call,
+# SF12 = 118us per call; with ~25 calls per peak the SF12 case alone
+# costs ~3 ms / peak before this cache.  Pure memoization, bit-identical
+# output — output arrays are read-only views from the cache so callers
+# can't mutate the cached template (e.g. an in-place multiply elsewhere
+# would corrupt every later use).
+_DOWNCHIRP_CACHE = {}
+
+
 def generate_downchirp(sf, bw, fs):
+    """Module-level cached.  See _DOWNCHIRP_CACHE comment above."""
+    key = (int(sf), int(bw), int(fs))
+    cached = _DOWNCHIRP_CACHE.get(key)
+    if cached is not None:
+        return cached
     N = 2 ** sf
     osf = int(round(fs / bw))
     sps = N * osf
     t = np.arange(sps, dtype=np.float64) / fs
     Ts = N / bw
     phase = 2.0 * np.pi * (-bw / 2.0 * t + bw / (2.0 * Ts) * t * t)
-    return np.exp(-1j * phase).astype(np.complex64)
+    dc = np.exp(-1j * phase).astype(np.complex64)
+    dc.setflags(write=False)   # immutable view — callers MUST NOT mutate
+    _DOWNCHIRP_CACHE[key] = dc
+    return dc
 
 
 def _hybrid_sc_locate_window(iq, fs, sf, bw, top_k=1):
