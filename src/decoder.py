@@ -5931,7 +5931,31 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 pre_last_i_cand = int(run[-1][0] - run[0][0])
                 pre_len_cand = run_len
 
+            # Locate the SFD robustly.  The classic anchor is pre_last_i+3 (preamble
+            # end + 2 sync symbols), but that assumes the preamble-RUN length was
+            # counted exactly — which fails for MeshCore's long 32-symbol preamble:
+            # the run either caps at the rescan limit (over-count) or breaks early
+            # on bin drift (under-count), putting the fixed offset inside the
+            # preamble so the SFD is never seen.  Preamble/sync/data are all
+            # up-chirps (energy under the down-chirp ref); only the SFD's 2 down-
+            # chirps are down-chirp-dominant (energy under the up-chirp ref).  So
+            # scan forward from the run end for the first pair of down-chirp-
+            # dominant symbols and anchor the SFD there; fall back to +3 if none.
             sfd_i_cand = pre_last_i_cand + 3
+            for _ci in range(pre_last_i_cand + 1, pre_last_i_cand + 1 + 38):
+                _p0 = preamble_start_cand + _ci * N
+                if _p0 < 0 or _p0 + 2 * N > len(iq1):
+                    break
+                _pair = 0
+                for _s in range(2):
+                    _sg = iq1[_p0 + _s * N:_p0 + (_s + 1) * N]
+                    _de = float(np.max(np.abs(_fft(_sg * upchirp)))) ** 2
+                    _ue = float(np.max(np.abs(_fft(_sg * downchirp)))) ** 2
+                    if _de > _ue * 0.5:
+                        _pair += 1
+                if _pair == 2:
+                    sfd_i_cand = _ci
+                    break
             sfd_ok_cand = 0
             sfd_metric = 0.0
             sfd_cfo_bins_cand = []
@@ -6171,6 +6195,28 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
     # After correction, preamble bin ≈ 0, so no bin subtraction needed
     cfo_shift = 0
+
+    # ---- Re-anchor pre_last_i from the SFD (robust to preamble-length miscount)
+    # MeshCore uses a 32-symbol preamble (Meshtastic ~16); the preamble-run length
+    # is therefore unreliable (capped by the rescan, or broken early by bin drift),
+    # and BOTH data_start (below) and the SFD check derive from pre_last_i.  The
+    # SFD's 2 down-chirps are down-chirp-dominant (peak energy under the UP-chirp
+    # reference) whereas preamble/sync/data are all up-chirps, so scan forward for
+    # the first such pair and set pre_last_i = sfd_pos - 3 (preamble end + 2 sync).
+    for _ci in range(max(0, pre_last_i - 2), pre_last_i + 40):
+        _p0 = preamble_start + _ci * N
+        if _p0 < 0 or _p0 + 2 * N > len(iq1):
+            break
+        _pair = 0
+        for _s in range(2):
+            _sg = iq1[_p0 + _s * N:_p0 + (_s + 1) * N]
+            if (float(np.max(np.abs(_fft(_sg * upchirp)))) ** 2
+                    > float(np.max(np.abs(_fft(_sg * downchirp)))) ** 2 * 0.5):
+                _pair += 1
+        if _pair == 2:
+            if _ci - 3 >= 0:
+                pre_last_i = _ci - 3
+            break
 
     # ---- Deterministic data_start (matching analysis script) ----
     # LoRa packet structure after last preamble symbol:
