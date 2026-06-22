@@ -2584,6 +2584,8 @@ def parse_meshcore_packet(payload):
     _parts = []
     if rec.get('mc_name'):
         _parts.append(rec['mc_name'] + ((' (%s)' % rec['mc_role']) if rec.get('mc_role') else ''))
+    if rec.get('lat') is not None:   # ADVERT with a published location → show it inline
+        _parts.append('\U0001F4CD %s, %s' % (rec['lat'], rec['lon']))
     if rec.get('mc_hops'):
         _parts.append('%d hops' % rec['mc_hops'])
     rec['summary'] = ' · '.join(_parts)
