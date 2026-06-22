@@ -117,7 +117,7 @@
       <span class="chip" data-f="ebyte_lora" style="border-color:var(--acc)">EByte LoRa</span>
       <span class="chip" data-f="radiohead" style="border-color:var(--acc)">RadioHead</span>
       <span class="chip" data-f="unknown" style="border-color:var(--warn)">unknown</span>
-      <label><input type="checkbox" id="follow" checked> follow live</label>
+      <label title="Combine all receptions of the same Meshtastic message (heard direct + heard via 1+ relays) into one row.  When on, the row shows the highest hop count observed for that pktid; when off, every reception is its own row."><input type="checkbox" id="mergeRelays"> Merge relays</label>
       <span class="muted" id="shown"></span>
     </div>
     <div id="mysterybox" style="display:none;margin:8px 0;padding:8px 12px;background:rgba(255,176,32,.06);border:1px solid rgba(255,176,32,.25);border-radius:6px">
@@ -393,13 +393,10 @@ function pktDetail(p){
   if(p.chan) row('chan', `<span class="mono">${esc(p.chan)}</span>`);
   // Two simple fields, matching the column:
   //   max hops:   the TTL the sender set (hop_start in the packet)
-  //   hops taken: how many relays the packet actually went through to reach
-  //               us.  For a grouped row this is _maxhop — the highest
-  //               relay count we observed for this packet — which is also
-  //               what the "↻ N" column displays.
+  //   hops taken: how many relays this reception travelled through.
+  // Each reception is its own row, so this is just p.hops directly.
   if(p.hop_start != null) row('max hops', p.hop_start);
-  const hopsTaken = (p._maxhop != null) ? p._maxhop : p.hops;
-  if(hopsTaken != null) row('hops taken', hopsTaken);
+  if(p.hops != null) row('hops taken', p.hops);
 
   // RF / PHY
   if(p.sf!=null) row('SF / BW', `SF${p.sf}/BW${(p.bw||0)/1000}k`+(p.cr!=null?` · CR 4/${4+p.cr}`:''));
@@ -606,24 +603,45 @@ setInterval(refreshMystery, 4000); refreshMystery();
 function renderPkts(){
   const cols=[{k:'ts',t:'time'},{k:'freq_mhz',t:'freq'},{k:'from',t:'from'},{k:'to',t:'to'},{k:'hops',t:'hops'},
               {k:'chan',t:'chan'},{k:'port_name',t:'type'},{k:'rssi',t:'rssi'},{k:'decrypted',t:'state'},{k:'text',t:'message / payload'}];
-  // Conjoin a message's hop copies (same pktid received at hop0, hop1, …) into ONE
-  // row.  Representative = the best reception (decoded first, then fewest hops);
-  // `_maxhop` records how far it was relayed.  Non-Meshtastic frames (no pktid)
-  // stay as individual rows.
-  const groups=new Map(); let _gi=0;
-  for(const p of PK.filter(matchFilter)){
-    const key=(proto(p)==='meshtastic'&&p.pktid!=null)?('m|'+p.pktid):('x'+(_gi++));
-    const g=groups.get(key);
-    if(!g){groups.set(key,{rep:p,maxhop:(p.hops||0)});}
-    else{g.maxhop=Math.max(g.maxhop,p.hops||0);
-      const better=((p.decrypted?1:0)-(g.rep.decrypted?1:0))||((g.rep.hops??99)-(p.hops??99));
-      if(better>0)g.rep=p;}
+  // Reception display: by default each reception is its own row, so a
+  // Meshtastic message heard direct (hops=0) AND via a relay (hops=1)
+  // produces two rows.  The "Merge relays" toggle in the toolbar collapses
+  // all receptions of the same Meshtastic pktid into ONE row whose hop
+  // count is the HIGHEST observed (i.e. how far the packet propagated),
+  // for users who prefer one row per logical message.  Non-Meshtastic
+  // frames (no pktid) never merge.
+  const mergeRelays = $('#mergeRelays') && $('#mergeRelays').checked;
+  let reps;
+  if(mergeRelays){
+    const groups=new Map(); let _gi=0;
+    for(const p of PK.filter(matchFilter)){
+      const key=(proto(p)==='meshtastic'&&p.pktid!=null)?('m|'+p.pktid):('x'+(_gi++));
+      const g=groups.get(key);
+      if(!g){groups.set(key,{rep:p,maxhop:(p.hops||0)});}
+      else{
+        // Keep the rep with the HIGHEST hops (the deepest-relayed reception),
+        // since that's what the column shows in merged mode.  Prefer
+        // decrypted if both are equally hopped.
+        g.maxhop=Math.max(g.maxhop,p.hops||0);
+        const better=((p.decrypted?1:0)-(g.rep.decrypted?1:0))||((p.hops??-1)-(g.rep.hops??-1));
+        if(better>0)g.rep=p;
+      }
+    }
+    reps=[...groups.values()].map(g=>({...g.rep, hops:g.maxhop}));
+  } else {
+    reps = PK.filter(matchFilter).slice();
   }
-  let reps=[...groups.values()].map(g=>({...g.rep,_maxhop:g.maxhop}));
   reps=sortRows(reps,SORT.pkts.k,SORT.pkts.dir);
   $('#shown').textContent=reps.length+' shown / '+PK.length+' packets';
   const body=reps.slice(0,3000).map(p=>{const ret=!p.decrypted&&p.enc_hex; const wm=NODEMETA[p.from]; const hi=wm&&wm.watch&&wm.watch_mode!=='alert';
-    const hopcell=p._maxhop>0?`<span class="pill" title="received via up to ${p._maxhop} relay hop${p._maxhop===1?'':'s'}">↻ ${p._maxhop}</span>`:(p.hops??'');
+    // Each row = one reception.  Show its hop count straight from the
+    // packet record.  Add the relay icon when hops>0 so the user can
+    // quickly tell at a glance whether this row is the direct receive
+    // (hops=0) or a relay rebroadcast (hops>=1).
+    const hopcell = p.hops==null ? ''
+      : p.hops > 0
+        ? `<span class="pill" title="this reception travelled through ${p.hops} relay hop${p.hops===1?'':'s'}">↻ ${p.hops}</span>`
+        : `<span title="received direct from sender (no relay)">0</span>`;
     const key=pktKey(p); const op=PK_OPEN.has(key);
     const cls=['pktrow', op?'open':'', ret?'encrow':''].filter(Boolean).join(' ');
     const main=`<tr class="${cls}" data-pkey="${esc(key)}" data-pktid="${esc(p.pktid)}" data-hops="${p.hops}"${hi?' style="background:rgba(255,93,93,.13);box-shadow:inset 3px 0 0 var(--warn)"':''}>
@@ -1563,6 +1581,9 @@ function activateTab(name){
 }
 document.querySelectorAll('nav a').forEach(a=>a.onclick=()=>activateTab(a.dataset.tab));
 $('#filter').oninput=e=>{FILTER=e.target.value.trim();renderPkts();};
+// Merge-relays toggle: when on, collapse multi-reception rows of the same
+// Meshtastic pktid into one row showing the HIGHEST observed hop count.
+$('#mergeRelays').onchange=()=>renderPkts();
 document.querySelectorAll('.chip[data-f]').forEach(c=>c.onclick=()=>{document.querySelectorAll('.chip[data-f]').forEach(x=>x.classList.remove('active'));c.classList.add('active');PFILT=c.dataset.f;renderPkts();});
 $('#btnStart').onclick=()=>fetch('/api/pipeline/start',{method:'POST'});
 $('#btnStop').onclick=()=>fetch('/api/pipeline/stop',{method:'POST'});
