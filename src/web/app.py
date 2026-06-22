@@ -1792,7 +1792,10 @@ def _build_pipeline_cmd():
     # RAM-safety cap: see _safe_buf_seconds for rationale.  No-op on hosts
     # with plenty of memory.
     _bufs = _safe_buf_seconds(rate, fmt, _bufs_requested)
-    gate = (f'python3 {shlex.quote(detector_py)} -r {rate} -b {bw} -c {r["center_mhz"]} '
+    # Use THIS server's interpreter for the gate (it already holds numpy/scipy),
+    # not a bare `python3` that PATH might resolve to a different env. run/web.py
+    # guarantees sys.executable has the full stack (re-execs if it didn't).
+    gate = (f'{shlex.quote(sys.executable)} {shlex.quote(detector_py)} -r {rate} -b {bw} -c {r["center_mhz"]} '
             f'-t {fmt} --threshold {_thresh} '
             f'--overlap {d["overlap"]} --energy-threshold {_eth} '
             f'--detect-workers {d["detect_workers"]} --buf-seconds {_bufs} '
