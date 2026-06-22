@@ -1501,7 +1501,18 @@ def _tail_health():
             with open(PIPELINE_LOG, 'r', errors='replace') as f:
                 f.seek(pos); lines = f.readlines(); pos = f.tell()
             changed = False
+            # When the pipeline is stopped, ignore any STAT lines that may
+            # still be flushed into the log between stop_pipeline()'s pkill
+            # and the detector process actually dying.  Without this gate,
+            # _tail_health re-populates HEALTH.msps / dec_q / pipe_ms after
+            # stop_pipeline() cleared them and the GUI shows live-looking
+            # values even though "pipeline_running" is false.  (Note: pos
+            # is still advanced so when the pipeline next starts we don't
+            # replay buffered pre-stop content.)
+            pipeline_live = PIPELINE.get('running', False)
             for ln in lines:
+                if not pipeline_live:
+                    continue
                 m = _RE_STAT.search(ln)
                 if m:
                     HEALTH.update(elapsed=float(m.group(1)), msps=float(m.group(2)),
