@@ -4579,7 +4579,15 @@ def process_file(fpath, relay_after=None, relay_before=None,
                 break
     if fs is None:
         fs = int(round(len(iq) / 2.0))
-    dec = fs // bw
+    # ROUND, not floor: the capture is an integer multiple of BW, but the
+    # filename rounds the rate to whole ksps, so non-round BWs land just under.
+    # 41.67 kHz @ 83.34 ksps writes "83ksps" → fs/bw = 1.99, and `fs // bw` floors
+    # it to 1 (claiming 1× when it's 2× oversampled) → samples/symbol halved →
+    # preamble/multi-SF resolve the wrong SF → "NO PREAMBLE", no decode (issue #4
+    # detection worked but decode did not).  round() gives 2, and rebuilding fs as
+    # bw*dec also recovers the 0.34 ksps the filename token dropped.
+    dec = int(round(fs / bw))
+    fs = bw * dec
 
     print("=== %s ===" % name)
     print("SF%d BW=%dk N=%d ppm=%d fs=%dk" % (sf, bw // 1000, N, ppm, fs // 1000))
