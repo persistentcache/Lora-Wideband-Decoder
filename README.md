@@ -4,23 +4,6 @@ A self-hosted, single-user intercept receiver for LoRa traffic on typical and no
 IQ from your SDR, demodulates and decodes in software near-real-time, surfaces
 everything in a local web UI.
 
-## I wanna use it!
-
-Debian / Ubuntu:
-
-```bash
-./install.sh
-python3 run/web.py          # opens http://127.0.0.1:5000
-```
-
-Open the URL it prints, configure your SDR in the Config tab, hit **Start** in the UI, and intercepted
-packets stream in live. The pipeline (SDR capture + detector + decoder)
-is launched from the web UI based on `lora.toml`.
-
-If your SDR is already plugged in and you've rebooted (or re-logged in)
-after the installer added you to `plugdev`, the UI's **Config →
-SDR/Radio → Detect** finds it automatically.
-
 ## What it does
 
 - Captures wideband IQ from any SoapySDR-compatible SDR or bladeRF.
@@ -42,6 +25,24 @@ SDR/Radio → Detect** finds it automatically.
 | RTL-SDR, Airspy, LimeSDR, PlutoSDR, … | SoapySDR | Varies — see device specs. |
 
 Named profiles + live capability probing live in `src/sdr_profiles.py`.
+
+## Simple Install
+
+Debian / Ubuntu:
+
+```bash
+./install.sh
+python3 run/web.py          # opens http://127.0.0.1:5000
+```
+
+Open the URL it prints, configure your SDR in the Config tab, hit **Start** in the UI, and intercepted
+packets stream in live. The pipeline (SDR capture + detector + decoder)
+is launched from the web UI based on `lora.toml`.
+
+If your SDR is already plugged in and you've rebooted (or re-logged in)
+after the installer added you to `plugdev`, the UI's **Config →
+SDR/Radio → Detect** finds it automatically.
+
 
 ## Building from source
 
