@@ -6140,10 +6140,12 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # no-op; at SF12 the payload is ~80 syms and cumulative drift can be 4+
     # bins, putting every payload symbol's FFT peak in the wrong bin.
     # SF/BW-agnostic.  Latency: one numpy multiply, negligible.
+    _drift_applied = False
     if abs(drift_bins_per_sym) > 1e-4:
         _n_drift = np.arange(len(iq1), dtype=np.float64) - preamble_start
         _drift_phase = -np.pi * drift_bins_per_sym * (_n_drift / N) ** 2
         iq1 = (iq1 * np.exp(1j * _drift_phase)).astype(np.complex64)
+        _drift_applied = True
 
     # Measure post-correction residual on preamble symbols.
     # The regression can be off by 0.1-0.2 bins, which causes ±1 bin errors
@@ -6784,6 +6786,26 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         crc_ok, crc_method = check_crc(raw_bytes, payload_len)
         _clean_crc = crc_ok
         print("  CRC: %s %s" % (crc_method, "OK" if crc_ok else ""))
+
+    # TRY-BOTH DRIFT: if the drift-corrected payload failed CRC, re-decode it once
+    # WITHOUT the drift correction.  Real drift -> the primary (drift on) passes,
+    # so this never runs.  A noise slope -> the drift injected tail error and the
+    # primary fails; removing it recovers the packet.  Same data_start/timing; the
+    # CRC arbitrates, so this can only ADD recoveries, never regress.
+    if ((not crc_ok) and _drift_applied and crc_present
+            and not __import__('os').environ.get('LORA_DRIFT_LEGACY')):
+        _save_iq = iq1
+        iq1 = (iq1 * np.exp(-1j * _drift_phase)).astype(np.complex64)
+        _rb2, _pl2, _si2, _nb2 = soft_decode_payload(0, 0.0, frac_tau=tau_frac)
+        _ok2 = False
+        if len(_rb2) >= payload_len + 2:
+            _ok2, _m2 = check_crc(_rb2, payload_len)
+        if _ok2:
+            raw_bytes, payload, pay_soft_info, decoded_nibs = _rb2, _pl2, _si2, _nb2
+            crc_ok, crc_method, _clean_crc = True, _m2, True
+            print("  CRC: %s OK (drift correction removed by try-both)" % _m2)
+        else:
+            iq1 = _save_iq   # keep drift version for the chase
 
     if _HARNESS_OUT:
         _margins = [float(s[3]) for s in pay_soft_info] if pay_soft_info else []
