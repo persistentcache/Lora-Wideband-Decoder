@@ -1178,6 +1178,7 @@ const ADV_DEFAULTS = {
   unknown: false,
   fingerprint: true,
   ldro_fallback: true,
+  iq_invert: false,
   wide_scan: false,
   tune: {threshold: 0.55, energy_threshold: 12.0, buf_seconds: 16}
 };
@@ -1196,6 +1197,8 @@ const ADV_TIPS = {
   unknown: "Surface good-CRC LoRa frames matching no enabled protocol. Off by default. When off, decoder skips them entirely (saves CPU).",
   fingerprint: "Extract UMOP features (CFO jitter, AM ripple, PLL phase, I/Q balance) from the preamble. Feeds Mystery Devices and per-node clustering. ~10–15 % extra decode CPU. Header decode coverage unchanged.",
   ldro_fallback: "When a payload fails CRC, retry it once with the opposite Low Data Rate Optimization (LDRO) setting. LDRO is normally inferred from symbol time (auto-on above 16 ms), but some transmitters force it against that default (e.g. satellite / tinyGS at SF8/41.7 kHz) — without this, those packets never decode or even surface as unknown. The CRC arbitrates, so it only adds decodes. On by default; runs only on CRC-fail, negligible cost.",
+  iq_normal: "Standard LoRa IQ orientation — Meshtastic, MeshCore, LoRaWAN uplink, and virtually all terrestrial LoRa. Leave here unless you are specifically receiving an inverted source.",
+  iq_inverted: "Conjugate the input stream to decode IQ-inverted transmitters: LoRaWAN downlink and satellite / tinyGS configs with Invert-IQ enabled. MUTUALLY EXCLUSIVE — in this mode normal (non-inverted) traffic will NOT decode. Use only when monitoring a known-inverted source.",
   scan_all: "Adds SF11/500, SF12/500, SF12/250 and the 31.25 kHz set on top of Common. Catches niche signals at the cost of higher CPU and some spurious detections. Off by default.",
   scan_presets: "Curated SF×BW set: every SF 7–12 at 62.5/125/250 kHz plus SF7-9/500 kHz. Covers all Meshtastic + MeshCore presets (including 62.5 kHz MeshCore) and common LoRaWAN. Recommended.",
   threshold: "Schmidl-Cox preamble-lock confidence. Default 0.55. Raise → 0.8 to suppress false positives in noisy RF. Lower → 0.4 to catch weak distant signals.",
@@ -1247,6 +1250,15 @@ function renderAdvancedConfig(box){
           </select>
           <span class="muted" style="font-size:11px">applies on next Start</span>
         </div>
+        <div style="display:flex;gap:8px;align-items:center;margin:14px 0 0">
+          <span class="muted">IQ inversion:</span>
+          <select id="iqmode" title="${esc(s.iq_invert ? ADV_TIPS.iq_inverted : ADV_TIPS.iq_normal)}" style="cursor:help">
+            <option value="normal"${!s.iq_invert?' selected':''} title="${esc(ADV_TIPS.iq_normal)}">Normal (default)</option>
+            <option value="inverted"${s.iq_invert?' selected':''} title="${esc(ADV_TIPS.iq_inverted)}">Inverted (satellite / downlink)</option>
+          </select>
+          <span class="muted" style="font-size:11px">applies on next Start</span>
+        </div>
+        <p class="muted" style="font-size:11px;margin:4px 0 0;line-height:1.5">Inverted decodes IQ-inverted transmitters (LoRaWAN downlink, satellite / tinyGS). Mutually exclusive — normal traffic won't decode while this is set.</p>
         <h4 style="margin:18px 0 2px">Pipeline tuning</h4>
         <p class="muted" style="font-size:11px;margin:0 0 6px;line-height:1.5">Detector sensitivity and buffer size. The defaults are tuned for typical Meshtastic / LoRaWAN traffic on a multi-core host. Hover each row for when to change it. Applies on next Start.</p>
         ${num('tunethresh',tune.threshold,0.1,1.0,0.05,'Schmidl-Cox threshold',ADV_TIPS.threshold)}
@@ -1272,6 +1284,7 @@ function renderAdvancedConfig(box){
     q('#fp').onchange=e=>post({fingerprint:e.target.checked});
     q('#ldro').onchange=e=>post({ldro_fallback:e.target.checked});
     q('#scanmode').onchange=e=>post({wide_scan:e.target.value==='all'});
+    q('#iqmode').onchange=e=>post({iq_invert:e.target.value==='inverted'});
     q('#unkdl').onclick=()=>{window.location='/api/unknown?download=1';};
     q('#unkclr').onclick=()=>{if(confirm('Clear the unknown-protocol report?'))fetch('/api/unknown',{method:'DELETE'}).then(()=>renderAdvancedConfig(box));};
     const saveTune=()=>post({tune:{

@@ -70,6 +70,7 @@ def load_settings():
                  'unknown': False,          # master: surface unidentified protocols (default OFF)
                  'fingerprint': True,       # RF hardware fingerprinting (Mystery Devices + clustering)
                  'ldro_fallback': True,     # retry payload with opposite LDRO on CRC fail (forced-LDRO TX)
+                 'iq_invert': False,        # conjugate the input stream to decode IQ-inverted (satellite/downlink) TX
                  'sdr': 'bladerf',          # selected SDR profile (persists across sessions)
                  'radio': {},               # web overrides of lora.toml [radio] (rate/bw/center/gain)
                  # Pipeline tuning — overrides lora.toml [detect] when set.  Defaults
@@ -1875,6 +1876,11 @@ def start_pipeline():
     # symbol-time default (e.g. satellite / tinyGS at SF8/41.7).  Default on; only
     # runs on CRC-fail so the cost is negligible.
     env['LORA_LDRO_FALLBACK'] = '1' if SETTINGS.get('ldro_fallback', True) else '0'
+    # IQ inversion: conjugate the input stream so an IQ-inverted transmitter
+    # (LoRaWAN downlink, satellite / tinyGS with Invert-IQ) decodes.  Default off
+    # (normal IQ).  Mutually exclusive with normal traffic, so it's an explicit
+    # mode the user selects, not an automatic fallback.
+    env['LORA_IQ_INVERT'] = '1' if SETTINGS.get('iq_invert') else '0'
     _pr = SETTINGS.get('protocols') or {}
     env['LORA_PROTOCOLS'] = ','.join(k for k in (
         'meshtastic', 'meshcore', 'lorawan', 'loramesher',
