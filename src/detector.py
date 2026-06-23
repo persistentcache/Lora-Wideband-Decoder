@@ -121,6 +121,14 @@ MAX_ENERGY_PEAKS = 10
 SPUR_REJECT_DB = 200
 DECHIRP_MIN_DB = 15.0
 
+# IQ inversion: when set, conjugate the input stream (negate Q) so an IQ-inverted
+# transmitter — LoRaWAN downlink, satellite / tinyGS configs with Invert-IQ on —
+# decodes.  It must happen at the stream input, before detection: the detector's
+# carrier/timing refinement uses a directional dechirp, so a post-extraction flip
+# is too late.  Read once at import (env is fixed per process).  Default off
+# (normal IQ).  Mutually exclusive with normal traffic.  GUI: Config → Advanced.
+_IQ_INVERT = os.environ.get('LORA_IQ_INVERT') == '1'
+
 
 class IQReader:
     def __init__(self, fp, fmt='sc16'):
@@ -131,9 +139,9 @@ class IQReader:
         if len(raw) < n * self.bps: return None
         if self.sc16:
             s = np.frombuffer(raw, dtype=np.int16)
-            return (s[0::2] + 1j * s[1::2]).astype(np.complex64) / 2048.0
+            return (s[0::2] + (-1j if _IQ_INVERT else 1j) * s[1::2]).astype(np.complex64) / 2048.0
         b = np.frombuffer(raw, dtype=np.int8)
-        return (b[0::2] + 1j * b[1::2]).astype(np.complex64) / 128.0
+        return (b[0::2] + (-1j if _IQ_INVERT else 1j) * b[1::2]).astype(np.complex64) / 128.0
 
 
 class StreamBuffer:
@@ -302,6 +310,8 @@ class StreamBuffer:
                     scale = 2048.0 if self.sc16 else 128.0
                     raw_f = raw.astype(np.float32)
                     raw_f /= scale
+                    if _IQ_INVERT:
+                        raw_f[1::2] *= -1.0   # conjugate the stream → decode IQ-inverted TX
                     return raw_f.view(np.complex64), skipped
 
                 if self._eof:
