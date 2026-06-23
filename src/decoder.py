@@ -5579,7 +5579,15 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             pmr = 10 * np.log10(fft_out.max(axis=1)
                                 / (fft_out.mean(axis=1) + 1e-30) + 1e-15)
             syms = [(i, int(bins[i]), float(pmr[i])) for i in range(n_total)]
-        strong = [(i, b, p) for i, b, p in syms if p > 8]
+        # Preamble run gate.  A real preamble is consecutive same-bin upchirps;
+        # at marginal SNR they sit at ~6-8 dB peak-to-mean, so the old 8 dB gate
+        # cliffed them out ("NO PREAMBLE") even with ~29 clean same-bin symbols
+        # present — costing ~2 dB of sensitivity for no benefit.  6 dB recovers
+        # it; the 4-consecutive-same-bin run requirement plus the payload CRC keep
+        # false runs at ~0 (pure noise still never decodes, verified).  Env
+        # override LORA_PRE_PMR for tuning/regression.
+        _pmr_gate = float(__import__('os').environ.get('LORA_PRE_PMR', '6'))
+        strong = [(i, b, p) for i, b, p in syms if p > _pmr_gate]
         runs = []
         cur = []
         for i, b, p in strong:
