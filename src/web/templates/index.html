@@ -1063,6 +1063,7 @@ function _renderConfigBody(){
   $('#kfile').onchange=e=>{const f=e.target.files[0]; if(!f)return; const rd=new FileReader();
     rd.onload=()=>fetch('/api/keys/import?merge=1',{method:'POST',body:rd.result}).then(x=>x.json()).then(res=>{if(res.keys){KEYS=res.keys;_renderConfigBody();}}); rd.readAsText(f); e.target.value='';};
   const sc=document.createElement('div'); el.insertBefore(sc, el.firstChild); renderSdrConfig(sc);
+  const pc=document.createElement('div'); el.insertBefore(pc, sc.nextSibling); renderProtocolsConfig(pc);
   const ac=document.createElement('div'); el.appendChild(ac); renderAlertsConfig(ac);
   const uc=document.createElement('div'); el.appendChild(uc); renderAdvancedConfig(uc);
 }
@@ -1208,21 +1209,17 @@ const ADV_TIPS = {
   energy_threshold: "Energy gate, dB above noise floor. Below this, Schmidl-Cox is skipped. Default 12.0. Raise → 18 to filter spurs. Lower → 5 for weak / distant signals.",
   buf_seconds: "Ring-buffer headroom. ~120 MB/s at 28 Msps. Default 16. Raise to 32 if KEEP-UP warnings appear. Lower to 8 on RAM-constrained hosts."
 };
-function renderAdvancedConfig(box){
+function renderProtocolsConfig(box){
   Promise.all([fetch('/api/settings').then(r=>r.json()),fetch('/api/unknown').then(r=>r.json())]).then(([s,u])=>{
     const pr=s.protocols||ADV_DEFAULTS.protocols;
     const unk=!!s.unknown;
-    const tune=Object.assign({}, ADV_DEFAULTS.tune, s.tune||{});
-    // Checkbox with hover tooltip on the WHOLE label so users can hover anywhere.
     const cb=(id,on,lbl,tip)=>`<label title="${esc(tip||'')}" style="display:flex;gap:8px;align-items:flex-start;margin:5px 0;cursor:help"><input type="checkbox" id="${id}"${on?' checked':''} style="margin-top:3px;cursor:pointer"> <span>${lbl}</span></label>`;
-    // Numeric input row with hover tooltip.
-    const num=(id,val,min,max,step,lbl,tip)=>`<label title="${esc(tip)}" style="display:flex;gap:10px;align-items:center;margin:6px 0;cursor:help"><span style="min-width:200px">${lbl}</span><input type="number" id="${id}" value="${val}" min="${min}" max="${max}" step="${step}" style="width:96px"><span class="muted" style="font-size:11px">range ${min}–${max}</span></label>`;
-    box.innerHTML=`<details style="max-width:920px;margin-top:20px;border:1px solid var(--line);border-radius:6px;padding:6px 12px">
-      <summary style="cursor:pointer;font-weight:600;font-size:15px;padding:4px 0">Advanced Options</summary>
+    box.innerHTML=`<details style="max-width:920px;margin-top:16px;border:1px solid var(--line);border-radius:6px;padding:6px 12px">
+      <summary style="cursor:pointer;font-weight:600;font-size:15px;padding:4px 0">Protocols</summary>
       <div style="padding:8px 2px 4px">
-        <p class="muted" style="font-size:11px;margin:2px 0 12px;line-height:1.5">Hover any option for a detailed explanation. Most users never need to touch these — the defaults are tuned for typical use. If you mess something up, use <b>Reset to defaults</b> at the bottom of this section.</p>
-        <h4 style="margin:10px 0 2px">Protocols</h4>
-        <p class="muted" style="font-size:11px;margin:0 0 4px;line-height:1.5">Disable protocols you don't need. The decoder skips them — and when <b>Unknown</b> is off it also skips decoding frames whose sync word can't belong to any enabled protocol, saving compute. Applies on next Start.</p>
+        <p class="muted" style="font-size:11px;margin:2px 0 10px;line-height:1.5">Which LoRa protocols the decoder attempts, how it handles frames that match none, and which SF/BW combinations it scans. Hover any option for detail. Applies on next Start.</p>
+        <h4 style="margin:10px 0 2px">Enabled protocols</h4>
+        <p class="muted" style="font-size:11px;margin:0 0 4px;line-height:1.5">Disable protocols you don't need. The decoder skips them — and when <b>Unknown</b> is off it also skips decoding frames whose sync word can't belong to any enabled protocol, saving compute.</p>
         ${cb('pmesh',pr.meshtastic!==false,'Meshtastic',ADV_TIPS.meshtastic)}
         ${cb('pmc',pr.meshcore!==false,'MeshCore',ADV_TIPS.meshcore)}
         ${cb('plw',pr.lorawan!==false,'LoRaWAN',ADV_TIPS.lorawan)}
@@ -1234,10 +1231,6 @@ function renderAdvancedConfig(box){
         ${cb('prh',pr.radiohead!==false,'RadioHead RF95 <span class="muted" style="font-size:11px">(Adafruit/Sparkfun starter library)</span>',ADV_TIPS.radiohead)}
         <h4 style="margin:18px 0 2px">Unknown protocols</h4>
         ${cb('unk',unk,'<b>Unknown (Off / On)</b><br><span class="muted" style="font-size:11px">Surface intact LoRa frames (good CRC) that match no enabled protocol — a possible new/unsupported protocol. Off by default; off also lets the decoder skip them entirely to save compute.</span>',ADV_TIPS.unknown)}
-        <h4 style="margin:18px 0 2px">RF hardware fingerprinting</h4>
-        ${cb('fp',s.fingerprint!==false,'<b>Fingerprint TX hardware (On / Off)</b><br><span class="muted" style="font-size:11px">Extract per-packet UMOP features (CFO jitter, AM ripple, PLL phase, I/Q balance) from the LoRa preamble. Feeds the <b>Mystery Devices</b> panel and per-node device clustering. On by default. Disable on low-core hosts to save ~10–15 % decode CPU — header decode coverage is unchanged.</span>',ADV_TIPS.fingerprint)}
-        <h4 style="margin:18px 0 2px">LDRO fallback</h4>
-        ${cb('ldro',s.ldro_fallback!==false,'<b>LDRO fallback (On / Off)</b><br><span class="muted" style="font-size:11px">When a payload fails CRC, retry it once with the opposite <b>Low Data Rate Optimization</b> setting. LDRO is normally inferred from symbol time (auto-on above 16 ms), but some transmitters force it against that default — e.g. satellite / tinyGS configs at SF8/41.7 kHz — and those packets otherwise never decode or surface as unknown. On by default: the CRC arbitrates so it only adds decodes, and it runs only on CRC-fail (negligible cost).</span>',ADV_TIPS.ldro_fallback)}
         <h4 style="margin:18px 0 2px">Unknown-protocol report</h4>
         <p class="muted" style="font-size:11px;margin:0 0 4px">Raw bytes + PHY params of captured unknown frames — hand to a developer to add support. Needs Unknown on.</p>
         <div style="display:flex;gap:8px;align-items:center">
@@ -1245,8 +1238,8 @@ function renderAdvancedConfig(box){
           <button id="unkdl"${u.count?'':' disabled'}>Download</button>
           <button id="unkclr"${u.count?'':' disabled'}>Clear</button>
         </div>
-        <div style="display:flex;gap:8px;align-items:center;margin:18px 0 0">
-          <span class="muted">LoRa SF/BW scan:</span>
+        <h4 style="margin:18px 0 2px">LoRa SF/BW scan</h4>
+        <div style="display:flex;gap:8px;align-items:center">
           <select id="scanmode" title="${esc(s.wide_scan ? ADV_TIPS.scan_all : ADV_TIPS.scan_presets)}" style="cursor:help">
             <option value="presets"${!s.wide_scan?' selected':''} title="${esc(ADV_TIPS.scan_presets)}">Common (recommended)</option>
             <option value="all"${s.wide_scan?' selected':''} title="${esc(ADV_TIPS.scan_all)}">All SF/BW combinations</option>
@@ -1254,24 +1247,6 @@ function renderAdvancedConfig(box){
           <span class="muted" style="font-size:11px">applies on next Start</span>
         </div>
         <p class="muted" style="font-size:11px;margin:5px 0 0;line-height:1.6"><b>Common</b> (recommended) scans every SF 7–12 at 62.5 / 125 / 250 kHz plus SF 7–9 at 500 kHz — this covers all Meshtastic and MeshCore presets (including 62.5 kHz MeshCore) and common LoRaWAN. <b>All SF/BW combinations</b> adds SF11/500, SF12/500, SF12/250 and the full 31.25 kHz set on top of Common. It catches niche / extreme-range signals, but every extra SF×BW pair widens the preamble search — so it costs noticeably more CPU and surfaces more spurious detections. Stay on <b>Common</b> unless you're specifically hunting a signal it misses.</p>
-        <div style="display:flex;gap:8px;align-items:center;margin:14px 0 0">
-          <span class="muted">IQ inversion:</span>
-          <select id="iqmode" title="${esc(s.iq_invert ? ADV_TIPS.iq_inverted : ADV_TIPS.iq_normal)}" style="cursor:help">
-            <option value="normal"${!s.iq_invert?' selected':''} title="${esc(ADV_TIPS.iq_normal)}">Normal (default)</option>
-            <option value="inverted"${s.iq_invert?' selected':''} title="${esc(ADV_TIPS.iq_inverted)}">Inverted (satellite / downlink)</option>
-          </select>
-          <span class="muted" style="font-size:11px">applies on next Start</span>
-        </div>
-        <p class="muted" style="font-size:11px;margin:4px 0 0;line-height:1.5">Inverted decodes IQ-inverted transmitters (LoRaWAN downlink, satellite / tinyGS). Mutually exclusive — normal traffic won't decode while this is set.</p>
-        <h4 style="margin:18px 0 2px">Pipeline tuning</h4>
-        <p class="muted" style="font-size:11px;margin:0 0 6px;line-height:1.5">Detector sensitivity and buffer size. The defaults are tuned for typical Meshtastic / LoRaWAN traffic on a multi-core host. Hover each row for when to change it. Applies on next Start.</p>
-        ${num('tunethresh',tune.threshold,0.1,1.0,0.05,'Schmidl-Cox threshold',ADV_TIPS.threshold)}
-        ${num('tuneeth',tune.energy_threshold,0,40,0.5,'Energy threshold (dB)',ADV_TIPS.energy_threshold)}
-        ${num('tunebuf',tune.buf_seconds,2,128,1,'Buffer headroom (s)',ADV_TIPS.buf_seconds)}
-        <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--line);display:flex;gap:10px;align-items:center">
-          <button id="advreset" title="Restore every option in this Advanced Options section to its built-in default. Does NOT touch SDR/Radio or Channel keys.">Reset Advanced Options to defaults</button>
-          <span class="muted" style="font-size:11px">Restores everything in this panel (protocols, unknown, fingerprint, scan mode, tuning). Doesn't affect SDR/Radio or Channel keys.</span>
-        </div>
       </div>
     </details>`;
     const q=id=>box.querySelector(id);
@@ -1285,12 +1260,49 @@ function renderAdvancedConfig(box){
     }});
     ['#pmesh','#pmc','#plw','#plm','#paprs','#prns','#pdr','#peb','#prh'].forEach(s=>q(s).onchange=saveProtos);
     q('#unk').onchange=e=>post({unknown:e.target.checked});
+    q('#scanmode').onchange=e=>post({wide_scan:e.target.value==='all'});
+    q('#unkdl').onclick=()=>{window.location='/api/unknown?download=1';};
+    q('#unkclr').onclick=()=>{if(confirm('Clear the unknown-protocol report?'))fetch('/api/unknown',{method:'DELETE'}).then(()=>renderProtocolsConfig(box));};
+  }).catch(()=>{});
+}
+function renderAdvancedConfig(box){
+  fetch('/api/settings').then(r=>r.json()).then(s=>{
+    const tune=Object.assign({}, ADV_DEFAULTS.tune, s.tune||{});
+    const cb=(id,on,lbl,tip)=>`<label title="${esc(tip||'')}" style="display:flex;gap:8px;align-items:flex-start;margin:5px 0;cursor:help"><input type="checkbox" id="${id}"${on?' checked':''} style="margin-top:3px;cursor:pointer"> <span>${lbl}</span></label>`;
+    const num=(id,val,min,max,step,lbl,tip)=>`<label title="${esc(tip)}" style="display:flex;gap:10px;align-items:center;margin:6px 0;cursor:help"><span style="min-width:200px">${lbl}</span><input type="number" id="${id}" value="${val}" min="${min}" max="${max}" step="${step}" style="width:96px"><span class="muted" style="font-size:11px">range ${min}–${max}</span></label>`;
+    box.innerHTML=`<details style="max-width:920px;margin-top:16px;border:1px solid var(--line);border-radius:6px;padding:6px 12px">
+      <summary style="cursor:pointer;font-weight:600;font-size:15px;padding:4px 0">Advanced Options</summary>
+      <div style="padding:8px 2px 4px">
+        <p class="muted" style="font-size:11px;margin:2px 0 12px;line-height:1.5">Hover any option for a detailed explanation. Most users never need to touch these — the defaults are tuned for typical use. If you mess something up, use <b>Reset to defaults</b> at the bottom of this section.</p>
+        <h4 style="margin:10px 0 2px">Pipeline tuning</h4>
+        <p class="muted" style="font-size:11px;margin:0 0 6px;line-height:1.5">Detector sensitivity and buffer size. The defaults are tuned for typical Meshtastic / LoRaWAN traffic on a multi-core host. Hover each row for when to change it. Applies on next Start.</p>
+        ${num('tunethresh',tune.threshold,0.1,1.0,0.05,'Schmidl-Cox threshold',ADV_TIPS.threshold)}
+        ${num('tuneeth',tune.energy_threshold,0,40,0.5,'Energy threshold (dB)',ADV_TIPS.energy_threshold)}
+        ${num('tunebuf',tune.buf_seconds,2,128,1,'Buffer headroom (s)',ADV_TIPS.buf_seconds)}
+        <h4 style="margin:18px 0 2px">RF hardware fingerprinting</h4>
+        ${cb('fp',s.fingerprint!==false,'<b>Fingerprint TX hardware (On / Off)</b><br><span class="muted" style="font-size:11px">Extract per-packet UMOP features (CFO jitter, AM ripple, PLL phase, I/Q balance) from the LoRa preamble. Feeds the <b>Mystery Devices</b> panel and per-node device clustering. On by default. Disable on low-core hosts to save ~10–15 % decode CPU — header decode coverage is unchanged.</span>',ADV_TIPS.fingerprint)}
+        <h4 style="margin:18px 0 2px">LDRO fallback</h4>
+        ${cb('ldro',s.ldro_fallback!==false,'<b>LDRO fallback (On / Off)</b><br><span class="muted" style="font-size:11px">When a payload fails CRC, retry it once with the opposite <b>Low Data Rate Optimization</b> setting. LDRO is normally inferred from symbol time (auto-on above 16 ms), but some transmitters force it against that default — e.g. satellite / tinyGS configs at SF8/41.7 kHz — and those packets otherwise never decode or surface as unknown. On by default: the CRC arbitrates so it only adds decodes, and it runs only on CRC-fail (negligible cost).</span>',ADV_TIPS.ldro_fallback)}
+        <h4 style="margin:18px 0 2px">IQ inversion</h4>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="iqmode" title="${esc(s.iq_invert ? ADV_TIPS.iq_inverted : ADV_TIPS.iq_normal)}" style="cursor:help">
+            <option value="normal"${!s.iq_invert?' selected':''} title="${esc(ADV_TIPS.iq_normal)}">Normal (default)</option>
+            <option value="inverted"${s.iq_invert?' selected':''} title="${esc(ADV_TIPS.iq_inverted)}">Inverted (satellite / downlink)</option>
+          </select>
+          <span class="muted" style="font-size:11px">applies on next Start</span>
+        </div>
+        <p class="muted" style="font-size:11px;margin:4px 0 0;line-height:1.5">Inverted decodes IQ-inverted transmitters (LoRaWAN downlink, satellite / tinyGS). Mutually exclusive — normal traffic won't decode while this is set.</p>
+        <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--line);display:flex;gap:10px;align-items:center">
+          <button id="advreset" title="Restore every Protocols and Advanced option to its built-in default. Does NOT touch SDR/Radio or Channel keys.">Reset to defaults</button>
+          <span class="muted" style="font-size:11px">Restores all Protocols + Advanced options (protocols, unknown, scan, fingerprint, LDRO, IQ, tuning). Doesn't affect SDR/Radio or Channel keys.</span>
+        </div>
+      </div>
+    </details>`;
+    const q=id=>box.querySelector(id);
+    const post=b=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
     q('#fp').onchange=e=>post({fingerprint:e.target.checked});
     q('#ldro').onchange=e=>post({ldro_fallback:e.target.checked});
-    q('#scanmode').onchange=e=>post({wide_scan:e.target.value==='all'});
     q('#iqmode').onchange=e=>post({iq_invert:e.target.value==='inverted'});
-    q('#unkdl').onclick=()=>{window.location='/api/unknown?download=1';};
-    q('#unkclr').onclick=()=>{if(confirm('Clear the unknown-protocol report?'))fetch('/api/unknown',{method:'DELETE'}).then(()=>renderAdvancedConfig(box));};
     const saveTune=()=>post({tune:{
       threshold:parseFloat(q('#tunethresh').value),
       energy_threshold:parseFloat(q('#tuneeth').value),
@@ -1298,8 +1310,8 @@ function renderAdvancedConfig(box){
     }});
     ['#tunethresh','#tuneeth','#tunebuf'].forEach(s=>q(s).onchange=saveTune);
     q('#advreset').onclick=()=>{
-      if(!confirm('Reset every Advanced Option in this panel (protocols, unknown, fingerprint, scan mode, tuning) to defaults? Channel keys and SDR/Radio settings are NOT touched.'))return;
-      post(ADV_DEFAULTS).then(()=>renderAdvancedConfig(box));
+      if(!confirm('Reset every Protocols and Advanced option to defaults? Channel keys and SDR/Radio settings are NOT touched.'))return;
+      post(ADV_DEFAULTS).then(()=>_renderConfigBody());
     };
   }).catch(()=>{});
 }
