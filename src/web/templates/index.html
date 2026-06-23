@@ -168,8 +168,20 @@ const SEEN_NODES=new Set(); const _alertFired=new Set(); const _geoState={};
 const STATIC=(()=>{try{return new URLSearchParams(location.search).has('static');}catch(e){return false;}})();
 const SORT={pkts:{k:'ts',dir:-1}, nodes:{k:'count',dir:-1}};
 const $=s=>document.querySelector(s);
-const fmtTime=ts=>ts?new Date(ts*1000).toLocaleTimeString():'';
-const fmtDateTime=ts=>ts?new Date(ts*1000).toLocaleString():'';
+// Display prefs (Config → Preferences). Loaded from /api/settings on boot; the
+// server applies the same prefs to CSV/JSONL exports so rows and exports match.
+let TIME_FMT='12', DATE_FMT='MMDDYY';
+const _p2=n=>String(n).padStart(2,'0');
+function fmtDate(ts){const d=new Date(ts*1000),DD=_p2(d.getDate()),MM=_p2(d.getMonth()+1),Y=d.getFullYear(),YY=_p2(Y%100);
+  switch(DATE_FMT){
+    case'DDMMYY':return DD+'/'+MM+'/'+YY; case'DDMMYYYY':return DD+'/'+MM+'/'+Y;
+    case'MMDDYYYY':return MM+'/'+DD+'/'+Y; case'YYYYMMDD':return Y+'-'+MM+'-'+DD;
+    default:return MM+'/'+DD+'/'+YY;}}                       // MMDDYY (default)
+function fmtClock(ts){const d=new Date(ts*1000);let h=d.getHours();const m=_p2(d.getMinutes()),s=_p2(d.getSeconds());
+  if(TIME_FMT==='24')return _p2(h)+':'+m+':'+s;
+  const ap=h<12?'AM':'PM';h=h%12||12;return h+':'+m+':'+s+' '+ap;}
+const fmtTime=ts=>ts?fmtDate(ts)+' '+fmtClock(ts):'';
+const fmtDateTime=ts=>ts?fmtDate(ts)+' '+fmtClock(ts):'';
 const ago=ts=>ts?Math.max(0,Math.round(Date.now()/1000-ts))+'s':'';
 const esc=s=>(s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const NAMES={};                       // node id -> friendly name (from NODEINFO)
@@ -1065,6 +1077,7 @@ function _renderConfigBody(){
   const sc=document.createElement('div'); el.insertBefore(sc, el.firstChild); renderSdrConfig(sc);
   const pc=document.createElement('div'); el.insertBefore(pc, sc.nextSibling); renderProtocolsConfig(pc);
   const ac=document.createElement('div'); el.appendChild(ac); renderAlertsConfig(ac);
+  const fc=document.createElement('div'); el.appendChild(fc); renderPreferencesConfig(fc);
   const uc=document.createElement('div'); el.appendChild(uc); renderAdvancedConfig(uc);
 }
 function renderSdrConfig(box){
@@ -1313,6 +1326,30 @@ function renderAdvancedConfig(box){
       if(!confirm('Reset every Protocols and Advanced option to defaults? Channel keys and SDR/Radio settings are NOT touched.'))return;
       post(ADV_DEFAULTS).then(()=>_renderConfigBody());
     };
+  }).catch(()=>{});
+}
+function renderPreferencesConfig(box){
+  fetch('/api/settings').then(r=>r.json()).then(s=>{
+    const tf=s.time_format||'12', df=s.date_format||'MMDDYY';
+    const topt=(v,l)=>`<option value="${v}"${tf===v?' selected':''}>${l}</option>`;
+    const dopt=(v,l)=>`<option value="${v}"${df===v?' selected':''}>${l}</option>`;
+    box.innerHTML=`<details style="max-width:920px;margin-top:16px;border:1px solid var(--line);border-radius:6px;padding:6px 12px">
+      <summary style="cursor:pointer;font-weight:600;font-size:15px;padding:4px 0">Preferences</summary>
+      <div style="padding:8px 2px 4px">
+        <p class="muted" style="font-size:11px;margin:2px 0 12px;line-height:1.5">Timestamp display format. Applies to <b>every row</b> across the app and to <b>CSV / JSONL exports</b>, so the GUI and your saved files match. Each row's time column shows the date followed by the time.</p>
+        <label style="display:flex;gap:10px;align-items:center;margin:6px 0"><span style="min-width:120px">Time format</span>
+          <select id="prtime">${topt('12','12-hour (1:30:05 PM)')}${topt('24','24-hour (13:30:05)')}</select></label>
+        <label style="display:flex;gap:10px;align-items:center;margin:6px 0"><span style="min-width:120px">Date format</span>
+          <select id="prdate">${dopt('MMDDYY','MM/DD/YY')}${dopt('MMDDYYYY','MM/DD/YYYY')}${dopt('DDMMYY','DD/MM/YY')}${dopt('DDMMYYYY','DD/MM/YYYY')}${dopt('YYYYMMDD','YYYY-MM-DD (ISO)')}</select></label>
+        <p class="muted" style="font-size:12px;margin:10px 0 0">Preview: <span class="mono" id="prprev" style="color:var(--acc)"></span></p>
+      </div>
+    </details>`;
+    const q=id=>box.querySelector(id);
+    const post=b=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+    const prev=()=>{q('#prprev').textContent=fmtTime(Date.now()/1000);};
+    q('#prtime').onchange=e=>{TIME_FMT=e.target.value;post({time_format:e.target.value});prev();};
+    q('#prdate').onchange=e=>{DATE_FMT=e.target.value;post({date_format:e.target.value});prev();};
+    prev();
   }).catch(()=>{});
 }
 function renderAlertsConfig(box){
@@ -1681,7 +1718,9 @@ $('#importFile').onchange=e=>{const f=e.target.files[0]; if(!f)return; const r=n
     alert('Imported '+res.imported+' packets. Start the pipeline to add new data, then Save to export old + new.');});};
   r.readAsText(f); e.target.value='';};
 const _as=$('#autosave');
-fetch('/api/settings').then(r=>r.json()).then(s=>{_as.checked=!!s.autosave;WFON=s.waterfall!==false;}).catch(()=>{});
+fetch('/api/settings').then(r=>r.json()).then(s=>{_as.checked=!!s.autosave;WFON=s.waterfall!==false;
+  if(s.time_format)TIME_FMT=s.time_format; if(s.date_format)DATE_FMT=s.date_format;
+  try{renderCurrent();}catch(e){}}).catch(()=>{});
 _as.onchange=()=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autosave:_as.checked})});
 $('#btnClear').onclick=()=>{if(confirm('Clear all captured packets (also clears the saved log)?')){fetch('/api/clear',{method:'POST'});PK.length=0;G.nodes=[];OPEN.clear();renderCurrent();}};
 try{new URLSearchParams(location.search).getAll('open').forEach(id=>OPEN.add(id));}catch(e){}
