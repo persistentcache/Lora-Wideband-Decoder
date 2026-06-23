@@ -6807,6 +6807,31 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         else:
             iq1 = _save_iq   # keep drift version for the chase
 
+    # LDRO FALLBACK: the decoder infers Low Data Rate Optimization from the 16 ms
+    # symbol-time rule, but a TX can FORCE LDRO against that default (e.g. tinyGS /
+    # satellite configs at SF8/41.7 with FLDRO on).  That flips the payload symbol
+    # rate ppm = SF <-> SF-2 and the CRC never passes (no decode, no "unknown").
+    # If the primary failed, re-decode the payload once with the opposite LDRO and
+    # accept only if ITS CRC passes -> can only ADD recoveries.  Toggle in the GUI
+    # (Advanced Options); on by default.
+    if ((not crc_ok) and crc_present
+            and __import__('os').environ.get('LORA_LDRO_FALLBACK', '1') != '0'):
+        _sv = (ppm_pay, pay_levels, pay_bin_group)
+        ppm_pay = (sf - 2) if ppm_pay == sf else sf
+        pay_levels = N if ppm_pay == sf else (N // 4)
+        pay_bin_group = 1 if ppm_pay == sf else 4
+        _lr, _lp, _ls, _ln = soft_decode_payload(0, 0.0, frac_tau=tau_frac)
+        if len(_lr) >= payload_len + 2:
+            _lok, _lm = check_crc(_lr, payload_len)
+            if _lok:
+                raw_bytes, payload, pay_soft_info, decoded_nibs = _lr, _lp, _ls, _ln
+                crc_ok, crc_method, _clean_crc = True, _lm, True
+                print("  CRC: %s OK (LDRO fallback, ppm=%d)" % (_lm, ppm_pay))
+            else:
+                ppm_pay, pay_levels, pay_bin_group = _sv
+        else:
+            ppm_pay, pay_levels, pay_bin_group = _sv
+
     if _HARNESS_OUT:
         _margins = [float(s[3]) for s in pay_soft_info] if pay_soft_info else []
         _harness_emit('primary_decode',

@@ -69,6 +69,7 @@ def load_settings():
                                'disaster_radio': True, 'ebyte_lora': True, 'radiohead': True},
                  'unknown': False,          # master: surface unidentified protocols (default OFF)
                  'fingerprint': True,       # RF hardware fingerprinting (Mystery Devices + clustering)
+                 'ldro_fallback': True,     # retry payload with opposite LDRO on CRC fail (forced-LDRO TX)
                  'sdr': 'bladerf',          # selected SDR profile (persists across sessions)
                  'radio': {},               # web overrides of lora.toml [radio] (rate/bw/center/gain)
                  # Pipeline tuning — overrides lora.toml [detect] when set.  Defaults
@@ -1869,6 +1870,11 @@ def start_pipeline():
         env['LORA_FINGERPRINT'] = '1'
     else:
         env['LORA_FINGERPRINT'] = '0'
+    # LDRO fallback: on CRC fail, retry the payload with the opposite Low Data Rate
+    # Optimization setting.  Recovers transmitters that force LDRO against the 16 ms
+    # symbol-time default (e.g. satellite / tinyGS at SF8/41.7).  Default on; only
+    # runs on CRC-fail so the cost is negligible.
+    env['LORA_LDRO_FALLBACK'] = '1' if SETTINGS.get('ldro_fallback', True) else '0'
     _pr = SETTINGS.get('protocols') or {}
     env['LORA_PROTOCOLS'] = ','.join(k for k in (
         'meshtastic', 'meshcore', 'lorawan', 'loramesher',
