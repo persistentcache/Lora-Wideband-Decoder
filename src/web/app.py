@@ -71,6 +71,8 @@ def load_settings():
                  'fingerprint': True,       # RF hardware fingerprinting (Mystery Devices + clustering)
                  'ldro_fallback': True,     # retry payload with opposite LDRO on CRC fail (forced-LDRO TX)
                  'iq_invert': False,        # conjugate the input stream to decode IQ-inverted (satellite/downlink) TX
+                 'time_format': '12',       # display: '12' (AM/PM) or '24' — rows + exports
+                 'date_format': 'MMDDYY',   # display: MMDDYY|MMDDYYYY|DDMMYY|DDMMYYYY|YYYYMMDD
                  'sdr': 'bladerf',          # selected SDR profile (persists across sessions)
                  'radio': {},               # web overrides of lora.toml [radio] (rate/bw/center/gain)
                  # Pipeline tuning — overrides lora.toml [detect] when set.  Defaults
@@ -229,10 +231,36 @@ _CSV_INT = {'hops', 'hop_start', 'hop_limit', 'portnum', 'rssi', 'sf', 'bw', 'ba
 _CSV_FLOAT = {'ts', 'freq_mhz', 'lat', 'lon', 'voltage'}
 
 
+_DATE_STRFTIME = {'DDMMYY': '%d/%m/%y', 'DDMMYYYY': '%d/%m/%Y',
+                  'MMDDYY': '%m/%d/%y', 'MMDDYYYY': '%m/%d/%Y',
+                  'YYYYMMDD': '%Y-%m-%d'}
+
+
+def _fmt_export_dt(ts):
+    """Human-readable 'date time' string for a Unix ts, using the user's
+    Preferences (time_format / date_format).  Mirrors the GUI's fmtTime so
+    exported rows match what's shown on screen.  Raw `ts` stays in its own
+    column for re-import; this is the display column."""
+    try:
+        import datetime as _dt
+        d = _dt.datetime.fromtimestamp(float(ts))
+    except Exception:
+        return ''
+    ds = d.strftime(_DATE_STRFTIME.get(SETTINGS.get('date_format', 'MMDDYY'),
+                                       '%m/%d/%y'))
+    if SETTINGS.get('time_format', '12') == '24':
+        ts_str = d.strftime('%H:%M:%S')
+    else:
+        ts_str = d.strftime('%I:%M:%S %p').lstrip('0')
+    return ds + ' ' + ts_str
+
+
 def _csv_row_to_rec(row):
     """Coerce a CSV row (all strings) back to a typed packet record."""
     rec = {}
     for k, v in row.items():
+        if k == 'datetime':          # display-only export column; ts is the source of truth
+            continue
         if v is None or v == '':
             continue
         if k in _CSV_INT:
@@ -2147,8 +2175,17 @@ def api_settings():
                     except (TypeError, ValueError):
                         pass
             SETTINGS['tune'] = tune
+        if 'ldro_fallback' in d:
+            SETTINGS['ldro_fallback'] = bool(d['ldro_fallback'])
+        if 'iq_invert' in d:
+            SETTINGS['iq_invert'] = bool(d['iq_invert'])
+        if 'time_format' in d and str(d['time_format']) in ('12', '24'):
+            SETTINGS['time_format'] = str(d['time_format'])
+        if 'date_format' in d and str(d['date_format']) in _DATE_STRFTIME:
+            SETTINGS['date_format'] = str(d['date_format'])
         if any(k in d for k in ('autosave', 'waterfall', 'unknown', 'fingerprint',
-                                'protocols', 'wide_scan', 'sdr', 'radio', 'tune')):
+                                'protocols', 'wide_scan', 'sdr', 'radio', 'tune',
+                                'ldro_fallback', 'iq_invert', 'time_format', 'date_format')):
             save_settings(SETTINGS)
             _apply_waterfall_flag()
             _apply_unknown_flag()
@@ -2724,14 +2761,19 @@ def api_export():
         pkts = list(PACKETS)
     stamp = time.strftime('%Y%m%d_%H%M%S')
     if fmt == 'json':
-        body = '\n'.join(json.dumps(p, separators=(',', ':')) for p in pkts)
+        body = '\n'.join(json.dumps(
+            ({'datetime': _fmt_export_dt(p['ts']), **p} if p.get('ts') else p),
+            separators=(',', ':')) for p in pkts)
         return Response(body, mimetype='application/x-ndjson',
                         headers={'Content-Disposition':
                                  f'attachment; filename=lora_session_{stamp}.jsonl'})
     import io, csv
-    buf = io.StringIO(); w = csv.writer(buf); w.writerow(_CSV_COLS)
+    # 'datetime' = human-readable display column (per Preferences); 'ts' stays raw for re-import.
+    cols = ['datetime'] + _CSV_COLS
+    buf = io.StringIO(); w = csv.writer(buf); w.writerow(cols)
     for p in pkts:
-        w.writerow([p.get(c, '') for c in _CSV_COLS])
+        dt = _fmt_export_dt(p['ts']) if p.get('ts') else ''
+        w.writerow([dt] + [p.get(c, '') for c in _CSV_COLS])
     return Response(buf.getvalue(), mimetype='text/csv',
                     headers={'Content-Disposition':
                              f'attachment; filename=lora_session_{stamp}.csv'})
