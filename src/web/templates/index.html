@@ -972,6 +972,8 @@ function _renderConfigBody(){
       +'<td><input type="text" class="knotes" data-ri="'+ri+'" placeholder="notes…" value="'+esc(r.notes)+'" style="width:150px"></td>'
       +'<td class="right">'+action+'</td></tr>';};
   el.innerHTML=`<div style="max-width:1000px;padding:16px 0">
+    <details style="border:1px solid var(--line);border-radius:6px;padding:6px 12px"><summary style="cursor:pointer;font-weight:600;font-size:15px;padding:4px 0">Keys &amp; node identities <span class="muted" style="font-weight:400;font-size:12px">— channel PSKs + your node pub/priv keypairs</span></summary>
+    <div style="padding:8px 2px 4px">
     <h3 style="margin:0 0 4px">Channel keys <span class="muted" style="font-weight:400;font-size:13px">— shared group PSKs (16-byte AES). Decrypts public/channel traffic.</span></h3>
     <p class="muted" style="line-height:1.5"><b style="color:var(--acc)">⚠ This is NOT your node's pub/priv keypair.</b> If your key is longer than 16 bytes (typically 32B pub + 64B priv for MeshCore, or 32B pub + 32B priv for Meshtastic), it belongs in <b>Node identities</b> below, not here. Channel keys are tagged by <b>protocol</b> and tried in ascending <b>priority</b> (<b>lower = first</b>); the first valid decode wins. A key applies if it targets <b>all nodes</b> or <b>lists the sender</b>. The two <b>Public/Default</b> keys are built in — their value is locked and they can't be deleted, but you can enable/disable, node-scope, and annotate them. Persists across sessions; applies live.</p>
     <table style="margin:8px 0;width:100%"><thead><tr><th style="width:60px">prio</th><th style="width:34px">on</th><th style="width:90px">protocol</th><th>label</th><th style="width:200px">scope</th><th>key</th><th style="width:160px">notes</th><th></th></tr></thead><tbody>${_KROWS.map(rowHtml).join('')}</tbody></table>
@@ -1029,6 +1031,7 @@ function _renderConfigBody(){
       <button id="kimport">Import key list</button>
       <input type="file" id="kfile" accept=".json,application/json" style="display:none">
     </div>
+    </div></details>
   </div>`;
   el.querySelectorAll('.ktoggle').forEach(c=>c.onchange=()=>_kRowUpdate(+c.dataset.ri,{enabled:c.checked}));
   el.querySelectorAll('.knotes').forEach(i=>i.onchange=()=>_kRowUpdate(+i.dataset.ri,{notes:i.value}));
@@ -1250,6 +1253,7 @@ function renderAdvancedConfig(box){
           </select>
           <span class="muted" style="font-size:11px">applies on next Start</span>
         </div>
+        <p class="muted" style="font-size:11px;margin:5px 0 0;line-height:1.6"><b>Common</b> (recommended) scans every SF 7–12 at 62.5 / 125 / 250 kHz plus SF 7–9 at 500 kHz — this covers all Meshtastic and MeshCore presets (including 62.5 kHz MeshCore) and common LoRaWAN. <b>All SF/BW combinations</b> adds SF11/500, SF12/500, SF12/250 and the full 31.25 kHz set on top of Common. It catches niche / extreme-range signals, but every extra SF×BW pair widens the preamble search — so it costs noticeably more CPU and surfaces more spurious detections. Stay on <b>Common</b> unless you're specifically hunting a signal it misses.</p>
         <div style="display:flex;gap:8px;align-items:center;margin:14px 0 0">
           <span class="muted">IQ inversion:</span>
           <select id="iqmode" title="${esc(s.iq_invert ? ADV_TIPS.iq_inverted : ADV_TIPS.iq_normal)}" style="cursor:help">
@@ -1308,7 +1312,8 @@ function renderAlertsConfig(box){
     <td class="right"><button data-aldel="${r.id}">delete</button></td></tr>`).join('')
     ||'<tr><td colspan=5 class=muted style="padding:10px">no alert rules — add one below</td></tr>';
   box.innerHTML=`<div style="max-width:900px">
-    <h3 style="margin:24px 0 4px">Alerts &amp; triggers</h3>
+    <details style="border:1px solid var(--line);border-radius:6px;padding:6px 12px;margin-top:20px"><summary style="cursor:pointer;font-weight:600;font-size:15px;padding:4px 0">Alerts &amp; triggers</summary>
+    <div style="padding:8px 2px 4px">
     <p class="muted" style="line-height:1.5">Fire a notification when intercepted traffic matches a rule. Evaluated live in this browser (keep a tab open); rules persist across sessions. Pick a trigger type, set its condition, and choose whether it shows a desktop notification and/or plays a sound. Fired alerts collect under the 🔔 bell.</p>
     <table style="margin:6px 0"><thead><tr><th></th><th>label</th><th>condition</th><th>actions</th><th></th></tr></thead><tbody>${rows}</tbody></table>
     <div class="nodecard" style="margin-top:12px">
@@ -1337,6 +1342,7 @@ function renderAlertsConfig(box){
       <div id="al-err" style="color:var(--warn);margin-top:8px;font-size:12px"></div>
     </div>
     ${('Notification' in window)?'<div style="margin-top:10px"><button id="al-perm">Enable browser notifications</button> <span class="muted" id="al-perms" style="font-size:12px"></span></div>':'<div class="muted" style="margin-top:10px;font-size:12px">(this browser has no notification support — alerts still show in-app)</div>'}
+    </div></details>
   </div>`;
   const ty=box.querySelector('#al-type');
   const showParams=()=>{box.querySelectorAll('.alp').forEach(x=>x.style.display='none'); const m={node:'alp-node',content:'alp-content',type:'alp-type',signal:'alp-signal',channel:'alp-channel',geofence:'alp-geofence'}[ty.value]; if(m)box.querySelector('#'+m).style.display='';};
