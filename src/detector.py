@@ -21,7 +21,7 @@ Usage:
   | python detector.py -r 40000000 -b 28000000 -c 915 -t sc16 -d 1
 """
 
-import sys, os, time, argparse, numpy as np
+import sys, os, time, json, argparse, numpy as np
 import threading, queue, io, subprocess, fcntl
 
 # Make the GIL hand off 5× more often.  Default 5ms means a Python-only
@@ -3894,6 +3894,17 @@ def main():
     _warned_slow = False   # keep-up monitor: warn once if the gate can't sustain rate
     t_start = time.time()
     center_hz = a.center * 1e6
+    # Live center frequency: poll the SDR control file (the same file soapy_rx uses
+    # to retune the radio) so a center change relabels detections WITHOUT a restart.
+    # _live_center_mhz is read by the closures/loop below; the integer-bin transition
+    # blip during a manual change lasts < 1 window and self-corrects.
+    _live_center_mhz = a.center
+    _ctl_path = os.environ.get('LORA_SDR_CTL') or None
+    try:
+        _ctl_mtime = os.stat(_ctl_path).st_mtime if _ctl_path else None
+    except OSError:
+        _ctl_mtime = None
+    _last_ctl_poll = 0.0
 
     recorder = None
     if a.export_iq:
@@ -4053,11 +4064,34 @@ def main():
           if _spur_notch_hz:
               _fr2 = a.rate / 4096
               for _sf, _hw in _spur_notch_hz:
-                  _sb = 4096 // 2 + int(round((_sf - a.center * 1e6) / _fr2))
+                  _sb = 4096 // 2 + int(round((_sf - _live_center_mhz * 1e6) / _fr2))
                   _nb = max(1, int(round(_hw / _fr2)))
                   _pp[max(0, _sb - _nb):min(4096, _sb + _nb + 1)] = np.median(_pp)
       while True:
         _t_step = time.time()
+        # ---- Live SDR control: pick up a center-freq change (~2x/sec) ----
+        if _ctl_path and _t_step - _last_ctl_poll > 0.5:
+            _last_ctl_poll = _t_step
+            try:
+                _mt = os.stat(_ctl_path).st_mtime
+                if _mt != _ctl_mtime:
+                    _ctl_mtime = _mt
+                    with open(_ctl_path) as _cf:
+                        _cc = json.load(_cf)
+                    if _cc.get('center_hz') is not None:
+                        _nc = float(_cc['center_hz']) / 1e6
+                        if _nc != _live_center_mhz:
+                            _live_center_mhz = _nc
+                            # The recorder reads center_hz live to compute each
+                            # capture's wideband crop offset (off = freq_hz -
+                            # center_hz).  It MUST track the retune or it crops the
+                            # wrong slice and every decode fails after a move.
+                            if recorder is not None:
+                                recorder.center_hz = _live_center_mhz * 1e6
+                            sys.stderr.write('detector: live center -> %.4f MHz\n'
+                                             % _live_center_mhz); sys.stderr.flush()
+            except (OSError, ValueError):
+                pass
         # ---- Read hop_n samples ----
         # If last iter consumed tail samples (for the save), prepend them
         # here and read fewer fresh samples — keeps the audio timeline
@@ -4165,7 +4199,7 @@ def main():
         if _spur_notch_hz:
             _fres2 = a.rate / 4096
             for _sf, _hw in _spur_notch_hz:
-                _sb = 4096 // 2 + int(round((_sf - a.center * 1e6) / _fres2))
+                _sb = 4096 // 2 + int(round((_sf - _live_center_mhz * 1e6) / _fres2))
                 _nb = max(1, int(round(_hw / _fres2)))
                 _psd_gate[max(0, _sb - _nb):min(4096, _sb + _nb + 1)] = np.median(_psd_gate)
         _prof['welch'] += time.time() - _t_step
@@ -4210,7 +4244,7 @@ def main():
             if _spur_notch_hz:
                 _fres_short = a.rate / 4096
                 for _sf, _hw in _spur_notch_hz:
-                    _sb_s = 4096 // 2 + int(round((_sf - a.center * 1e6) / _fres_short))
+                    _sb_s = 4096 // 2 + int(round((_sf - _live_center_mhz * 1e6) / _fres_short))
                     _nb_s = max(1, int(round(_hw / _fres_short)))
                     _p_short[max(0, _sb_s - _nb_s):min(4096, _sb_s + _nb_s + 1)] = np.median(_p_short)
             # Width filter: a LoRa SF7/500k chirp spans ≥73 bins (500 kHz at
@@ -4317,7 +4351,7 @@ def main():
             _slot = _pool.acquire_slot()
             _pool.slot_array(_slot)[:len(buf)] = buf
             _pool.dispatch(_slot, _seq, len(buf), _psd_gate, _gate_peaks,
-                           spur_db=_spur_db)
+                           spur_db=_spur_db, center=_live_center_mhz)
             _inflight.append({'seq': _seq, 'slot': _slot,
                               'pre_hop': pre_hop, 'tot_s': tot_s})
             _seq += 1
@@ -4344,7 +4378,7 @@ def main():
             _prof['detect'] += dt
             _t_step = time.time()
         else:
-            dets = detect_preamble(buf, a.rate, a.bandwidth, a.center,
+            dets = detect_preamble(buf, a.rate, a.bandwidth, _live_center_mhz,
                                    sc_threshold=a.threshold,
                                    ethresh=a.energy_threshold,
                                    spur_db=_spur_db, dc_notch_mhz=a.dc_notch,

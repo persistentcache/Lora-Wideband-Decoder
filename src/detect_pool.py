@@ -57,7 +57,7 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
         task = task_q.get()
         if task is None:
             break
-        slot, seq, n, psd, peaks, spur_db = task
+        slot, seq, n, psd, peaks, spur_db, task_center = task
         iq = views[slot][:n]
         try:
             kw = dict(sc_threshold=sc_thr, ethresh=ethr,
@@ -65,7 +65,8 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
                       debug=_dbg, cached_psd=psd, cached_peaks=peaks)
             if spur_db is not None:
                 kw['spur_db'] = spur_db
-            dets = L.detect_preamble(iq, wb_fs, wb_bw, center, **kw)
+            _c = task_center if task_center is not None else center
+            dets = L.detect_preamble(iq, wb_fs, wb_bw, _c, **kw)
         except Exception as e:
             dets = []
             result_q.put((seq, dets, 'ERR:%s' % e))
@@ -121,8 +122,10 @@ class DetectPool:
     def n_free(self):
         return len(self._free)
 
-    def dispatch(self, slot, seq, n, psd, peaks, spur_db=None):
-        self._task_q.put((slot, seq, n, psd, peaks, spur_db))
+    def dispatch(self, slot, seq, n, psd, peaks, spur_db=None, center=None):
+        # center (MHz) is passed per-task so a live center-frequency change takes
+        # effect without re-spawning workers; None → use the spawn-time params center.
+        self._task_q.put((slot, seq, n, psd, peaks, spur_db, center))
 
     def result(self, seq):
         """Block until window `seq`'s detection is available; return dets."""
