@@ -1485,6 +1485,7 @@ def tail_packet_log(path):
 
 
 PIPELINE_LOG = '/tmp/lora_web_pipeline.log'
+SDR_CTL_PATH = '/tmp/lora_sdr_ctl.json'   # live SDR control (gain/freq) — soapy_rx polls this
 HEALTH = {'msps': None, 'rate_msps': None, 'drops_m': 0.0, 'save_q': None,
           'dec_q': None, 'det': None, 'pipe_ms': None, 'elapsed': None,
           'warn': None, 'detect_workers': None, 'preflight_note': None,
@@ -1923,6 +1924,14 @@ def start_pipeline():
     # (normal IQ).  Mutually exclusive with normal traffic, so it's an explicit
     # mode the user selects, not an automatic fallback.
     env['LORA_IQ_INVERT'] = '1' if SETTINGS.get('iq_invert') else '0'
+    # Live SDR control: soapy_rx polls this file so gain changes apply WITHOUT a
+    # pipeline restart.  Start fresh — drop any stale file so the -g in the command
+    # wins on this run; later gain edits (POST /api/settings) rewrite it.
+    env['LORA_SDR_CTL'] = SDR_CTL_PATH
+    try:
+        os.remove(SDR_CTL_PATH)
+    except OSError:
+        pass
     _pr = SETTINGS.get('protocols') or {}
     env['LORA_PROTOCOLS'] = ','.join(k for k in (
         'meshtastic', 'meshcore', 'lorawan', 'loramesher',
@@ -2172,6 +2181,18 @@ def api_settings():
             if sdr_profiles is not None:
                 rad = sdr_profiles.clamp_radio(SETTINGS.get('sdr', 'bladerf'), rad)
             SETTINGS['radio'] = rad
+            # Live-apply GAIN to a RUNNING pipeline (no restart) by writing the
+            # control file soapy_rx polls.  Numeric gain only — 'auto' (AGC mode)
+            # and rate/center reshape the whole capture/detection chain and still
+            # need a restart (handled by the GUI's "applies on next Start" note).
+            if PIPELINE.get('running') and 'gain' in d['radio']:
+                try:
+                    _gv = float(rad['gain'])
+                    with open(SDR_CTL_PATH, 'w') as _cf:
+                        json.dump({'gain': _gv}, _cf)
+                    HEALTH['live_gain'] = _gv   # surfaced so the UI can confirm it took
+                except (TypeError, ValueError):
+                    pass
         if 'tune' in d and isinstance(d['tune'], dict):
             tune = dict(SETTINGS.get('tune') or {})
             # Bounds match the CLI flag ranges and keep the pipeline numerically

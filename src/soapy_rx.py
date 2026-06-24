@@ -19,6 +19,7 @@ counted and logged to stderr — never silently swallowed.
 import os
 import sys
 import time
+import json
 import queue
 import argparse
 import threading
@@ -161,9 +162,51 @@ def main():
 
     dev.activateStream(st)
 
+    # ---- Live control: app.py writes {"gain":dB,"freq_hz":Hz} to LORA_SDR_CTL when
+    # the user changes SDR settings while the pipeline runs, so gain (and on
+    # supported devices, center freq) apply WITHOUT a pipeline restart.  Polled from
+    # the reader thread (the only thread that touches the device) so there is no
+    # concurrent device access.  The file's mtime at startup is recorded but NOT
+    # applied — the -g/-f the command already set wins on a fresh start; only later
+    # changes take effect.  SoapySDR setGain/setFrequency act on the live stream.
+    _ctl_path = os.environ.get('LORA_SDR_CTL') or None
+    try:
+        _ctl_mtime = os.stat(_ctl_path).st_mtime if _ctl_path else None
+    except OSError:
+        _ctl_mtime = None
+
+    def _apply_ctl():
+        nonlocal _ctl_mtime
+        try:
+            mt = os.stat(_ctl_path).st_mtime
+        except OSError:
+            return
+        if mt == _ctl_mtime:
+            return
+        _ctl_mtime = mt
+        try:
+            with open(_ctl_path) as cf:
+                c = json.load(cf)
+        except Exception:
+            return
+        if c.get('gain') is not None:
+            try:
+                dev.setGainMode(SOAPY_SDR_RX, 0, False)   # AGC off so manual gain sticks
+                dev.setGain(SOAPY_SDR_RX, 0, float(c['gain']))
+                sys.stderr.write('soapy_rx: live gain -> %s dB\n' % c['gain']); sys.stderr.flush()
+            except Exception as e:
+                sys.stderr.write('soapy_rx: live gain failed: %s\n' % e)
+        if c.get('freq_hz') is not None:
+            try:
+                dev.setFrequency(SOAPY_SDR_RX, 0, float(c['freq_hz']))
+                sys.stderr.write('soapy_rx: live freq -> %s Hz\n' % c['freq_hz']); sys.stderr.flush()
+            except Exception as e:
+                sys.stderr.write('soapy_rx: live freq failed: %s\n' % e)
+
     def reader():
         """Service the device continuously — this thread must never block long."""
         buf = np.empty(2 * N, np.int16)
+        _last_ctl = time.time()
         while not stop.is_set():
             sr = dev.readStream(st, [buf], N, timeoutUs=500000)
             n = sr.ret
@@ -177,6 +220,9 @@ def main():
             elif n == SOAPY_SDR_OVERFLOW:
                 stats['overflow'] += 1          # device dropped (host too slow) — visible
             # else: timeout / transient (n < 0) → just retry
+            if _ctl_path and time.time() - _last_ctl > 0.5:
+                _last_ctl = time.time()
+                _apply_ctl()
 
     th = threading.Thread(target=reader, daemon=True)
     th.start()
