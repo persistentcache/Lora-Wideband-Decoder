@@ -196,12 +196,12 @@ def main():
                 sys.stderr.write('soapy_rx: live gain -> %s dB\n' % c['gain']); sys.stderr.flush()
             except Exception as e:
                 sys.stderr.write('soapy_rx: live gain failed: %s\n' % e)
-        if c.get('freq_hz') is not None:
+        if c.get('center_hz') is not None:
             try:
-                dev.setFrequency(SOAPY_SDR_RX, 0, float(c['freq_hz']))
-                sys.stderr.write('soapy_rx: live freq -> %s Hz\n' % c['freq_hz']); sys.stderr.flush()
+                dev.setFrequency(SOAPY_SDR_RX, 0, float(c['center_hz']))
+                sys.stderr.write('soapy_rx: live center -> %s Hz\n' % c['center_hz']); sys.stderr.flush()
             except Exception as e:
-                sys.stderr.write('soapy_rx: live freq failed: %s\n' % e)
+                sys.stderr.write('soapy_rx: live center failed: %s\n' % e)
 
     def reader():
         """Service the device continuously — this thread must never block long."""

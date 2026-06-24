@@ -2181,18 +2181,25 @@ def api_settings():
             if sdr_profiles is not None:
                 rad = sdr_profiles.clamp_radio(SETTINGS.get('sdr', 'bladerf'), rad)
             SETTINGS['radio'] = rad
-            # Live-apply GAIN to a RUNNING pipeline (no restart) by writing the
-            # control file soapy_rx polls.  Numeric gain only — 'auto' (AGC mode)
-            # and rate/center reshape the whole capture/detection chain and still
-            # need a restart (handled by the GUI's "applies on next Start" note).
-            if PIPELINE.get('running') and 'gain' in d['radio']:
-                try:
-                    _gv = float(rad['gain'])
-                    with open(SDR_CTL_PATH, 'w') as _cf:
-                        json.dump({'gain': _gv}, _cf)
-                    HEALTH['live_gain'] = _gv   # surfaced so the UI can confirm it took
-                except (TypeError, ValueError):
-                    pass
+            # Live-apply GAIN and CENTER FREQ to a RUNNING pipeline (no restart) by
+            # writing the control file soapy_rx + detector poll: soapy_rx retunes
+            # the radio (setGain/setFrequency), the detector relabels detections at
+            # the new center.  Numeric gain only ('auto'/AGC needs a restart); sample
+            # rate still needs a restart (it reshapes the buffer/FFT chain).
+            if PIPELINE.get('running') and ('gain' in d['radio'] or 'center_mhz' in d['radio']):
+                _rc = _radio_cfg()
+                _ctl = {}
+                try: _ctl['gain'] = float(_rc.get('gain'))
+                except (TypeError, ValueError): pass
+                try: _ctl['center_hz'] = float(_rc['center_mhz']) * 1e6
+                except (TypeError, ValueError, KeyError): pass
+                if _ctl:
+                    try:
+                        with open(SDR_CTL_PATH, 'w') as _cf:
+                            json.dump(_ctl, _cf)
+                        HEALTH['live_gain'] = _ctl.get('gain')
+                    except OSError:
+                        pass
         if 'tune' in d and isinstance(d['tune'], dict):
             tune = dict(SETTINGS.get('tune') or {})
             # Bounds match the CLI flag ranges and keep the pipeline numerically

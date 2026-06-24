@@ -1087,7 +1087,7 @@ function renderSdrConfig(box){
     const opt=p=>'<option value="'+p.id+'"'+(p.id===cur?' selected':'')+'>'+esc(p.label)+(p.tested?'':' — best-effort')+'</option>';
     box.innerHTML='<div style="max-width:1000px;padding:16px 0;border-bottom:1px solid var(--line)">'
       +'<h3 style="margin:0 0 4px">SDR / Radio</h3>'
-      +'<p class="muted" style="line-height:1.5">Pick your SDR and radio settings — persists across sessions. <b>Gain applies live</b> to a running pipeline (no restart); sample rate, center frequency, and SDR selection apply on the next <b>Start</b>. Inputs are limited to the device\'s capabilities. Only <b>bladeRF</b> is validated here; others need their tool on PATH (HackRF→<code>hackrf_transfer</code>, or any device via <b>SoapySDR</b>→<code>python3-soapysdr</code>).</p>'
+      +'<p class="muted" style="line-height:1.5">Pick your SDR and radio settings — persists across sessions. <b>Gain and center frequency apply live</b> to a running pipeline (no restart); sample rate and SDR selection apply on the next <b>Start</b>. Inputs are limited to the device\'s capabilities. Only <b>bladeRF</b> is validated here; others need their tool on PATH (HackRF→<code>hackrf_transfer</code>, or any device via <b>SoapySDR</b>→<code>python3-soapysdr</code>).</p>'
       +'<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">'
         +'<label>SDR<br><select id="sdrsel">'+profs.map(opt).join('')+'</select></label>'
         +'<label>Center (MHz)<br><input id="sdrcen" type="number" step="0.1" value="'+(r.center_mhz!=null?r.center_mhz:915.0)+'" style="width:104px"></label>'
@@ -1176,7 +1176,7 @@ function renderSdrConfig(box){
         gain:readGain()}};
       if(q('#sdrsel').value==='soapy')body.radio.soapy_driver=q('#sdrdrv').value.trim();
       return fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(x=>x.json());};
-    q('#sdrsave').onclick=()=>saveSdr().then(()=>{q('#sdrresult').innerHTML='<span style="color:#2ecc71">saved — gain applied live; rate/center on next Start</span>';});
+    q('#sdrsave').onclick=()=>saveSdr().then(()=>{q('#sdrresult').innerHTML='<span style="color:#2ecc71">saved — gain &amp; center applied live; rate on next Start</span>';});
     q('#sdrdetect').onclick=()=>{q('#sdrresult').textContent='detecting…';
       saveSdr().then(()=>fetch('/api/sdr/detect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdr:q('#sdrsel').value})}).then(x=>x.json()).then(res=>{
         if(res.found)q('#sdrresult').innerHTML='<span style="color:#2ecc71">✓ Found'+(res.serial?' — serial <span class="mono">'+esc(res.serial)+'</span>':'')+'</span>';
