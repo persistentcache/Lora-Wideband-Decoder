@@ -6324,7 +6324,12 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
     # ---- Sync word extraction (two upchirp symbols immediately after preamble) ----
     # Symbol pre_last_i+1 and pre_last_i+2 encode the sync word nibbles.
-    # Formula: sync_word = (bin1//(N//16) << 4) | (bin2//(N//16))
+    # Each nibble is transmitted at cyclic-shift bin = nibble * 8 (the Semtech
+    # public/private sync encoding, SF-independent — see reconstruct_lora_packet),
+    # so nibble = bin // 8.  Formula: sync_word = (bin1//8 << 4) | (bin2//8).
+    # NOTE: the divisor is a CONSTANT 8, not N//16.  N//16 only equals 8 at SF7,
+    # so the old code read sync correctly at SF7 but halved it at SF8, quartered
+    # at SF9, ... → 0x00 for everything by SF12.  bin//8 is correct for all SF.
     # Known: 0x2B=Meshtastic, 0x34=LoRaWAN, 0x12=MeshCore/Private, 0x0F=Meshtastic(alt)
     # Sync word is a HINT about likely protocol family, NEVER the identification.
     # 0x12 is the Semtech default ("public LoRa") used by MeshCore, RadioLib raw
@@ -6340,7 +6345,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     _sw2_p = preamble_start + (pre_last_i + 2) * N
     _sync_word = None
     if _sw1_p + N <= len(iq1) and _sw2_p + N <= len(iq1):
-        _nib_scale = max(1, N // 16)
+        _nib_scale = 8   # bin = nibble*8 (SF-independent); was N//16 (only right at SF7)
         _b1 = int(np.argmax(np.abs(_fft(iq1[_sw1_p:_sw1_p + N] * downchirp))))
         _b2 = int(np.argmax(np.abs(_fft(iq1[_sw2_p:_sw2_p + N] * downchirp))))
         _sync_word = ((_b1 // _nib_scale & 0xF) << 4) | (_b2 // _nib_scale & 0xF)
