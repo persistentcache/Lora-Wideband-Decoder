@@ -1581,10 +1581,9 @@ def _tail_health():
                     cm = _RE_CLIP.search(ln)
                     HEALTH['clip_pct'] = float(cm.group(1)) if cm else 0.0
                     if HEALTH['clip_pct'] >= 1.0:
-                        clip_warn = (f"ADC clipping {HEALTH['clip_pct']:.0f}% — the input is "
-                                     f"saturating. Lower the SDR gain (Config → SDR/Radio). "
-                                     f"A strong nearby transmitter overdrives the front end "
-                                     f"and corrupts longer packets even though short ones decode.")
+                        clip_warn = (f"ADC Clipping (Over Saturated) {HEALTH['clip_pct']:.0f}%. "
+                                     f"Recommend you lower your SDR gain. Failure to lower may "
+                                     f"cause missed or false decodes for close nodes.")
                     else:
                         clip_warn = None
                 a = _RE_AUTO.search(ln)
