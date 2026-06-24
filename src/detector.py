@@ -3880,6 +3880,7 @@ def main():
     # in that gap are never detected.
     _carry_tail = None
     buf_pos = tot_s = tot_d = wc = 0
+    _sat_max = 0.0   # worst ADC-clip fraction since the last [STAT] (surfaced as a warning)
     # Worst-case preamble duration across all Meshtastic presets:
     #   SF12/62.5k = 16×4096/62500 = 1.049s  →  not capturable within hop anyway
     #   SF12/125k  = 16×4096/125000 = 0.524s  ← needs most lookback in-window
@@ -4278,6 +4279,8 @@ def main():
         _abs_sub = np.abs(_sub)
         _peak_amp = float(_abs_sub.max())
         _sat_frac = float(np.count_nonzero(_abs_sub > _clip_thresh)) / len(_abs_sub)
+        if _sat_frac > _sat_max:
+            _sat_max = _sat_frac
         _spur_db  = a.spur_reject
         if _sat_frac > 0.005:   # > 0.5 % of samples clipping
             # Saturation creates harmonic distortion that looks like extra
@@ -4498,8 +4501,10 @@ def main():
             print(f"[STAT] {elapsed:.1f}s | {msps:.1f}Msps | win={wc} det={tot_d} "
                   f"save_q={save_q} dec_q={dec_q} active={active} "
                   f"pipe={dt * 1000:.0f}ms"
-                  + (f" drops={drops/1e6:.1f}M" if drops else ""),
+                  + (f" drops={drops/1e6:.1f}M" if drops else "")
+                  + (f" clip={_sat_max*100:.1f}%" if _sat_max > 0.005 else ""),
                   file=sys.stderr)
+            _sat_max = 0.0   # reset the clip tracker for the next [STAT] interval
             if _prof['n'] > 0:
                 n = _prof['n']
                 print(f"  PROF (avg ms over {n} wins): "

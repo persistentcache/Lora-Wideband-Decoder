@@ -1487,11 +1487,13 @@ def tail_packet_log(path):
 PIPELINE_LOG = '/tmp/lora_web_pipeline.log'
 HEALTH = {'msps': None, 'rate_msps': None, 'drops_m': 0.0, 'save_q': None,
           'dec_q': None, 'det': None, 'pipe_ms': None, 'elapsed': None,
-          'warn': None, 'detect_workers': None, 'preflight_note': None}
+          'warn': None, 'detect_workers': None, 'preflight_note': None,
+          'clip_pct': None}
 import re as _re
 _RE_STAT = _re.compile(r'\[STAT\]\s+([\d.]+)s\s+\|\s+([\d.]+)Msps\s+\|\s+win=(\d+)\s+'
                        r'det=(\d+)\s+save_q=(\d+)\s+dec_q=(\d+)\s+active=(\d+)\s+'
                        r'pipe=(\d+)ms(?:\s+drops=([\d.]+)M)?')
+_RE_CLIP = _re.compile(r'clip=([\d.]+)%')   # ADC saturation, appended to [STAT] when clipping
 _RE_AUTO = _re.compile(r'Detect workers: AUTO = (\d+)')
 # CATCHUP appears when the detector falls so far behind the ring buffer it has
 # to skip ahead to avoid wrapping past unread data.  Each occurrence is hard,
@@ -1522,6 +1524,7 @@ def _tail_health():
     last_stat_at = None     # timestamp of the most recent successful [STAT] parse
     immediate_warn = None   # CATCHUP / no-telemetry warnings (bypass keep-up
                             # warmup gating — they're deterministic, not statistical)
+    clip_warn = None        # ADC-saturation warning (deterministic; clears when clipping stops)
     while True:
         try:
             now = time.time()
@@ -1573,6 +1576,17 @@ def _tail_health():
                     # 30 s keep-up reevaluation should govern that.
                     if immediate_warn and immediate_warn.startswith('Pipeline running '):
                         immediate_warn = None
+                    # ADC clipping is appended to [STAT] only when present; a STAT
+                    # without it means clipping fell back below 0.5 % → clear.
+                    cm = _RE_CLIP.search(ln)
+                    HEALTH['clip_pct'] = float(cm.group(1)) if cm else 0.0
+                    if HEALTH['clip_pct'] >= 1.0:
+                        clip_warn = (f"ADC clipping {HEALTH['clip_pct']:.0f}% — the input is "
+                                     f"saturating. Lower the SDR gain (Config → SDR/Radio). "
+                                     f"A strong nearby transmitter overdrives the front end "
+                                     f"and corrupts longer packets even though short ones decode.")
+                    else:
+                        clip_warn = None
                 a = _RE_AUTO.search(ln)
                 if a:
                     HEALTH['detect_workers'] = int(a.group(1))
@@ -1612,7 +1626,8 @@ def _tail_health():
             # keep-up).
             if PIPELINE.get('running') and started_at:
                 since_start = now - started_at
-                want_warn = immediate_warn
+                # Priority: CATCHUP/no-telemetry (immediate) > ADC clipping > keep-up.
+                want_warn = immediate_warn or clip_warn
                 if not want_warn:
                     if since_start < WARMUP_S:
                         want_warn = None
