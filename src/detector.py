@@ -4273,12 +4273,17 @@ def main():
             if not any(abs(_sp[0] - _mp[0]) < _DEDUP_BINS for _mp in _gate_peaks):
                 _gate_peaks.append(_sp)
 
-        has_energy = len(_gate_peaks) > 0
-        # No signal in this window → the gate just did light work and is caught
-        # up.  Use that real-time idle moment to let the decoder re-decode ONE
-        # deferred straggler (big budget).  Driven by the gate's own idle state,
-        # so it self-adapts to traffic density with no idle-time threshold.
-        if not has_energy and decoder is not None:
+        # Try to release ONE deferred straggler for a big-budget re-decode.  Drive
+        # this off the decode system's ACTUAL idle state — maybe_release_straggler
+        # self-gates on (slow queue non-empty AND fast queue empty AND nothing
+        # decoding) — NOT off the gate's per-window peak count.  Peak count was a
+        # broken proxy for "idle": at high gain find_peaks returns spur peaks every
+        # window, so the old `if not has_energy` guard was never true and the slow
+        # queue never drained (observed: 4 SF11 stragglers stuck indefinitely while
+        # the gate sat with no real traffic).  Realtime stays protected by the
+        # _gate_stress throttle, which pauses the heavy re-decode if the gate starts
+        # dropping samples; this call itself is just a few cheap checks.
+        if decoder is not None:
             decoder.maybe_release_straggler()
         _prof['notch'] += time.time() - _t_step
         _t_step = time.time()
