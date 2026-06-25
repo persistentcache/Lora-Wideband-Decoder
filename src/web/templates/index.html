@@ -1308,7 +1308,8 @@ function renderAdvancedConfig(box){
         <p class="muted" style="font-size:11px;margin:4px 0 0;line-height:1.5">Inverted decodes IQ-inverted transmitters (LoRaWAN downlink, satellite / tinyGS). Mutually exclusive — normal traffic won't decode while this is set.</p>
         <h4 style="margin:18px 0 2px">Channelizer recommendation <span class="muted" style="font-size:11px">(beta)</span></h4>
         ${cb('chrecommend',s.recommend_channelizing!==false,'<b>Recommend Channelizing (On / Off)</b><br><span class="muted" style="font-size:11px">While the full band is scanned, learn which LoRa channels are actually live. Once the channel set settles (no new / out-of-band channel for a while), a banner appears recommending a switch to watching <b>only those channels</b> — far more efficient and a higher decode rate than wideband scan, since it skips the wideband peak-search entirely. You accept or decline. On by default.</span>','Learn the live channels during wideband scan and recommend channelizing once they converge.')}
-        <div id="chsub" style="margin:2px 0 0 26px">${num('chaftern',s.channelize_after_n||15,3,500,1,'After X intercepts',"How many decoded LoRa packets to learn from before evaluating whether the channel set has settled enough to recommend channelizing.")}</div>
+        <div id="chsub" style="margin:2px 0 0 26px">${num('chaftern',s.channelize_after_n||15,3,500,1,'After X intercepts',"How many decoded LoRa packets to learn from before evaluating whether the channel set has settled enough to recommend channelizing.")}
+          ${num('chrescan',s.channelize_rescan_min||0,0,1440,1,'Auto re-scan every X min (0 = off)',"Once channelizing, every X minutes briefly drop back to a wideband sweep to discover any new / out-of-band channels, then re-channelize with the updated set. 0 disables it — use the banner's Back to wideband to re-scan manually. A re-scan dwells ~60s on wideband.")}</div>
         <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--line);display:flex;gap:10px;align-items:center">
           <button id="advreset" title="Restore every Protocols and Advanced option to its built-in default. Does NOT touch SDR/Radio or Channel keys.">Reset to defaults</button>
           <span class="muted" style="font-size:11px">Restores all Protocols + Advanced options (protocols, unknown, scan, fingerprint, LDRO, IQ, tuning). Doesn't affect SDR/Radio or Channel keys.</span>
@@ -1320,9 +1321,10 @@ function renderAdvancedConfig(box){
     q('#fp').onchange=e=>post({fingerprint:e.target.checked});
     q('#ldro').onchange=e=>post({ldro_fallback:e.target.checked});
     q('#iqmode').onchange=e=>post({iq_invert:e.target.value==='inverted'});
-    const chSync=on=>{ q('#chsub').style.opacity=on?'1':'.45'; q('#chaftern').disabled=!on; };
+    const chSync=on=>{ q('#chsub').style.opacity=on?'1':'.45'; q('#chaftern').disabled=!on; q('#chrescan').disabled=!on; };
     q('#chrecommend').onchange=e=>{ post({recommend_channelizing:e.target.checked}); chSync(e.target.checked); };
     q('#chaftern').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_after_n:n}); };
+    q('#chrescan').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_rescan_min:n}); };
     chSync(s.recommend_channelizing!==false);
     const saveTune=()=>post({tune:{
       threshold:parseFloat(q('#tunethresh').value),
@@ -1752,9 +1754,16 @@ function renderChannelize(st){
     $('#chaccept').onclick=()=>chDecide(true); $('#chdecline').onclick=()=>chDecide(false);
   } else if(st.state==='accepted'){
     b.style.display='';
-    b.innerHTML='<b>Channelizing</b> — watching '+st.n_channels+' learned channel'+(st.n_channels===1?'':'s')+': '+chList
-      +' <button id="chrescan" style="margin-left:6px">Back to wideband</button>';
-    $('#chrescan').onclick=()=>fetch('/api/channelize/reset',{method:'POST'}).then(r=>r.json()).then(renderChannelize);
+    if(st.rescanning){
+      b.innerHTML='<b>Re-scanning…</b> <span class="muted">briefly on wideband to discover new channels — will re-channelize automatically.</span>';
+    } else {
+      const every=st.rescan_min>0?(' &nbsp;·&nbsp; auto re-scan every '+st.rescan_min+' min'):'';
+      b.innerHTML='<b>Channelizing</b> — watching '+st.n_channels+' learned channel'+(st.n_channels===1?'':'s')+': '+chList
+        +'<span class="muted">'+every+'</span>'
+        +' <button id="chrescannow" style="margin-left:6px">Re-scan now</button> <button id="chwide">Back to wideband</button>';
+      $('#chrescannow').onclick=()=>fetch('/api/channelize/rescan',{method:'POST'});
+      $('#chwide').onclick=()=>fetch('/api/channelize/reset',{method:'POST'}).then(r=>r.json()).then(renderChannelize);
+    }
   } else { b.style.display='none'; }
 }
 fetch('/api/channelize').then(r=>r.json()).then(renderChannelize).catch(()=>{});

@@ -83,7 +83,11 @@ def load_settings():
                  # channels and they converge (no new/out-of-band channel for a
                  # while), recommend switching to watching only those channels.
                  'recommend_channelizing': True,   # show the recommendation banner
-                 'channelize_after_n': 15}         # intercepts before evaluating
+                 'channelize_after_n': 15,         # intercepts before evaluating
+                 # While channelizing, every X minutes briefly drop back to wideband
+                 # to discover new/out-of-band channels, then re-channelize with the
+                 # updated set.  0 = never (manual 'Back to wideband' only).
+                 'channelize_rescan_min': 0}
     try:
         with open(SETTINGS_PATH) as f:
             return {**_defaults, **json.load(f)}
@@ -115,11 +119,13 @@ class ChannelTracker:
         self.state = 'scanning'
         self.declined_session = False
         self.accepted = []        # channel list frozen at Accept — what the gate watches
+        self.rescanning = False   # mid auto re-scan: temporarily back on wideband
 
     def reset(self):
         with self._lock:
             self.channels = []; self.total = 0; self.last_new_at = 0
-            self.state = 'scanning'; self.declined_session = False; self.accepted = []
+            self.state = 'scanning'; self.declined_session = False
+            self.accepted = []; self.rescanning = False
 
     def add(self, freq_mhz, bw, proto, sf, ts):
         """Cluster one decoded packet.  Returns 'recommend' if the state just
@@ -182,9 +188,24 @@ class ChannelTracker:
             return ','.join('%.5f:%.1f' % (c['center_mhz'], c['bw_khz']) for c in self.accepted)
 
     def active(self):
-        """True when the user has accepted and there are channels to watch."""
+        """True when the gate should be channelized — accepted, has channels, and
+        not mid re-scan (during a re-scan we drop the mask to find new channels)."""
         with self._lock:
-            return self.state == 'accepted' and bool(self.accepted)
+            return self.state == 'accepted' and bool(self.accepted) and not self.rescanning
+
+    def set_rescanning(self, on):
+        with self._lock:
+            self.rescanning = bool(on)
+
+    def refreeze(self):
+        """Re-snapshot the watched set = currently learned channels (called after a
+        re-scan window so any newly-discovered channel joins the mask).  Returns the
+        center_mhz of channels that are new vs the previous accepted set."""
+        with self._lock:
+            prev = {round(c['center_mhz'], 3) for c in self.accepted}
+            self.accepted = [dict(c) for c in sorted(self.channels, key=lambda x: -x['count'])]
+            return [round(c['center_mhz'], 4) for c in self.accepted
+                    if round(c['center_mhz'], 3) not in prev]
 
     def status(self):
         with self._lock:
@@ -192,6 +213,8 @@ class ChannelTracker:
             return {'state': self.state, 'total': self.total,
                     'after_n': int(SETTINGS.get('channelize_after_n', 15) or 15),
                     'enabled': bool(SETTINGS.get('recommend_channelizing', True)),
+                    'rescanning': self.rescanning,
+                    'rescan_min': int(SETTINGS.get('channelize_rescan_min', 0) or 0),
                     'n_channels': len(self.channels),
                     'channels': [{'center_mhz': round(c['center_mhz'], 4),
                                   'bw_khz': round(c['bw_khz'], 1), 'count': c['count'],
@@ -2358,10 +2381,16 @@ def api_settings():
                 SETTINGS['channelize_after_n'] = max(3, min(500, int(d['channelize_after_n'])))
             except (TypeError, ValueError):
                 pass
+        if 'channelize_rescan_min' in d:
+            try:
+                SETTINGS['channelize_rescan_min'] = max(0, min(1440, int(d['channelize_rescan_min'])))
+            except (TypeError, ValueError):
+                pass
         if any(k in d for k in ('autosave', 'waterfall', 'unknown', 'fingerprint',
                                 'protocols', 'wide_scan', 'sdr', 'radio', 'tune',
                                 'ldro_fallback', 'iq_invert', 'time_format', 'date_format',
-                                'recommend_channelizing', 'channelize_after_n')):
+                                'recommend_channelizing', 'channelize_after_n',
+                                'channelize_rescan_min')):
             save_settings(SETTINGS)
             _apply_waterfall_flag()
             _apply_unknown_flag()
@@ -3153,6 +3182,76 @@ def _maybe_restart_for_channelize(was_active):
     threading.Thread(target=_do, daemon=True).start()
 
 
+RESCAN_WINDOW_S = 60.0   # wideband dwell per re-scan — catches a 15 s beacon ~4x
+
+
+def _channelize_rescan_once():
+    """One re-scan cycle: drop the channel mask, dwell on wideband to discover new
+    channels (the follower keeps learning), then re-channelize with the updated set.
+    Aborts cleanly if the user stops the pipeline or leaves channelize mode mid-cycle
+    (never restarts a pipeline the user intentionally stopped)."""
+    if not (PIPELINE.get('running') and CHAN.active()):
+        return
+    print('[CHAN] re-scanning for new channels (%ds wideband)' % int(RESCAN_WINDOW_S),
+          file=sys.stderr, flush=True)
+    CHAN.set_rescanning(True)                       # active() -> False -> wideband
+    _broadcast({'type': 'channelize', 'data': CHAN.status()})
+    stop_pipeline(); time.sleep(1.2)
+    if not (CHAN.rescanning and CHAN.state == 'accepted'):
+        CHAN.set_rescanning(False); return          # aborted during the gap
+    start_pipeline()
+    _t0 = time.time()
+    while time.time() - _t0 < RESCAN_WINDOW_S:
+        if not (CHAN.rescanning and CHAN.state == 'accepted' and PIPELINE.get('running')):
+            break
+        time.sleep(2)
+    aborted = not (CHAN.state == 'accepted' and PIPELINE.get('running'))
+    CHAN.set_rescanning(False)
+    if aborted:                                      # user stopped or went wideband
+        _broadcast({'type': 'channelize', 'data': CHAN.status()})
+        return
+    new = CHAN.refreeze()                            # accepted = learned (+ any new)
+    if new:
+        print('[CHAN] re-scan found %d new channel(s): %s' % (
+            len(new), ', '.join('%.4f MHz' % f for f in new)), file=sys.stderr, flush=True)
+    stop_pipeline(); time.sleep(1.2); start_pipeline()   # back to channelize, updated mask
+    _broadcast({'type': 'channelize', 'data': CHAN.status()})
+
+
+def _channelize_rescan_loop():
+    """Trigger _channelize_rescan_once every channelize_rescan_min minutes while
+    channelizing.  0 = off.  Waits in short steps so an interval change, a stop, or
+    leaving channelize mode is picked up promptly."""
+    while True:
+        try:
+            mins = int(SETTINGS.get('channelize_rescan_min', 0) or 0)
+            if mins > 0 and CHAN.active() and PIPELINE.get('running'):
+                waited = 0
+                while waited < mins * 60:
+                    time.sleep(5); waited += 5
+                    if int(SETTINGS.get('channelize_rescan_min', 0) or 0) != mins:
+                        break                        # interval changed → recompute
+                    if not (CHAN.active() and PIPELINE.get('running')):
+                        break                        # left channelize / stopped
+                else:
+                    if CHAN.active() and PIPELINE.get('running') \
+                       and int(SETTINGS.get('channelize_rescan_min', 0) or 0) > 0:
+                        _channelize_rescan_once()
+            else:
+                time.sleep(5)
+        except Exception:
+            time.sleep(10)
+
+
+@app.route('/api/channelize/rescan', methods=['POST'])
+def api_channelize_rescan():
+    """Manually trigger one re-scan cycle now (background)."""
+    if CHAN.active() and PIPELINE.get('running'):
+        threading.Thread(target=_channelize_rescan_once, daemon=True).start()
+        return jsonify({'ok': True})
+    return jsonify({'ok': False, 'error': 'not channelizing'})
+
+
 @app.route('/api/channelize/decision', methods=['POST'])
 def api_channelize_decision():
     """User accepts/declines the channelizer recommendation.  Accept switches the
@@ -3235,6 +3334,7 @@ def main():
     _apply_unknown_flag()
     threading.Thread(target=_tail_health, daemon=True).start()
     threading.Thread(target=_tail_psd, daemon=True).start()
+    threading.Thread(target=_channelize_rescan_loop, daemon=True).start()
     _startup_line = (f"lora_web: config={CFG.get('_path')}  tailing={log_path}  "
                      f"serving http://{host}:{port}")
     if os.environ.get('LORA_DEBUG') == '1':
