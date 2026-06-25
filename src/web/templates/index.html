@@ -95,6 +95,7 @@
   <span id="bell" title="Alerts" style="margin-left:auto;align-self:center;cursor:pointer;position:relative;padding:0 14px;font-size:15px">🔔<span id="bellct" style="display:none;position:absolute;top:-2px;right:6px;background:var(--warn);color:#fff;border-radius:9px;font-size:10px;padding:0 5px;line-height:15px"></span></span>
   <span id="healthbar" style="align-self:center;font-size:12px;color:var(--mut);padding-right:12px"></span>
 </nav>
+<div id="chbanner" style="display:none;margin:8px 10px;padding:10px 14px;border:1px solid var(--warn);border-radius:6px;background:rgba(241,196,15,.08);font-size:13px"></div>
 <div id="warnbar" style="display:none;background:rgba(255,93,93,.15);color:#ff8c8c;padding:7px 16px;border-bottom:1px solid var(--warn);font-size:12px"></div>
 <div class="wrap">
   <div id="tab-pkts">
@@ -1305,6 +1306,9 @@ function renderAdvancedConfig(box){
           <span class="muted" style="font-size:11px">applies on next Start</span>
         </div>
         <p class="muted" style="font-size:11px;margin:4px 0 0;line-height:1.5">Inverted decodes IQ-inverted transmitters (LoRaWAN downlink, satellite / tinyGS). Mutually exclusive — normal traffic won't decode while this is set.</p>
+        <h4 style="margin:18px 0 2px">Channelizer recommendation <span class="muted" style="font-size:11px">(beta)</span></h4>
+        ${cb('chrecommend',s.recommend_channelizing!==false,'<b>Recommend Channelizing (On / Off)</b><br><span class="muted" style="font-size:11px">While the full band is scanned, learn which LoRa channels are actually live. Once the channel set settles (no new / out-of-band channel for a while), a banner appears recommending a switch to watching <b>only those channels</b> — far more efficient and a higher decode rate than wideband scan, since it skips the wideband peak-search entirely. You accept or decline. On by default.</span>','Learn the live channels during wideband scan and recommend channelizing once they converge.')}
+        <div id="chsub" style="margin:2px 0 0 26px">${num('chaftern',s.channelize_after_n||15,3,500,1,'After X intercepts',"How many decoded LoRa packets to learn from before evaluating whether the channel set has settled enough to recommend channelizing.")}</div>
         <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--line);display:flex;gap:10px;align-items:center">
           <button id="advreset" title="Restore every Protocols and Advanced option to its built-in default. Does NOT touch SDR/Radio or Channel keys.">Reset to defaults</button>
           <span class="muted" style="font-size:11px">Restores all Protocols + Advanced options (protocols, unknown, scan, fingerprint, LDRO, IQ, tuning). Doesn't affect SDR/Radio or Channel keys.</span>
@@ -1316,6 +1320,10 @@ function renderAdvancedConfig(box){
     q('#fp').onchange=e=>post({fingerprint:e.target.checked});
     q('#ldro').onchange=e=>post({ldro_fallback:e.target.checked});
     q('#iqmode').onchange=e=>post({iq_invert:e.target.value==='inverted'});
+    const chSync=on=>{ q('#chsub').style.opacity=on?'1':'.45'; q('#chaftern').disabled=!on; };
+    q('#chrecommend').onchange=e=>{ post({recommend_channelizing:e.target.checked}); chSync(e.target.checked); };
+    q('#chaftern').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_after_n:n}); };
+    chSync(s.recommend_channelizing!==false);
     const saveTune=()=>post({tune:{
       threshold:parseFloat(q('#tunethresh').value),
       energy_threshold:parseFloat(q('#tuneeth').value),
@@ -1730,6 +1738,26 @@ try{const _q=new URLSearchParams(location.search).get('q'); if(_q)SEARCHQ=_q;}ca
 // never sticks at the lora.toml default.
 let HDR_KEY='default';
 function setHdrCenter(mhz){ const el=$('#center'); if(el)el.textContent='center '+(+Number(mhz).toFixed(4))+' MHz · key '+HDR_KEY; }
+
+// Channelizer recommendation banner (beta).
+function chDecide(accept){ fetch('/api/channelize/decision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({accept:accept})}).then(r=>r.json()).then(renderChannelize); }
+function renderChannelize(st){
+  const b=$('#chbanner'); if(!b||!st)return;
+  const chList=(st.channels||[]).map(c=>(+c.center_mhz.toFixed(3))+' MHz <span class="muted">('+(c.protos.join('/')||'lora')+' SF'+(c.sfs.join('/')||'?')+' ×'+c.count+')</span>').join(' &nbsp;·&nbsp; ');
+  if(st.state==='recommend'){
+    b.style.display='';
+    b.innerHTML='<b>⚡ Recommend switching to channelizer technique.</b> No out-of-band LoRa detected — all '+st.total+' intercepts are on '+st.n_channels+' channel'+(st.n_channels===1?'':'s')+': '+chList
+      +'<br><span class="muted">Watching only these is far more efficient and decodes better than wideband scan.</span> '
+      +'<button id="chaccept" style="margin-left:6px">Accept — channelize</button> <button id="chdecline">Decline</button>';
+    $('#chaccept').onclick=()=>chDecide(true); $('#chdecline').onclick=()=>chDecide(false);
+  } else if(st.state==='accepted'){
+    b.style.display='';
+    b.innerHTML='<b>Channelizing</b> — watching '+st.n_channels+' learned channel'+(st.n_channels===1?'':'s')+': '+chList
+      +' <button id="chrescan" style="margin-left:6px">Back to wideband</button>';
+    $('#chrescan').onclick=()=>fetch('/api/channelize/reset',{method:'POST'}).then(r=>r.json()).then(renderChannelize);
+  } else { b.style.display='none'; }
+}
+fetch('/api/channelize').then(r=>r.json()).then(renderChannelize).catch(()=>{});
 fetch('/api/state').then(r=>r.json()).then(d=>{PK.push(...d.packets);d.packets.forEach(noteName);d.packets.forEach(p=>{if(p.from)SEEN_NODES.add(p.from);});renderStats(d.stats);CFGW=d.config||{};activateTab(location.hash.slice(1)||'pkts');
   HDR_KEY=(d.config&&d.config.key)||'default'; if(d.config&&d.config.center_mhz!=null)setHdrCenter(d.config.center_mhz);}).catch(()=>activateTab('pkts'));
 fetch('/api/health').then(r=>r.json()).then(renderHealth).catch(()=>{});
@@ -1743,6 +1771,7 @@ if(!STATIC){
   es.addEventListener('update',e=>{const p=JSON.parse(e.data);evalAlerts(p);const i=PK.findIndex(x=>x.pktid===p.pktid&&x.hops===p.hops); if(i>=0)PK[i]=p; else PK.push(p); noteName(p); if(TAB!=='net'&&TAB!=='config')renderCurrent();});
   es.addEventListener('confirm',e=>{const d=JSON.parse(e.data); if(d&&d.devaddr){let ch=false; for(const p of PK){if(p.devaddr===d.devaddr&&p.proto==='unknown'){p.proto='lorawan';p.confidence='confirmed';p.from='LW:'+d.devaddr;delete p.hint;ch=true;}} if(ch&&TAB!=='net'&&TAB!=='config')renderCurrent();}});
   es.addEventListener('stats',e=>renderStats(JSON.parse(e.data)));
+  es.addEventListener('channelize',e=>{ try{renderChannelize(JSON.parse(e.data));}catch(_){} });
   es.addEventListener('health',e=>renderHealth(JSON.parse(e.data)));
   es.addEventListener('psd',e=>{ const _d=JSON.parse(e.data); if(_d.center_mhz!=null)setHdrCenter(_d.center_mhz); if(TAB==='wf'&&WF)wfRow(_d); });
   es.addEventListener('nodemeta',e=>{ const d=JSON.parse(e.data); if(d&&d.id){ if(d.meta&&Object.keys(d.meta).length)NODEMETA[d.id]=d.meta; else delete NODEMETA[d.id]; if(TAB!=='net'&&TAB!=='config')renderCurrent(); } });
