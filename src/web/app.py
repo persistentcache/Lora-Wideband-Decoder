@@ -1675,8 +1675,6 @@ def _apply_waterfall_flag():
 
 def _tail_psd():
     last_m = None
-    rate_mhz = float(CFG['radio']['rate_hz']) / 1e6
-    center_mhz = float(CFG['radio'].get('center_mhz', 915.0))
     while True:
         try:
             if not SUBS or not SETTINGS.get('waterfall', True) or not os.path.exists(PSD_FILE):
@@ -1688,9 +1686,15 @@ def _tail_psd():
             with open(PSD_FILE, 'rb') as f:
                 raw = f.read()
             if raw:
+                # Effective (Config-tab-overridden) rate/center so the waterfall
+                # frequency axis matches what the pipeline is actually running, not
+                # the lora.toml default.  Recomputed per frame so a live re-tune /
+                # Config change is reflected without a restart.
+                _rc = _radio_cfg()
                 _broadcast({'type': 'psd', 'data': {
                     'b64': _b64.b64encode(raw).decode('ascii'),
-                    'center_mhz': center_mhz, 'rate_mhz': rate_mhz}})
+                    'center_mhz': float(_rc.get('center_mhz', 915.0)),
+                    'rate_mhz': float(_rc['rate_hz']) / 1e6}})
             time.sleep(0.08)
         except Exception:
             time.sleep(0.3)
@@ -1998,7 +2002,7 @@ def api_state():
         pkts = list(PACKETS)[-2000:]
         nodes = [_node_view(n) for n in NODES.values()]
     return jsonify({'packets': pkts, 'nodes': nodes, 'edges': _edges_view(),
-                    'stats': _stats(), 'config': {'center_mhz': CFG['radio']['center_mhz'],
+                    'stats': _stats(), 'config': {'center_mhz': _radio_cfg().get('center_mhz', 915.0),
                                                   'key': CFG['decode'].get('key')}})
 
 
@@ -2133,9 +2137,10 @@ def api_psd():
     try:
         with open(PSD_FILE, 'rb') as f:
             raw = f.read()
+        _rc = _radio_cfg()   # effective config (Config tab over lora.toml)
         return jsonify({'b64': _b64.b64encode(raw).decode('ascii'),
-                        'center_mhz': float(CFG['radio'].get('center_mhz', 915.0)),
-                        'rate_mhz': float(CFG['radio']['rate_hz']) / 1e6})
+                        'center_mhz': float(_rc.get('center_mhz', 915.0)),
+                        'rate_mhz': float(_rc['rate_hz']) / 1e6})
     except Exception:
         return jsonify({'b64': None})
 
