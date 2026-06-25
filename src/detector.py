@@ -3728,6 +3728,12 @@ def main():
                         '(e.g. 920.0:0.5,923.5:0.3). Default half-width: 0.5 MHz. '
                         'Example: --spur-notch 920.0 suppresses the bladeRF1 '
                         'LO harmonic at 920 MHz when tuned to 915 MHz.')
+    p.add_argument('--channels', default='',
+                   help='Channelizer mode (beta): restrict the Stage-1 gate to '
+                        'ONLY these learned LoRa channels, ignoring all other '
+                        'energy (spurs, out-of-band).  Comma-separated '
+                        'center_MHz:bandwidth_kHz tokens, e.g. '
+                        '906.875:250,910.525:250.  Empty = wideband scan (default).')
     p.add_argument('--export-iq', default=None, metavar='DIR',
                    help='Export detected signal IQ to DIR as .cf32 files')
     p.add_argument('--decode', action='store_true', default=None,
@@ -3809,6 +3815,27 @@ def main():
                 _spur_notch_hz.append((float(freq_s) * 1e6, float(hw_s) * 1e6))
             else:
                 _spur_notch_hz.append((float(tok) * 1e6, 0.5e6))  # default ±0.5 MHz
+
+    # Channelizer mode (beta): parse the learned-channel allowlist.  Each entry is
+    # (center_hz, half_width_hz) — half-width = BW/2 plus a CFO/carrier-position
+    # margin so an in-channel peak near the band edge is still kept.
+    _chan_mask = []
+    if a.channels:
+        for tok in a.channels.split(','):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                cen_s, bw_s = tok.split(':', 1)
+                cen_hz = float(cen_s) * 1e6
+                bw_hz = float(bw_s) * 1e3
+                _chan_mask.append((cen_hz, bw_hz / 2.0 + max(40e3, bw_hz * 0.2)))
+            except ValueError:
+                pass
+    if _chan_mask:
+        print('[GATE] channelizer mode: watching %d channel(s): %s' % (
+            len(_chan_mask), ', '.join('%.4f MHz' % (c / 1e6) for c, _ in _chan_mask)),
+            file=sys.stderr, flush=True)
 
     # Build the multiprocess detect pool FIRST — before any reader/recorder/
     # decoder THREAD starts.  Forking a multithreaded process inherits the
@@ -4272,6 +4299,23 @@ def main():
         for _sp in _short_peaks_all:
             if not any(abs(_sp[0] - _mp[0]) < _DEDUP_BINS for _mp in _gate_peaks):
                 _gate_peaks.append(_sp)
+
+        # Channelizer mode (beta): keep ONLY peaks whose carrier falls inside a
+        # learned channel; drop everything else (out-of-band spurs, adjacent junk).
+        # This is the whole win — zero extract/decode work off the known channels,
+        # so no spur flood and no straggler pile-up.  Bin->Hz uses the SAME mapping
+        # as the notch code above (center + (bin-2048)*rate/4096), tracking live
+        # re-tunes via _live_center_mhz.  Empty mask => untouched wideband behavior.
+        if _chan_mask:
+            _fres_gate = a.rate / 4096.0
+            _cen_hz = _live_center_mhz * 1e6
+            _n_before = len(_gate_peaks)
+            _gate_peaks = [_pk for _pk in _gate_peaks
+                           if any(abs(_cen_hz + (_pk[0] - 2048) * _fres_gate - _cc) <= _hw
+                                  for _cc, _hw in _chan_mask)]
+            if a.debug and _n_before and len(_gate_peaks) < _n_before:
+                print('[GATE] channel mask: %d/%d peaks in-channel' % (
+                    len(_gate_peaks), _n_before), file=sys.stderr, flush=True)
 
         # Try to release ONE deferred straggler for a big-budget re-decode.  Drive
         # this off the decode system's ACTUAL idle state — maybe_release_straggler
