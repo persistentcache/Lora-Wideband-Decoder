@@ -78,7 +78,12 @@ def load_settings():
                  # Pipeline tuning — overrides lora.toml [detect] when set.  Defaults
                  # match the well-tuned values; users only edit these to chase weak
                  # signals, suppress false positives in noisy RF, or absorb bursts.
-                 'tune': {'threshold': 0.55, 'energy_threshold': 12.0, 'buf_seconds': 16}}
+                 'tune': {'threshold': 0.55, 'energy_threshold': 12.0, 'buf_seconds': 16},
+                 # Channelizer (beta): after the wideband scan learns the live LoRa
+                 # channels and they converge (no new/out-of-band channel for a
+                 # while), recommend switching to watching only those channels.
+                 'recommend_channelizing': True,   # show the recommendation banner
+                 'channelize_after_n': 15}         # intercepts before evaluating
     try:
         with open(SETTINGS_PATH) as f:
             return {**_defaults, **json.load(f)}
@@ -91,6 +96,96 @@ def save_settings(s):
     except Exception:
         pass
 SETTINGS = load_settings()
+
+# ---------------------------------------------------------------- channelizer (beta)
+class ChannelTracker:
+    """Learns the live LoRa channels from decoded packets (clustered by frequency +
+    bandwidth) during wideband scan, and recommends switching to a channelizer that
+    watches ONLY those channels once the set converges — i.e. no new/out-of-band
+    channel has appeared for a while.  Watching just the seen channels skips the
+    wideband peak-search entirely (no spur flood) and concentrates decode effort.
+
+    States: scanning -> recommend -> accepted | declined.
+    """
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.channels = []        # [{center_mhz,bw_khz,count,last_ts,protos[],sfs[]}]
+        self.total = 0            # total LoRa intercepts clustered
+        self.last_new_at = 0      # self.total when the last NEW channel appeared
+        self.state = 'scanning'
+        self.declined_session = False
+
+    def reset(self):
+        with self._lock:
+            self.channels = []; self.total = 0; self.last_new_at = 0
+            self.state = 'scanning'; self.declined_session = False
+
+    def add(self, freq_mhz, bw, proto, sf, ts):
+        """Cluster one decoded packet.  Returns 'recommend' if the state just
+        flipped to recommend (so the caller can broadcast it), else None."""
+        if freq_mhz is None:
+            return None
+        try:
+            freq_mhz = float(freq_mhz)
+        except (TypeError, ValueError):
+            return None
+        bw_khz = float(bw) / 1000.0 if bw else 250.0   # bw stored in Hz on the record
+        tol_mhz = (bw_khz / 1000.0) / 4.0              # ±BW/4 clusters CFO jitter as one channel
+        with self._lock:
+            self.total += 1
+            ch = None
+            for c in self.channels:
+                if abs(c['center_mhz'] - freq_mhz) <= max(tol_mhz, (c['bw_khz'] / 1000.0) / 4.0):
+                    ch = c; break
+            if ch is None:
+                ch = {'center_mhz': freq_mhz, 'bw_khz': bw_khz, 'count': 0,
+                      'last_ts': ts, 'protos': [], 'sfs': []}
+                self.channels.append(ch)
+                self.last_new_at = self.total
+            n = ch['count']
+            ch['center_mhz'] = (ch['center_mhz'] * n + freq_mhz) / (n + 1)   # running mean
+            ch['count'] = n + 1
+            ch['last_ts'] = ts
+            if bw:
+                ch['bw_khz'] = bw_khz
+            if proto and proto not in ch['protos']:
+                ch['protos'].append(proto)
+            if sf and sf not in ch['sfs']:
+                ch['sfs'].append(sf)
+            return self._eval()
+
+    def _eval(self):                                    # caller holds the lock
+        if self.state in ('accepted', 'declined') or self.declined_session:
+            return None
+        if not SETTINGS.get('recommend_channelizing', True):
+            return None
+        after_n = max(3, int(SETTINGS.get('channelize_after_n', 15) or 15))
+        converge = max(3, after_n // 3)                 # this many intercepts with no new channel
+        if self.total >= after_n and (self.total - self.last_new_at) >= converge:
+            if self.state != 'recommend':
+                self.state = 'recommend'
+                return 'recommend'
+        return None
+
+    def decide(self, accept):
+        with self._lock:
+            self.state = 'accepted' if accept else 'declined'
+            if not accept:
+                self.declined_session = True
+
+    def status(self):
+        with self._lock:
+            chans = sorted(self.channels, key=lambda x: -x['count'])
+            return {'state': self.state, 'total': self.total,
+                    'after_n': int(SETTINGS.get('channelize_after_n', 15) or 15),
+                    'enabled': bool(SETTINGS.get('recommend_channelizing', True)),
+                    'n_channels': len(self.channels),
+                    'channels': [{'center_mhz': round(c['center_mhz'], 4),
+                                  'bw_khz': round(c['bw_khz'], 1), 'count': c['count'],
+                                  'protos': list(c['protos']), 'sfs': sorted(c['sfs'])}
+                                 for c in chans]}
+
+CHAN = ChannelTracker()
 
 # ---------------------------------------------------------------- channel keys
 # Persistent key list (survives all sessions) the decoder reads via LORA_KEYS.
@@ -1479,6 +1574,15 @@ def tail_packet_log(path):
                 if ingest(rec) is not None:
                     _broadcast({'type': 'packet', 'data': rec})
                     _broadcast({'type': 'stats', 'data': _stats()})
+                # Channelizer learning: cluster EVERY decoded-LoRa record by channel,
+                # independent of ingest's keep/drop — channel presence is about RF
+                # energy on a frequency, not whether the payload decoded or was a
+                # de-duplicated retransmit (a chatty beacon or an undecryptable
+                # encrypted DM is still real activity on a real channel).
+                if rec.get('freq_mhz') is not None:
+                    if CHAN.add(rec.get('freq_mhz'), rec.get('bw'), rec.get('proto'),
+                                rec.get('sf'), rec.get('ts') or time.time()) == 'recommend':
+                        _broadcast({'type': 'channelize', 'data': CHAN.status()})
             time.sleep(0.3)
         except Exception:
             time.sleep(0.5)
@@ -2230,9 +2334,17 @@ def api_settings():
             SETTINGS['time_format'] = str(d['time_format'])
         if 'date_format' in d and str(d['date_format']) in _DATE_STRFTIME:
             SETTINGS['date_format'] = str(d['date_format'])
+        if 'recommend_channelizing' in d:
+            SETTINGS['recommend_channelizing'] = bool(d['recommend_channelizing'])
+        if 'channelize_after_n' in d:
+            try:
+                SETTINGS['channelize_after_n'] = max(3, min(500, int(d['channelize_after_n'])))
+            except (TypeError, ValueError):
+                pass
         if any(k in d for k in ('autosave', 'waterfall', 'unknown', 'fingerprint',
                                 'protocols', 'wide_scan', 'sdr', 'radio', 'tune',
-                                'ldro_fallback', 'iq_invert', 'time_format', 'date_format')):
+                                'ldro_fallback', 'iq_invert', 'time_format', 'date_format',
+                                'recommend_channelizing', 'channelize_after_n')):
             save_settings(SETTINGS)
             _apply_waterfall_flag()
             _apply_unknown_flag()
@@ -3004,6 +3116,30 @@ def _tee_pipeline_log_to_stderr():
         except Exception as e:
             print(f'[pipe-tee error: {e}]', file=sys.stderr, flush=True)
         time.sleep(0.5)
+
+
+# ------------------------------------------------------------- channelizer endpoints
+@app.route('/api/channelize')
+def api_channelize():
+    """Learned-channel state: scanning/recommend/accepted/declined + the channels."""
+    return jsonify(CHAN.status())
+
+
+@app.route('/api/channelize/decision', methods=['POST'])
+def api_channelize_decision():
+    """User accepts/declines the channelizer recommendation."""
+    d = request.get_json(force=True, silent=True) or {}
+    CHAN.decide(bool(d.get('accept')))
+    _broadcast({'type': 'channelize', 'data': CHAN.status()})
+    return jsonify(CHAN.status())
+
+
+@app.route('/api/channelize/reset', methods=['POST'])
+def api_channelize_reset():
+    """Reset learning back to scanning (re-discover channels from scratch)."""
+    CHAN.reset()
+    _broadcast({'type': 'channelize', 'data': CHAN.status()})
+    return jsonify(CHAN.status())
 
 
 def main():
