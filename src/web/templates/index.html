@@ -1176,7 +1176,7 @@ function renderSdrConfig(box){
         gain:readGain()}};
       if(q('#sdrsel').value==='soapy')body.radio.soapy_driver=q('#sdrdrv').value.trim();
       return fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(x=>x.json());};
-    q('#sdrsave').onclick=()=>saveSdr().then(()=>{q('#sdrresult').innerHTML='<span style="color:#2ecc71">saved — gain &amp; center applied live; rate on next Start</span>';});
+    q('#sdrsave').onclick=()=>saveSdr().then(()=>{q('#sdrresult').innerHTML='<span style="color:#2ecc71">saved — gain &amp; center applied live; rate on next Start</span>'; const _c=parseFloat(q('#sdrcen').value); if(isFinite(_c)&&typeof setHdrCenter==='function')setHdrCenter(_c);});
     q('#sdrdetect').onclick=()=>{q('#sdrresult').textContent='detecting…';
       saveSdr().then(()=>fetch('/api/sdr/detect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdr:q('#sdrsel').value})}).then(x=>x.json()).then(res=>{
         if(res.found)q('#sdrresult').innerHTML='<span style="color:#2ecc71">✓ Found'+(res.serial?' — serial <span class="mono">'+esc(res.serial)+'</span>':'')+'</span>';
@@ -1725,8 +1725,13 @@ _as.onchange=()=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'a
 $('#btnClear').onclick=()=>{if(confirm('Clear all captured packets (also clears the saved log)?')){fetch('/api/clear',{method:'POST'});PK.length=0;G.nodes=[];OPEN.clear();renderCurrent();}};
 try{new URLSearchParams(location.search).getAll('open').forEach(id=>OPEN.add(id));}catch(e){}
 try{const _q=new URLSearchParams(location.search).get('q'); if(_q)SEARCHQ=_q;}catch(e){}
+// Header center-freq display — kept current from the effective config (page load),
+// and live from the PSD stream (reflects Config-tab changes + live re-tunes), so it
+// never sticks at the lora.toml default.
+let HDR_KEY='default';
+function setHdrCenter(mhz){ const el=$('#center'); if(el)el.textContent='center '+(+Number(mhz).toFixed(4))+' MHz · key '+HDR_KEY; }
 fetch('/api/state').then(r=>r.json()).then(d=>{PK.push(...d.packets);d.packets.forEach(noteName);d.packets.forEach(p=>{if(p.from)SEEN_NODES.add(p.from);});renderStats(d.stats);CFGW=d.config||{};activateTab(location.hash.slice(1)||'pkts');
-  if(d.config&&d.config.center_mhz)$('#center').textContent='center '+d.config.center_mhz+' MHz · key '+(d.config.key||'default');}).catch(()=>activateTab('pkts'));
+  HDR_KEY=(d.config&&d.config.key)||'default'; if(d.config&&d.config.center_mhz!=null)setHdrCenter(d.config.center_mhz);}).catch(()=>activateTab('pkts'));
 fetch('/api/health').then(r=>r.json()).then(renderHealth).catch(()=>{});
 fetch('/api/keys').then(r=>r.json()).then(k=>{KEYS=k;}).catch(()=>{});   // for the retry-decode menu
 fetch('/api/alerts').then(r=>r.json()).then(a=>{ALERTS=a;}).catch(()=>{});   // alert rules
@@ -1739,7 +1744,7 @@ if(!STATIC){
   es.addEventListener('confirm',e=>{const d=JSON.parse(e.data); if(d&&d.devaddr){let ch=false; for(const p of PK){if(p.devaddr===d.devaddr&&p.proto==='unknown'){p.proto='lorawan';p.confidence='confirmed';p.from='LW:'+d.devaddr;delete p.hint;ch=true;}} if(ch&&TAB!=='net'&&TAB!=='config')renderCurrent();}});
   es.addEventListener('stats',e=>renderStats(JSON.parse(e.data)));
   es.addEventListener('health',e=>renderHealth(JSON.parse(e.data)));
-  es.addEventListener('psd',e=>{ if(TAB==='wf'&&WF)wfRow(JSON.parse(e.data)); });
+  es.addEventListener('psd',e=>{ const _d=JSON.parse(e.data); if(_d.center_mhz!=null)setHdrCenter(_d.center_mhz); if(TAB==='wf'&&WF)wfRow(_d); });
   es.addEventListener('nodemeta',e=>{ const d=JSON.parse(e.data); if(d&&d.id){ if(d.meta&&Object.keys(d.meta).length)NODEMETA[d.id]=d.meta; else delete NODEMETA[d.id]; if(TAB!=='net'&&TAB!=='config')renderCurrent(); } });
   setInterval(()=>{if(TAB==='nodes')renderNodes();else if(TAB==='net')buildGraph();},5000);
 }
