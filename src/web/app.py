@@ -87,7 +87,10 @@ def load_settings():
                  # While channelizing, every X minutes briefly drop back to wideband
                  # to discover new/out-of-band channels, then re-channelize with the
                  # updated set.  0 = never (manual 'Back to wideband' only).
-                 'channelize_rescan_min': 0}
+                 'channelize_rescan_min': 0,
+                 # How long each re-scan dwells on wideband (seconds).  Longer =
+                 # catches slower/less-chatty channels; shorter = less disruption.
+                 'channelize_rescan_window_s': 60}
     try:
         with open(SETTINGS_PATH) as f:
             return {**_defaults, **json.load(f)}
@@ -215,6 +218,7 @@ class ChannelTracker:
                     'enabled': bool(SETTINGS.get('recommend_channelizing', True)),
                     'rescanning': self.rescanning,
                     'rescan_min': int(SETTINGS.get('channelize_rescan_min', 0) or 0),
+                    'rescan_window_s': int(SETTINGS.get('channelize_rescan_window_s', 60) or 60),
                     'n_channels': len(self.channels),
                     'channels': [{'center_mhz': round(c['center_mhz'], 4),
                                   'bw_khz': round(c['bw_khz'], 1), 'count': c['count'],
@@ -2386,11 +2390,16 @@ def api_settings():
                 SETTINGS['channelize_rescan_min'] = max(0, min(1440, int(d['channelize_rescan_min'])))
             except (TypeError, ValueError):
                 pass
+        if 'channelize_rescan_window_s' in d:
+            try:
+                SETTINGS['channelize_rescan_window_s'] = max(5, min(600, int(d['channelize_rescan_window_s'])))
+            except (TypeError, ValueError):
+                pass
         if any(k in d for k in ('autosave', 'waterfall', 'unknown', 'fingerprint',
                                 'protocols', 'wide_scan', 'sdr', 'radio', 'tune',
                                 'ldro_fallback', 'iq_invert', 'time_format', 'date_format',
                                 'recommend_channelizing', 'channelize_after_n',
-                                'channelize_rescan_min')):
+                                'channelize_rescan_min', 'channelize_rescan_window_s')):
             save_settings(SETTINGS)
             _apply_waterfall_flag()
             _apply_unknown_flag()
@@ -3182,7 +3191,15 @@ def _maybe_restart_for_channelize(was_active):
     threading.Thread(target=_do, daemon=True).start()
 
 
-RESCAN_WINDOW_S = 60.0   # wideband dwell per re-scan — catches a 15 s beacon ~4x
+RESCAN_WINDOW_DEFAULT_S = 60.0   # wideband dwell per re-scan — catches a 15 s beacon ~4x
+
+
+def _rescan_window_s():
+    try:
+        return max(5.0, min(600.0, float(SETTINGS.get('channelize_rescan_window_s',
+                                                       RESCAN_WINDOW_DEFAULT_S))))
+    except (TypeError, ValueError):
+        return RESCAN_WINDOW_DEFAULT_S
 
 
 def _channelize_rescan_once():
@@ -3192,7 +3209,8 @@ def _channelize_rescan_once():
     (never restarts a pipeline the user intentionally stopped)."""
     if not (PIPELINE.get('running') and CHAN.active()):
         return
-    print('[CHAN] re-scanning for new channels (%ds wideband)' % int(RESCAN_WINDOW_S),
+    _win = _rescan_window_s()
+    print('[CHAN] re-scanning for new channels (%ds wideband)' % int(_win),
           file=sys.stderr, flush=True)
     CHAN.set_rescanning(True)                       # active() -> False -> wideband
     _broadcast({'type': 'channelize', 'data': CHAN.status()})
@@ -3201,7 +3219,7 @@ def _channelize_rescan_once():
         CHAN.set_rescanning(False); return          # aborted during the gap
     start_pipeline()
     _t0 = time.time()
-    while time.time() - _t0 < RESCAN_WINDOW_S:
+    while time.time() - _t0 < _win:
         if not (CHAN.rescanning and CHAN.state == 'accepted' and PIPELINE.get('running')):
             break
         time.sleep(2)
