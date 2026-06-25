@@ -114,11 +114,12 @@ class ChannelTracker:
         self.last_new_at = 0      # self.total when the last NEW channel appeared
         self.state = 'scanning'
         self.declined_session = False
+        self.accepted = []        # channel list frozen at Accept — what the gate watches
 
     def reset(self):
         with self._lock:
             self.channels = []; self.total = 0; self.last_new_at = 0
-            self.state = 'scanning'; self.declined_session = False
+            self.state = 'scanning'; self.declined_session = False; self.accepted = []
 
     def add(self, freq_mhz, bw, proto, sf, ts):
         """Cluster one decoded packet.  Returns 'recommend' if the state just
@@ -170,8 +171,20 @@ class ChannelTracker:
     def decide(self, accept):
         with self._lock:
             self.state = 'accepted' if accept else 'declined'
-            if not accept:
+            if accept:
+                self.accepted = [dict(c) for c in sorted(self.channels, key=lambda x: -x['count'])]
+            else:
                 self.declined_session = True
+
+    def channel_tokens(self):
+        """center_mhz:bw_khz tokens for the gate --channels arg (frozen at Accept)."""
+        with self._lock:
+            return ','.join('%.5f:%.1f' % (c['center_mhz'], c['bw_khz']) for c in self.accepted)
+
+    def active(self):
+        """True when the user has accepted and there are channels to watch."""
+        with self._lock:
+            return self.state == 'accepted' and bool(self.accepted)
 
     def status(self):
         with self._lock:
@@ -1953,6 +1966,10 @@ def _build_pipeline_cmd():
             f'--overlap {d["overlap"]} --energy-threshold {_eth} '
             f'--detect-workers {d["detect_workers"]} --buf-seconds {_bufs} '
             f'--decode --export-iq {shlex.quote(dec["export_dir"])} -d 1')
+    # Channelizer mode (beta): if the user accepted the recommendation, restrict the
+    # gate to the learned channels.  Applied at launch, so a mode change restarts.
+    if CHAN.active():
+        gate += ' --channels ' + shlex.quote(CHAN.channel_tokens())
     return cap + ' | ' + gate
 
 
@@ -3125,19 +3142,36 @@ def api_channelize():
     return jsonify(CHAN.status())
 
 
+def _maybe_restart_for_channelize(was_active):
+    """When channelize mode flips, restart the running pipeline so the gate picks
+    up (or drops) --channels.  Done in a background thread so the request returns
+    immediately; no-op if the pipeline isn't running (applies on next Start)."""
+    if CHAN.active() == was_active or not PIPELINE.get('running'):
+        return
+    def _do():
+        stop_pipeline(); time.sleep(1.2); start_pipeline()
+    threading.Thread(target=_do, daemon=True).start()
+
+
 @app.route('/api/channelize/decision', methods=['POST'])
 def api_channelize_decision():
-    """User accepts/declines the channelizer recommendation."""
+    """User accepts/declines the channelizer recommendation.  Accept switches the
+    gate to watch only the learned channels (restarts the pipeline if running)."""
     d = request.get_json(force=True, silent=True) or {}
+    was = CHAN.active()
     CHAN.decide(bool(d.get('accept')))
+    _maybe_restart_for_channelize(was)
     _broadcast({'type': 'channelize', 'data': CHAN.status()})
     return jsonify(CHAN.status())
 
 
 @app.route('/api/channelize/reset', methods=['POST'])
 def api_channelize_reset():
-    """Reset learning back to scanning (re-discover channels from scratch)."""
+    """Reset learning back to scanning — re-discover channels (and drop back to
+    wideband if we were channelizing)."""
+    was = CHAN.active()
     CHAN.reset()
+    _maybe_restart_for_channelize(was)
     _broadcast({'type': 'channelize', 'data': CHAN.status()})
     return jsonify(CHAN.status())
 
