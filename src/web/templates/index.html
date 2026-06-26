@@ -1079,6 +1079,7 @@ function _renderConfigBody(){
   const pc=document.createElement('div'); el.insertBefore(pc, sc.nextSibling); renderProtocolsConfig(pc);
   const ac=document.createElement('div'); el.appendChild(ac); renderAlertsConfig(ac);
   const fc=document.createElement('div'); el.appendChild(fc); renderPreferencesConfig(fc);
+  const xc=document.createElement('div'); el.appendChild(xc); renderExperimentalConfig(xc);
   const uc=document.createElement('div'); el.appendChild(uc); renderAdvancedConfig(uc);
 }
 function renderSdrConfig(box){
@@ -1279,6 +1280,31 @@ function renderProtocolsConfig(box){
     q('#unkclr').onclick=()=>{if(confirm('Clear the unknown-protocol report?'))fetch('/api/unknown',{method:'DELETE'}).then(()=>renderProtocolsConfig(box));};
   }).catch(()=>{});
 }
+function renderExperimentalConfig(box){
+  fetch('/api/settings').then(r=>r.json()).then(s=>{
+    const cb=(id,on,lbl,tip)=>`<label title="${esc(tip||'')}" style="display:flex;gap:8px;align-items:flex-start;margin:5px 0;cursor:help"><input type="checkbox" id="${id}"${on?' checked':''} style="margin-top:3px;cursor:pointer"> <span>${lbl}</span></label>`;
+    const num=(id,val,min,max,step,lbl,tip)=>`<label title="${esc(tip)}" style="display:flex;gap:10px;align-items:center;margin:6px 0;cursor:help"><span style="min-width:200px">${lbl}</span><input type="number" id="${id}" value="${val}" min="${min}" max="${max}" step="${step}" style="width:96px"><span class="muted" style="font-size:11px">range ${min}–${max}</span></label>`;
+    box.innerHTML=`<details style="max-width:920px;margin-top:16px;border:1px solid var(--line);border-radius:6px;padding:6px 12px">
+      <summary style="cursor:pointer;font-weight:600;font-size:15px;padding:4px 0">Experimental</summary>
+      <div style="padding:8px 2px 4px">
+        <p class="muted" style="font-size:11px;margin:2px 0 12px;line-height:1.5">Beta features under active development — behaviour may change. Hover any option for details.</p>
+        <h4 style="margin:10px 0 2px">Channelizer recommendation <span class="muted" style="font-size:11px">(beta)</span></h4>
+        ${cb('chrecommend',s.recommend_channelizing!==false,'<b>Recommend Channelizing (On / Off)</b><br><span class="muted" style="font-size:11px">While the full band is scanned, learn which LoRa channels are actually live. Once the channel set settles (no new / out-of-band channel for a while), a banner appears recommending a switch to watching <b>only those channels</b> — far more efficient and a higher decode rate than wideband scan, since it skips the wideband peak-search entirely. You accept or decline. On by default.</span>','Learn the live channels during wideband scan and recommend channelizing once they converge.')}
+        <div id="chsub" style="margin:2px 0 0 26px">${num('chaftern',s.channelize_after_n||15,3,500,1,'After X intercepts',"How many decoded LoRa packets to learn from before evaluating whether the channel set has settled enough to recommend channelizing.")}
+          ${num('chrescan',s.channelize_rescan_min||0,0,1440,1,'Auto re-scan every X min (0 = off)',"Once channelizing, every X minutes briefly drop back to a wideband sweep to discover any new / out-of-band channels, then re-channelize with the updated set. 0 disables it — use the banner's Back to wideband to re-scan manually.")}
+          ${num('chrescanwin',s.channelize_rescan_window_s||60,5,600,5,'Re-scan sweep length (sec)',"How long each re-scan dwells on wideband before re-channelizing. Longer catches slower / less-chatty channels (a 15s beacon needs ~30-60s to show a couple of transmissions); shorter means less disruption per re-scan.")}</div>
+      </div>
+    </details>`;
+    const q=id=>box.querySelector(id);
+    const post=b=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
+    const chSync=on=>{ q('#chsub').style.opacity=on?'1':'.45'; q('#chaftern').disabled=!on; q('#chrescan').disabled=!on; q('#chrescanwin').disabled=!on; };
+    q('#chrecommend').onchange=e=>{ post({recommend_channelizing:e.target.checked}); chSync(e.target.checked); };
+    q('#chaftern').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_after_n:n}); };
+    q('#chrescan').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_rescan_min:n}); };
+    q('#chrescanwin').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_rescan_window_s:n}); };
+    chSync(s.recommend_channelizing!==false);
+  }).catch(()=>{});
+}
 function renderAdvancedConfig(box){
   fetch('/api/settings').then(r=>r.json()).then(s=>{
     const tune=Object.assign({}, ADV_DEFAULTS.tune, s.tune||{});
@@ -1306,11 +1332,6 @@ function renderAdvancedConfig(box){
           <span class="muted" style="font-size:11px">applies on next Start</span>
         </div>
         <p class="muted" style="font-size:11px;margin:4px 0 0;line-height:1.5">Inverted decodes IQ-inverted transmitters (LoRaWAN downlink, satellite / tinyGS). Mutually exclusive — normal traffic won't decode while this is set.</p>
-        <h4 style="margin:18px 0 2px">Channelizer recommendation <span class="muted" style="font-size:11px">(beta)</span></h4>
-        ${cb('chrecommend',s.recommend_channelizing!==false,'<b>Recommend Channelizing (On / Off)</b><br><span class="muted" style="font-size:11px">While the full band is scanned, learn which LoRa channels are actually live. Once the channel set settles (no new / out-of-band channel for a while), a banner appears recommending a switch to watching <b>only those channels</b> — far more efficient and a higher decode rate than wideband scan, since it skips the wideband peak-search entirely. You accept or decline. On by default.</span>','Learn the live channels during wideband scan and recommend channelizing once they converge.')}
-        <div id="chsub" style="margin:2px 0 0 26px">${num('chaftern',s.channelize_after_n||15,3,500,1,'After X intercepts',"How many decoded LoRa packets to learn from before evaluating whether the channel set has settled enough to recommend channelizing.")}
-          ${num('chrescan',s.channelize_rescan_min||0,0,1440,1,'Auto re-scan every X min (0 = off)',"Once channelizing, every X minutes briefly drop back to a wideband sweep to discover any new / out-of-band channels, then re-channelize with the updated set. 0 disables it — use the banner's Back to wideband to re-scan manually.")}
-          ${num('chrescanwin',s.channelize_rescan_window_s||60,5,600,5,'Re-scan sweep length (sec)',"How long each re-scan dwells on wideband before re-channelizing. Longer catches slower / less-chatty channels (a 15s beacon needs ~30-60s to show a couple of transmissions); shorter means less disruption per re-scan.")}</div>
         <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--line);display:flex;gap:10px;align-items:center">
           <button id="advreset" title="Restore every Protocols and Advanced option to its built-in default. Does NOT touch SDR/Radio or Channel keys.">Reset to defaults</button>
           <span class="muted" style="font-size:11px">Restores all Protocols + Advanced options (protocols, unknown, scan, fingerprint, LDRO, IQ, tuning). Doesn't affect SDR/Radio or Channel keys.</span>
@@ -1322,12 +1343,6 @@ function renderAdvancedConfig(box){
     q('#fp').onchange=e=>post({fingerprint:e.target.checked});
     q('#ldro').onchange=e=>post({ldro_fallback:e.target.checked});
     q('#iqmode').onchange=e=>post({iq_invert:e.target.value==='inverted'});
-    const chSync=on=>{ q('#chsub').style.opacity=on?'1':'.45'; q('#chaftern').disabled=!on; q('#chrescan').disabled=!on; q('#chrescanwin').disabled=!on; };
-    q('#chrecommend').onchange=e=>{ post({recommend_channelizing:e.target.checked}); chSync(e.target.checked); };
-    q('#chaftern').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_after_n:n}); };
-    q('#chrescan').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_rescan_min:n}); };
-    q('#chrescanwin').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_rescan_window_s:n}); };
-    chSync(s.recommend_channelizing!==false);
     const saveTune=()=>post({tune:{
       threshold:parseFloat(q('#tunethresh').value),
       energy_threshold:parseFloat(q('#tuneeth').value),
