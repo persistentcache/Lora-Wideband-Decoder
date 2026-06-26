@@ -1759,9 +1759,10 @@ function renderChannelize(st){
     if(st.rescanning){
       b.innerHTML='<b>Re-scanning…</b> <span class="muted">'+(st.rescan_window_s||60)+'s on wideband to discover new channels — will re-channelize automatically.</span>';
     } else {
+      const ibw=st.ibw_mhz?(' &nbsp;·&nbsp; <b>'+st.ibw_mhz+' MHz IBW</b> @ '+st.ibw_center_mhz+' MHz'):'';
       const every=st.rescan_min>0?(' &nbsp;·&nbsp; auto re-scan every '+st.rescan_min+' min'):'';
       b.innerHTML='<b>Channelizing</b> — watching '+st.n_channels+' learned channel'+(st.n_channels===1?'':'s')+': '+chList
-        +'<span class="muted">'+every+'</span>'
+        +'<span class="muted">'+ibw+every+'</span>'
         +' <button id="chrescannow" style="margin-left:6px">Re-scan now</button> <button id="chwide">Back to wideband</button>';
       $('#chrescannow').onclick=()=>fetch('/api/channelize/rescan',{method:'POST'});
       $('#chwide').onclick=()=>fetch('/api/channelize/reset',{method:'POST'}).then(r=>r.json()).then(renderChannelize);

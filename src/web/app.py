@@ -190,6 +190,11 @@ class ChannelTracker:
         with self._lock:
             return ','.join('%.5f:%.1f' % (c['center_mhz'], c['bw_khz']) for c in self.accepted)
 
+    def accepted_list(self):
+        """Copy of the watched channels (for computing the narrowed IBW span)."""
+        with self._lock:
+            return [dict(c) for c in self.accepted]
+
     def active(self):
         """True when the gate should be channelized — accepted, has channels, and
         not mid re-scan (during a re-scan we drop the mask to find new channels)."""
@@ -1624,7 +1629,7 @@ def tail_packet_log(path):
                     if rec.get('freq_mhz') is not None:
                         if CHAN.add(rec.get('freq_mhz'), rec.get('bw'), rec.get('proto'),
                                     rec.get('sf'), rec.get('ts') or time.time()) == 'recommend':
-                            _broadcast({'type': 'channelize', 'data': CHAN.status()})
+                            _broadcast({'type': 'channelize', 'data': _channelize_status()})
             time.sleep(0.3)
         except Exception:
             time.sleep(0.5)
@@ -1836,11 +1841,11 @@ def _tail_psd():
                 # frequency axis matches what the pipeline is actually running, not
                 # the lora.toml default.  Recomputed per frame so a live re-tune /
                 # Config change is reflected without a restart.
-                _rc = _radio_cfg()
+                _erate, _ebw, _ecen = _effective_radio()   # narrowed band when channelizing
                 _broadcast({'type': 'psd', 'data': {
                     'b64': _b64.b64encode(raw).decode('ascii'),
-                    'center_mhz': float(_rc.get('center_mhz', 915.0)),
-                    'rate_mhz': float(_rc['rate_hz']) / 1e6}})
+                    'center_mhz': _ecen,
+                    'rate_mhz': _erate / 1e6}})
             time.sleep(0.08)
         except Exception:
             time.sleep(0.3)
@@ -1953,6 +1958,62 @@ def _safe_buf_seconds(rate_hz, fmt, requested_s):
     return capped
 
 
+CHANNELIZE_IBW_GUARD_HZ = 200e3   # margin beyond each channel edge: CFO + SDR filter rolloff
+
+
+def _narrow_radio_for_channels(full_rate_hz):
+    """Channelizer IBW narrowing: a (rate_hz, bw_hz, center_mhz) that just spans the
+    accepted channels plus guard, clamped to the SDR's rate limits.  The guard is wide
+    enough that a packet slightly off the channel centre is never clipped, and the band
+    keeps the channels well inside the SDR filter's flat region.  Returns None when
+    narrowing wouldn't help (channels span most of the band) or can't cover them — the
+    caller then keeps the full configured radio (e.g. during a wideband re-scan)."""
+    chans = CHAN.accepted_list()
+    if not chans:
+        return None
+    import math
+    los = [c['center_mhz'] * 1e6 - c['bw_khz'] * 500.0 - CHANNELIZE_IBW_GUARD_HZ for c in chans]
+    his = [c['center_mhz'] * 1e6 + c['bw_khz'] * 500.0 + CHANNELIZE_IBW_GUARD_HZ for c in chans]
+    span = max(his) - min(los)
+    center_mhz = (max(his) + min(los)) / 2.0 / 1e6
+    widest_bw = max(c['bw_khz'] * 1e3 for c in chans)
+    rate = max(span * 1.15, widest_bw * 2.5)              # cover span + edge headroom
+    rate = math.ceil(rate / 5e5) * 5e5                    # tidy 0.5 MHz step
+    lim = sdr_profiles.SDR_PROFILES.get(SETTINGS.get('sdr', 'bladerf'), {}).get('limits', {}) \
+        if sdr_profiles is not None else {}
+    rmin, rmax = lim.get('rate_hz', (1e6, 20e6))
+    rate = max(rmin, min(rmax, rate))
+    if rate >= full_rate_hz or rate < span:               # no benefit, or can't cover the span
+        return None
+    return int(rate), int(rate), round(center_mhz, 4)
+
+
+def _effective_radio():
+    """The (rate_hz, bw_hz, center_mhz) the pipeline is ACTUALLY running at: the
+    channelizer-narrowed band when channelizing, else the full configured radio.
+    Single source of truth for the gate launch AND the PSD/waterfall labels, so the
+    display matches the capture.  Re-scan clears CHAN.active() → this returns full,
+    so the wideband sweep automatically uses the full band, then re-narrows after."""
+    r = _radio_cfg()
+    rate = int(r['rate_hz']); bw = int(r['bandwidth_hz']); center_mhz = float(r['center_mhz'])
+    if CHAN.active():
+        nb = _narrow_radio_for_channels(rate)
+        if nb:
+            rate, bw, center_mhz = nb
+    return rate, bw, center_mhz
+
+
+def _channelize_status():
+    """CHAN.status() plus the live narrowed-IBW readout while channelizing, so the
+    banner can show how wide the SDR is actually running vs the full band."""
+    st = CHAN.status()
+    if CHAN.active():
+        _r, _b, _c = _effective_radio()
+        st['ibw_mhz'] = round(_r / 1e6, 2)
+        st['ibw_center_mhz'] = _c
+    return st
+
+
 def _build_pipeline_cmd():
     """Construct the <SDR capture> | detector shell pipeline for the SELECTED SDR.
     The capture half comes from the SDR profile registry (bladeRF's command is
@@ -1962,8 +2023,8 @@ def _build_pipeline_cmd():
     collapse a second after starting."""
     import shlex
     r = _radio_cfg(); d = CFG['detect']; dec = CFG['decode']
-    rate = int(r['rate_hz']); bw = int(r['bandwidth_hz'])
-    cen_hz = int(float(r['center_mhz']) * 1e6)
+    rate, bw, _center_mhz = _effective_radio()   # narrowed to the channels when channelizing
+    cen_hz = int(_center_mhz * 1e6)
     sdr = SETTINGS.get('sdr', 'bladerf')
     if sdr_profiles is not None:
         cap = sdr_profiles.build_capture(sdr, cen_hz, rate, bw,
@@ -1990,7 +2051,7 @@ def _build_pipeline_cmd():
     # Use THIS server's interpreter for the gate (it already holds numpy/scipy),
     # not a bare `python3` that PATH might resolve to a different env. run/web.py
     # guarantees sys.executable has the full stack (re-execs if it didn't).
-    gate = (f'{shlex.quote(sys.executable)} {shlex.quote(detector_py)} -r {rate} -b {bw} -c {r["center_mhz"]} '
+    gate = (f'{shlex.quote(sys.executable)} {shlex.quote(detector_py)} -r {rate} -b {bw} -c {_center_mhz} '
             f'-t {fmt} --threshold {_thresh} '
             f'--overlap {d["overlap"]} --energy-threshold {_eth} '
             f'--detect-workers {d["detect_workers"]} --buf-seconds {_bufs} '
@@ -2152,7 +2213,7 @@ def api_state():
         pkts = list(PACKETS)[-2000:]
         nodes = [_node_view(n) for n in NODES.values()]
     return jsonify({'packets': pkts, 'nodes': nodes, 'edges': _edges_view(),
-                    'stats': _stats(), 'config': {'center_mhz': _radio_cfg().get('center_mhz', 915.0),
+                    'stats': _stats(), 'config': {'center_mhz': _effective_radio()[2],
                                                   'key': CFG['decode'].get('key')}})
 
 
@@ -2287,10 +2348,10 @@ def api_psd():
     try:
         with open(PSD_FILE, 'rb') as f:
             raw = f.read()
-        _rc = _radio_cfg()   # effective config (Config tab over lora.toml)
+        _erate, _ebw, _ecen = _effective_radio()   # narrowed band when channelizing
         return jsonify({'b64': _b64.b64encode(raw).decode('ascii'),
-                        'center_mhz': float(_rc.get('center_mhz', 915.0)),
-                        'rate_mhz': float(_rc['rate_hz']) / 1e6})
+                        'center_mhz': _ecen,
+                        'rate_mhz': _erate / 1e6})
     except Exception:
         return jsonify({'b64': None})
 
@@ -2346,7 +2407,7 @@ def api_settings():
                 _ctl = {}
                 try: _ctl['gain'] = float(_rc.get('gain'))
                 except (TypeError, ValueError): pass
-                try: _ctl['center_hz'] = float(_rc['center_mhz']) * 1e6
+                try: _ctl['center_hz'] = _effective_radio()[2] * 1e6   # narrowed centre when channelizing
                 except (TypeError, ValueError, KeyError): pass
                 if _ctl:
                     try:
@@ -3179,7 +3240,7 @@ def _tee_pipeline_log_to_stderr():
 @app.route('/api/channelize')
 def api_channelize():
     """Learned-channel state: scanning/recommend/accepted/declined + the channels."""
-    return jsonify(CHAN.status())
+    return jsonify(_channelize_status())
 
 
 def _maybe_restart_for_channelize(was_active):
@@ -3215,7 +3276,7 @@ def _channelize_rescan_once():
     print('[CHAN] re-scanning for new channels (%ds wideband)' % int(_win),
           file=sys.stderr, flush=True)
     CHAN.set_rescanning(True)                       # active() -> False -> wideband
-    _broadcast({'type': 'channelize', 'data': CHAN.status()})
+    _broadcast({'type': 'channelize', 'data': _channelize_status()})
     stop_pipeline(); time.sleep(1.2)
     if not (CHAN.rescanning and CHAN.state == 'accepted'):
         CHAN.set_rescanning(False); return          # aborted during the gap
@@ -3228,14 +3289,14 @@ def _channelize_rescan_once():
     aborted = not (CHAN.state == 'accepted' and PIPELINE.get('running'))
     CHAN.set_rescanning(False)
     if aborted:                                      # user stopped or went wideband
-        _broadcast({'type': 'channelize', 'data': CHAN.status()})
+        _broadcast({'type': 'channelize', 'data': _channelize_status()})
         return
     new = CHAN.refreeze()                            # accepted = learned (+ any new)
     if new:
         print('[CHAN] re-scan found %d new channel(s): %s' % (
             len(new), ', '.join('%.4f MHz' % f for f in new)), file=sys.stderr, flush=True)
     stop_pipeline(); time.sleep(1.2); start_pipeline()   # back to channelize, updated mask
-    _broadcast({'type': 'channelize', 'data': CHAN.status()})
+    _broadcast({'type': 'channelize', 'data': _channelize_status()})
 
 
 def _channelize_rescan_loop():
@@ -3280,8 +3341,8 @@ def api_channelize_decision():
     was = CHAN.active()
     CHAN.decide(bool(d.get('accept')))
     _maybe_restart_for_channelize(was)
-    _broadcast({'type': 'channelize', 'data': CHAN.status()})
-    return jsonify(CHAN.status())
+    _broadcast({'type': 'channelize', 'data': _channelize_status()})
+    return jsonify(_channelize_status())
 
 
 @app.route('/api/channelize/reset', methods=['POST'])
@@ -3291,8 +3352,8 @@ def api_channelize_reset():
     was = CHAN.active()
     CHAN.reset()
     _maybe_restart_for_channelize(was)
-    _broadcast({'type': 'channelize', 'data': CHAN.status()})
-    return jsonify(CHAN.status())
+    _broadcast({'type': 'channelize', 'data': _channelize_status()})
+    return jsonify(_channelize_status())
 
 
 def main():
