@@ -28,6 +28,9 @@ lora_web/lora_autosave.jsonl
 lora_web/lora_unknown.jsonl
 lora_web/lora_packets.jsonl
 lora_web/dec_pkts.jsonl
+# Rotated / disabled runtime logs — the *.jsonl rule above misses suffixed
+# variants like lora_unknown.jsonl.off, which slipped in once.
+*.jsonl.*
 
 # Secrets
 *.key
@@ -61,6 +64,9 @@ archive/
 
 # Per-deployment classifier state — built from each user's own Meshtastic traffic.
 # Should not be shipped — each user's system bootstraps to their own hardware.
-lora_web/lwbd_model.pkl
-lora_web/lora_node_profiles.json
-lora_web/lora_device_clusters.json
+# Listed by bare name (no dir prefix) so they're ignored wherever the process cwd
+# drops them — lora_web/ when run from the repo root, src/web/ otherwise (the
+# src/web/ copy is exactly what leaked in once).
+lwbd_model.pkl
+lora_node_profiles.json
+lora_device_clusters.json
