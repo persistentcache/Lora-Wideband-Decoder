@@ -2521,8 +2521,7 @@ def api_sdr():
         # react when the driver field changes (e.g. driver=hackrf → no AGC).
         soapy_no_agc = dict(sdr_profiles._SOAPY_NO_AGC)
     return jsonify({'profiles': profs, 'current': SETTINGS.get('sdr', 'bladerf'),
-                    'radio': _radio_cfg(), 'soapy_no_agc': soapy_no_agc,
-                    'dc_guard_khz': int(SETTINGS.get('dc_guard_khz', 250) or 250)})
+                    'radio': _radio_cfg(), 'soapy_no_agc': soapy_no_agc})
 
 
 @app.route('/api/sdr/detect', methods=['POST'])

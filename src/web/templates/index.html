@@ -1095,7 +1095,6 @@ function renderSdrConfig(box){
         +'<label>Center (MHz)<br><input id="sdrcen" type="number" step="0.1" value="'+(r.center_mhz!=null?r.center_mhz:915.0)+'" style="width:104px"></label>'
         +'<label>Sample rate (MHz)<br><input id="sdrrate" type="number" step="0.1" value="'+((r.rate_hz||28000000)/1e6)+'" style="width:120px"></label>'
         +'<label>Bandwidth (MHz)<br><input id="sdrbw" type="number" step="0.1" value="'+((r.bandwidth_hz||28000000)/1e6)+'" style="width:120px"></label>'
-        +'<label title="When channelizing, keep every channel at least this far from the SDR center (DC). A signal sitting on DC is corrupted by the SDR\'s DC/LO-leak spike — increase this if your SDR has a wide DC spike, decrease for tighter narrowing. Default 250 kHz. Only affects channelize mode." style="cursor:help">DC offset (kHz)<br><input id="sdrdc" type="number" min="50" max="2000" step="10" value="'+(d.dc_guard_khz!=null?d.dc_guard_khz:250)+'" style="width:104px"></label>'
         +'<span id="sdrgainwrap" style="display:contents"></span>'
         +'<label id="sdrdrvwrap" style="display:'+(cur==="soapy"?"":"none")+'">Soapy driver<br><input id="sdrdrv" type="text" value="'+esc(r.soapy_driver||"hackrf")+'" placeholder="hackrf/rtlsdr/lime…" style="width:150px"></label>'
         +'<button id="sdrsave" class="go">Save</button>'
@@ -1178,7 +1177,6 @@ function renderSdrConfig(box){
         bandwidth_hz:Math.round(parseFloat(q('#sdrbw').value)*1e6),
         gain:readGain()}};
       if(q('#sdrsel').value==='soapy')body.radio.soapy_driver=q('#sdrdrv').value.trim();
-      const _dc=parseInt(q('#sdrdc').value,10); if(isFinite(_dc))body.dc_guard_khz=_dc;
       return fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(x=>x.json());};
     q('#sdrsave').onclick=()=>saveSdr().then(()=>{q('#sdrresult').innerHTML='<span style="color:#2ecc71">saved — gain &amp; center applied live; rate on next Start</span>'; const _c=parseFloat(q('#sdrcen').value); if(isFinite(_c)&&typeof setHdrCenter==='function')setHdrCenter(_c);});
     q('#sdrdetect').onclick=()=>{q('#sdrresult').textContent='detecting…';
@@ -1295,6 +1293,7 @@ function renderExperimentalConfig(box){
         <div id="chsub" style="margin:2px 0 0 26px">${num('chaftern',s.channelize_after_n||15,3,500,1,'After X intercepts',"How many decoded LoRa packets to learn from before evaluating whether the channel set has settled enough to recommend channelizing.")}
           ${num('chrescan',s.channelize_rescan_min||0,0,1440,1,'Auto re-scan every X min (0 = off)',"Once channelizing, every X minutes briefly drop back to a wideband sweep to discover any new / out-of-band channels, then re-channelize with the updated set. 0 disables it — use the banner's Back to wideband to re-scan manually.")}
           ${num('chrescanwin',s.channelize_rescan_window_s||60,5,600,5,'Re-scan sweep length (sec)',"How long each re-scan dwells on wideband before re-channelizing. Longer catches slower / less-chatty channels (a 15s beacon needs ~30-60s to show a couple of transmissions); shorter means less disruption per re-scan.")}</div>
+        ${num('chdc',s.dc_guard_khz||250,50,2000,10,'Channelizer DC Offset (kHz)',"When channelizing, keep every channel at least this far from the SDR center (DC). A signal sitting on DC is corrupted by the SDR's DC/LO-leak spike — increase this if your SDR has a wide DC spike, decrease for tighter narrowing (a smaller IBW). Default 250 kHz.")}
       </div>
     </details>`;
     const q=id=>box.querySelector(id);
@@ -1304,6 +1303,7 @@ function renderExperimentalConfig(box){
     q('#chaftern').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_after_n:n}); };
     q('#chrescan').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_rescan_min:n}); };
     q('#chrescanwin').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_rescan_window_s:n}); };
+    q('#chdc').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({dc_guard_khz:n}); };
     chSync(s.recommend_channelizing===true);
   }).catch(()=>{});
 }
