@@ -4336,11 +4336,23 @@ def main():
             _psd_last = time.time()
             if not (_psd_off and os.path.exists(_psd_off)):
                 _emit_psd_frame(_psd_file, _psd_gate)
-        _gate_peaks = find_peaks(_psd_gate, thresh_db=a.energy_threshold)
+        # Width floor: drop narrow CW/LO/clipping spikes (a few bins) BEFORE they reach
+        # the expensive per-peak extract+SC+dechirp — the main source of high-gain
+        # overload.  A LoRa channel is a wide flat hump; a spur is a sharp spike.  The
+        # 1s + max-hold passes previously appended peaks with NO width check (only the
+        # short-window sweep at `_w >= 30` filtered).  Carrier-aware (bins/Hz scales with
+        # sample rate) and CAPPED so it can never exceed ~0.5x the narrowest configurable
+        # LoRa BW (31.25 kHz) — so no real channel is dropped at ANY sample rate, with
+        # margin.  At normal wideband rates (≤~16 Msps) this is 4 bins, killing the 1-3
+        # bin CW/LO/clipping spikes; at higher rates it backs off (20 Msps -> 3 bins,
+        # 61 Msps -> no-op) so a narrow channel spanning few bins is never at risk.
+        _min_w = min(4, max(1, int(round(0.5 * 31250.0 / (a.rate / 4096.0)))))
+        _gate_peaks = [_p for _p in find_peaks(_psd_gate, thresh_db=a.energy_threshold)
+                       if _p[1] >= _min_w]
         if _psd_gmax is not None:
             _notch_psd(_psd_gmax)
             for _mh in find_peaks(_psd_gmax, thresh_db=a.energy_threshold):
-                if not any(abs(_mh[0] - _g[0]) < 15 for _g in _gate_peaks):
+                if _mh[1] >= _min_w and not any(abs(_mh[0] - _g[0]) < 15 for _g in _gate_peaks):
                     _gate_peaks.append(_mh)
 
         # ---- Multi-resolution Welch: short-window sweep ----
