@@ -1958,34 +1958,50 @@ def _safe_buf_seconds(rate_hz, fmt, requested_s):
     return capped
 
 
-CHANNELIZE_IBW_GUARD_HZ = 200e3   # margin beyond each channel edge: CFO + SDR filter rolloff
+CHANNELIZE_IBW_GUARD_HZ = 200e3   # margin beyond the outer channel edges: CFO + SDR filter rolloff
+CHANNELIZE_DC_GUARD_HZ = 250e3    # keep the SDR centre (DC) at least this far from any channel edge
 
 
 def _narrow_radio_for_channels(full_rate_hz):
-    """Channelizer IBW narrowing: a (rate_hz, bw_hz, center_mhz) that just spans the
-    accepted channels plus guard, clamped to the SDR's rate limits.  The guard is wide
-    enough that a packet slightly off the channel centre is never clipped, and the band
-    keeps the channels well inside the SDR filter's flat region.  Returns None when
-    narrowing wouldn't help (channels span most of the band) or can't cover them — the
-    caller then keeps the full configured radio (e.g. during a wideband re-scan)."""
+    """Channelizer IBW narrowing: a (rate_hz, bw_hz, center_mhz) spanning the accepted
+    channels, clamped to the SDR's rate limits.  Returns None when narrowing wouldn't
+    help (channels span most of the band) or can't cover them — the caller then keeps
+    the full configured radio (e.g. during a wideband re-scan).
+
+    Critically, the SDR centre (== DC) is placed so NO channel sits on it: a LoRa
+    signal centred at DC is wrecked by the SDR's DC offset / LO leakage (and the
+    detector's own DC-bin removal).  Prefer a wide gap between channels for DC; if
+    none (a lone channel, or tightly-packed ones), offset DC just below the cluster.
+    The outer guard keeps the channels inside the SDR filter's flat region and never
+    clips a packet that drifts slightly off its channel centre."""
     chans = CHAN.accepted_list()
     if not chans:
         return None
     import math
-    los = [c['center_mhz'] * 1e6 - c['bw_khz'] * 500.0 - CHANNELIZE_IBW_GUARD_HZ for c in chans]
-    his = [c['center_mhz'] * 1e6 + c['bw_khz'] * 500.0 + CHANNELIZE_IBW_GUARD_HZ for c in chans]
-    span = max(his) - min(los)
-    center_mhz = (max(his) + min(los)) / 2.0 / 1e6
-    widest_bw = max(c['bw_khz'] * 1e3 for c in chans)
-    rate = max(span * 1.15, widest_bw * 2.5)              # cover span + edge headroom
-    rate = math.ceil(rate / 5e5) * 5e5                    # tidy 0.5 MHz step
+    ch_lo = min(c['center_mhz'] * 1e6 - c['bw_khz'] * 500.0 for c in chans)   # lowest signal edge
+    ch_hi = max(c['center_mhz'] * 1e6 + c['bw_khz'] * 500.0 for c in chans)   # highest signal edge
+    centers = sorted(c['center_mhz'] * 1e6 for c in chans)
+    # Pick DC: widest inter-channel gap if it's roomy enough, else just below the cluster.
+    best_gap, gap_mid = 0.0, None
+    for a, b in zip(centers, centers[1:]):
+        if b - a > best_gap:
+            best_gap, gap_mid = b - a, (a + b) / 2.0
+    if gap_mid is not None and best_gap >= 2 * CHANNELIZE_DC_GUARD_HZ:
+        center_hz = gap_mid                                   # DC in the quiet gap
+    else:
+        center_hz = ch_lo - CHANNELIZE_DC_GUARD_HZ            # DC just below the lone/packed cluster
+    # Symmetric band around DC that reaches both outer channel edges + guard.
+    half = max(ch_hi + CHANNELIZE_IBW_GUARD_HZ - center_hz,
+               center_hz - (ch_lo - CHANNELIZE_IBW_GUARD_HZ))
+    rate = max(2 * half, max(c['bw_khz'] * 1e3 for c in chans) * 2.5)
+    rate = math.ceil(rate / 5e5) * 5e5                        # tidy 0.5 MHz step
     lim = sdr_profiles.SDR_PROFILES.get(SETTINGS.get('sdr', 'bladerf'), {}).get('limits', {}) \
         if sdr_profiles is not None else {}
     rmin, rmax = lim.get('rate_hz', (1e6, 20e6))
     rate = max(rmin, min(rmax, rate))
-    if rate >= full_rate_hz or rate < span:               # no benefit, or can't cover the span
+    if rate >= full_rate_hz or rate < 2 * half:               # no benefit, or can't cover the channels
         return None
-    return int(rate), int(rate), round(center_mhz, 4)
+    return int(rate), int(rate), round(center_hz / 1e6, 4)
 
 
 def _effective_radio():
