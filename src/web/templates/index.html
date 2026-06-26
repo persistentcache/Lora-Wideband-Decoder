@@ -1289,7 +1289,7 @@ function renderExperimentalConfig(box){
       <div style="padding:8px 2px 4px">
         <p class="muted" style="font-size:11px;margin:2px 0 12px;line-height:1.5">Beta features under active development — behaviour may change. Hover any option for details.</p>
         <h4 style="margin:10px 0 2px">Channelizer recommendation <span class="muted" style="font-size:11px">(beta)</span></h4>
-        ${cb('chrecommend',s.recommend_channelizing!==false,'<b>Recommend Channelizing (On / Off)</b><br><span class="muted" style="font-size:11px">While the full band is scanned, learn which LoRa channels are actually live. Once the channel set settles (no new / out-of-band channel for a while), a banner appears recommending a switch to watching <b>only those channels</b> — far more efficient and a higher decode rate than wideband scan, since it skips the wideband peak-search entirely. You accept or decline. On by default.</span>','Learn the live channels during wideband scan and recommend channelizing once they converge.')}
+        ${cb('chrecommend',s.recommend_channelizing===true,'<b>Recommend Channelizing (On / Off)</b><br><span class="muted" style="font-size:11px">Off by default. While the full band is scanned, learn which LoRa channels are actually live. Once the channel set settles (no new / out-of-band channel for a while), a banner appears recommending a switch to watching <b>only those channels</b> — far more efficient and a higher decode rate than wideband scan, since it skips the wideband peak-search entirely. You accept or decline. On by default.</span>','Learn the live channels during wideband scan and recommend channelizing once they converge.')}
         <div id="chsub" style="margin:2px 0 0 26px">${num('chaftern',s.channelize_after_n||15,3,500,1,'After X intercepts',"How many decoded LoRa packets to learn from before evaluating whether the channel set has settled enough to recommend channelizing.")}
           ${num('chrescan',s.channelize_rescan_min||0,0,1440,1,'Auto re-scan every X min (0 = off)',"Once channelizing, every X minutes briefly drop back to a wideband sweep to discover any new / out-of-band channels, then re-channelize with the updated set. 0 disables it — use the banner's Back to wideband to re-scan manually.")}
           ${num('chrescanwin',s.channelize_rescan_window_s||60,5,600,5,'Re-scan sweep length (sec)',"How long each re-scan dwells on wideband before re-channelizing. Longer catches slower / less-chatty channels (a 15s beacon needs ~30-60s to show a couple of transmissions); shorter means less disruption per re-scan.")}</div>
@@ -1302,7 +1302,7 @@ function renderExperimentalConfig(box){
     q('#chaftern').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_after_n:n}); };
     q('#chrescan').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_rescan_min:n}); };
     q('#chrescanwin').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_rescan_window_s:n}); };
-    chSync(s.recommend_channelizing!==false);
+    chSync(s.recommend_channelizing===true);
   }).catch(()=>{});
 }
 function renderAdvancedConfig(box){

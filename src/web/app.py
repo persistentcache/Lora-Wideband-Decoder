@@ -82,7 +82,7 @@ def load_settings():
                  # Channelizer (beta): after the wideband scan learns the live LoRa
                  # channels and they converge (no new/out-of-band channel for a
                  # while), recommend switching to watching only those channels.
-                 'recommend_channelizing': True,   # show the recommendation banner
+                 'recommend_channelizing': False,  # show the recommendation banner (off by default — experimental)
                  'channelize_after_n': 15,         # intercepts before evaluating
                  # While channelizing, every X minutes briefly drop back to wideband
                  # to discover new/out-of-band channels, then re-channelize with the
@@ -167,7 +167,7 @@ class ChannelTracker:
     def _eval(self):                                    # caller holds the lock
         if self.state in ('accepted', 'declined') or self.declined_session:
             return None
-        if not SETTINGS.get('recommend_channelizing', True):
+        if not SETTINGS.get('recommend_channelizing', False):
             return None
         after_n = max(3, int(SETTINGS.get('channelize_after_n', 15) or 15))
         converge = max(3, after_n // 3)                 # this many intercepts with no new channel
@@ -220,7 +220,7 @@ class ChannelTracker:
             chans = sorted(self.channels, key=lambda x: -x['count'])
             return {'state': self.state, 'total': self.total,
                     'after_n': int(SETTINGS.get('channelize_after_n', 15) or 15),
-                    'enabled': bool(SETTINGS.get('recommend_channelizing', True)),
+                    'enabled': bool(SETTINGS.get('recommend_channelizing', False)),
                     'rescanning': self.rescanning,
                     'rescan_min': int(SETTINGS.get('channelize_rescan_min', 0) or 0),
                     'rescan_window_s': int(SETTINGS.get('channelize_rescan_window_s', 60) or 60),
