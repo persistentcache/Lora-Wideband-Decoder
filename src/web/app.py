@@ -90,7 +90,11 @@ def load_settings():
                  'channelize_rescan_min': 0,
                  # How long each re-scan dwells on wideband (seconds).  Longer =
                  # catches slower/less-chatty channels; shorter = less disruption.
-                 'channelize_rescan_window_s': 60}
+                 'channelize_rescan_window_s': 60,
+                 # DC-offset guard (kHz): when channelizing, keep every channel at
+                 # least this far from the SDR centre (DC), since a signal on DC is
+                 # corrupted by the SDR's DC/LO-leak spike.  Tunable per SDR.
+                 'dc_guard_khz': 250}
     try:
         with open(SETTINGS_PATH) as f:
             return {**_defaults, **json.load(f)}
@@ -1959,7 +1963,16 @@ def _safe_buf_seconds(rate_hz, fmt, requested_s):
 
 
 CHANNELIZE_IBW_GUARD_HZ = 200e3   # margin beyond the outer channel edges: CFO + SDR filter rolloff
-CHANNELIZE_DC_GUARD_HZ = 250e3    # keep the SDR centre (DC) at least this far from any channel edge
+CHANNELIZE_DC_GUARD_HZ = 250e3    # default DC guard; overridable per SDR via the dc_guard_khz setting
+
+
+def _dc_guard_hz():
+    """Configurable DC-offset guard (Config > SDR/Radio).  Clamped so it can never
+    sit a channel on DC (min) or blow the band absurdly wide (max)."""
+    try:
+        return max(50e3, min(2e6, float(SETTINGS.get('dc_guard_khz', 250)) * 1e3))
+    except (TypeError, ValueError):
+        return CHANNELIZE_DC_GUARD_HZ
 
 
 def _narrow_radio_for_channels(full_rate_hz):
@@ -1981,15 +1994,16 @@ def _narrow_radio_for_channels(full_rate_hz):
     ch_lo = min(c['center_mhz'] * 1e6 - c['bw_khz'] * 500.0 for c in chans)   # lowest signal edge
     ch_hi = max(c['center_mhz'] * 1e6 + c['bw_khz'] * 500.0 for c in chans)   # highest signal edge
     centers = sorted(c['center_mhz'] * 1e6 for c in chans)
+    dcg = _dc_guard_hz()                                       # configurable DC-offset guard
     # Pick DC: widest inter-channel gap if it's roomy enough, else just below the cluster.
     best_gap, gap_mid = 0.0, None
     for a, b in zip(centers, centers[1:]):
         if b - a > best_gap:
             best_gap, gap_mid = b - a, (a + b) / 2.0
-    if gap_mid is not None and best_gap >= 2 * CHANNELIZE_DC_GUARD_HZ:
+    if gap_mid is not None and best_gap >= 2 * dcg:
         center_hz = gap_mid                                   # DC in the quiet gap
     else:
-        center_hz = ch_lo - CHANNELIZE_DC_GUARD_HZ            # DC just below the lone/packed cluster
+        center_hz = ch_lo - dcg                               # DC just below the lone/packed cluster
     # Symmetric band around DC that reaches both outer channel edges + guard.
     half = max(ch_hi + CHANNELIZE_IBW_GUARD_HZ - center_hz,
                center_hz - (ch_lo - CHANNELIZE_IBW_GUARD_HZ))
@@ -2474,11 +2488,17 @@ def api_settings():
                 SETTINGS['channelize_rescan_window_s'] = max(5, min(600, int(d['channelize_rescan_window_s'])))
             except (TypeError, ValueError):
                 pass
+        if 'dc_guard_khz' in d:
+            try:
+                SETTINGS['dc_guard_khz'] = max(50, min(2000, int(round(float(d['dc_guard_khz'])))))
+            except (TypeError, ValueError):
+                pass
         if any(k in d for k in ('autosave', 'waterfall', 'unknown', 'fingerprint',
                                 'protocols', 'wide_scan', 'sdr', 'radio', 'tune',
                                 'ldro_fallback', 'iq_invert', 'time_format', 'date_format',
                                 'recommend_channelizing', 'channelize_after_n',
-                                'channelize_rescan_min', 'channelize_rescan_window_s')):
+                                'channelize_rescan_min', 'channelize_rescan_window_s',
+                                'dc_guard_khz')):
             save_settings(SETTINGS)
             _apply_waterfall_flag()
             _apply_unknown_flag()
@@ -2501,7 +2521,8 @@ def api_sdr():
         # react when the driver field changes (e.g. driver=hackrf → no AGC).
         soapy_no_agc = dict(sdr_profiles._SOAPY_NO_AGC)
     return jsonify({'profiles': profs, 'current': SETTINGS.get('sdr', 'bladerf'),
-                    'radio': _radio_cfg(), 'soapy_no_agc': soapy_no_agc})
+                    'radio': _radio_cfg(), 'soapy_no_agc': soapy_no_agc,
+                    'dc_guard_khz': int(SETTINGS.get('dc_guard_khz', 250) or 250)})
 
 
 @app.route('/api/sdr/detect', methods=['POST'])
