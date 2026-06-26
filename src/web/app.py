@@ -190,9 +190,12 @@ class ChannelTracker:
                 self.declined_session = True
 
     def channel_tokens(self):
-        """center_mhz:bw_khz tokens for the gate --channels arg (frozen at Accept)."""
+        """center_mhz:bw_khz:sf tokens for the gate --channels arg (frozen at Accept).
+        The SF lets the gate run the dechirp matched-filter on each channel."""
         with self._lock:
-            return ','.join('%.5f:%.1f' % (c['center_mhz'], c['bw_khz']) for c in self.accepted)
+            return ','.join('%.5f:%.1f:%d' % (
+                c['center_mhz'], c['bw_khz'], int(c.get('sf') or _freq_sf(c['center_mhz'])))
+                for c in self.accepted)
 
     def accepted_list(self):
         """Copy of the watched channels (for computing the narrowed IBW span)."""
@@ -2042,6 +2045,19 @@ def _channelize_status():
         st['ibw_mhz'] = round(_r / 1e6, 2)
         st['ibw_center_mhz'] = _c
     return st
+
+
+def _freq_sf(center_mhz, default=7):
+    """SF of the most-recent decode near a frequency — for the channelizer dechirp
+    template (each learned channel may be a different node/preset).  Defaults to SF7."""
+    for _p in reversed(PACKETS):
+        _f = _p.get('freq_mhz')
+        if _f is not None and abs(_f - center_mhz) < 0.13 and _p.get('sf'):
+            try:
+                return int(_p['sf'])
+            except (TypeError, ValueError):
+                pass
+    return default
 
 
 def _build_pipeline_cmd():

@@ -43,6 +43,7 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
     wb_fs = params['wb_fs']; wb_bw = params['wb_bw']; center = params['center']
     sc_thr = params['sc_threshold']; ethr = params['ethresh']
     dc_notch = params['dc_notch']; spur_notch = params['spur_notch']
+    dechirp_chans = params.get('dechirp_chans', None)   # channelizer dechirp detector
     spur_default = params.get('spur_db_default', None)
     # Honor LORA_DEBUG so users diagnosing detection issues actually see the
     # per-peak energy / SC / dechirp output the gate already knows how to print.
@@ -62,7 +63,8 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
         try:
             kw = dict(sc_threshold=sc_thr, ethresh=ethr,
                       dc_notch_mhz=dc_notch, spur_notch_hz=spur_notch,
-                      debug=_dbg, cached_psd=psd, cached_peaks=peaks)
+                      debug=_dbg, cached_psd=psd, cached_peaks=peaks,
+                      dechirp_chans=dechirp_chans)
             if spur_db is not None:
                 kw['spur_db'] = spur_db
             _c = task_center if task_center is not None else center
