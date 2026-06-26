@@ -140,12 +140,12 @@ class ChannelTracker:
         except (TypeError, ValueError):
             return None
         bw_khz = float(bw) / 1000.0 if bw else 250.0   # bw stored in Hz on the record
-        tol_mhz = (bw_khz / 1000.0) / 4.0              # ±BW/4 clusters CFO jitter as one channel
-        with self._lock:
+        tol_mhz = (bw_khz / 1000.0) / 3.0              # ±BW/3 clusters CFO jitter as one channel
+        with self._lock:                               # (BW/4 was too tight: ~30ppm node CFO split SF11 into two)
             self.total += 1
             ch = None
             for c in self.channels:
-                if abs(c['center_mhz'] - freq_mhz) <= max(tol_mhz, (c['bw_khz'] / 1000.0) / 4.0):
+                if abs(c['center_mhz'] - freq_mhz) <= max(tol_mhz, (c['bw_khz'] / 1000.0) / 3.0):
                     ch = c; break
             if ch is None:
                 ch = {'center_mhz': freq_mhz, 'bw_khz': bw_khz, 'count': 0,
@@ -1614,15 +1614,17 @@ def tail_packet_log(path):
                 if ingest(rec) is not None:
                     _broadcast({'type': 'packet', 'data': rec})
                     _broadcast({'type': 'stats', 'data': _stats()})
-                # Channelizer learning: cluster EVERY decoded-LoRa record by channel,
-                # independent of ingest's keep/drop — channel presence is about RF
-                # energy on a frequency, not whether the payload decoded or was a
-                # de-duplicated retransmit (a chatty beacon or an undecryptable
-                # encrypted DM is still real activity on a real channel).
-                if rec.get('freq_mhz') is not None:
-                    if CHAN.add(rec.get('freq_mhz'), rec.get('bw'), rec.get('proto'),
-                                rec.get('sf'), rec.get('ts') or time.time()) == 'recommend':
-                        _broadcast({'type': 'channelize', 'data': CHAN.status()})
+                    # Channelizer learning: count ONLY packets ingest keeps — i.e.
+                    # the de-duplicated packets shown in the GUI.  Counting every raw
+                    # record instead massively over-counts: mesh relays (each node
+                    # rebroadcasts a packet) and duplicate re-decodes meant ~13
+                    # distinct packets showed up as 117 "intercepts" and tripped the
+                    # recommendation almost immediately.  One kept packet = one
+                    # intercept, so "after N intercepts" matches what the user sees.
+                    if rec.get('freq_mhz') is not None:
+                        if CHAN.add(rec.get('freq_mhz'), rec.get('bw'), rec.get('proto'),
+                                    rec.get('sf'), rec.get('ts') or time.time()) == 'recommend':
+                            _broadcast({'type': 'channelize', 'data': CHAN.status()})
             time.sleep(0.3)
         except Exception:
             time.sleep(0.5)
