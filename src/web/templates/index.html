@@ -95,7 +95,6 @@
   <span id="bell" title="Alerts" style="margin-left:auto;align-self:center;cursor:pointer;position:relative;padding:0 14px;font-size:15px">🔔<span id="bellct" style="display:none;position:absolute;top:-2px;right:6px;background:var(--warn);color:#fff;border-radius:9px;font-size:10px;padding:0 5px;line-height:15px"></span></span>
   <span id="healthbar" style="align-self:center;font-size:12px;color:var(--mut);padding-right:12px"></span>
 </nav>
-<div id="chbanner" style="display:none;margin:8px 10px;padding:10px 14px;border:1px solid var(--warn);border-radius:6px;background:rgba(241,196,15,.08);font-size:13px"></div>
 <div id="warnbar" style="display:none;background:rgba(255,93,93,.15);color:#ff8c8c;padding:7px 16px;border-bottom:1px solid var(--warn);font-size:12px"></div>
 <div class="wrap">
   <div id="tab-pkts">
@@ -1079,7 +1078,6 @@ function _renderConfigBody(){
   const pc=document.createElement('div'); el.insertBefore(pc, sc.nextSibling); renderProtocolsConfig(pc);
   const ac=document.createElement('div'); el.appendChild(ac); renderAlertsConfig(ac);
   const fc=document.createElement('div'); el.appendChild(fc); renderPreferencesConfig(fc);
-  const xc=document.createElement('div'); el.appendChild(xc); renderExperimentalConfig(xc);
   const uc=document.createElement('div'); el.appendChild(uc); renderAdvancedConfig(uc);
 }
 function renderSdrConfig(box){
@@ -1278,33 +1276,6 @@ function renderProtocolsConfig(box){
     q('#scanmode').onchange=e=>post({wide_scan:e.target.value==='all'});
     q('#unkdl').onclick=()=>{window.location='/api/unknown?download=1';};
     q('#unkclr').onclick=()=>{if(confirm('Clear the unknown-protocol report?'))fetch('/api/unknown',{method:'DELETE'}).then(()=>renderProtocolsConfig(box));};
-  }).catch(()=>{});
-}
-function renderExperimentalConfig(box){
-  fetch('/api/settings').then(r=>r.json()).then(s=>{
-    const cb=(id,on,lbl,tip)=>`<label title="${esc(tip||'')}" style="display:flex;gap:8px;align-items:flex-start;margin:5px 0;cursor:help"><input type="checkbox" id="${id}"${on?' checked':''} style="margin-top:3px;cursor:pointer"> <span>${lbl}</span></label>`;
-    const num=(id,val,min,max,step,lbl,tip)=>`<label title="${esc(tip)}" style="display:flex;gap:10px;align-items:center;margin:6px 0;cursor:help"><span style="min-width:200px">${lbl}</span><input type="number" id="${id}" value="${val}" min="${min}" max="${max}" step="${step}" style="width:96px"><span class="muted" style="font-size:11px">range ${min}–${max}</span></label>`;
-    box.innerHTML=`<details style="max-width:920px;margin-top:16px;border:1px solid var(--line);border-radius:6px;padding:6px 12px">
-      <summary style="cursor:pointer;font-weight:600;font-size:15px;padding:4px 0">Experimental</summary>
-      <div style="padding:8px 2px 4px">
-        <p class="muted" style="font-size:11px;margin:2px 0 12px;line-height:1.5">Beta features under active development — behaviour may change. Hover any option for details.</p>
-        <h4 style="margin:10px 0 2px">Channelizer recommendation <span class="muted" style="font-size:11px">(beta)</span></h4>
-        ${cb('chrecommend',s.recommend_channelizing===true,'<b>Recommend Channelizing (On / Off)</b><br><span class="muted" style="font-size:11px">Off by default. While the full band is scanned, learn which LoRa channels are actually live. Once the channel set settles (no new / out-of-band channel for a while), a banner appears recommending a switch to watching <b>only those channels</b> — far more efficient and a higher decode rate than wideband scan, since it skips the wideband peak-search entirely. You accept or decline. On by default.</span>','Learn the live channels during wideband scan and recommend channelizing once they converge.')}
-        <div id="chsub" style="margin:2px 0 0 26px">${num('chaftern',s.channelize_after_n||15,3,500,1,'After X intercepts',"How many decoded LoRa packets to learn from before evaluating whether the channel set has settled enough to recommend channelizing.")}
-          ${num('chrescan',s.channelize_rescan_min||0,0,1440,1,'Auto re-scan every X min (0 = off)',"Once channelizing, every X minutes briefly drop back to a wideband sweep to discover any new / out-of-band channels, then re-channelize with the updated set. 0 disables it — use the banner's Back to wideband to re-scan manually.")}
-          ${num('chrescanwin',s.channelize_rescan_window_s||60,5,600,5,'Re-scan sweep length (sec)',"How long each re-scan dwells on wideband before re-channelizing. Longer catches slower / less-chatty channels (a 15s beacon needs ~30-60s to show a couple of transmissions); shorter means less disruption per re-scan.")}</div>
-        ${num('chdc',s.dc_guard_khz||250,50,2000,10,'Channelizer DC Offset (kHz)',"When channelizing, keep every channel at least this far from the SDR center (DC). A signal sitting on DC is corrupted by the SDR's DC/LO-leak spike — increase this if your SDR has a wide DC spike, decrease for tighter narrowing (a smaller IBW). Default 250 kHz.")}
-      </div>
-    </details>`;
-    const q=id=>box.querySelector(id);
-    const post=b=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});
-    const chSync=on=>{ q('#chsub').style.opacity=on?'1':'.45'; q('#chaftern').disabled=!on; q('#chrescan').disabled=!on; q('#chrescanwin').disabled=!on; };
-    q('#chrecommend').onchange=e=>{ post({recommend_channelizing:e.target.checked}); chSync(e.target.checked); };
-    q('#chaftern').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_after_n:n}); };
-    q('#chrescan').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_rescan_min:n}); };
-    q('#chrescanwin').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({channelize_rescan_window_s:n}); };
-    q('#chdc').onchange=e=>{ const n=parseInt(e.target.value,10); if(isFinite(n))post({dc_guard_khz:n}); };
-    chSync(s.recommend_channelizing===true);
   }).catch(()=>{});
 }
 function renderAdvancedConfig(box){
@@ -1760,33 +1731,6 @@ try{const _q=new URLSearchParams(location.search).get('q'); if(_q)SEARCHQ=_q;}ca
 let HDR_KEY='default';
 function setHdrCenter(mhz){ const el=$('#center'); if(el)el.textContent='center '+(+Number(mhz).toFixed(4))+' MHz · key '+HDR_KEY; }
 
-// Channelizer recommendation banner (beta).
-function chDecide(accept){ fetch('/api/channelize/decision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({accept:accept})}).then(r=>r.json()).then(renderChannelize); }
-function renderChannelize(st){
-  const b=$('#chbanner'); if(!b||!st)return;
-  const chList=(st.channels||[]).map(c=>(+c.center_mhz.toFixed(3))+' MHz <span class="muted">('+(c.protos.join('/')||'lora')+' SF'+(c.sfs.join('/')||'?')+' ×'+c.count+')</span>').join(' &nbsp;·&nbsp; ');
-  if(st.state==='recommend'){
-    b.style.display='';
-    b.innerHTML='<b>⚡ Recommend switching to channelizer technique.</b> No out-of-band LoRa detected — all '+st.total+' intercepts are on '+st.n_channels+' channel'+(st.n_channels===1?'':'s')+': '+chList
-      +'<br><span class="muted">Watching only these is far more efficient and decodes better than wideband scan.</span> '
-      +'<button id="chaccept" style="margin-left:6px">Accept — channelize</button> <button id="chdecline">Decline</button>';
-    $('#chaccept').onclick=()=>chDecide(true); $('#chdecline').onclick=()=>chDecide(false);
-  } else if(st.state==='accepted'){
-    b.style.display='';
-    if(st.rescanning){
-      b.innerHTML='<b>Re-scanning…</b> <span class="muted">'+(st.rescan_window_s||60)+'s on wideband to discover new channels — will re-channelize automatically.</span>';
-    } else {
-      const ibw=st.ibw_mhz?(' &nbsp;·&nbsp; <b>'+st.ibw_mhz+' MHz IBW</b> @ '+st.ibw_center_mhz+' MHz'):'';
-      const every=st.rescan_min>0?(' &nbsp;·&nbsp; auto re-scan every '+st.rescan_min+' min'):'';
-      b.innerHTML='<b>Channelizing</b> — watching '+st.n_channels+' learned channel'+(st.n_channels===1?'':'s')+': '+chList
-        +'<span class="muted">'+ibw+every+'</span>'
-        +' <button id="chrescannow" style="margin-left:6px">Re-scan now</button> <button id="chwide">Back to wideband</button>';
-      $('#chrescannow').onclick=()=>fetch('/api/channelize/rescan',{method:'POST'});
-      $('#chwide').onclick=()=>fetch('/api/channelize/reset',{method:'POST'}).then(r=>r.json()).then(renderChannelize);
-    }
-  } else { b.style.display='none'; }
-}
-fetch('/api/channelize').then(r=>r.json()).then(renderChannelize).catch(()=>{});
 fetch('/api/state').then(r=>r.json()).then(d=>{PK.push(...d.packets);d.packets.forEach(noteName);d.packets.forEach(p=>{if(p.from)SEEN_NODES.add(p.from);});renderStats(d.stats);CFGW=d.config||{};activateTab(location.hash.slice(1)||'pkts');
   HDR_KEY=(d.config&&d.config.key)||'default'; if(d.config&&d.config.center_mhz!=null)setHdrCenter(d.config.center_mhz);}).catch(()=>activateTab('pkts'));
 fetch('/api/health').then(r=>r.json()).then(renderHealth).catch(()=>{});
@@ -1800,7 +1744,6 @@ if(!STATIC){
   es.addEventListener('update',e=>{const p=JSON.parse(e.data);evalAlerts(p);const i=PK.findIndex(x=>x.pktid===p.pktid&&x.hops===p.hops); if(i>=0)PK[i]=p; else PK.push(p); noteName(p); if(TAB!=='net'&&TAB!=='config')renderCurrent();});
   es.addEventListener('confirm',e=>{const d=JSON.parse(e.data); if(d&&d.devaddr){let ch=false; for(const p of PK){if(p.devaddr===d.devaddr&&p.proto==='unknown'){p.proto='lorawan';p.confidence='confirmed';p.from='LW:'+d.devaddr;delete p.hint;ch=true;}} if(ch&&TAB!=='net'&&TAB!=='config')renderCurrent();}});
   es.addEventListener('stats',e=>renderStats(JSON.parse(e.data)));
-  es.addEventListener('channelize',e=>{ try{renderChannelize(JSON.parse(e.data));}catch(_){} });
   es.addEventListener('health',e=>renderHealth(JSON.parse(e.data)));
   es.addEventListener('psd',e=>{ const _d=JSON.parse(e.data); if(_d.center_mhz!=null)setHdrCenter(_d.center_mhz); if(TAB==='wf'&&WF)wfRow(_d); });
   es.addEventListener('nodemeta',e=>{ const d=JSON.parse(e.data); if(d&&d.id){ if(d.meta&&Object.keys(d.meta).length)NODEMETA[d.id]=d.meta; else delete NODEMETA[d.id]; if(TAB!=='net'&&TAB!=='config')renderCurrent(); } });

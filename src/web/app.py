@@ -78,23 +78,7 @@ def load_settings():
                  # Pipeline tuning — overrides lora.toml [detect] when set.  Defaults
                  # match the well-tuned values; users only edit these to chase weak
                  # signals, suppress false positives in noisy RF, or absorb bursts.
-                 'tune': {'threshold': 0.55, 'energy_threshold': 12.0, 'buf_seconds': 16},
-                 # Channelizer (beta): after the wideband scan learns the live LoRa
-                 # channels and they converge (no new/out-of-band channel for a
-                 # while), recommend switching to watching only those channels.
-                 'recommend_channelizing': False,  # show the recommendation banner (off by default — experimental)
-                 'channelize_after_n': 15,         # intercepts before evaluating
-                 # While channelizing, every X minutes briefly drop back to wideband
-                 # to discover new/out-of-band channels, then re-channelize with the
-                 # updated set.  0 = never (manual 'Back to wideband' only).
-                 'channelize_rescan_min': 0,
-                 # How long each re-scan dwells on wideband (seconds).  Longer =
-                 # catches slower/less-chatty channels; shorter = less disruption.
-                 'channelize_rescan_window_s': 60,
-                 # DC-offset guard (kHz): when channelizing, keep every channel at
-                 # least this far from the SDR centre (DC), since a signal on DC is
-                 # corrupted by the SDR's DC/LO-leak spike.  Tunable per SDR.
-                 'dc_guard_khz': 250}
+                 'tune': {'threshold': 0.55, 'energy_threshold': 12.0, 'buf_seconds': 16}}
     try:
         with open(SETTINGS_PATH) as f:
             return {**_defaults, **json.load(f)}
@@ -107,137 +91,6 @@ def save_settings(s):
     except Exception:
         pass
 SETTINGS = load_settings()
-
-# ---------------------------------------------------------------- channelizer (beta)
-class ChannelTracker:
-    """Learns the live LoRa channels from decoded packets (clustered by frequency +
-    bandwidth) during wideband scan, and recommends switching to a channelizer that
-    watches ONLY those channels once the set converges — i.e. no new/out-of-band
-    channel has appeared for a while.  Watching just the seen channels skips the
-    wideband peak-search entirely (no spur flood) and concentrates decode effort.
-
-    States: scanning -> recommend -> accepted | declined.
-    """
-    def __init__(self):
-        self._lock = threading.Lock()
-        self.channels = []        # [{center_mhz,bw_khz,count,last_ts,protos[],sfs[]}]
-        self.total = 0            # total LoRa intercepts clustered
-        self.last_new_at = 0      # self.total when the last NEW channel appeared
-        self.state = 'scanning'
-        self.declined_session = False
-        self.accepted = []        # channel list frozen at Accept — what the gate watches
-        self.rescanning = False   # mid auto re-scan: temporarily back on wideband
-
-    def reset(self):
-        with self._lock:
-            self.channels = []; self.total = 0; self.last_new_at = 0
-            self.state = 'scanning'; self.declined_session = False
-            self.accepted = []; self.rescanning = False
-
-    def add(self, freq_mhz, bw, proto, sf, ts):
-        """Cluster one decoded packet.  Returns 'recommend' if the state just
-        flipped to recommend (so the caller can broadcast it), else None."""
-        if freq_mhz is None:
-            return None
-        try:
-            freq_mhz = float(freq_mhz)
-        except (TypeError, ValueError):
-            return None
-        bw_khz = float(bw) / 1000.0 if bw else 250.0   # bw stored in Hz on the record
-        tol_mhz = (bw_khz / 1000.0) / 3.0              # ±BW/3 clusters CFO jitter as one channel
-        with self._lock:                               # (BW/4 was too tight: ~30ppm node CFO split SF11 into two)
-            self.total += 1
-            ch = None
-            for c in self.channels:
-                if abs(c['center_mhz'] - freq_mhz) <= max(tol_mhz, (c['bw_khz'] / 1000.0) / 3.0):
-                    ch = c; break
-            if ch is None:
-                ch = {'center_mhz': freq_mhz, 'bw_khz': bw_khz, 'count': 0,
-                      'last_ts': ts, 'protos': [], 'sfs': []}
-                self.channels.append(ch)
-                self.last_new_at = self.total
-            n = ch['count']
-            ch['center_mhz'] = (ch['center_mhz'] * n + freq_mhz) / (n + 1)   # running mean
-            ch['count'] = n + 1
-            ch['last_ts'] = ts
-            if bw:
-                ch['bw_khz'] = bw_khz
-            if proto and proto not in ch['protos']:
-                ch['protos'].append(proto)
-            if sf and sf not in ch['sfs']:
-                ch['sfs'].append(sf)
-            return self._eval()
-
-    def _eval(self):                                    # caller holds the lock
-        if self.state in ('accepted', 'declined') or self.declined_session:
-            return None
-        if not SETTINGS.get('recommend_channelizing', False):
-            return None
-        after_n = max(3, int(SETTINGS.get('channelize_after_n', 15) or 15))
-        converge = max(3, after_n // 3)                 # this many intercepts with no new channel
-        if self.total >= after_n and (self.total - self.last_new_at) >= converge:
-            if self.state != 'recommend':
-                self.state = 'recommend'
-                return 'recommend'
-        return None
-
-    def decide(self, accept):
-        with self._lock:
-            self.state = 'accepted' if accept else 'declined'
-            if accept:
-                self.accepted = [dict(c) for c in sorted(self.channels, key=lambda x: -x['count'])]
-            else:
-                self.declined_session = True
-
-    def channel_tokens(self):
-        """center_mhz:bw_khz:sf tokens for the gate --channels arg (frozen at Accept).
-        The SF lets the gate run the dechirp matched-filter on each channel."""
-        with self._lock:
-            return ','.join('%.5f:%.1f:%d' % (
-                c['center_mhz'], c['bw_khz'], int(c.get('sf') or _freq_sf(c['center_mhz'])))
-                for c in self.accepted)
-
-    def accepted_list(self):
-        """Copy of the watched channels (for computing the narrowed IBW span)."""
-        with self._lock:
-            return [dict(c) for c in self.accepted]
-
-    def active(self):
-        """True when the gate should be channelized — accepted, has channels, and
-        not mid re-scan (during a re-scan we drop the mask to find new channels)."""
-        with self._lock:
-            return self.state == 'accepted' and bool(self.accepted) and not self.rescanning
-
-    def set_rescanning(self, on):
-        with self._lock:
-            self.rescanning = bool(on)
-
-    def refreeze(self):
-        """Re-snapshot the watched set = currently learned channels (called after a
-        re-scan window so any newly-discovered channel joins the mask).  Returns the
-        center_mhz of channels that are new vs the previous accepted set."""
-        with self._lock:
-            prev = {round(c['center_mhz'], 3) for c in self.accepted}
-            self.accepted = [dict(c) for c in sorted(self.channels, key=lambda x: -x['count'])]
-            return [round(c['center_mhz'], 4) for c in self.accepted
-                    if round(c['center_mhz'], 3) not in prev]
-
-    def status(self):
-        with self._lock:
-            chans = sorted(self.channels, key=lambda x: -x['count'])
-            return {'state': self.state, 'total': self.total,
-                    'after_n': int(SETTINGS.get('channelize_after_n', 15) or 15),
-                    'enabled': bool(SETTINGS.get('recommend_channelizing', False)),
-                    'rescanning': self.rescanning,
-                    'rescan_min': int(SETTINGS.get('channelize_rescan_min', 0) or 0),
-                    'rescan_window_s': int(SETTINGS.get('channelize_rescan_window_s', 60) or 60),
-                    'n_channels': len(self.channels),
-                    'channels': [{'center_mhz': round(c['center_mhz'], 4),
-                                  'bw_khz': round(c['bw_khz'], 1), 'count': c['count'],
-                                  'protos': list(c['protos']), 'sfs': sorted(c['sfs'])}
-                                 for c in chans]}
-
-CHAN = ChannelTracker()
 
 # ---------------------------------------------------------------- channel keys
 # Persistent key list (survives all sessions) the decoder reads via LORA_KEYS.
@@ -1626,17 +1479,6 @@ def tail_packet_log(path):
                 if ingest(rec) is not None:
                     _broadcast({'type': 'packet', 'data': rec})
                     _broadcast({'type': 'stats', 'data': _stats()})
-                    # Channelizer learning: count ONLY packets ingest keeps — i.e.
-                    # the de-duplicated packets shown in the GUI.  Counting every raw
-                    # record instead massively over-counts: mesh relays (each node
-                    # rebroadcasts a packet) and duplicate re-decodes meant ~13
-                    # distinct packets showed up as 117 "intercepts" and tripped the
-                    # recommendation almost immediately.  One kept packet = one
-                    # intercept, so "after N intercepts" matches what the user sees.
-                    if rec.get('freq_mhz') is not None:
-                        if CHAN.add(rec.get('freq_mhz'), rec.get('bw'), rec.get('proto'),
-                                    rec.get('sf'), rec.get('ts') or time.time()) == 'recommend':
-                            _broadcast({'type': 'channelize', 'data': _channelize_status()})
             time.sleep(0.3)
         except Exception:
             time.sleep(0.5)
@@ -1848,7 +1690,7 @@ def _tail_psd():
                 # frequency axis matches what the pipeline is actually running, not
                 # the lora.toml default.  Recomputed per frame so a live re-tune /
                 # Config change is reflected without a restart.
-                _erate, _ebw, _ecen = _effective_radio()   # narrowed band when channelizing
+                _erate, _ebw, _ecen = _effective_radio()
                 _broadcast({'type': 'psd', 'data': {
                     'b64': _b64.b64encode(raw).decode('ascii'),
                     'center_mhz': _ecen,
@@ -1965,99 +1807,12 @@ def _safe_buf_seconds(rate_hz, fmt, requested_s):
     return capped
 
 
-CHANNELIZE_IBW_GUARD_HZ = 200e3   # margin beyond the outer channel edges: CFO + SDR filter rolloff
-CHANNELIZE_DC_GUARD_HZ = 250e3    # default DC guard; overridable per SDR via the dc_guard_khz setting
-
-
-def _dc_guard_hz():
-    """Configurable DC-offset guard (Config > SDR/Radio).  Clamped so it can never
-    sit a channel on DC (min) or blow the band absurdly wide (max)."""
-    try:
-        return max(50e3, min(2e6, float(SETTINGS.get('dc_guard_khz', 250)) * 1e3))
-    except (TypeError, ValueError):
-        return CHANNELIZE_DC_GUARD_HZ
-
-
-def _narrow_radio_for_channels(full_rate_hz):
-    """Channelizer IBW narrowing: a (rate_hz, bw_hz, center_mhz) spanning the accepted
-    channels, clamped to the SDR's rate limits.  Returns None when narrowing wouldn't
-    help (channels span most of the band) or can't cover them — the caller then keeps
-    the full configured radio (e.g. during a wideband re-scan).
-
-    Critically, the SDR centre (== DC) is placed so NO channel sits on it: a LoRa
-    signal centred at DC is wrecked by the SDR's DC offset / LO leakage (and the
-    detector's own DC-bin removal).  Prefer a wide gap between channels for DC; if
-    none (a lone channel, or tightly-packed ones), offset DC just below the cluster.
-    The outer guard keeps the channels inside the SDR filter's flat region and never
-    clips a packet that drifts slightly off its channel centre."""
-    chans = CHAN.accepted_list()
-    if not chans:
-        return None
-    import math
-    ch_lo = min(c['center_mhz'] * 1e6 - c['bw_khz'] * 500.0 for c in chans)   # lowest signal edge
-    ch_hi = max(c['center_mhz'] * 1e6 + c['bw_khz'] * 500.0 for c in chans)   # highest signal edge
-    centers = sorted(c['center_mhz'] * 1e6 for c in chans)
-    dcg = _dc_guard_hz()                                       # configurable DC-offset guard
-    # Pick DC: widest inter-channel gap if it's roomy enough, else just below the cluster.
-    best_gap, gap_mid = 0.0, None
-    for a, b in zip(centers, centers[1:]):
-        if b - a > best_gap:
-            best_gap, gap_mid = b - a, (a + b) / 2.0
-    if gap_mid is not None and best_gap >= 2 * dcg:
-        center_hz = gap_mid                                   # DC in the quiet gap
-    else:
-        center_hz = ch_lo - dcg                               # DC just below the lone/packed cluster
-    # Symmetric band around DC that reaches both outer channel edges + guard.
-    half = max(ch_hi + CHANNELIZE_IBW_GUARD_HZ - center_hz,
-               center_hz - (ch_lo - CHANNELIZE_IBW_GUARD_HZ))
-    rate = max(2 * half, max(c['bw_khz'] * 1e3 for c in chans) * 2.5)
-    rate = math.ceil(rate / 5e5) * 5e5                        # tidy 0.5 MHz step
-    lim = sdr_profiles.SDR_PROFILES.get(SETTINGS.get('sdr', 'bladerf'), {}).get('limits', {}) \
-        if sdr_profiles is not None else {}
-    rmin, rmax = lim.get('rate_hz', (1e6, 20e6))
-    rate = max(rmin, min(rmax, rate))
-    if rate >= full_rate_hz or rate < 2 * half:               # no benefit, or can't cover the channels
-        return None
-    return int(rate), int(rate), round(center_hz / 1e6, 4)
-
-
 def _effective_radio():
-    """The (rate_hz, bw_hz, center_mhz) the pipeline is ACTUALLY running at: the
-    channelizer-narrowed band when channelizing, else the full configured radio.
-    Single source of truth for the gate launch AND the PSD/waterfall labels, so the
-    display matches the capture.  Re-scan clears CHAN.active() → this returns full,
-    so the wideband sweep automatically uses the full band, then re-narrows after."""
+    """The (rate_hz, bw_hz, center_mhz) the pipeline is ACTUALLY running at: the full
+    configured radio.  Single source of truth for the gate launch AND the
+    PSD/waterfall labels, so the display matches the capture."""
     r = _radio_cfg()
-    rate = int(r['rate_hz']); bw = int(r['bandwidth_hz']); center_mhz = float(r['center_mhz'])
-    if CHAN.active():
-        nb = _narrow_radio_for_channels(rate)
-        if nb:
-            rate, bw, center_mhz = nb
-    return rate, bw, center_mhz
-
-
-def _channelize_status():
-    """CHAN.status() plus the live narrowed-IBW readout while channelizing, so the
-    banner can show how wide the SDR is actually running vs the full band."""
-    st = CHAN.status()
-    if CHAN.active():
-        _r, _b, _c = _effective_radio()
-        st['ibw_mhz'] = round(_r / 1e6, 2)
-        st['ibw_center_mhz'] = _c
-    return st
-
-
-def _freq_sf(center_mhz, default=7):
-    """SF of the most-recent decode near a frequency — for the channelizer dechirp
-    template (each learned channel may be a different node/preset).  Defaults to SF7."""
-    for _p in reversed(PACKETS):
-        _f = _p.get('freq_mhz')
-        if _f is not None and abs(_f - center_mhz) < 0.13 and _p.get('sf'):
-            try:
-                return int(_p['sf'])
-            except (TypeError, ValueError):
-                pass
-    return default
+    return int(r['rate_hz']), int(r['bandwidth_hz']), float(r['center_mhz'])
 
 
 def _build_pipeline_cmd():
@@ -2069,7 +1824,7 @@ def _build_pipeline_cmd():
     collapse a second after starting."""
     import shlex
     r = _radio_cfg(); d = CFG['detect']; dec = CFG['decode']
-    rate, bw, _center_mhz = _effective_radio()   # narrowed to the channels when channelizing
+    rate, bw, _center_mhz = _effective_radio()
     cen_hz = int(_center_mhz * 1e6)
     sdr = SETTINGS.get('sdr', 'bladerf')
     if sdr_profiles is not None:
@@ -2102,10 +1857,6 @@ def _build_pipeline_cmd():
             f'--overlap {d["overlap"]} --energy-threshold {_eth} '
             f'--detect-workers {d["detect_workers"]} --buf-seconds {_bufs} '
             f'--decode --export-iq {shlex.quote(dec["export_dir"])} -d 1')
-    # Channelizer mode (beta): if the user accepted the recommendation, restrict the
-    # gate to the learned channels.  Applied at launch, so a mode change restarts.
-    if CHAN.active():
-        gate += ' --channels ' + shlex.quote(CHAN.channel_tokens())
     return cap + ' | ' + gate
 
 
@@ -2394,7 +2145,7 @@ def api_psd():
     try:
         with open(PSD_FILE, 'rb') as f:
             raw = f.read()
-        _erate, _ebw, _ecen = _effective_radio()   # narrowed band when channelizing
+        _erate, _ebw, _ecen = _effective_radio()
         return jsonify({'b64': _b64.b64encode(raw).decode('ascii'),
                         'center_mhz': _ecen,
                         'rate_mhz': _erate / 1e6})
@@ -2453,7 +2204,7 @@ def api_settings():
                 _ctl = {}
                 try: _ctl['gain'] = float(_rc.get('gain'))
                 except (TypeError, ValueError): pass
-                try: _ctl['center_hz'] = _effective_radio()[2] * 1e6   # narrowed centre when channelizing
+                try: _ctl['center_hz'] = _effective_radio()[2] * 1e6
                 except (TypeError, ValueError, KeyError): pass
                 if _ctl:
                     try:
@@ -2487,34 +2238,9 @@ def api_settings():
             SETTINGS['time_format'] = str(d['time_format'])
         if 'date_format' in d and str(d['date_format']) in _DATE_STRFTIME:
             SETTINGS['date_format'] = str(d['date_format'])
-        if 'recommend_channelizing' in d:
-            SETTINGS['recommend_channelizing'] = bool(d['recommend_channelizing'])
-        if 'channelize_after_n' in d:
-            try:
-                SETTINGS['channelize_after_n'] = max(3, min(500, int(d['channelize_after_n'])))
-            except (TypeError, ValueError):
-                pass
-        if 'channelize_rescan_min' in d:
-            try:
-                SETTINGS['channelize_rescan_min'] = max(0, min(1440, int(d['channelize_rescan_min'])))
-            except (TypeError, ValueError):
-                pass
-        if 'channelize_rescan_window_s' in d:
-            try:
-                SETTINGS['channelize_rescan_window_s'] = max(5, min(600, int(d['channelize_rescan_window_s'])))
-            except (TypeError, ValueError):
-                pass
-        if 'dc_guard_khz' in d:
-            try:
-                SETTINGS['dc_guard_khz'] = max(50, min(2000, int(round(float(d['dc_guard_khz'])))))
-            except (TypeError, ValueError):
-                pass
         if any(k in d for k in ('autosave', 'waterfall', 'unknown', 'fingerprint',
                                 'protocols', 'wide_scan', 'sdr', 'radio', 'tune',
-                                'ldro_fallback', 'iq_invert', 'time_format', 'date_format',
-                                'recommend_channelizing', 'channelize_after_n',
-                                'channelize_rescan_min', 'channelize_rescan_window_s',
-                                'dc_guard_khz')):
+                                'ldro_fallback', 'iq_invert', 'time_format', 'date_format')):
             save_settings(SETTINGS)
             _apply_waterfall_flag()
             _apply_unknown_flag()
@@ -3288,126 +3014,6 @@ def _tee_pipeline_log_to_stderr():
         time.sleep(0.5)
 
 
-# ------------------------------------------------------------- channelizer endpoints
-@app.route('/api/channelize')
-def api_channelize():
-    """Learned-channel state: scanning/recommend/accepted/declined + the channels."""
-    return jsonify(_channelize_status())
-
-
-def _maybe_restart_for_channelize(was_active):
-    """When channelize mode flips, restart the running pipeline so the gate picks
-    up (or drops) --channels.  Done in a background thread so the request returns
-    immediately; no-op if the pipeline isn't running (applies on next Start)."""
-    if CHAN.active() == was_active or not PIPELINE.get('running'):
-        return
-    def _do():
-        stop_pipeline(); time.sleep(1.2); start_pipeline()
-    threading.Thread(target=_do, daemon=True).start()
-
-
-RESCAN_WINDOW_DEFAULT_S = 60.0   # wideband dwell per re-scan — catches a 15 s beacon ~4x
-
-
-def _rescan_window_s():
-    try:
-        return max(5.0, min(600.0, float(SETTINGS.get('channelize_rescan_window_s',
-                                                       RESCAN_WINDOW_DEFAULT_S))))
-    except (TypeError, ValueError):
-        return RESCAN_WINDOW_DEFAULT_S
-
-
-def _channelize_rescan_once():
-    """One re-scan cycle: drop the channel mask, dwell on wideband to discover new
-    channels (the follower keeps learning), then re-channelize with the updated set.
-    Aborts cleanly if the user stops the pipeline or leaves channelize mode mid-cycle
-    (never restarts a pipeline the user intentionally stopped)."""
-    if not (PIPELINE.get('running') and CHAN.active()):
-        return
-    _win = _rescan_window_s()
-    print('[CHAN] re-scanning for new channels (%ds wideband)' % int(_win),
-          file=sys.stderr, flush=True)
-    CHAN.set_rescanning(True)                       # active() -> False -> wideband
-    _broadcast({'type': 'channelize', 'data': _channelize_status()})
-    stop_pipeline(); time.sleep(1.2)
-    if not (CHAN.rescanning and CHAN.state == 'accepted'):
-        CHAN.set_rescanning(False); return          # aborted during the gap
-    start_pipeline()
-    _t0 = time.time()
-    while time.time() - _t0 < _win:
-        if not (CHAN.rescanning and CHAN.state == 'accepted' and PIPELINE.get('running')):
-            break
-        time.sleep(2)
-    aborted = not (CHAN.state == 'accepted' and PIPELINE.get('running'))
-    CHAN.set_rescanning(False)
-    if aborted:                                      # user stopped or went wideband
-        _broadcast({'type': 'channelize', 'data': _channelize_status()})
-        return
-    new = CHAN.refreeze()                            # accepted = learned (+ any new)
-    if new:
-        print('[CHAN] re-scan found %d new channel(s): %s' % (
-            len(new), ', '.join('%.4f MHz' % f for f in new)), file=sys.stderr, flush=True)
-    stop_pipeline(); time.sleep(1.2); start_pipeline()   # back to channelize, updated mask
-    _broadcast({'type': 'channelize', 'data': _channelize_status()})
-
-
-def _channelize_rescan_loop():
-    """Trigger _channelize_rescan_once every channelize_rescan_min minutes while
-    channelizing.  0 = off.  Waits in short steps so an interval change, a stop, or
-    leaving channelize mode is picked up promptly."""
-    while True:
-        try:
-            mins = int(SETTINGS.get('channelize_rescan_min', 0) or 0)
-            if mins > 0 and CHAN.active() and PIPELINE.get('running'):
-                waited = 0
-                while waited < mins * 60:
-                    time.sleep(5); waited += 5
-                    if int(SETTINGS.get('channelize_rescan_min', 0) or 0) != mins:
-                        break                        # interval changed → recompute
-                    if not (CHAN.active() and PIPELINE.get('running')):
-                        break                        # left channelize / stopped
-                else:
-                    if CHAN.active() and PIPELINE.get('running') \
-                       and int(SETTINGS.get('channelize_rescan_min', 0) or 0) > 0:
-                        _channelize_rescan_once()
-            else:
-                time.sleep(5)
-        except Exception:
-            time.sleep(10)
-
-
-@app.route('/api/channelize/rescan', methods=['POST'])
-def api_channelize_rescan():
-    """Manually trigger one re-scan cycle now (background)."""
-    if CHAN.active() and PIPELINE.get('running'):
-        threading.Thread(target=_channelize_rescan_once, daemon=True).start()
-        return jsonify({'ok': True})
-    return jsonify({'ok': False, 'error': 'not channelizing'})
-
-
-@app.route('/api/channelize/decision', methods=['POST'])
-def api_channelize_decision():
-    """User accepts/declines the channelizer recommendation.  Accept switches the
-    gate to watch only the learned channels (restarts the pipeline if running)."""
-    d = request.get_json(force=True, silent=True) or {}
-    was = CHAN.active()
-    CHAN.decide(bool(d.get('accept')))
-    _maybe_restart_for_channelize(was)
-    _broadcast({'type': 'channelize', 'data': _channelize_status()})
-    return jsonify(_channelize_status())
-
-
-@app.route('/api/channelize/reset', methods=['POST'])
-def api_channelize_reset():
-    """Reset learning back to scanning — re-discover channels (and drop back to
-    wideband if we were channelizing)."""
-    was = CHAN.active()
-    CHAN.reset()
-    _maybe_restart_for_channelize(was)
-    _broadcast({'type': 'channelize', 'data': _channelize_status()})
-    return jsonify(_channelize_status())
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', default=None)
@@ -3467,7 +3073,6 @@ def main():
     _apply_unknown_flag()
     threading.Thread(target=_tail_health, daemon=True).start()
     threading.Thread(target=_tail_psd, daemon=True).start()
-    threading.Thread(target=_channelize_rescan_loop, daemon=True).start()
     _startup_line = (f"lora_web: config={CFG.get('_path')}  tailing={log_path}  "
                      f"serving http://{host}:{port}")
     if os.environ.get('LORA_DEBUG') == '1':
