@@ -1305,6 +1305,11 @@ function renderAdvancedConfig(box){
           <span class="muted" style="font-size:11px">applies on next Start</span>
         </div>
         <p class="muted" style="font-size:11px;margin:4px 0 0;line-height:1.5">Inverted decodes IQ-inverted transmitters (LoRaWAN downlink, satellite / tinyGS). Mutually exclusive — normal traffic won't decode while this is set.</p>
+        <h4 style="margin:18px 0 2px">Channelizer (auto)</h4>
+        ${cb('chanon',s.channelize_enabled!==false,'<b>Channelizer (On / Off)</b><br><span class="muted" style="font-size:11px">Learns the live LoRa channels from decoded packets and forces the dechirp matched-filter on the busiest ones — <b>additively</b>, on top of the wideband energy gate (no narrowing, no mask). Pulls weak / long-range packets on known channels out of the noise. Fully automatic. Changing any channelizer option restarts a running pipeline.</span>','Auto-channelize the busiest learned channels with the dechirp matched-filter, additively.')}
+        ${num('chanaftern',s.channelize_after_n||10,3,500,1,'Min intercepts per channel','How many decoded packets a channel must accumulate before it is fed to the dechirp matched-filter. Lower = faster to channelize, higher = only well-established channels.')}
+        ${num('chanmax',s.channelize_max_channels||10,1,20,1,'Max channels','Cap on how many learned channels run the dechirp matched-filter at once (busiest first). Higher = more coverage, more CPU.')}
+        <div id="chanlist" class="muted" style="font-size:11px;margin:6px 0 0;line-height:1.6">loading channels…</div>
         <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--line);display:flex;gap:10px;align-items:center">
           <button id="advreset" title="Restore every Protocols and Advanced option to its built-in default. Does NOT touch SDR/Radio or Channel keys.">Reset to defaults</button>
           <span class="muted" style="font-size:11px">Restores all Protocols + Advanced options (protocols, unknown, scan, fingerprint, LDRO, IQ, tuning). Doesn't affect SDR/Radio or Channel keys.</span>
@@ -1322,6 +1327,19 @@ function renderAdvancedConfig(box){
       buf_seconds:parseInt(q('#tunebuf').value,10)
     }});
     ['#tunethresh','#tuneeth','#tunebuf'].forEach(s=>q(s).onchange=saveTune);
+    q('#chanon').onchange=e=>post({channelize_enabled:e.target.checked});
+    q('#chanaftern').onchange=e=>post({channelize_after_n:parseInt(e.target.value,10)});
+    q('#chanmax').onchange=e=>post({channelize_max_channels:parseInt(e.target.value,10)});
+    const renderChans=()=>fetch('/api/channelize').then(r=>r.json()).then(c=>{
+      const el=q('#chanlist'); if(!el)return;
+      const chans=(c.channels||[]);
+      if(!chans.length){ el.innerHTML='No channels learned yet — decode some packets first.'; return; }
+      const fed=Math.min(c.max_channels||10, chans.filter(x=>x.count>=(c.after_n||10)).length);
+      el.innerHTML='<b>Active channels</b> (feeding '+fed+' of '+chans.length+' learned to the dechirp):<br>'
+        +chans.map(x=>{const on=x.count>=(c.after_n||10);
+          return '<span style="opacity:'+(on?1:0.5)+'">'+x.center_mhz.toFixed(3)+' MHz · SF'+x.sf+' · '+x.count+(on?' ✓':'')+'</span>';}).join('<br>');
+    }).catch(()=>{});
+    renderChans();
     q('#advreset').onclick=()=>{
       if(!confirm('Reset every Protocols and Advanced option to defaults? Channel keys and SDR/Radio settings are NOT touched.'))return;
       post(ADV_DEFAULTS).then(()=>_renderConfigBody());
