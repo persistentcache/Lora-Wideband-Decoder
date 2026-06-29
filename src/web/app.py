@@ -75,6 +75,11 @@ def load_settings():
                  'date_format': 'MMDDYY',   # display: MMDDYY|MMDDYYYY|DDMMYY|DDMMYYYY|YYYYMMDD
                  'sdr': 'bladerf',          # selected SDR profile (persists across sessions)
                  'radio': {},               # web overrides of lora.toml [radio] (rate/bw/center/gain)
+                 # Channelizer (ADDITIVE / AUTO): force the dechirp matched-filter on the
+                 # busiest learned channels, ON TOP of the wideband gate (no mask).
+                 'channelize_enabled': True,    # master on/off (always-on when True)
+                 'channelize_after_n': 10,      # min intercepts before a channel is fed
+                 'channelize_max_channels': 10, # cap on channels fed (top by count)
                  # Pipeline tuning — overrides lora.toml [detect] when set.  Defaults
                  # match the well-tuned values; users only edit these to chase weak
                  # signals, suppress false positives in noisy RF, or absorb bursts.
@@ -1447,6 +1452,164 @@ def _stats():
 
 
 # ---------------------------------------------------------------- log tailer
+def _freq_sf(center_mhz, default=7):
+    """SF of the most-recent decode near a frequency — for the channelizer dechirp
+    template (each learned channel may be a different node/preset).  Defaults to SF7."""
+    for _p in reversed(PACKETS):
+        _f = _p.get('freq_mhz')
+        if _f is not None and abs(_f - center_mhz) < 0.13 and _p.get('sf'):
+            try:
+                return int(_p['sf'])
+            except (TypeError, ValueError):
+                pass
+    return default
+
+
+class ChannelTracker:
+    """Learns the live LoRa channels from decoded packets (clustered by carrier
+    frequency) so the channelizer can FORCE the dechirp matched-filter on the busy
+    channels — ADDITIVELY, on top of the full wideband energy gate.  No narrowing,
+    no mask, no accept/decline: it just feeds the busiest learned channels (≥
+    channelize_after_n intercepts, top channelize_max_channels by count) into the
+    detector's --channels arg whenever channelize_enabled is True."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.channels = []        # [{center_mhz,bw_khz,sf,count,last_ts,protos[],sfs[]}]
+        self.total = 0            # total LoRa intercepts clustered
+
+    def reset(self):
+        with self._lock:
+            self.channels = []; self.total = 0
+
+    def add(self, freq_mhz, bw, proto, sf, ts):
+        """Cluster one decoded packet into a learned channel (running-average center)."""
+        if freq_mhz is None:
+            return
+        try:
+            freq_mhz = float(freq_mhz)
+        except (TypeError, ValueError):
+            return
+        bw_hz = float(bw) if bw else 250000.0     # bw stored in Hz on the record
+        bw_khz = bw_hz / 1000.0
+        # MERGE TOLERANCE: a packet within ~one channel bandwidth of an existing
+        # learned channel folds INTO it (updates the running-average center) instead
+        # of spawning a new one.  Using max(packet_bw, 200 kHz) stops a strong
+        # signal's nearby energy / sidelobes from being learned as several channels.
+        tol_hz = max(bw_hz, 200000.0)
+        tol_mhz = tol_hz / 1e6
+        with self._lock:
+            self.total += 1
+            ch = None
+            for c in self.channels:
+                c_tol = max(c['bw_khz'] * 1000.0, 200000.0) / 1e6
+                if abs(c['center_mhz'] - freq_mhz) <= max(tol_mhz, c_tol):
+                    ch = c; break
+            if ch is None:
+                ch = {'center_mhz': freq_mhz, 'bw_khz': bw_khz, 'sf': None,
+                      'count': 0, 'last_ts': ts, 'protos': [], 'sfs': []}
+                self.channels.append(ch)
+            n = ch['count']
+            ch['center_mhz'] = (ch['center_mhz'] * n + freq_mhz) / (n + 1)   # running mean
+            ch['count'] = n + 1
+            ch['last_ts'] = ts
+            if bw:
+                ch['bw_khz'] = bw_khz
+            if sf:
+                try:
+                    ch['sf'] = int(sf)
+                except (TypeError, ValueError):
+                    pass
+                if sf not in ch['sfs']:
+                    ch['sfs'].append(sf)
+            if proto and proto not in ch['protos']:
+                ch['protos'].append(proto)
+
+    def _fed(self):
+        """The channels currently fed to the detector: ≥ after_n intercepts, top
+        max_channels by count.  Caller may or may not hold the lock — read-only."""
+        after_n = max(3, int(SETTINGS.get('channelize_after_n', 10) or 10))
+        cap = max(1, int(SETTINGS.get('channelize_max_channels', 10) or 10))
+        eligible = [c for c in self.channels if c['count'] >= after_n]
+        eligible.sort(key=lambda x: -x['count'])
+        return eligible[:cap]
+
+    def channel_tokens(self):
+        """center_MHz:bw_kHz:sf tokens for the detector --channels arg (the fed set).
+        The SF lets the detector run the dechirp matched-filter on each channel."""
+        with self._lock:
+            return ','.join('%.5f:%.1f:%d' % (
+                c['center_mhz'], c['bw_khz'], int(c.get('sf') or _freq_sf(c['center_mhz'])))
+                for c in self._fed())
+
+    def status(self):
+        with self._lock:
+            chans = sorted(self.channels, key=lambda x: -x['count'])
+            return {'enabled': bool(SETTINGS.get('channelize_enabled', True)),
+                    'after_n': int(SETTINGS.get('channelize_after_n', 10) or 10),
+                    'max_channels': int(SETTINGS.get('channelize_max_channels', 10) or 10),
+                    'total': self.total, 'n_channels': len(self.channels),
+                    'channels': [{'center_mhz': round(c['center_mhz'], 4),
+                                  'bw_khz': round(c['bw_khz'], 1),
+                                  'sf': int(c.get('sf') or _freq_sf(c['center_mhz'])),
+                                  'count': c['count']} for c in chans]}
+
+CHAN = ChannelTracker()
+
+# The channelizer token string the RUNNING gate was launched with (set in
+# _build_pipeline_cmd).  The auto-apply loop compares the live learned set against this
+# and re-channelizes when they diverge, so a newly-learned channel activates on its own.
+_APPLIED_CHAN_TOKENS = ''
+
+
+def _chan_sig(tokens):
+    """Drift-insensitive signature of a --channels token string: each channel's centre
+    snapped to a 50 kHz grid + its SF.  A learned channel's running-average centre
+    wandering a few kHz must NOT read as a change — that would thrash the auto-apply loop
+    with a restart every cycle.  Only a genuinely new/dropped channel changes the sig."""
+    sig = set()
+    for tok in (tokens or '').split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            _p = tok.split(':')
+            sig.add((round(float(_p[0]) / 0.05), _p[2] if len(_p) > 2 else '7'))
+        except (ValueError, IndexError):
+            pass
+    return frozenset(sig)
+
+
+def _restart_pipeline_bg():
+    """Restart the running pipeline in a background thread (so the request returns at
+    once) to apply a launch-time change — e.g. a new channelizer --channels feed.
+    No-op if the pipeline isn't running (applies on next Start)."""
+    if not PIPELINE.get('running'):
+        return
+    def _do():
+        stop_pipeline(); time.sleep(1.2); start_pipeline()
+    threading.Thread(target=_do, daemon=True).start()
+
+
+def _channelize_apply_loop():
+    """Auto-apply: when the channelizer's fed set changes (a new channel crossed
+    channelize_after_n, or the busiest-N set shifted) from what the running gate is
+    actually dechirping, restart the pipeline in the background so the new --channels take
+    effect — no manual restart.  Periodic (debounced) so a burst of new learns costs at
+    most one restart per interval.  No-op when channelizing is off / pipeline stopped."""
+    while True:
+        try:
+            time.sleep(75)
+            if not (SETTINGS.get('channelize_enabled', True) and PIPELINE.get('running')):
+                continue
+            _cur = CHAN.channel_tokens()
+            if _cur and _chan_sig(_cur) != _chan_sig(_APPLIED_CHAN_TOKENS):
+                print('[CHAN] learned channel set changed → re-channelizing',
+                      file=sys.stderr, flush=True)
+                _restart_pipeline_bg()
+        except Exception:
+            time.sleep(15)
+
+
 def tail_packet_log(path):
     """Follow the JSONL, ingesting + broadcasting.  On startup, if auto-save is
     ON we replay the existing log (session persists across restarts); if OFF we
@@ -1479,6 +1642,13 @@ def tail_packet_log(path):
                 if ingest(rec) is not None:
                     _broadcast({'type': 'packet', 'data': rec})
                     _broadcast({'type': 'stats', 'data': _stats()})
+                    # Channelizer learning: count ONLY packets ingest keeps — i.e.
+                    # the de-duplicated packets shown in the GUI (counting every raw
+                    # record over-counts mesh relays + duplicate re-decodes), so
+                    # "after N intercepts" matches what the user sees.
+                    if rec.get('freq_mhz') is not None:
+                        CHAN.add(rec.get('freq_mhz'), rec.get('bw'), rec.get('proto'),
+                                 rec.get('sf'), rec.get('ts') or time.time())
             time.sleep(0.3)
         except Exception:
             time.sleep(0.5)
@@ -1857,6 +2027,17 @@ def _build_pipeline_cmd():
             f'--overlap {d["overlap"]} --energy-threshold {_eth} '
             f'--detect-workers {d["detect_workers"]} --buf-seconds {_bufs} '
             f'--decode --export-iq {shlex.quote(dec["export_dir"])} -d 1')
+    # Channelizer (ADDITIVE / AUTO): force the dechirp matched-filter on the busiest
+    # learned channels, ON TOP of the wideband gate.  Always-on when channelize_enabled
+    # — no narrowing, no mask, no accept.  Fed set = ≥ channelize_after_n intercepts,
+    # top channelize_max_channels by count.
+    global _APPLIED_CHAN_TOKENS
+    _APPLIED_CHAN_TOKENS = ''
+    if SETTINGS.get('channelize_enabled', True):
+        _ch_tokens = CHAN.channel_tokens()
+        if _ch_tokens:
+            gate += ' --channels ' + shlex.quote(_ch_tokens)
+            _APPLIED_CHAN_TOKENS = _ch_tokens   # what the RUNNING gate is dechirping
     return cap + ' | ' + gate
 
 
@@ -2238,13 +2419,44 @@ def api_settings():
             SETTINGS['time_format'] = str(d['time_format'])
         if 'date_format' in d and str(d['date_format']) in _DATE_STRFTIME:
             SETTINGS['date_format'] = str(d['date_format'])
+        # --- Channelizer settings (ADDITIVE / AUTO) ---
+        _chan_changed = False
+        if 'channelize_enabled' in d:
+            SETTINGS['channelize_enabled'] = bool(d['channelize_enabled']); _chan_changed = True
+        if 'channelize_after_n' in d:
+            try:
+                SETTINGS['channelize_after_n'] = max(3, min(500, int(d['channelize_after_n'])))
+                _chan_changed = True
+            except (TypeError, ValueError):
+                pass
+        if 'channelize_max_channels' in d:
+            try:
+                SETTINGS['channelize_max_channels'] = max(1, min(20, int(d['channelize_max_channels'])))
+                _chan_changed = True
+            except (TypeError, ValueError):
+                pass
+        _chan_keys = ('channelize_enabled', 'channelize_after_n', 'channelize_max_channels')
         if any(k in d for k in ('autosave', 'waterfall', 'unknown', 'fingerprint',
                                 'protocols', 'wide_scan', 'sdr', 'radio', 'tune',
-                                'ldro_fallback', 'iq_invert', 'time_format', 'date_format')):
+                                'ldro_fallback', 'iq_invert', 'time_format', 'date_format')
+               + _chan_keys):
             save_settings(SETTINGS)
             _apply_waterfall_flag()
             _apply_unknown_flag()
+        # A channelize_* change alters the detector's --channels at launch — restart
+        # the running pipeline (background thread) so the new feed applies.  No-op if
+        # not running.
+        if _chan_changed:
+            _restart_pipeline_bg()
     return jsonify(SETTINGS)
+
+
+@app.route('/api/channelize')
+def api_channelize():
+    """Channelizer status for the GUI: the master enable, the thresholds, and the
+    learned channels (busiest first) with the live intercept count each.  Read-only —
+    the feature is fully automatic; settings are changed via /api/settings."""
+    return jsonify(CHAN.status())
 
 
 @app.route('/api/sdr')
@@ -3055,6 +3267,7 @@ def main():
         pass
     threading.Thread(target=_watch_pipeline, daemon=True).start()
     threading.Thread(target=_autosave_loop, daemon=True).start()
+    threading.Thread(target=_channelize_apply_loop, daemon=True).start()
     # Periodic persistence of node hardware profiles (saves the classifier's
     # calibration state across web restarts).
     def _profiles_save_loop():

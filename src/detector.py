@@ -120,6 +120,26 @@ MAX_ENERGY_PEAKS = 10
 # disabled; the main loop bumps it to ≈30dB only when saturation is detected.
 SPUR_REJECT_DB = 200
 DECHIRP_MIN_DB = 15.0
+# Channelizer dechirp matched-filter detection threshold.  Despread quality is ~9 dB on
+# noise and ~14.5-16.5 dB on a weak packet the energy gate and Schmidl-Cox both miss —
+# so 12 dB cleanly separates signal from noise while detecting well below where SC and
+# the energy gate give out.
+DECHIRP_MF_MIN_DB = 12.0
+
+# Forced-dechirp (channelizer) per-channel cooldown for the cross-batch capture dedup.
+# The forced dechirp re-fires every window a packet spans (and on its payload), so the
+# same packet would be captured/decoded many times.  Anchored to the channel carrier
+# (fix #1), these repeats collapse to one capture per channel per this window.  1.5 s
+# covers a packet's airtime + relay hops while staying well under typical inter-packet
+# gaps (e.g. a 15 s beacon), so distinct transmissions are preserved.
+DECHIRP_DEDUP_WIN_S = 1.5
+
+# Max channels to run the dechirp matched-filter on at once (the channelizer's learned
+# channels).  Each is a forced per-window dechirp scan (cheap after the per-channel-
+# compute fix, fix #3); the cap bounds worst-case work if the channelizer learns many
+# channels.  This is the user-facing "max dechirp channels" (default 10); app.py passes
+# the learned set.  Channels beyond this are still energy-gated, just not dechirp-boosted.
+DECHIRP_MAX_CHANS = 10
 
 # IQ inversion: when set, conjugate the input stream (negate Q) so an IQ-inverted
 # transmitter — LoRaWAN downlink, satellite / tinyGS configs with Invert-IQ on —
@@ -1118,6 +1138,47 @@ def dechirp_peak_quality(iq, sf, bw):
     return 10.0 * np.log10(best_avg + 1e-15), peak_bin
 
 
+def _dechirp_scan(nb, sf, bw, nbfs):
+    """Dechirp matched-filter preamble detection for a single channel.
+
+    Scans sub-symbol offsets; at each, dechirps the channel into symbols and finds the
+    best 8-symbol window — the preamble's identical upchirps all dechirp to the SAME
+    FFT bin, so they sum to a sharp peak.  The detection metric is that despread
+    peak-to-mean ratio (full SF processing gain), which detects well BELOW where
+    Schmidl-Cox and the energy gate go deaf.  Mirrors dechirp_peak_quality's dechirp
+    exactly, but also returns the preamble TIMING so a capture can be cut.
+
+    Returns (quality_db, preamble_t_s_from_channel_start, peak_bin) for the best
+    offset, or None.  nb must be the channel at nbfs ≈ 2*bw.
+    """
+    N = 2 ** sf
+    osf = max(1, int(round(nbfs / bw)))
+    sym = N * osf
+    if len(nb) < 8 * sym:
+        return None
+    dc = generate_downchirp(sf, bw, nbfs)
+    best = None
+    for off in range(0, sym, max(1, sym // 8)):
+        seg = nb[off:]
+        ns = len(seg) // sym
+        if ns < 8:
+            continue
+        d = seg[:ns * sym].reshape(ns, sym) * dc
+        if osf > 1:
+            d = d.reshape(ns, N, osf).mean(axis=2)
+        spec = np.abs(_fft(d, axis=1)) ** 2
+        mn = spec.mean(axis=1)
+        ratios = np.where(mn > 0, spec.max(axis=1) / mn, 0.0)
+        cs = np.cumsum(ratios)
+        sums = cs[7:] - np.concatenate(([0.0], cs[:-8]))
+        bs = int(np.argmax(sums))
+        q = 10.0 * np.log10(sums[bs] / 8.0 + 1e-15)
+        if best is None or q > best[0]:
+            pbin = int(np.argmax(spec[bs:bs + 8].mean(axis=0)))
+            best = (q, (off + bs * sym) / float(nbfs), pbin)
+    return best
+
+
 def find_preamble_bin(iq, sf, bw, fs=None):
     """Find the preamble carrier frequency offset.
     
@@ -1469,7 +1530,7 @@ def _resolve_sf_bw_global(iq_1m, lag, pos=None, sc_scores=None, fft_cache=None):
 def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     ethresh=8.0, spur_db=SPUR_REJECT_DB,
                     dc_notch_mhz=0.0, spur_notch_hz=None, debug=0,
-                    cached_psd=None, cached_peaks=None):
+                    cached_psd=None, cached_peaks=None, dechirp_chans=None):
     """Schmidl-Cox LoRa preamble detector.  Replaces the CNN detect() pipeline.
 
     1. Welch PSD → find energy peaks
@@ -1588,6 +1649,46 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         # Minimum length: 3 × worst-case symbol duration (SF12/125k at 1Msps = 32768)
         if len(iq_1m) < 32768 * 3:
             return _ld
+
+        # === Channelizer dechirp matched-filter detection ===
+        # If this peak is one of the channelizer's channels, despread it and detect on
+        # the dechirp peak-to-noise — sensitive BELOW where Schmidl-Cox and the energy
+        # gate go deaf.  Emits a detection the decoder then confirms (CRC rejects false
+        # positives).  When it fires we skip SC for this peak (dechirp is more sensitive).
+        _dech = None
+        for _dc in (dechirp_chans or ()):
+            if abs(off_hz - _dc[0]) < _dc[2]:   # _dc = (offset_hz, sf, bw)
+                _dech = _dc
+                break
+        if _dech is not None:
+            _ldoff, _ldsf, _ldbw = _dech
+            try:
+                _nbq, _nbqfs = extract_narrowband_fft(iq_1m, _rate1m, 0.0, _ldbw)
+                _r = _dechirp_scan(_nbq, _ldsf, _ldbw, _nbqfs)
+                if _r is not None and _r[0] >= DECHIRP_MF_MIN_DB:
+                    _q, _ts, _pbin = _r
+                    # Fix #1 (anchor): tag the detection with the CHANNEL carrier, not this
+                    # peak's offset.  The forced dechirp fires on EVERY energy peak within
+                    # ±bw of the channel, so using each peak's own offset smears one packet
+                    # across the band.  Channel granularity is what the channelizer tracks.
+                    _fhz = center_hz + _ldoff
+                    if debug >= 1:
+                        print("  CHAN-DECHIRP SF%d q=%.1fdB t=%.0fms f=%.4fMHz" % (
+                            _ldsf, _q, _ts * 1000, _fhz / 1e6), file=sys.stderr)
+                    _ld.append({
+                        'freq_hz': _fhz, 'freq_mhz': _fhz / 1e6,
+                        'sf': _ldsf, 'bw': int(_ldbw), 'bw_cnn': int(_ldbw),
+                        'detect_conf': float(min(1.0, _q / 20.0)),
+                        'sf_conf': float(min(1.0, _q / 20.0)),
+                        'bw_quality_db': float(_q),
+                        'peak_power_db': pwr,
+                        'preamble_t_s': float(_ts),
+                        'forced_dechirp': True,   # Fix #2: collapse repeats via wide cooldown dedup
+                    })
+                    return _ld
+            except Exception:
+                pass
+        # === end channelizer dechirp ===
 
         # Multi-lag Schmidl-Cox across all Meshtastic symbol durations.
         # The FFT extraction's rate is ~999756 Hz, not exactly 1 Msps, so a
@@ -2377,6 +2478,7 @@ class SignalRecorder:
                         'peak_pwr_db': d_pwr,
                         'status':      'LOCK',
                         'preamble_t_s': float(d.get('preamble_t_s', 0.0)),
+                        'forced_dechirp': bool(d.get('forced_dechirp')),  # carry through for the cooldown dedup
                     })
                 if not preambles:
                     self._save_queue.task_done()
@@ -2429,6 +2531,14 @@ class SignalRecorder:
                     # lost live.  Scale with ~24 symbols of airtime (well under
                     # the gap, well over the jitter); floor 0.03 s.
                     _dt_win = max(0.03, 24.0 * (2 ** sf) / bw)
+                    # Fix #2 (forced-dechirp cooldown): a channelized channel's forced
+                    # dechirp re-fires every window a packet spans (and on the payload),
+                    # so its abs_t scatters past the airtime window above and the same
+                    # packet gets captured many times.  Anchored to the channel (fix #1,
+                    # one carrier), collapse those repeats with a wide per-channel cooldown
+                    # — keeps the channel's earliest hop, drops the rest.
+                    if p.get('forced_dechirp'):
+                        _dt_win = DECHIRP_DEDUP_WIN_S
                     _match = 0
                     with self._saved_abs_t_lock:
                         for _sf_hz, _st in self._saved_abs_t:
@@ -3728,6 +3838,13 @@ def main():
                         '(e.g. 920.0:0.5,923.5:0.3). Default half-width: 0.5 MHz. '
                         'Example: --spur-notch 920.0 suppresses the bladeRF1 '
                         'LO harmonic at 920 MHz when tuned to 915 MHz.')
+    p.add_argument('--channels', default='',
+                   help='Channelizer mode (beta): ADDITIVELY run a dechirp matched-'
+                        'filter on these learned LoRa channels every window — far more '
+                        'sensitive than the energy gate, catching weak/far packets it '
+                        'and Schmidl-Cox miss.  Rides ON TOP of the normal wideband '
+                        'scan (no masking).  Comma-separated center_MHz:bandwidth_kHz'
+                        '[:sf] tokens, e.g. 906.875:250,910.525:250:7.  Empty = off.')
     p.add_argument('--export-iq', default=None, metavar='DIR',
                    help='Export detected signal IQ to DIR as .cf32 files')
     p.add_argument('--decode', action='store_true', default=None,
@@ -3810,6 +3927,31 @@ def main():
             else:
                 _spur_notch_hz.append((float(tok) * 1e6, 0.5e6))  # default ±0.5 MHz
 
+    # Channelizer (beta): the dechirp matched-filter runs on the channelizer's learned
+    # channels (--channels).  ADDITIVE — these ride ON TOP of the full wideband energy
+    # gate (no mask, no narrowing), so the gate keeps discovering everything else while
+    # the dechirp tracks known channels at negative SNR.  Each is (center_hz, bw_hz, sf).
+    _chan_sf = []
+    if a.channels:
+        for tok in a.channels.split(','):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                _cp = tok.split(':')   # center_MHz:bw_kHz[:sf]
+                _csf = int(_cp[2]) if len(_cp) > 2 and _cp[2] else 7
+                _chan_sf.append((float(_cp[0]) * 1e6, float(_cp[1]) * 1e3, _csf))
+            except (ValueError, IndexError):
+                pass
+
+    # Channels to run the dechirp matched-filter on (the channelizer's learned channels,
+    # capped).  Each gets a forced per-window dechirp scan so weak/far packets the energy
+    # gate misses still get despread and detected.  Each is (center_hz, bw_hz, sf).
+    _dechirp_src = _chan_sf[:DECHIRP_MAX_CHANS]
+    if _dechirp_src:
+        print('[GATE] channelizer dechirp matched-filter on %d/%d channel(s)' % (
+            len(_dechirp_src), len(_chan_sf)), file=sys.stderr, flush=True)
+
     # Build the multiprocess detect pool FIRST — before any reader/recorder/
     # decoder THREAD starts.  Forking a multithreaded process inherits the
     # other threads' held locks and the workers deadlock (the live gate hung
@@ -3839,7 +3981,9 @@ def main():
             win_n=_win_n,
             params=dict(wb_fs=a.rate, wb_bw=a.bandwidth, center=a.center,
                         sc_threshold=a.threshold, ethresh=a.energy_threshold,
-                        dc_notch=a.dc_notch, spur_notch=_spur_notch_hz or None))
+                        dc_notch=a.dc_notch, spur_notch=_spur_notch_hz or None,
+                        dechirp_chans=([(_c - a.center * 1e6, _s, _b)
+                                        for (_c, _b, _s) in _dechirp_src] or None)))
         print(f"Detect pool: {a.detect_workers} worker processes "
               f"({a.detect_workers + 4} slots)", flush=True)
 
@@ -4285,6 +4429,36 @@ def main():
             if not any(abs(_sp[0] - _mp[0]) < _DEDUP_BINS for _mp in _gate_peaks):
                 _gate_peaks.append(_sp)
 
+        # Channelizer dechirp matched-filter: FORCE a candidate at each channelizer
+        # channel every window — even with no energy peak — so the sensitive dechirp
+        # stage always runs on it.  This bypasses the +Ndb energy gate (which discards
+        # weak/far signals that would despread fine), giving dedicated-narrowband-
+        # receiver sensitivity.  No false-positive risk: dechirp + CRC reject empty
+        # windows; cost bounded by the cap.  ADDITIVE — non-channel peaks untouched.
+        if _dechirp_src:
+            _fres_gate = a.rate / 4096.0
+            _cen_hz = _live_center_mhz * 1e6
+            for _cc, _bw_hz, _csf in _dechirp_src:
+                _cbin = 2048 + int(round((_cc - _cen_hz) / _fres_gate))
+                if 0 <= _cbin < 4096 and not any(abs(_pk[0] - _cbin) < 15 for _pk in _gate_peaks):
+                    _wbins = max(3, int(round(_bw_hz / _fres_gate)))
+                    # carry the channel's REAL PSD value (not a placeholder) so the
+                    # spur-reject / power ordering downstream treat it correctly
+                    _gate_peaks.append((_cbin, _wbins, float(_psd_gate[_cbin])))   # forced; dechirp decides
+            # Fix #3 (per-channel compute): a strong signal's sidelobes each fall within
+            # ±bw of a channel and would EACH fire the expensive forced dechirp + decode.
+            # Keep only the peak NEAREST each channel centre (the carrier); drop the
+            # in-channel sidelobes so the dechirp runs ONCE per channel.  Peaks OUTSIDE
+            # the learned channels (wideband discovery) are untouched.
+            for _cc, _bw_hz, _csf in _dechirp_src:
+                _cbin = 2048 + int(round((_cc - _cen_hz) / _fres_gate))
+                _w = max(1, int(round(_bw_hz / _fres_gate)))
+                _in = [_pk for _pk in _gate_peaks if abs(_pk[0] - _cbin) < _w]
+                if len(_in) > 1:
+                    _keep = min(_in, key=lambda _pk: abs(_pk[0] - _cbin))
+                    _drop = {id(_pk) for _pk in _in if _pk is not _keep}
+                    _gate_peaks = [_pk for _pk in _gate_peaks if id(_pk) not in _drop]
+
         # Try to release ONE deferred straggler for a big-budget re-decode.  Drive
         # this off the decode system's ACTUAL idle state — maybe_release_straggler
         # self-gates on (slow queue non-empty AND fast queue empty AND nothing
@@ -4402,7 +4576,9 @@ def main():
                                    spur_notch_hz=_spur_notch_hz or None,
                                    debug=a.debug,
                                    cached_psd=_psd_gate,
-                                   cached_peaks=_gate_peaks)
+                                   cached_peaks=_gate_peaks,
+                                   dechirp_chans=([(_c - _live_center_mhz * 1e6, _s, _b)
+                                                   for (_c, _b, _s) in _dechirp_src] or None))
             dt = time.time() - tw; elapsed = time.time() - t_start
             _prof['detect'] += dt
             _t_step = time.time()
