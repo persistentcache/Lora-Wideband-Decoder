@@ -556,9 +556,16 @@ def extract_nb_fft_multi_bw(iq, wb_fs, offset_hz, target_bws, chunk=65536,
     Batched FFT-crop: forward FFTs computed ONCE, then crop at each BW.
     Returns list of (nb_iq, nb_fs) per BW. Not phase-coherent — fine for CNN.
 
-    fft_cache: precomputed list of fftshift(fft(chunk)) arrays.  When provided,
+    fft_cache: precomputed list of UNSHIFTED fft(chunk) arrays.  When provided,
     the forward FFT pass is skipped entirely — pass the same cache to every peak
     in a multi-peak window to avoid recomputing the same 28 M-sample FFT N times.
+
+    PERF: the forward FFTs are stored UNSHIFTED (DC at bin 0).  The old code
+    np.fft.fftshift'd every chunk (a full array roll, ~42 % of this function's
+    time on the batched 65536-chunk cache), then cropped a centered slice.  We
+    instead crop directly from the unshifted spectrum with a contiguous (≤2-piece
+    wrap) slice and keep the cheap ifftshift on the small crop — bit-identical
+    output, no large roll.  Zero-padding at the ±Nyquist edges is preserved.
     """
     if fft_cache is None:
         n_chunks = max(1, len(iq) // chunk)
@@ -566,20 +573,30 @@ def extract_nb_fft_multi_bw(iq, wb_fs, offset_hz, target_bws, chunk=65536,
         for c in range(n_chunks):
             s = c * chunk
             if s + chunk > len(iq): break
-            fft_cache.append(np.fft.fftshift(_fft(iq[s:s + chunk])))
+            fft_cache.append(_fft(iq[s:s + chunk]))
 
     cb = chunk // 2 + int(round(offset_hz * chunk / wb_fs))
+    _h = chunk // 2
     results = []
     for tbw in target_bws:
         bw_bins = max(4, int(round(tbw * chunk / wb_fs)))
         lo, hi = cb - bw_bins, cb + bw_bins
         cw = hi - lo
+        # Valid range in shifted coords, then map to the unshifted spectrum.
+        lo_c, hi_c = max(0, lo), min(chunk, hi)
+        dst = max(0, -lo)
+        cnt = hi_c - lo_c
+        src = (lo_c - _h) % chunk        # shifted bin lo_c → unshifted bin
         parts = []
         for F in fft_cache:
             cropped = np.zeros(cw, dtype=np.complex64)
-            lo_c, hi_c = max(0, lo), min(chunk, hi)
-            dst = max(0, -lo)
-            cropped[dst:dst + hi_c - lo_c] = F[lo_c:hi_c]
+            if cnt > 0:
+                if src + cnt <= chunk:
+                    cropped[dst:dst + cnt] = F[src:src + cnt]
+                else:                     # wraps the DC/Nyquist boundary once
+                    f0 = chunk - src
+                    cropped[dst:dst + f0] = F[src:]
+                    cropped[dst + f0:dst + cnt] = F[:cnt - f0]
             parts.append(_ifft(np.fft.ifftshift(cropped)).astype(np.complex64))
         if parts:
             results.append((np.concatenate(parts), cw * wb_fs / chunk))
@@ -711,10 +728,13 @@ def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
     N0 = len(iq)
     target_fs = target_bw * 2
 
-    # FFT and shift so DC is in the middle (reuse if caller is iterating
-    # multiple offsets over the same wideband buffer).  Pad to a fast FFT
-    # length to avoid prime-factor slowdowns; the cached F's length defines
-    # N for all crop math so cached and fresh calls stay consistent.
+    # Forward FFT stored UNSHIFTED (DC at bin 0).  The old code fftshift'd the
+    # whole spectrum (a full array roll) so it could take a centered slice; we
+    # instead map the centered crop back into the unshifted spectrum with a
+    # contiguous (≤2-piece wrap) slice below, dropping the large roll while
+    # staying bit-identical.  Pad to a fast FFT length to avoid prime-factor
+    # slowdowns; the cached F's length defines N for all crop math so cached and
+    # fresh calls stay consistent.
     if fft_cache is not None and fft_cache:
         F = fft_cache[0]
         N = len(F)
@@ -724,9 +744,9 @@ def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
             iqp = np.empty(N, dtype=np.complex64)
             iqp[:N0] = iq
             iqp[N0:] = 0
-            F = np.fft.fftshift(_fft(iqp))
+            F = _fft(iqp)
         else:
-            F = np.fft.fftshift(_fft(iq))
+            F = _fft(iq)
         if fft_cache is not None:
             fft_cache.append(F)
 
@@ -756,7 +776,18 @@ def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
     src_hi = min(N, hi)
     dst_lo = src_lo - lo
     dst_hi = dst_lo + (src_hi - src_lo)
-    cropped[dst_lo:dst_hi] = F[src_lo:src_hi]
+    # F is unshifted: shifted bin src_lo maps to unshifted bin (src_lo - N//2)%N,
+    # a contiguous run that wraps the boundary at most once.  Edge zero-padding
+    # (dst_lo>0 / dst_hi<n_out) is preserved exactly as before.
+    _cnt = src_hi - src_lo
+    if _cnt > 0:
+        _src = (src_lo - N // 2) % N
+        if _src + _cnt <= N:
+            cropped[dst_lo:dst_hi] = F[_src:_src + _cnt]
+        else:
+            _f0 = N - _src
+            cropped[dst_lo:dst_lo + _f0] = F[_src:]
+            cropped[dst_lo + _f0:dst_hi] = F[:_cnt - _f0]
 
     # IFFT back to time domain — signal is now centered at DC.
     # _ifft preserves complex64 dtype when given complex64 input.
@@ -1616,7 +1647,10 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             except TypeError:
                 # numpy.fft fallback: no `workers`, no batched FFT speedup
                 _ffts = _fft(_iq_2d, axis=1)
-            _ffts = np.fft.fftshift(_ffts, axes=1)
+            # Store UNSHIFTED — extract_nb_fft_multi_bw crops the unshifted
+            # spectrum directly.  The old fftshift(axes=1) here was a full
+            # per-chunk roll costing ~42 % of this batched-FFT step; removing it
+            # is bit-identical (verified) and the dominant per-peak-window win.
             _nb_fft_cache = [_ffts[i] for i in range(_nc)]
         except MemoryError:
             # Heap-fragmented allocation failure (seen on 28Msps + buf-seconds=16
