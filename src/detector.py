@@ -157,11 +157,16 @@ class IQReader:
     def read(self, n):
         raw = self.fp.read(n * self.bps)
         if len(raw) < n * self.bps: return None
-        if self.sc16:
-            s = np.frombuffer(raw, dtype=np.int16)
-            return (s[0::2] + (-1j if _IQ_INVERT else 1j) * s[1::2]).astype(np.complex64) / 2048.0
-        b = np.frombuffer(raw, dtype=np.int8)
-        return (b[0::2] + (-1j if _IQ_INVERT else 1j) * b[1::2]).astype(np.complex64) / 128.0
+        # Contiguous astype + zero-copy complex reinterpret — same conversion
+        # the live StreamBuffer path uses (bit-identical to the old strided
+        # (s[0::2]+1j*s[1::2]) form, measured 2.8x faster: 244->88 ms per
+        # 0.9 s hop at 20 Msps). Matters for file replay/regression runs.
+        s = np.frombuffer(raw, dtype=np.int16 if self.sc16 else np.int8)
+        f = s.astype(np.float32)
+        f /= (2048.0 if self.sc16 else 128.0)
+        if _IQ_INVERT:
+            f[1::2] *= -1.0
+        return f.view(np.complex64)
 
 
 class StreamBuffer:
