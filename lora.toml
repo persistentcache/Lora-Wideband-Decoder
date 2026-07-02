@@ -26,9 +26,14 @@ threshold        = 0.55      # Schmidl-Cox preamble threshold (Recommended NOT t
 # threshold      = 0.45      # ALT: looser detector — catches more weak preambles, more phantom-preamble captures the decoder rejects.
 # threshold      = 0.65      # ALT: stricter and fewer false fires in noisy RF.
 
-energy_threshold = 12.0      # gate energy-peak threshold (dB) — strict default, filters noise/spurs.
-                             # Lower to 5.0 if you need to catch very weak distant signals at the cost of
-                             # more spurious captures the decoder must reject.
+energy_threshold = 6.0       # gate energy-peak threshold (dB above PSD median).
+                             # Sensitive by default: SC + dechirp reject noise (measured zero false
+                             # positives at 5-6 dB live and on recordings), and the gate now sheds its
+                             # weakest candidate peaks automatically if the host falls behind — so the
+                             # low threshold costs accuracy nothing.  The old strict 12.0 measured 0/3
+                             # detections on real ~13 dB-SNR SF7/500k beacons that 5.0 caught 3/3.
+# energy_threshold = 12.0    # ALT: old strict default — only if a busy/spurry band overwhelms a very
+                             # weak host even with the automatic peak throttle.
                              
 overlap          = 0.5       # window overlap (0.5 = 50%)
 # overlap        = 0.25      # ALT: less overlap → lower CPU, may miss edge-aligned packets.

@@ -450,7 +450,8 @@ def _emit_psd_frame(path, psd_db, out_bins=512, span_db=55.0):
 
 
 def find_peaks(psd_db, thresh_db=8.0, min_bins=3, max_peaks=MAX_ENERGY_PEAKS,
-               wide_run_bins=100, min_sep_bins=20):
+               wide_run_bins=100, min_sep_bins=20,
+               base_contour_db=4.0, base_min_bins=4):
     """Find energy peaks in a PSD.
 
     Each contiguous above-threshold run normally maps to one signal — but
@@ -463,6 +464,20 @@ def find_peaks(psd_db, thresh_db=8.0, min_bins=3, max_peaks=MAX_ENERGY_PEAKS,
     two or more signals have merged and decompose the run into ≥2 local
     maxima separated by `min_sep_bins`.  Narrow runs (single signal) emit
     one peak only, keeping the per-window SC cost bounded.
+
+    Hysteresis width rescue (bandwidth-aware): a run NARROWER than min_bins
+    is normally dropped as a CW spur — but a weak wide-BW LoRa signal
+    (SF7/500k especially) spreads its energy so thin that only 1-2 bins
+    clear (median + thresh_db) while its true footprint is many bins wide
+    at a lower contour.  Measured live: real SF7/500k beacons ~13 dB SNR
+    poke 2 bins above +12 dB (rejected, packet lost) but span 4+ bins above
+    +4-5 dB.  So for narrow runs ONLY, re-measure the footprint width at
+    (median + base_contour_db); if it spans >= base_min_bins the peak is
+    LoRa-shaped and is accepted, centred on the footprint's power centroid.
+    A CW spur / front-end overload comb tooth stays 1-3 bins wide at ANY
+    contour (verified at max-gain overload: full-band ~100 kHz spur comb,
+    every tooth narrow), so spur immunity is preserved.  ADDITIVE ONLY:
+    runs that already pass min_bins are emitted exactly as before.
 
     Returns: list of (center_bin, width_bins, peak_db) tuples, sorted by
     peak_db descending, truncated to `max_peaks`.
@@ -481,7 +496,28 @@ def find_peaks(psd_db, thresh_db=8.0, min_bins=3, max_peaks=MAX_ENERGY_PEAKS,
         starts = np.concatenate(([0], starts))
     if a[-1]:
         ends = np.concatenate((ends, [n]))
+    base_thr = nf + min(base_contour_db, thresh_db)
+    rescued = []   # (lo, hi) footprints already emitted, to fold split runs
     for s, e in zip(starts.tolist(), ends.tolist()):
+        if e - s < min_bins and base_min_bins > 0:
+            # Narrow at the detection threshold — check the low-contour
+            # footprint before rejecting.  Per-bin expansion is cheap: it
+            # only runs for narrow runs and stops at the contour edge.
+            pk = s + int(np.argmax(psd_db[s:e]))
+            if any(lo <= pk <= hi for lo, hi in rescued):
+                continue   # split-run twin of an already-rescued footprint
+            lo = pk
+            while lo > 0 and psd_db[lo - 1] > base_thr:
+                lo -= 1
+            hi = pk
+            while hi < n - 1 and psd_db[hi + 1] > base_thr:
+                hi += 1
+            w = hi - lo + 1
+            if w >= base_min_bins:
+                peaks.append((_power_centroid(psd_db, lo, hi + 1), w,
+                              float(psd_db[pk])))
+                rescued.append((lo, hi))
+            continue
         _emit_run_peaks(psd_db, s, e, min_bins, wide_run_bins, min_sep_bins, peaks)
     peaks.sort(key=lambda p: p[2], reverse=True)
     return peaks[:max_peaks]
@@ -4234,6 +4270,17 @@ def main():
       # appends extra candidates (SC+dechirp+CRC still confirm each).  Set
       # LORA_MAXHOLD=0 to disable on a very weak host (fewer candidates to confirm).
       _maxhold = str(os.environ.get('LORA_MAXHOLD', '1')).strip().lower() in ('1', 'true', 'yes', 'on')
+      # Keep-up-driven peak throttle state (see the throttle block in the loop).
+      # HI bounds the merged multi-pass candidate list on any host; LO is the
+      # floor under sustained pressure (the strongest 3 are always processed).
+      try:
+          _PEAK_CAP_HI = max(3, int(os.environ.get('LORA_PEAK_CAP', '24')))
+      except ValueError:
+          _PEAK_CAP_HI = 24
+      _PEAK_CAP_LO = 3
+      _peak_cap = _PEAK_CAP_HI
+      _cap_calm = 0
+      _ring_n_total = max(1, int(a.rate * a.buf_seconds))
 
       def _notch_psd(_pp):
           if a.dc_notch > 0:
@@ -4462,6 +4509,43 @@ def main():
         for _sp in _short_peaks_all:
             if not any(abs(_sp[0] - _mp[0]) < _DEDUP_BINS for _mp in _gate_peaks):
                 _gate_peaks.append(_sp)
+
+        # ---- Keep-up-driven peak throttle ----
+        # The energy gate's job is bounding COMPUTE, not judging what's real —
+        # SC + dechirp reject noise (measured: zero false positives even at
+        # energy_threshold 5).  So instead of a conservative fixed threshold
+        # that silently drops weak-but-real signals, run sensitive and clamp
+        # the number of candidate peaks per window ONLY when the host is
+        # measurably falling behind.  The pressure signal is ring occupancy —
+        # the direct precursor of the CATCHUP sample-drop path (which fires at
+        # 80% fill): throttle at >50% fill, recover when calm (<20% for 8
+        # consecutive windows).  A healthy host never throttles and keeps full
+        # sensitivity; a weak host in a busy band sheds the WEAKEST candidates
+        # first instead of dropping raw samples.  Truncation is always logged —
+        # a silent cap reads as "band was quiet" when it wasn't.  Applied
+        # BEFORE the channelizer's forced peaks so learned channels are never
+        # shed.  _PEAK_CAP_HI also bounds the merged multi-pass peak list on
+        # any host (the per-pass find_peaks cap of MAX_ENERGY_PEAKS never
+        # bounded the merged 1s + max-hold + short-sweep total).
+        if is_live:
+            _ring_frac = reader.available() / float(_ring_n_total)
+            if _ring_frac > 0.5:
+                if _peak_cap > _PEAK_CAP_LO:
+                    _peak_cap = max(_PEAK_CAP_LO, _peak_cap // 2)
+                    print(f"[GATE-THROTTLE] ring {int(_ring_frac*100)}% full — "
+                          f"peak cap -> {_peak_cap}", file=sys.stderr, flush=True)
+                _cap_calm = 0
+            elif _ring_frac < 0.2:
+                _cap_calm += 1
+                if _cap_calm >= 8 and _peak_cap < _PEAK_CAP_HI:
+                    _peak_cap += 1
+                    _cap_calm = 0
+        if len(_gate_peaks) > _peak_cap:
+            _gate_peaks.sort(key=lambda p: -p[2])
+            _n_shed = len(_gate_peaks) - _peak_cap
+            _gate_peaks = _gate_peaks[:_peak_cap]
+            print(f"[GATE-THROTTLE] shed {_n_shed} weakest candidate peak(s) "
+                  f"(cap {_peak_cap})", file=sys.stderr, flush=True)
 
         # Channelizer dechirp matched-filter: FORCE a candidate at each channelizer
         # channel every window — even with no energy peak — so the sensitive dechirp
