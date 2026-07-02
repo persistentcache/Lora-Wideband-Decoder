@@ -1659,7 +1659,21 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
 
     if len(peaks) > 1:
         max_pwr = max(p[2] for p in peaks)
-        peaks = [p for p in peaks if p[2] >= max_pwr - spur_db]
+        kept = [p for p in peaks if p[2] >= max_pwr - spur_db]
+        # Never cull silently: a real weak co-window signal dropped here is
+        # otherwise indistinguishable from a quiet band.  This only ever
+        # fires when a tightened gate (saturation path, or a user-set
+        # --spur-reject) actually eats a peak — at the 200 dB default the
+        # condition is unreachable.
+        if len(kept) < len(peaks):
+            culled = [p for p in peaks if p[2] < max_pwr - spur_db]
+            _desc = " ".join(
+                f"{(center_hz + (p[0] - nfft_c / 2) * fres) / 1e6:.3f}MHz"
+                f"({p[2] - max_pwr:+.0f}dB)" for p in culled[:6])
+            print(f"  [SPUR-CULL] {len(culled)} peak(s) >{spur_db:.0f}dB "
+                  f"below strongest dropped: {_desc}",
+                  file=sys.stderr, flush=True)
+        peaks = kept
 
     if debug >= 2:
         print(f"  Energy: {len(peaks)} peaks after spur-reject", file=sys.stderr)
@@ -4662,12 +4676,20 @@ def main():
         _spur_db  = a.spur_reject
         if _sat_frac > 0.005:   # > 0.5 % of samples clipping
             # Saturation creates harmonic distortion that looks like extra
-            # peaks.  Engage real spur rejection (15 dB base + up to 20 dB
-            # extra scaled with clip rate, so 5 % clip → 35 dB total).  When
-            # NOT saturating, spur rejection stays at the (very high) default
-            # so legitimate weak LoRa peaks aren't dropped just because a
-            # stronger one is present in the same window.
-            _spur_db = 15.0 + min(20.0, _sat_frac * 300.0)
+            # peaks, so engage real spur rejection — but FLAT at 35 dB.
+            # The old clip-scaled ramp (15 dB base + up to 20 dB with clip
+            # rate) made LIGHT clipping the most aggressive rejector: a
+            # local node kissing the rail (0.5-2 % clip) silently ate real
+            # co-window signals 15-35 dB down that are trivially decodable,
+            # while heavy clipping (>7 %) kept them.  Measured live (gain-60
+            # capture, 39 clipped windows incl. natural 0.6-1.6 % light
+            # clip): 35 dB admits ZERO false detections from real front-end
+            # IMD/harmonics — SC + dechirp reject them — and recovers the
+            # weak co-window signals the ramp dropped.  When NOT saturating,
+            # spur rejection stays at the (very high) default so legitimate
+            # weak LoRa peaks aren't dropped just because a stronger one is
+            # present in the same window.
+            _spur_db = 35.0
             if a.debug >= 1:
                 print(f"  [SAT] peak={_peak_amp:.3f}  clipped={_sat_frac*100:.2f}%  "
                       f"spur_reject={a.spur_reject:.0f}→{_spur_db:.0f}dB",
