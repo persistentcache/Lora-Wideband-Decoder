@@ -4642,7 +4642,12 @@ def main():
         # The clip threshold is format-dependent: SC16 is normalised by 2048
         # (full-scale ≈ 16.0), SC8 by 128 (full-scale ≈ 1.0).
         _norm_scale = 2048.0 if a.format == 'sc16' else 128.0
-        _clip_thresh = 0.9 * (32767.0 / _norm_scale)   # 90 % of ADC full-scale
+        # 90 % of ADC full-scale per format.  sc16 arrives shifted to the full
+        # int16 range (SoapyHackRF <<8), so full-scale is 32767; sc8 is raw
+        # int8, so full-scale is 127.  Using 32767 for sc8 put the threshold
+        # ~230× above reachable amplitude and [SAT] could never fire.
+        _fullscale = 32767.0 if a.format == 'sc16' else 127.0
+        _clip_thresh = 0.9 * (_fullscale / _norm_scale)
         # Saturation check: just need to know if a meaningful fraction of
         # samples is clipping.  Computing np.percentile on 28 M complex samples
         # was ~250 ms per iteration — over a quarter of the hop budget.  We
