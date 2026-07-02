@@ -2785,6 +2785,18 @@ class BackgroundDecoder:
         self._fp_dedup = {}              # fingerprint (int) -> last_seen_time
         self._fp_dedup_lock = threading.Lock()
 
+        # Truthful decode counters (observability).  The compact STDOUT summary
+        # interleaves secondary-pass "(no CRC/mesh parsed)" / "CRC: FAIL" lines
+        # with real decodes, so counting DECRYPTED/[PKT] lines in stdout badly
+        # under-reports actual decodes (this caused a false "decode is broken"
+        # investigation).  These count what actually reaches the packet log —
+        # the data path the web reads — so [STAT] can report an authoritative
+        # number.  _decoded_total = decode events (incl. redundant captures of
+        # one packet); _decoded_keys = distinct packets (by raw_hex/pktid/text).
+        self._decoded_total = 0
+        self._decoded_keys = set()
+        self._decoded_lock = threading.Lock()
+
         # Phase-2 chase optimization: cross-worker bucket dedup + in-flight
         # tracking with dispatch deferral.
         # PROBLEM: when KEEP-2 + PASS-2-iso both fire for one RF cluster, up
@@ -3252,6 +3264,13 @@ while True:
             return (self._queue.qsize() + self._slow_queue.qsize()
                     + self._active_count)
 
+    def decoded_counts(self):
+        """(total_decode_events, distinct_packets) reaching the packet log.
+        Authoritative — unlike counting DECRYPTED/[PKT] lines in the compact
+        stdout, which the secondary-pass diagnostics badly under-report."""
+        with self._decoded_lock:
+            return self._decoded_total, len(self._decoded_keys)
+
     def maybe_release_straggler(self):
         """Release ONE deferred straggler for a big-budget re-decode IF the
         decode system is idle right now — fast queue empty AND nothing decoding.
@@ -3478,7 +3497,7 @@ while True:
                 # Structured packet log: append each [PKT] record (decoded or
                 # encrypted-header-only) with a receive timestamp to the JSONL the
                 # web UI tails.  The web dedups by (pktid,hop); here we just append.
-                if self._pkt_log_path and '[PKT]' in output:
+                if '[PKT]' in output:
                     import json as _json
                     _now = time.time()
                     _out = []
@@ -3486,11 +3505,22 @@ while True:
                         if _ln.startswith('[PKT] '):
                             try:
                                 _r = _json.loads(_ln[6:])
+                            except Exception:
+                                continue
+                            # Authoritative decode count (data-path truth, not the
+                            # noisy compact stdout).  Distinct-packet key prefers a
+                            # stable identity: Meshtastic PacketID+hop, else the raw
+                            # payload hex, else the decoded text.
+                            _uk = (_r.get('pkt_id') or _r.get('packet_id')
+                                   or _r.get('raw_hex') or _r.get('text'))
+                            with self._decoded_lock:
+                                self._decoded_total += 1
+                                if _uk is not None:
+                                    self._decoded_keys.add((_r.get('proto'), _uk))
+                            if self._pkt_log_path:
                                 _r['ts'] = _now
                                 _out.append(_json.dumps(_r, separators=(',', ':')))
-                            except Exception:
-                                pass
-                    if _out:
+                    if _out and self._pkt_log_path:
                         try:
                             with self._pkt_log_lock:
                                 with open(self._pkt_log_path, 'a') as _pf:
@@ -4839,11 +4869,14 @@ def main():
             dec_q = recorder._decoder.pending() if (
                 recorder and getattr(recorder, '_decoder', None)) else 0
             active = 0
+            _dec_u = _dec_t = 0
             if recorder and getattr(recorder, '_decoder', None):
                 with recorder._decoder._lock:
                     active = recorder._decoder._active_count
+                _dec_t, _dec_u = recorder._decoder.decoded_counts()
             drops = reader.drops if is_live else 0
             print(f"[STAT] {elapsed:.1f}s | {msps:.1f}Msps | win={wc} det={tot_d} "
+                  f"decoded={_dec_u}u/{_dec_t} "
                   f"save_q={save_q} dec_q={dec_q} active={active} "
                   f"pipe={dt * 1000:.0f}ms"
                   + (f" drops={drops/1e6:.1f}M" if drops else "")
@@ -4893,8 +4926,12 @@ def main():
             decoder.drain(timeout=3600.0)
 
     total_drops = reader.drops if is_live else 0
+    _dec_summary = ''
+    if decoder:
+        _dt, _du = decoder.decoded_counts()
+        _dec_summary = f" (decode=on: {_du} distinct packet(s), {_dt} decode events)"
     print(f"\nDone: {time.time() - t_start:.1f}s, {tot_s} samples, {tot_d} detections"
-          + (f" (decode={'on' if decoder else 'off'})" if decoder else "")
+          + _dec_summary
           + (f" skipped={tot_skip/1e6:.1f}M" if tot_skip else ""),
           file=sys.stderr)
     if a.file: fp.close()
