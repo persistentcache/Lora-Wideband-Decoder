@@ -75,6 +75,11 @@ def load_settings():
                  'date_format': 'MMDDYY',   # display: MMDDYY|MMDDYYYY|DDMMYY|DDMMYYYY|YYYYMMDD
                  'sdr': 'bladerf',          # selected SDR profile (persists across sessions)
                  'radio': {},               # web overrides of lora.toml [radio] (rate/bw/center/gain)
+                 # Software auto-gain (detector --agc): climbs gain while the band is
+                 # clip-free for weak-signal reach, backs off only on SUSTAINED ADC
+                 # clipping.  Soapy-driven SDRs only (needs the live-gain ctl file);
+                 # a manual gain edit while running overrides it for that run.
+                 'auto_gain': True,
                  # Channelizer (ADDITIVE / AUTO): force the dechirp matched-filter on the
                  # busiest learned channels, ON TOP of the wideband gate (no mask).
                  'channelize_enabled': True,    # master on/off (always-on when True)
@@ -83,7 +88,9 @@ def load_settings():
                  # Pipeline tuning — overrides lora.toml [detect] when set.  Defaults
                  # match the well-tuned values; users only edit these to chase weak
                  # signals, suppress false positives in noisy RF, or absorb bursts.
-                 'tune': {'threshold': 0.55, 'energy_threshold': 12.0, 'buf_seconds': 16}}
+                 # energy_threshold 6.0 matches lora.toml's sensitive-gate default
+                 # (the 12->6 change; 12.0 here silently overrode it for web runs).
+                 'tune': {'threshold': 0.55, 'energy_threshold': 6.0, 'buf_seconds': 16}}
     try:
         with open(SETTINGS_PATH) as f:
             return {**_defaults, **json.load(f)}
@@ -2038,6 +2045,16 @@ def _build_pipeline_cmd():
         if _ch_tokens:
             gate += ' --channels ' + shlex.quote(_ch_tokens)
             _APPLIED_CHAN_TOKENS = _ch_tokens   # what the RUNNING gate is dechirping
+    # Software auto-gain: only when the capture half is soapy_rx (it polls the
+    # LORA_SDR_CTL file the governor writes) and the start gain is numeric —
+    # 'auto' means the user chose the device's own hardware AGC.
+    if SETTINGS.get('auto_gain', True) and 'soapy_rx' in cap:
+        try:
+            _g0 = float(r.get('gain'))
+        except (TypeError, ValueError):
+            _g0 = None
+        if _g0 is not None:
+            gate += f' --agc on --agc-start {_g0:g}'
     return cap + ' | ' + gate
 
 
@@ -2360,6 +2377,7 @@ def api_settings():
             SETTINGS['sdr'] = d['sdr']
         if 'radio' in d and isinstance(d['radio'], dict):
             rad = dict(SETTINGS.get('radio') or {})
+            _old_gain = str(rad.get('gain', '')).strip()
             for k in ('rate_hz', 'bandwidth_hz', 'center_mhz'):
                 if k in d['radio']:
                     try: rad[k] = float(d['radio'][k])
@@ -2383,8 +2401,15 @@ def api_settings():
             if PIPELINE.get('running') and ('gain' in d['radio'] or 'center_mhz' in d['radio']):
                 _rc = _radio_cfg()
                 _ctl = {}
-                try: _ctl['gain'] = float(_rc.get('gain'))
-                except (TypeError, ValueError): pass
+                # Include gain ONLY when its value actually CHANGED: a gain
+                # value here (without the governor's 'agc' marker) tells the
+                # detector's software AGC "manual override — stand down".  The
+                # Save button always posts a gain, so an unchanged value (or a
+                # center-only retune) must not carry one.
+                _new_gain = str(rad.get('gain', '')).strip()
+                if 'gain' in d['radio'] and _new_gain != _old_gain:
+                    try: _ctl['gain'] = float(_rc.get('gain'))
+                    except (TypeError, ValueError): pass
                 try: _ctl['center_hz'] = _effective_radio()[2] * 1e6
                 except (TypeError, ValueError, KeyError): pass
                 if _ctl:
@@ -2399,7 +2424,7 @@ def api_settings():
             # Bounds match the CLI flag ranges and keep the pipeline numerically
             # sane — out-of-range values get clamped, not rejected.
             _bounds = {'threshold': (0.1, 1.0, 0.55),
-                       'energy_threshold': (0.0, 40.0, 12.0),
+                       'energy_threshold': (0.0, 40.0, 6.0),
                        'buf_seconds': (2, 128, 16)}
             for k, (lo, hi, _def) in _bounds.items():
                 if k in d['tune']:
@@ -2415,6 +2440,8 @@ def api_settings():
             SETTINGS['ldro_fallback'] = bool(d['ldro_fallback'])
         if 'iq_invert' in d:
             SETTINGS['iq_invert'] = bool(d['iq_invert'])
+        if 'auto_gain' in d:
+            SETTINGS['auto_gain'] = bool(d['auto_gain'])
         if 'time_format' in d and str(d['time_format']) in ('12', '24'):
             SETTINGS['time_format'] = str(d['time_format'])
         if 'date_format' in d and str(d['date_format']) in _DATE_STRFTIME:
@@ -2470,12 +2497,16 @@ def api_sdr():
                           'tested': p.get('tested', False), 'note': p.get('note', ''),
                           'limits': p.get('limits', {}),
                           'agc_ok': p.get('agc_ok', True),
+                          # software auto-gain works when the capture half is
+                          # soapy_rx (it polls the live-gain ctl file)
+                          'soft_agc_ok': 'soapy_rx' in p.get('capture', ''),
                           'default_gain': p.get('default_gain', 'auto')})
         # Per-driver AGC overrides for the generic SoapySDR profile, so the UI can
         # react when the driver field changes (e.g. driver=hackrf → no AGC).
         soapy_no_agc = dict(sdr_profiles._SOAPY_NO_AGC)
     return jsonify({'profiles': profs, 'current': SETTINGS.get('sdr', 'bladerf'),
-                    'radio': _radio_cfg(), 'soapy_no_agc': soapy_no_agc})
+                    'radio': _radio_cfg(), 'soapy_no_agc': soapy_no_agc,
+                    'auto_gain': bool(SETTINGS.get('auto_gain', True))})
 
 
 @app.route('/api/sdr/detect', methods=['POST'])

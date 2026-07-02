@@ -75,7 +75,7 @@ export_dec  = 8                          # capture oversampling — 8 = 2 MHz fo
                                          # Higher rate gives clean dechirp + better
                                          # PA-onset temporal resolution for fingerprinting.
                                          # Decode keeps up at this rate IF the gate's
-                                         # energy_threshold (12.0 default) filters noise.
+                                         # energy_threshold (6.0 default) filters noise.
                                          
 # export_dec = 4                         # ALT: 4 Msps captures — faster decode, less fingerprint resolution.
 # export_dec = 16                        # ALT: 1 Msps captures — highest fingerprint resolution, slowest decode.

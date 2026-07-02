@@ -22,7 +22,7 @@ Usage:
 """
 
 import sys, os, time, json, argparse, numpy as np
-import threading, queue, io, subprocess, fcntl
+import threading, queue, io, subprocess, fcntl, collections
 
 # Make the GIL hand off 5× more often.  Default 5ms means a Python-only
 # thread (MainThread doing numpy bookkeeping, _save_worker thread building
@@ -3920,6 +3920,143 @@ def fmt_bw(bw_hz):
     return str(bw_hz)
 
 
+class AutoGainGovernor:
+    """Software AGC that maximises weak-signal reach.
+
+    Sensitivity on the HackRF is quantisation-limited well past the shipped
+    manual defaults: measured on this pipeline, gain 60 has ~12 dB more SNR
+    margin than gain 32 (noise floor rises only ~10 dB for ~28 dB more gain).
+    So the policy is asymmetric — climb whenever the band is clean, back off
+    only when clipping is SUSTAINED:
+
+      - CLIPPED window = the same subsampled >0.5 % ADC-clip test [SAT] uses.
+      - Back off (-STEP dB) when >DOWN_FRAC of the last DOWN_WIN windows
+        clipped.  A nearby beacon at ~10 % duty never reaches that, so burst
+        clipping keeps the high-sensitivity gain — clipped LoRa bursts still
+        detect AND decode (measured: 2/2 beacons through 33-97 % clip), and
+        the [SAT] spur gate handles their splatter.
+      - Climb (+STEP dB) when the last UP_WIN windows are all clip-free and
+        the previous window had no detections (never mid-packet).
+      - A climb that gets reverted by overload within UP_WIN windows sets a
+        ceiling at the reverted gain for CEIL_TTL_WIN windows (no flapping
+        against a persistent strong source).
+      - Manual override: a ctl-file write without our 'agc' marker (the web
+        UI's live gain edit) disables the governor for the rest of the run.
+
+    Actuation is a read-modify-write of the LORA_SDR_CTL json that soapy_rx
+    already polls (0.5 s) for seamless live setGain — center_hz is preserved.
+    """
+    STEP = 4.0
+    DOWN_FRAC = 0.25
+    DOWN_WIN = 60
+    UP_WIN = 120
+    COOL_WIN = 30
+    CEIL_TTL_WIN = 1800          # ~30 min of 1 s windows
+
+    def __init__(self, ctl_path, start_gain, gmin, gmax):
+        self.ctl_path = ctl_path
+        self.gain = float(start_gain)
+        self.gmin, self.gmax = float(gmin), float(gmax)
+        # Window constants are env-overridable for testing (defaults are the
+        # production behavior; a live climb test at 120 windows/step takes
+        # ~15 min, at 15 it takes ~2 min).
+        self.UP_WIN = int(os.environ.get('LORA_AGC_UP_WIN', self.UP_WIN))
+        self.DOWN_WIN = int(os.environ.get('LORA_AGC_DOWN_WIN', self.DOWN_WIN))
+        self.COOL_WIN = int(os.environ.get('LORA_AGC_COOL_WIN', self.COOL_WIN))
+        self.enabled = True
+        self.win = 0
+        self.cool = 0
+        self.hist = collections.deque(maxlen=self.UP_WIN)
+        self.ceiling = None
+        self.ceil_expire = 0
+        self.busy_wait = 0
+
+    def external_ctl(self, ctl_dict):
+        """Called by the main loop whenever the ctl file changes on disk.
+        A gain present WITHOUT our agc marker is a manual user edit."""
+        if not self.enabled:
+            return
+        if ctl_dict.get('gain') is not None and not ctl_dict.get('agc'):
+            self.enabled = False
+            print(f"  [AGC] manual gain override ({ctl_dict['gain']} dB) — "
+                  f"governor off for this run", file=sys.stderr, flush=True)
+
+    def _write(self):
+        cur = {}
+        try:
+            with open(self.ctl_path) as f:
+                cur = json.load(f)
+        except (OSError, ValueError):
+            pass
+        cur['gain'] = self.gain
+        cur['agc'] = True
+        tmp = self.ctl_path + '.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(cur, f)
+            os.replace(tmp, self.ctl_path)   # atomic — soapy_rx never sees a partial file
+        except OSError as e:
+            print(f"  [AGC] ctl write failed: {e}", file=sys.stderr, flush=True)
+
+    def observe(self, clipped, busy):
+        """Feed one 1-s window; may step the gain. busy = detections in the
+        previous window (blocks climbing, never blocks backing off)."""
+        if not self.enabled:
+            return
+        self.win += 1
+        self.hist.append(bool(clipped))
+        if self.cool > 0:
+            self.cool -= 1
+            return
+        if self.ceiling is not None and self.win >= self.ceil_expire:
+            self.ceiling = None
+
+        recent = list(self.hist)[-self.DOWN_WIN:]
+        if len(recent) >= self.DOWN_WIN and \
+                sum(recent) > self.DOWN_FRAC * len(recent) and \
+                self.gain - self.STEP >= self.gmin:
+            frac = sum(recent) / len(recent)
+            old = self.gain
+            self.gain -= self.STEP
+            # Gain `old` just proved too high — don't return to it until the
+            # ceiling expires, whether or not a climb put us there.  Without
+            # this, a periodic strong source that appears long after the climb
+            # causes a slow climb/back-off oscillation (observed live).
+            self.ceiling = old
+            self.ceil_expire = self.win + self.CEIL_TTL_WIN
+            print(f"  [AGC] gain {old:.0f}->{self.gain:.0f} dB "
+                  f"(sustained clip {frac*100:.0f}% of last {len(recent)} windows; "
+                  f"ceiling {self.ceiling:.0f} for ~{self.CEIL_TTL_WIN//60} min)",
+                  file=sys.stderr, flush=True)
+            self._write()
+            self.hist.clear()
+            self.cool = self.COOL_WIN
+            return
+
+        _up = min(self.gain + self.STEP, self.gmax)   # partial last step lands on gmax
+        _climb_ready = (len(self.hist) == self.UP_WIN
+                        and not any(self.hist)
+                        and _up > self.gain + 0.01
+                        and (self.ceiling is None or _up < self.ceiling - 0.01))
+        if _climb_ready and busy:
+            # Don't starve on a band with continuous (weak, non-clipping)
+            # traffic: after COOL_WIN windows of climb-ready-but-busy, step
+            # anyway — the band has proven clip-free for a full UP_WIN.
+            self.busy_wait += 1
+            if self.busy_wait < self.COOL_WIN:
+                return
+        if _climb_ready:
+            self.busy_wait = 0
+            old = self.gain
+            self.gain = _up
+            print(f"  [AGC] gain {old:.0f}->{self.gain:.0f} dB "
+                  f"(clip-free {self.UP_WIN} windows — climbing for sensitivity)",
+                  file=sys.stderr, flush=True)
+            self._write()
+            self.hist.clear()
+            self.cool = self.COOL_WIN
+
+
 def main():
     p = argparse.ArgumentParser(description='LoRa Schmidl-Cox Detector')
     p.add_argument('-r', '--rate', type=int, default=40_000_000)
@@ -3990,6 +4127,20 @@ def main():
                    help='Load radio/detect/decode defaults from a lora.toml so you '
                         "don't pass long flag strings (explicit CLI flags still "
                         'override). Opt-in: only applied when --config is given.')
+    p.add_argument('--agc', choices=['off', 'on'], default='off',
+                   help='Software auto-gain for weak-signal reach. Climbs gain '
+                        'while the band is clip-free, backs off only on SUSTAINED '
+                        'ADC clipping (>25%% of recent windows) — burst clipping '
+                        'from a nearby node keeps the high-sensitivity gain '
+                        '(clipped LoRa still decodes). Needs LORA_SDR_CTL (the '
+                        'live-gain file soapy_rx polls); live input only.')
+    p.add_argument('--agc-start', type=float, default=None,
+                   help='Gain (dB) the SDR was launched with — the AGC steps '
+                        'relative to this. Required for --agc on.')
+    p.add_argument('--agc-min', type=float, default=8.0,
+                   help='AGC lower gain bound (dB).')
+    p.add_argument('--agc-max', type=float, default=62.0,
+                   help='AGC upper gain bound (dB).')
     # Pre-parse just to find --config, then use the config values as the argparse
     # DEFAULTS — anything NOT passed on the CLI comes from the config, anything
     # passed overrides it.  Opt-in so existing flag-based invocations (and the
@@ -4163,6 +4314,25 @@ def main():
     except OSError:
         _ctl_mtime = None
     _last_ctl_poll = 0.0
+
+    _agc = None
+    if a.agc == 'on':
+        if a.file is not None:
+            print("AGC: ignored (file input)", file=sys.stderr)
+        elif not _ctl_path:
+            print("AGC: disabled — LORA_SDR_CTL not set (no live-gain path "
+                  "to the SDR)", file=sys.stderr)
+        elif a.agc_start is None:
+            print("AGC: disabled — --agc-start (launch gain) not given",
+                  file=sys.stderr)
+        else:
+            _agc = AutoGainGovernor(_ctl_path, a.agc_start,
+                                    a.agc_min, a.agc_max)
+            print(f"AGC: on — start {a.agc_start:.0f} dB, range "
+                  f"[{a.agc_min:.0f}, {a.agc_max:.0f}], climb after "
+                  f"{_agc.UP_WIN} clean windows, back off at "
+                  f">{_agc.DOWN_FRAC*100:.0f}% clip duty",
+                  file=sys.stderr)
 
     recorder = None
     if a.export_iq:
@@ -4347,6 +4517,8 @@ def main():
                     _ctl_mtime = _mt
                     with open(_ctl_path) as _cf:
                         _cc = json.load(_cf)
+                    if _agc is not None:
+                        _agc.external_ctl(_cc)
                     if _cc.get('center_hz') is not None:
                         _nc = float(_cc['center_hz']) / 1e6
                         if _nc != _live_center_mhz:
@@ -4695,6 +4867,12 @@ def main():
                       f"spur_reject={a.spur_reject:.0f}→{_spur_db:.0f}dB",
                       file=sys.stderr, flush=True)
 
+        if _agc is not None:
+            # busy = the gate sees candidate peaks this window — a climb could
+            # glitch an in-flight packet, so only climb on a truly idle band.
+            # Backing off under sustained clip is never blocked by busy.
+            _agc.observe(_sat_frac > 0.005, busy=bool(_gate_peaks))
+
         _prof['sat'] += time.time() - _t_step
         _t_step = time.time()
         # ---- Detect ----
@@ -4907,7 +5085,9 @@ def main():
                   f"save_q={save_q} dec_q={dec_q} active={active} "
                   f"pipe={dt * 1000:.0f}ms"
                   + (f" drops={drops/1e6:.1f}M" if drops else "")
-                  + (f" clip={_sat_max*100:.1f}%" if _sat_max > 0.005 else ""),
+                  + (f" clip={_sat_max*100:.1f}%" if _sat_max > 0.005 else "")
+                  + (f" gain={_agc.gain:.0f}" if _agc is not None and _agc.enabled
+                     else ""),
                   file=sys.stderr)
             _sat_max = 0.0   # reset the clip tracker for the next [STAT] interval
             if _prof['n'] > 0:

@@ -1111,8 +1111,18 @@ function renderSdrConfig(box){
     // Gain control. AGC-capable devices: an AGC checkbox (default on); when off, a
     // dB input (default from the profile) appears. AGC-less devices (HackRF): just
     // the dB input. _gain is the source of truth ('auto' = AGC on, else a number).
+    // Soapy-driven profiles also get an "Auto-gain (software)" checkbox: the
+    // detector's governor climbs gain while the band is clip-free for weak-signal
+    // reach and backs off only on sustained clipping. A manual gain edit while the
+    // pipeline runs overrides it for that run.
     let _gain=r.gain;   // preserve a previously-saved gain across re-renders
+    let _autoGain=(d.auto_gain!==false);
     const isAutoStr=g=>{const s=String(g==null?'':g).trim().toLowerCase(); return s===''||s==='auto';};
+    const softAgcHtml=(id)=>{const p=byId(id);
+      if(!(p.soft_agc_ok||id==='soapy'&&byId('soapy').soft_agc_ok!==false))return '';
+      return '<label style="display:flex;align-items:center;gap:6px;white-space:nowrap" title="Detector climbs gain while the band is clip-free (weak-signal reach), backs off only on sustained ADC clipping. Manual gain edits while running override it.">'
+        +'<input type="checkbox" id="sdrsoftagc"'+(_autoGain?' checked':'')+'> Auto-gain (software)</label>';};
+    const hookSoftAgc=()=>{const el=q('#sdrsoftagc'); if(el)el.onchange=()=>{_autoGain=el.checked;};};
     const renderGain=(id)=>{const gi=gainInfo(id); const wrap=q('#sdrgainwrap');
       const manualVal=(!isAutoStr(_gain)&&!isNaN(parseFloat(_gain)))?parseFloat(_gain):gi.default_gain;
       if(gi.agc_ok){
@@ -1120,15 +1130,18 @@ function renderSdrConfig(box){
         wrap.innerHTML='<label style="display:flex;align-items:center;gap:6px;white-space:nowrap">'
             +'<input type="checkbox" id="sdragc"'+(on?' checked':'')+'> AGC</label>'
           +'<label id="sdrgainml" style="display:'+(on?'none':'')+'">Gain (dB)<br>'
-            +'<input id="sdrgain" type="number" min="0" step="1" value="'+esc(String(manualVal))+'" style="width:84px"></label>';
+            +'<input id="sdrgain" type="number" min="0" step="1" value="'+esc(String(manualVal))+'" style="width:84px"></label>'
+          +softAgcHtml(id);
         const sync=()=>{const c=q('#sdragc').checked; q('#sdrgainml').style.display=c?'none':'';
           _gain=c?'auto':(q('#sdrgain').value.trim()||String(gi.default_gain));};
-        q('#sdragc').onchange=sync; q('#sdrgain').onchange=sync;
+        q('#sdragc').onchange=sync; q('#sdrgain').onchange=sync; hookSoftAgc();
       } else {
         wrap.innerHTML='<label>Gain (dB)<br><input id="sdrgain" type="number" min="0" step="1" value="'+esc(String(manualVal))+'" style="width:84px"></label>'
-          +'<div class="muted" style="flex-basis:100%;font-size:11px;margin-top:-2px">No AGC on this device — set gain manually in dB (default '+esc(String(gi.default_gain))+').</div>';
+          +softAgcHtml(id)
+          +'<div class="muted" style="flex-basis:100%;font-size:11px;margin-top:-2px">No hardware AGC on this device — gain is the dB value'+(byId(id).soft_agc_ok?', used as the software auto-gain start point when Auto-gain is on':' (default '+esc(String(gi.default_gain))+')')+'.</div>';
         _gain=String(manualVal);   // AGC-less device is never 'auto'
         q('#sdrgain').onchange=()=>{_gain=q('#sdrgain').value.trim()||String(gi.default_gain);};
+        hookSoftAgc();
       }};
     // Apply the selected SDR's capability limits to the inputs (and clamp values).
     // liveLim = ranges queried from the actual device (override the static profile
@@ -1169,7 +1182,7 @@ function renderSdrConfig(box){
     const readGain=()=>{const c=q('#sdragc'); if(c)return c.checked?'auto':(q('#sdrgain').value.trim()||'auto');
       return (q('#sdrgain')&&q('#sdrgain').value.trim())||'auto';};
     const saveSdr=()=>{['#sdrrate','#sdrbw','#sdrcen'].forEach(s=>clampInput(q(s)));
-      const body={sdr:q('#sdrsel').value, radio:{
+      const body={sdr:q('#sdrsel').value, auto_gain:_autoGain, radio:{
         center_mhz:parseFloat(q('#sdrcen').value),
         rate_hz:Math.round(parseFloat(q('#sdrrate').value)*1e6),
         bandwidth_hz:Math.round(parseFloat(q('#sdrbw').value)*1e6),
