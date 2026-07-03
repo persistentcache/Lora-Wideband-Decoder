@@ -4190,7 +4190,14 @@ def main():
     p.add_argument('-t', '--format', default='sc16', choices=['sc8', 'sc16'])
     p.add_argument('-f', '--file', default=None)
     p.add_argument('--window', type=float, default=1.0)
-    p.add_argument('--overlap', type=float, default=0.1)
+    # Default matches the shipped lora.toml [detect] overlap (0.5).  It was
+    # 0.1 here for years while production ran 0.5 via the web config — a
+    # silent divergence: manual/CLI runs had an ~18% structural DEAD ZONE
+    # (measured: an SF11/125k preamble starting in the last ~160 ms of a
+    # 0.9 s hop fits in NEITHER window — the 16-symbol edge-skip needs the
+    # span fully inside one window, and 0.1 overlap < the 262 ms span).
+    # A 30-position straddle sweep detects 30/30 at 0.5 vs 26/30 at 0.1.
+    p.add_argument('--overlap', type=float, default=0.5)
     p.add_argument('--threshold', type=float, default=0.7,
                    help='Schmidl-Cox preamble score threshold [0..1]. '
                         'During preamble all same-bin chirps score → 1.0; '
