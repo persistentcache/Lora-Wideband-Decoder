@@ -29,7 +29,54 @@ try:
     pyfftw.interfaces.cache.enable()
     pyfftw.interfaces.cache.set_keepalive_time(300.0)
     from pyfftw.interfaces.scipy_fft import (
-        fft as _fft, ifft as _ifft, rfft as _rfft)
+        fft as _fftw_fft, ifft as _fftw_ifft, rfft as _fftw_rfft)
+    from scipy.fft import (fft as _pf_fft, ifft as _pf_ifft,
+                           rfft as _pf_rfft)
+
+    # Route by dimensionality AND measured backend speed:
+    # - 1-D calls here are small transforms on differently-aligned views;
+    #   pyfftw keys plans on alignment/strides so they churn the planner
+    #   for microsecond-scale math. pocketfft has no planner: flat ~10 us.
+    #   1-D therefore ALWAYS routes to pocketfft.
+    # - 2-D symbol batches are the real math. Which backend wins is
+    #   PLATFORM-dependent (measured: pyfftw ~2x faster on x86, ~15%
+    #   SLOWER on ARM), so measure once at import (~100 ms, amortised by
+    #   the persistent worker) and route accordingly — an adaptive choice,
+    #   no hardware-specific constants.
+    def _pick_2d_backend():
+        import time as _t
+        try:
+            _x = pyfftw.empty_aligned((256, 2048), dtype='complex64')
+        except Exception:
+            return _pf_fft, _pf_ifft, _pf_rfft
+        _x[:] = 1.0 + 1.0j
+        _fftw_fft(_x, axis=1); _pf_fft(_x, axis=1)      # warm both
+        _t0 = _t.perf_counter()
+        for _ in range(6): _fftw_fft(_x, axis=1)
+        _tw = _t.perf_counter() - _t0
+        _t0 = _t.perf_counter()
+        for _ in range(6): _pf_fft(_x, axis=1)
+        _tp = _t.perf_counter() - _t0
+        if _tw < _tp:
+            return _fftw_fft, _fftw_ifft, _fftw_rfft
+        return _pf_fft, _pf_ifft, _pf_rfft
+
+    _2d_fft, _2d_ifft, _2d_rfft = _pick_2d_backend()
+
+    def _fft(a, *args, **kwargs):
+        if getattr(a, 'ndim', 1) >= 2:
+            return _2d_fft(a, *args, **kwargs)
+        return _pf_fft(a, *args, **kwargs)
+
+    def _ifft(a, *args, **kwargs):
+        if getattr(a, 'ndim', 1) >= 2:
+            return _2d_ifft(a, *args, **kwargs)
+        return _pf_ifft(a, *args, **kwargs)
+
+    def _rfft(a, *args, **kwargs):
+        if getattr(a, 'ndim', 1) >= 2:
+            return _2d_rfft(a, *args, **kwargs)
+        return _pf_rfft(a, *args, **kwargs)
 
     # Persist FFTW wisdom across runs so decoder workers don't re-plan from
     # scratch on every restart (slow on low-core hosts).  Each worker subprocess
@@ -5515,17 +5562,39 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             K_local = max(1, BATCH_BYTES // max(1, n_sc * N * 8))
             all_maxes = np.empty((n_offs, n_sc), dtype=np.float32)
             all_arg = np.empty((n_offs, n_sc), dtype=np.int32)
+            # FIXED-SHAPE, BYTE-ALIGNED scratch reused for every block:
+            # pyfftw keys its plan cache on shape AND alignment/strides, so
+            # ragged last blocks + np.empty's arbitrary alignment made most
+            # batches a plan-cache MISS (a replan + planning wait per call —
+            # measured ~0.4 ms/call in-situ vs tens of us on a hit).  One
+            # padded buffer per pass makes every block the same cache key.
+            # Padding rows hold stale unit-modulus-rotated data we never
+            # read (results are sliced to kb*n_sc) — harmless by design.
+            # Bucket the row count to a power of two: a fixed small set of
+            # shapes per (n_sc, N) means pyfftw plans each ONCE per worker
+            # lifetime instead of replanning for every distinct offsets
+            # count (planning waits measured ~20 ms each, several per
+            # decode).  Padding waste is bounded <2x of the real rows.
+            _kmax = min(K_local, n_offs)
+            _kb_bucket = 1
+            while _kb_bucket < _kmax:
+                _kb_bucket *= 2
+            _kmax = min(_kb_bucket, K_local)
+            try:
+                segs = pyfftw.empty_aligned((_kmax * n_sc, N),
+                                            dtype=iq_data.dtype)
+            except NameError:
+                segs = np.empty((_kmax * n_sc, N), dtype=iq_data.dtype)
             for bs in range(0, n_offs, K_local):
                 batch = offsets[bs:bs + K_local]
                 kb = len(batch)
-                segs = np.empty((kb * n_sc, N), dtype=iq_data.dtype)
                 for oi, off in enumerate(batch):
                     segs[oi*n_sc:(oi+1)*n_sc] = (
                         iq_data[off:off + n_sc*N].reshape(n_sc, N))
-                segs *= downchirp
+                segs[:kb*n_sc] *= downchirp
                 ff = np.abs(_fft(segs, axis=1)).astype(np.float32, copy=False)
-                all_maxes[bs:bs+kb] = ff.max(axis=1).reshape(kb, n_sc)
-                all_arg[bs:bs+kb] = ff.argmax(axis=1).reshape(kb, n_sc)
+                all_maxes[bs:bs+kb] = ff[:kb*n_sc].max(axis=1).reshape(kb, n_sc)
+                all_arg[bs:bs+kb] = ff[:kb*n_sc].argmax(axis=1).reshape(kb, n_sc)
             scores = all_maxes.sum(axis=1).astype(np.float64)
             # Consistent-bin bonus: max bincount per row.  Vectorised via
             # sort+diff: in a sorted row, a run of ≥4 identical bins → ≥3
@@ -5823,14 +5892,29 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             K_local = max(1, BATCH_BYTES // max(1, n_sc * N * 8))
             all_maxes = np.empty((n_offs, n_sc), dtype=np.float32)
             all_arg = np.empty((n_offs, n_sc), dtype=np.int32)
+            # Fixed-shape aligned scratch — see the twin _batched_pass above.
+            # Bucket the row count to a power of two: a fixed small set of
+            # shapes per (n_sc, N) means pyfftw plans each ONCE per worker
+            # lifetime instead of replanning for every distinct offsets
+            # count (planning waits measured ~20 ms each, several per
+            # decode).  Padding waste is bounded <2x of the real rows.
+            _kmax = min(K_local, n_offs)
+            _kb_bucket = 1
+            while _kb_bucket < _kmax:
+                _kb_bucket *= 2
+            _kmax = min(_kb_bucket, K_local)
+            try:
+                segs = pyfftw.empty_aligned((_kmax * n_sc, N),
+                                            dtype=iq1.dtype)
+            except NameError:
+                segs = np.empty((_kmax * n_sc, N), dtype=iq1.dtype)
             for bs in range(0, n_offs, K_local):
                 batch = offsets[bs:bs + K_local]
                 kb = len(batch)
-                segs = np.empty((kb * n_sc, N), dtype=iq1.dtype)
                 for oi, off in enumerate(batch):
                     segs[oi*n_sc:(oi+1)*n_sc] = (
                         iq1[off:off + n_sc*N].reshape(n_sc, N))
-                segs *= downchirp
+                segs[:kb*n_sc] *= downchirp
                 # Truncate AFTER dechirp — the chirp's tone is constant-
                 # frequency for the symbol duration, so the first N/D
                 # samples carry the same bin information at lower SNR.
@@ -5839,8 +5923,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 else:
                     segs_for_fft = segs
                 ff = np.abs(_fft(segs_for_fft, axis=1)).astype(np.float32, copy=False)
-                all_maxes[bs:bs+kb] = ff.max(axis=1).reshape(kb, n_sc)
-                all_arg[bs:bs+kb] = ff.argmax(axis=1).reshape(kb, n_sc)
+                all_maxes[bs:bs+kb] = ff[:kb*n_sc].max(axis=1).reshape(kb, n_sc)
+                all_arg[bs:bs+kb] = ff[:kb*n_sc].argmax(axis=1).reshape(kb, n_sc)
             scores = all_maxes.sum(axis=1).astype(np.float64)
             # Consistent-bin bonus (≥4 identical bins) — vectorised.
             sorted_arg = np.sort(all_arg, axis=1)
