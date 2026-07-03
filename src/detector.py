@@ -4186,7 +4186,13 @@ def main():
     p = argparse.ArgumentParser(description='LoRa Schmidl-Cox Detector')
     p.add_argument('-r', '--rate', type=int, default=40_000_000)
     p.add_argument('-b', '--bandwidth', type=int, default=28_000_000)
-    p.add_argument('-c', '--center', type=float, default=915.0)
+    p.add_argument('-c', '--center', type=float, default=915.0,
+                   help='Center frequency in MHz (e.g. 915.0). Values > 1e5 '
+                        'are treated as Hz and converted — passing Hz here '
+                        'used to silently inflate every printed/logged '
+                        'absolute frequency and capture filename a '
+                        'million-fold (internally harmless: all DSP is '
+                        'center-relative, which is how it went unnoticed).')
     p.add_argument('-t', '--format', default='sc16', choices=['sc8', 'sc16'])
     p.add_argument('-f', '--file', default=None)
     p.add_argument('--window', type=float, default=1.0)
@@ -4310,6 +4316,12 @@ def main():
             print(f"WARNING: --config failed ({_e}); using defaults/flags",
                   file=sys.stderr, flush=True)
     a = p.parse_args()
+    # Unit robustness: -c is MHz by contract (the web pipeline passes 915.0),
+    # but Hz has been passed by hand often enough to cause real analysis
+    # mistakes downstream. Normalize: nothing on Earth monitors LoRa below
+    # 100 kHz-as-MHz, so >1e5 can only mean Hz.
+    if a.center > 1e5:
+        a.center /= 1e6
 
     # Parse --spur-notch: "920.0,923.5:0.3" → [(920e6, 0.5e6), (923.5e6, 0.3e6)]
     _spur_notch_hz = []
