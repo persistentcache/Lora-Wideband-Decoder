@@ -1940,13 +1940,22 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 # standard pass; 6x cheaper than per-SF SC calls
                 _curve_h = _schmidl_cox_curve_multilag(
                     _nb_h, [l[1] for l in _lags_h])
+                # The rescue accepts at a LOWER SC bar than the standard
+                # pass (threshold - 0.15, floored at 0.30): SC at 0.55
+                # mathematically bottoms at ~+4 dB in-band even in the
+                # matched extraction, while the dechirp confirm behind it
+                # still shows 31+ dB peak-to-noise at +2 dB — dechirp is
+                # the stronger test, so let it do the rejecting. Applies
+                # ONLY to rescue hits; the standard pass keeps the user's
+                # threshold untouched.
+                _thr_r = max(0.30, sc_threshold - 0.15)
                 for _lag_nom, _lag_h in _lags_h:
                     _cv = _curve_h.get(_lag_h)
                     if _cv is None:
                         continue
                     _sc_h, _pos_h = schmidl_cox_score(
                         _nb_h, _lag_h, n_sym=8, _curve=_cv)
-                    if _sc_h >= sc_threshold:
+                    if _sc_h >= _thr_r:
                         _p1m = int(round(_pos_h * (1e6 / _fs_h)))
                         if _lag_nom not in _resc or _sc_h > _resc[_lag_nom][0]:
                             _resc[_lag_nom] = (_sc_h, _p1m)
