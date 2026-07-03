@@ -5083,21 +5083,28 @@ def main():
             # The tail provides additional IQ for the recorder to extract the
             # full LoRa frame when the preamble landed near the end of `buf`.
             if recorder and is_live and dets:
-                # 50ms minimum wait for samples to settle in the ring buffer,
-                # capped at 100ms total.
-                _min_tail_n = int(0.05 * a.rate)
-                _t_wait = time.time()
-                while reader.available() < _min_tail_n:
-                    if time.time() - _t_wait > 0.10:
-                        break
-                    time.sleep(0.005)
+                # Size the tail by the detected packet's AIRTIME and read it
+                # BLOCKING, exactly like file mode below.  The old code waited
+                # <=100 ms and took whatever had arrived in the ring — so every
+                # live capture of a long-airtime packet was TRUNCATED (an
+                # SF11/125k frame needs ~2.4 s of tail; captures came out
+                # 2.0-2.3 s total and the payload end was clipped -> CRC FAIL).
+                # How truncated depended on pipeline SPEED: a faster gate
+                # reaches this point sooner, finds less in the ring, and saves
+                # a SHORTER capture — so every gate optimization silently made
+                # live decode WORSE (caught in the 2026-07-03 live A/B: the
+                # optimized build's captures were ~120 ms shorter and its
+                # catch rate halved).  Blocking is safe and bounded: the
+                # samples arrive in real time (waiting T seconds yields T
+                # seconds of data, <=3 s at the cap), the ring (buf_seconds,
+                # default 16 s) absorbs the pause, and the data lands in
+                # _carry_tail so the audio timeline stays contiguous.
                 _max_pkt_s = max(
                     (148.25 * (2 ** d['sf']) / d['bw']) for d in dets)
-                _max_tail_n = min(int(_max_pkt_s * a.rate), 3 * win_n)
-                avail = reader.available()
-                tail_n = min(avail, _max_tail_n)
-                if tail_n > 0:
-                    tail_data, tail_skipped = reader.read(tail_n)
+                _max_tail_n = min(int(_max_pkt_s * a.rate), 3 * win_n,
+                                  _ring_n_total // 2)
+                if _max_tail_n > 0:
+                    tail_data, tail_skipped = reader.read(_max_tail_n)
                     if tail_data is not None:
                         pre_tail = tail_data
                         tot_s += len(pre_tail)
