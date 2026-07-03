@@ -635,13 +635,22 @@ def extract_nb_fft_multi_bw(iq, wb_fs, offset_hz, target_bws, chunk=65536,
     wrap) slice and keep the cheap ifftshift on the small crop — bit-identical
     output, no large roll.  Zero-padding at the ±Nyquist edges is preserved.
     """
-    if fft_cache is None:
-        n_chunks = max(1, len(iq) // chunk)
-        fft_cache = []
-        for c in range(n_chunks):
-            s = c * chunk
-            if s + chunk > len(iq): break
-            fft_cache.append(_fft(iq[s:s + chunk]))
+    # Normalize the cache to ONE 2-D (n_chunks, chunk) array.  The per-peak
+    # crop below then runs as two 2-D slice assignments + ONE batched ifft
+    # instead of a Python loop of ~305 tiny allocs/rolls/iffts per peak —
+    # measured on a Pi 4 that loop cost 0.3-1 s PER PEAK in busy windows
+    # (pure per-call overhead); the batched form is tens of ms and
+    # bit-identical (same crop, same ifftshift, same per-row ifft).
+    if fft_cache is None or (isinstance(fft_cache, list) and not fft_cache):
+        n_chunks = len(iq) // chunk
+        if n_chunks >= 1:
+            FF = _fft(iq[:n_chunks * chunk].reshape(n_chunks, chunk), axis=1)
+        else:
+            FF = None
+    elif isinstance(fft_cache, np.ndarray):
+        FF = fft_cache                    # already the batched 2-D cache
+    else:
+        FF = np.asarray(fft_cache)        # legacy list-of-rows input
 
     cb = chunk // 2 + int(round(offset_hz * chunk / wb_fs))
     _h = chunk // 2
@@ -655,21 +664,21 @@ def extract_nb_fft_multi_bw(iq, wb_fs, offset_hz, target_bws, chunk=65536,
         dst = max(0, -lo)
         cnt = hi_c - lo_c
         src = (lo_c - _h) % chunk        # shifted bin lo_c → unshifted bin
-        parts = []
-        for F in fft_cache:
-            cropped = np.zeros(cw, dtype=np.complex64)
-            if cnt > 0:
-                if src + cnt <= chunk:
-                    cropped[dst:dst + cnt] = F[src:src + cnt]
-                else:                     # wraps the DC/Nyquist boundary once
-                    f0 = chunk - src
-                    cropped[dst:dst + f0] = F[src:]
-                    cropped[dst + f0:dst + cnt] = F[:cnt - f0]
-            parts.append(_ifft(np.fft.ifftshift(cropped)).astype(np.complex64))
-        if parts:
-            results.append((np.concatenate(parts), cw * wb_fs / chunk))
-        else:
+        if FF is None:
             results.append((np.array([], dtype=np.complex64), tbw * 2))
+            continue
+        nc = FF.shape[0]
+        cropped = np.zeros((nc, cw), dtype=np.complex64)
+        if cnt > 0:
+            if src + cnt <= chunk:
+                cropped[:, dst:dst + cnt] = FF[:, src:src + cnt]
+            else:                         # wraps the DC/Nyquist boundary once
+                f0 = chunk - src
+                cropped[:, dst:dst + f0] = FF[:, src:]
+                cropped[:, dst + f0:dst + cnt] = FF[:, :cnt - f0]
+        nb = _ifft(np.fft.ifftshift(cropped, axes=1), axis=1)
+        results.append((nb.astype(np.complex64).reshape(-1),
+                        cw * wb_fs / chunk))
     return results
 
 
@@ -1733,7 +1742,9 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             # spectrum directly.  The old fftshift(axes=1) here was a full
             # per-chunk roll costing ~42 % of this batched-FFT step; removing it
             # is bit-identical (verified) and the dominant per-peak-window win.
-            _nb_fft_cache = [_ffts[i] for i in range(_nc)]
+            # Kept as the 2-D (n_chunks, chunk) array so each peak's crop is
+            # two 2-D slice assignments + one batched ifft (see the extractor).
+            _nb_fft_cache = _ffts
         except MemoryError:
             # Heap-fragmented allocation failure (seen on 28Msps + buf-seconds=16
             # ring buffers). Empty cache → per-peak FFTs computed on-demand;
@@ -2018,7 +2029,12 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             dets.extend(_process_one_peak(_pk))
     else:
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(len(peaks), 8)) as _ex:
+        # Cap workers at the PHYSICAL core count: on a 4-core host the old
+        # min(peaks, 8) ran 8 threads on 4 cores — pure oversubscription
+        # (GIL churn + context switches) since the per-peak numpy work is
+        # CPU-bound. Fast hosts with >=8 cores are unchanged.
+        _nw = min(len(peaks), 8, os.cpu_count() or 8)
+        with ThreadPoolExecutor(max_workers=_nw) as _ex:
             for _r in _ex.map(_process_one_peak, peaks):
                 dets.extend(_r)
 
