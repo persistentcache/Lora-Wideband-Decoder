@@ -4365,9 +4365,19 @@ def main():
             _ncpu_auto = len(os.sched_getaffinity(0))
         except (AttributeError, OSError):
             _ncpu_auto = os.cpu_count() or 4
-        a.detect_workers = max(2, min(8, _ncpu_auto // 4))
-        print(f"Detect workers: AUTO = {a.detect_workers} (cpu_count={_ncpu_auto})",
-              flush=True)
+        # Pool only when it can genuinely win: ncpu//4 workers, and if that
+        # is <2 run SERIAL instead.  The old max(2, ...) floor forced a
+        # 2-worker pool onto small hosts, where the pool's IPC/shm overhead
+        # costs more than it parallelizes — measured live on a 4-core host:
+        # 2 pooled workers pinned 2 cores at ~90% constant overhead and
+        # throttled intake to ~6.3 Msps, while serial detection freed both
+        # cores (quiet-window main-loop time dropped to ~0).  Hosts with
+        # >=8 cores are unchanged (24-core validated value stays 6).
+        _w = min(8, _ncpu_auto // 4)
+        a.detect_workers = _w if _w >= 2 else 0
+        print(f"Detect workers: AUTO = "
+              f"{a.detect_workers if a.detect_workers else 'serial'} "
+              f"(cpu_count={_ncpu_auto})", flush=True)
 
     _pool = None
     if a.detect_workers and a.detect_workers > 0:
