@@ -1563,17 +1563,41 @@ def schmidl_cox_multi(iq_1m, lags=None, n_sym=8):
     return {lag: schmidl_cox_score(iq_1m, lag, n_sym) for lag in lags}
 
 
-def _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=None):
+def _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=None, pos=None,
+                         nb_cache=None):
     """Pick best (sf, bw) from ambiguous Schmidl-Cox candidates via dechirp quality.
     fft_cache: reuses a single forward FFT across candidates with different BWs
     (same buffer, different narrowband extraction).  ~25 % per-call speedup when
-    a bucket has 3+ candidates."""
+    a bucket has 3+ candidates.
+    pos: optional SC preamble position (samples at 1 Msps).  When given, the
+    dechirp vote runs on a 16-symbol slice AT the preamble instead of the whole
+    1 s buffer — the same alignment the global resolver already applies, and
+    the quality of THIS preamble (not of whatever else shares the buffer) is
+    what the vote is supposed to measure.  ~4-60x less dechirp work per
+    candidate depending on SF.
+    nb_cache: optional {bw: (nb, fs)} shared with the CALLER's per-peak loop.
+    The narrowband extraction depends only on bw — without the shared cache a
+    peak with 4 hit lags extracted the same 125/250/500 kHz slices up to 3x
+    (once per resolver call, once again in the positions loop): the full-length
+    crop+IFFT per extraction was the dominant resolver cost on low-core hosts,
+    not the dechirp vote."""
     best_sf, best_bw, best_q = candidates[0][0], candidates[0][1], -99.0
     for sf, bw in candidates:
-        nb, _ = extract_narrowband_fft(iq_1m, 1_000_000, 0.0, bw, fft_cache=fft_cache)
-        if len(nb) < (2 ** sf) * 4:
+        if nb_cache is not None and bw in nb_cache:
+            nb = nb_cache[bw][0]
+        else:
+            nb, _fs = extract_narrowband_fft(iq_1m, 1_000_000, 0.0, bw,
+                                             fft_cache=fft_cache)
+            if nb_cache is not None:
+                nb_cache[bw] = (nb, _fs)
+        nb_use = nb
+        if pos:
+            _p = int(round(pos * (bw * 2) / 1_000_000.0))
+            if 0 < _p < len(nb) - (2 ** sf) * 4:
+                nb_use = nb[_p:_p + 32 * (2 ** sf)]   # 16 syms at 2x oversampling
+        if len(nb_use) < (2 ** sf) * 4:
             continue
-        q, _ = dechirp_peak_quality(nb, sf, bw)
+        q, _ = dechirp_peak_quality(nb_use, sf, bw)
         if q > best_q:
             best_q, best_sf, best_bw = q, sf, bw
     return best_sf, best_bw, best_q
@@ -1625,7 +1649,8 @@ def _resolve_sf_bw_global(iq_1m, lag, pos=None, sc_scores=None, fft_cache=None):
         if pos:
             _p = int(round(pos * (bw * 2) / 1_000_000.0))
             if 0 < _p < len(nb) - (2 ** sf) * 4:
-                nb_use = nb[_p:]
+                # 16-symbol slice at the preamble (see _resolve_sf_bw_ambig).
+                nb_use = nb[_p:_p + 32 * (2 ** sf)]
         if len(nb_use) < (2 ** sf) * 4:
             continue
         q, _ = dechirp_peak_quality(nb_use, sf, bw)
@@ -1873,7 +1898,13 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         hit_lags.sort(key=lambda x: x[1], reverse=True)
 
         seen = set()
+        tried = set()      # exact (sf, bw, pos) dechirps already evaluated —
+                           # different lags often resolve to the same candidate
         _ffc = []   # one forward-FFT cache shared by all candidate extractions
+        _nb_by_bw = {}     # bw -> (nb, fs): the narrowband extraction depends
+                           # only on bw, so share it across the hit-lag loop
+                           # (4 lags resolving to the same bw re-extracted the
+                           # SAME slice 4x — pure waste, identical values)
         for lag, sc_score_best, _pos_best in hit_lags[:4]:
             # Resolve SF/BW.  Presets: the curated per-lag vote (validated, byte-
             # identical).  Wide-scan: global divisor-lag resolution so any SF/BW is
@@ -1889,7 +1920,10 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 if len(candidates) == 1:
                     sf, bw = candidates[0]
                 else:
-                    sf, bw, _ = _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=_ffc)
+                    sf, bw, _ = _resolve_sf_bw_ambig(iq_1m, candidates,
+                                                     fft_cache=_ffc,
+                                                     pos=_pos_best,
+                                                     nb_cache=_nb_by_bw)
 
             # Find ALL time-separated preamble plateaus at this lag — so a
             # SECOND packet that shares this carrier + SF/BW (a relay hop1
@@ -1917,8 +1951,12 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             # nb_extract at ~130 ms / peak after the v2.2 sc_curve fix —
             # the dominant cost was these redundant forward FFTs across
             # the hit_lags loop.
-            nb, _nbfs = extract_narrowband_fft(iq_1m, 1_000_000, 0.0, bw,
-                                                fft_cache=_ffc)
+            if bw in _nb_by_bw:
+                nb, _nbfs = _nb_by_bw[bw]
+            else:
+                nb, _nbfs = extract_narrowband_fft(iq_1m, 1_000_000, 0.0, bw,
+                                                    fft_cache=_ffc)
+                _nb_by_bw[bw] = (nb, _nbfs)
 
             for sc_score, _pos in _positions:
                 # Merge the SAME packet re-found at another lag (≈20 ms time
@@ -1936,10 +1974,20 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 # CFO → stable carrier → one well-centred capture per packet.
                 N_sf = 2 ** sf
                 _pos_nb = int(round(_pos * _nbfs / 1_000_000.0))
+                # Exact-input dedup: different lags resolving to the same
+                # (sf, bw) yield plateaus at the same sample positions — the
+                # dechirp below would produce byte-identical results.
+                if (sf, bw, _pos_nb) in tried:
+                    continue
+                tried.add((sf, bw, _pos_nb))
                 if 0 < _pos_nb < len(nb) - N_sf * 4:
-                    nb_al = nb[_pos_nb:]
+                    # 16-symbol slice at the preamble: the quality/CFO of THIS
+                    # SC-aligned preamble lives in its first 8-12 symbols; the
+                    # old open-ended tail scan mostly measured payload/noise
+                    # (and could latch a DIFFERENT later packet's window).
+                    nb_al = nb[_pos_nb:_pos_nb + 32 * N_sf]
                 else:
-                    nb_al = nb
+                    nb_al = nb[:32 * N_sf]
                 if len(nb_al) >= N_sf * 4:
                     bw_quality, peak_bin = dechirp_peak_quality(nb_al, sf, bw)
                 else:
