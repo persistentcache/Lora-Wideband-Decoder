@@ -3037,6 +3037,10 @@ class BackgroundDecoder:
         # thread complete a USB transfer (~3 ms at 28 Msps × 32768 samples)
         # without starving steady-state SF12 throughput.
         self._stress_pause_s = 0.05
+        # Fail-fast fast-tier budget while the gate is stressed (CPU seconds,
+        # pre-SF-scaling — SF12 gets ~8.5 s vs the ~57 s a full 10 s budget
+        # scales to).  Bailed decodes are requeued to the slow tier.
+        self._stress_budget = float(os.environ.get('LORA_STRESS_BUDGET_S', '1.5'))
         # Respect cgroup/taskset CPU affinity — `os.cpu_count()` returns the
         # SYSTEM count (e.g. 24) even when the process is pinned to 4 cores via
         # taskset / cgroup; on those hosts that would auto-scale to 16 decode
@@ -3467,6 +3471,30 @@ while True:
             if self._gate_stress.is_set():
                 time.sleep(self._stress_pause_s)
             fpath, fname, relay_after_syms, relay_before_syms, job_budget = job
+            # Load-aware decode budget: when the gate is under pressure (ring
+            # filling or dropping — same signal as the pause above), a
+            # fast-tier decode runs with a FAIL-FAST budget instead of the
+            # full recovery budget.  The full budget assumes "the decoder
+            # process is mostly idle"; on a host where decode CPU competes
+            # with the live gate (any low-core machine, or a busy band on a
+            # big one) that assumption starves ingest — measured live on a
+            # 4-core host: SF-scaled 28-57 s CPU per capture cascading into
+            # ring loss.  A decode that bails on the small budget emits
+            # [BUDGET] and is requeued to the SLOW tier below — decoded in
+            # the next idle gap, so marginal packets are DEFERRED under
+            # load, never lost.  Idle behavior is byte-identical.
+            _stress_shrunk = False
+            if job_budget is None and self._gate_stress.is_set():
+                # Flat CPU budget: process_file multiplies any budget by
+                # 2^((sf-7)/2) (SF12 ≈ 5.7x — right for idle recovery, wrong
+                # for fail-fast).  Pre-divide by the same factor so the
+                # stressed budget is ~flat across SF: high-SF marginals bail
+                # to the slow tier instead of holding cores under load.
+                import re as _re_sf
+                _m_sf = _re_sf.search(r'SF(\d+)_', fname)
+                _sf_j = int(_m_sf.group(1)) if _m_sf else 7
+                job_budget = self._stress_budget / (2.0 ** ((_sf_j - 7) * 0.5))
+                _stress_shrunk = True
             if self._decoder_script is None:
                 self._queue.task_done()
                 continue
@@ -3646,7 +3674,8 @@ while True:
                 # _packet_dedup suppresses anything already emitted → no
                 # double-count.  Only PRIMARY (not relay/iso) jobs, only from
                 # the fast tier (is_slow guards against infinite re-queue).
-                if (job_budget is None and output and '[BUDGET]' in output
+                if ((job_budget is None or _stress_shrunk) and output
+                        and '[BUDGET]' in output
                         and relay_after_syms is None
                         and relay_before_syms is None):
                     self._ref_inc(fpath)
@@ -5146,18 +5175,25 @@ def main():
                       f"lower --detect-workers contention, or use a faster host. ***",
                       file=sys.stderr, flush=True)
         # Adaptive worker throttle: every 5 windows (~2.5 s) check whether
-        # reader.drops grew.  If yes, set _gate_stress → workers sleep
-        # briefly before next decode → DRAM bandwidth eases → gate recovers.
-        # Self-clearing when drops stop growing.  Per-window checking made
-        # things worse (event thrashing on drop-counter jitter).
+        # the gate is under pressure.  Two signals, either sets _gate_stress:
+        #   - reader.drops grew (ring already overwrote — the late signal), or
+        #   - ring >50 % full (PROACTIVE: the consumer is falling behind but
+        #     nothing is lost yet — the same fill signal the peak-cap
+        #     governor uses).  Reacting here, before loss, lets the decode
+        #     workers back off (pause + fail-fast budget) in time to save
+        #     the ring instead of after it wraps.
+        # Self-clearing when drops stop growing AND the ring has drained.
+        # Per-window checking made things worse (event thrashing on
+        # drop-counter jitter).
         if (is_live and wc % 5 == 0 and recorder
                 and getattr(recorder, '_decoder', None)):
             _drops_now = reader.drops
             _dec = recorder._decoder
             _prev_d = getattr(_dec, '_prev_drops_obs', 0)
-            if _drops_now > _prev_d:
+            _rfrac = reader.available() / float(_ring_n_total)
+            if _drops_now > _prev_d or _rfrac > 0.5:
                 _dec._gate_stress.set()
-            else:
+            elif _rfrac < 0.2:
                 _dec._gate_stress.clear()
             _dec._prev_drops_obs = _drops_now
         if a.debug >= 1 and wc % 10 == 0:
