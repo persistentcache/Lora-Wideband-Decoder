@@ -1891,6 +1891,71 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                   file=sys.stderr)
 
         if not hit_lags:
+            # ---- NARROW-BW SC RESCUE (additive: only when the standard
+            # 1 Msps pass found nothing) ----
+            # The fixed 1 Msps extraction makes a narrow signal correlate
+            # against up to 8-16x its own noise bandwidth: measured floors
+            # SC≥0.7 at ~16 dB in-band for 125 kHz presets while the
+            # dechirp confirm still shows 31+ dB PMR at 2 dB SNR — SC's
+            # noise-bandwidth mismatch is the ONLY binding gate.  Re-running
+            # SC on a bandwidth-MATCHED extraction (fs = 2xBW) recovers
+            # ~6 dB of floor (physics-tested: SC≥0.7 at ~10 dB).  Hits are
+            # mapped back onto the standard 1 Msps lag table and flow
+            # through the UNCHANGED resolve/dechirp/carrier path, so
+            # behavior above the old floor is identical, and the extra cost
+            # (3 cached crops + tiny-lag SC) is paid only by peaks that
+            # produced no standard hits.
+            _wh = bw_bins * fres          # peak's measured width (Hz)
+            # NOTE: a 0.18 pre-gate on the standard pass's best score was
+            # tried and REMOVED — it saved only ~1% CPU but cost SF9/125k
+            # its 4 dB battery tier (short-symbol SC scores at the floor
+            # sit right at the gate). The real cost control is the cached
+            # wideband-FFT crop + per-BW multilag below.
+            _resc = {}
+            _bws_h = [b for b in (62500.0, 125000.0, 250000.0)
+                      if _wh <= b * 2.5]
+            _nbs_h = (extract_nb_fft_multi_bw(
+                iq, wb_fs, off_hz, _bws_h, chunk=_NB_CHUNK,
+                fft_cache=_nb_fft_cache) if _bws_h else [])
+            for _bw_h, (_nb_h, _fs_h) in zip(_bws_h, _nbs_h):
+                # extraction crops the ALREADY-CACHED wideband FFT (same
+                # cache as the standard 1 Msps pass) — no new forward
+                # FFTs; the rescue's marginal cost is small iffts + the
+                # multilag correlation on 4-16x fewer samples
+                if len(_nb_h) < 1024:
+                    continue
+                _lags_h = []
+                for _sf_h in range(7, 13):
+                    _lag_nom = int(round((2 ** _sf_h) / _bw_h * 1e6))
+                    if _lag_nom not in _SC_LAGS_1M:
+                        continue
+                    _lag_h = int(round((2 ** _sf_h) / _bw_h * _fs_h))
+                    if len(_nb_h) < _lag_h * 10:
+                        continue
+                    _lags_h.append((_lag_nom, _lag_h))
+                if not _lags_h:
+                    continue
+                # one multilag curve per BW hypothesis (shared running
+                # sums), then cheap per-lag scoring — same trick as the
+                # standard pass; 6x cheaper than per-SF SC calls
+                _curve_h = _schmidl_cox_curve_multilag(
+                    _nb_h, [l[1] for l in _lags_h])
+                for _lag_nom, _lag_h in _lags_h:
+                    _cv = _curve_h.get(_lag_h)
+                    if _cv is None:
+                        continue
+                    _sc_h, _pos_h = schmidl_cox_score(
+                        _nb_h, _lag_h, n_sym=8, _curve=_cv)
+                    if _sc_h >= sc_threshold:
+                        _p1m = int(round(_pos_h * (1e6 / _fs_h)))
+                        if _lag_nom not in _resc or _sc_h > _resc[_lag_nom][0]:
+                            _resc[_lag_nom] = (_sc_h, _p1m)
+            for _lag_nom, (_sc_h, _p1m) in _resc.items():
+                hit_lags.append((_lag_nom, _sc_h, _p1m))
+            if hit_lags and debug >= 2:
+                print(f"  NARROW-RESCUE {len(hit_lags)} lag(s) at "
+                      f"{off_hz/1e6:+.3f}MHz", file=sys.stderr)
+        if not hit_lags:
             return _ld
 
         _wide = bool(os.environ.get('LORA_SCAN_FULL'))
@@ -4204,7 +4269,9 @@ def main():
     # span fully inside one window, and 0.1 overlap < the 262 ms span).
     # A 30-position straddle sweep detects 30/30 at 0.5 vs 26/30 at 0.1.
     p.add_argument('--overlap', type=float, default=0.5)
-    p.add_argument('--threshold', type=float, default=0.7,
+    # 0.55 matches the web tune default — the CLI sat at 0.7 for years
+    # (same class of CLI/production divergence as the overlap default).
+    p.add_argument('--threshold', type=float, default=0.55,
                    help='Schmidl-Cox preamble score threshold [0..1]. '
                         'During preamble all same-bin chirps score → 1.0; '
                         'noise scores near 0.  Default 0.7 works well in practice.')

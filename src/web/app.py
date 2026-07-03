@@ -48,7 +48,7 @@ if load_config is None:
     def load_config(path=None):
         return {'radio': {'rate_hz': 28000000, 'bandwidth_hz': 28000000,
                           'center_mhz': 915.0, 'format': 'sc16'},
-                'detect': {'threshold': 0.55, 'energy_threshold': 5.0, 'overlap': 0.5,
+                'detect': {'threshold': 0.55, 'energy_threshold': 6.0, 'overlap': 0.5,
                            'detect_workers': -1, 'buf_seconds': 16, 'commit_lag': 4},
                 'decode': {'budget_s': 10.0, 'workers': -1,
                            'export_dir': '/dev/shm/live_caps',
