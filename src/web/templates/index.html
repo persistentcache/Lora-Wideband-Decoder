@@ -1210,7 +1210,7 @@ const ADV_DEFAULTS = {
   ldro_fallback: true,
   iq_invert: false,
   wide_scan: false,
-  tune: {threshold: 0.55, energy_threshold: 12.0, buf_seconds: 16}
+  tune: {threshold: 0.55, energy_threshold: 6.0, buf_seconds: 16}
 };
 // Hover-tooltip text for every advanced option.  Terse, fact-first — what it
 // does, what changes when you toggle / adjust it, and the relevant numbers.
@@ -1232,7 +1232,7 @@ const ADV_TIPS = {
   scan_all: "Adds SF11/500, SF12/500, SF12/250 and the 31.25 kHz set on top of Common. Catches niche signals at the cost of higher CPU and some spurious detections. Off by default.",
   scan_presets: "Curated SF×BW set: every SF 7–12 at 62.5/125/250 kHz plus SF7-9/500 kHz. Covers all Meshtastic + MeshCore presets (including 62.5 kHz MeshCore) and common LoRaWAN. Recommended.",
   threshold: "Schmidl-Cox preamble-lock confidence. Default 0.55. Raise → 0.8 to suppress false positives in noisy RF. Lower → 0.4 to catch weak distant signals.",
-  energy_threshold: "Energy gate, dB above noise floor. Below this, Schmidl-Cox is skipped. Default 12.0. Raise → 18 to filter spurs. Lower → 5 for weak / distant signals.",
+  energy_threshold: "Energy gate, dB above noise floor. Below this, Schmidl-Cox is skipped. Default 6.0 (sensitive). Raise → 12-18 to filter spurs on noisy bands.",
   buf_seconds: "Ring-buffer headroom. ~120 MB/s at 28 Msps. Default 16. Raise to 32 if KEEP-UP warnings appear. Lower to 8 on RAM-constrained hosts."
 };
 function renderProtocolsConfig(box){
