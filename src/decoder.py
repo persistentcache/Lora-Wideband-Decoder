@@ -5693,7 +5693,20 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 cur = [(i, b, p)]
                 continue
             cur_bin = circular_mean_bin([bb for _, bb, _ in cur], N)
-            if circ_dist(b, cur_bin, N) <= max(1, sf - 6) and i - cur[-1][0] <= 2:
+            # Narrow BW: bins are 7.6-10 Hz wide, and real oscillators
+            # drift ~6 Hz per SF12 symbol (measured on MeshCore at
+            # 31.25 kHz: preamble bins WALK ~0.8 bins/symbol, so an
+            # anchor-fixed tolerance breaks the run after 3 symbols and
+            # the decoder declares NO PREAMBLE on a clean 20 dB signal).
+            # Track lag-1 (previous member) with a slope allowance; the
+            # CFO regression downstream already fits linear drift.
+            if bw <= 41667:
+                _ref = cur[-1][1]
+                _tol = 3
+            else:
+                _ref = cur_bin
+                _tol = max(1, sf - 6)
+            if circ_dist(b, _ref, N) <= _tol and i - cur[-1][0] <= 2:
                 cur.append((i, b, p))
             else:
                 if len(cur) >= 4:
@@ -6034,7 +6047,10 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             for i, b, p in strong2:
                 if not cur2:
                     cur2 = [(i, b, p)]
-                elif circ_dist(b, effective_bin, N) <= 2 and i - cur2[-1][0] <= 2:
+                elif (circ_dist(b, (cur2[-1][1] if (bw <= 41667 and cur2)
+                                    else effective_bin), N)
+                      <= (3 if bw <= 41667 else 2)
+                      and i - cur2[-1][0] <= 2):
                     cur2.append((i, b, p))
                 else:
                     if (len(cur2), np.mean([pp for _, _, pp in cur2]) if cur2 else -1.0) > (

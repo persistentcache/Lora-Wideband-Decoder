@@ -1406,7 +1406,7 @@ _SC_LAGS_1M = {
     # detections per MEDIUM_FAST run (493 -> 878), bloating decode time. If a
     # genuine SF11/500 source is ever needed, re-add it AND tighten the dechirp
     # resolver so SF9 2-symbol content can't pass as SF11/500.
-    4096:  [(8, 62500),  (9, 125000), (10, 250000)],
+    4096:  [(7, 31250),  (8, 62500),  (9, 125000), (10, 250000)],
     # SF12/500 omitted here for the same architectural reason as SF11/500: it
     # would share lag 8192 with SF10/125 + SF11/250, and the resolver may
     # mis-vote on 2-symbol harmonics of those fundamentals.  Re-add only after
@@ -1420,12 +1420,17 @@ _SC_LAGS_1M = {
     # unlike SF11/500, which these radios transmit as ~250 kHz on-air).
     # Without this entry, hits resolved to (10,250)-family junk with
     # scattered carriers and zero decodes (measured live).
-    8192:  [(9, 62500),  (10, 125000), (11, 250000), (12, 500000)],
+    8192:  [(8, 31250),  (9, 62500),  (10, 125000), (11, 250000), (12, 500000)],
     # SF12/250 omitted on the same harmonic-confusion grounds (would share
     # lag 16384 with SF11/125).
-    16384: [(10, 62500), (11, 125000)],
-    32768: [(11, 62500), (12, 125000)],
-    65536: [(12, 62500)],
+    16384: [(9, 31250),  (10, 62500), (11, 125000)],
+    32768: [(10, 31250), (11, 62500), (12, 125000)],
+    65536: [(11, 31250), (12, 62500)],
+    # 31.25 kHz family ADDED 2026-07-04: was entirely absent (the rig's own
+    # sweep transmits 30 beacons/cycle here, all invisible). Same-slope
+    # partners (sf+2, 62.5k) exist for every entry — the matched-primary
+    # grouped resolver is the prerequisite hardening, as with SF12/500.
+    131072: [(12, 31250)],
     # 41.67 kHz LoRa (Semtech-defined BW=0110) — used by long-range hobby
     # deployments + satellite TT&C (e.g. tinyGS).  Each SF lands on its own
     # unique lag bucket (no collision with the Meshtastic/MeshCore-focused
@@ -1666,11 +1671,23 @@ def _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=None, pos=None,
             for _g in _groups.values():
                 _g.sort(key=lambda t: t[0] - 10.0 * _m.log10(2.0 ** t[1]),
                         reverse=True)
+                if width_hz and len(_g) > 1:
+                    # same-slope members are dechirp- AND SC-degenerate BY
+                    # CONSTRUCTION (identical bw^2/2^sf) — their normalized
+                    # qualities differ only by noise, so no q-window: the
+                    # PEAK-RELATIVE occupied width (strength-invariant,
+                    # passed only when measurable at >= +18 dB) decides the
+                    # WHOLE group. Absent a trustworthy width, the
+                    # normalized order stands.
+                    _gw = sorted(_g, key=lambda t: abs(
+                        _m.log2(t[2] / width_hz)))
+                    _winners.append(_gw[0])
+                    continue
                 _winners.append(_g[0])
             _winners.sort(reverse=True)          # raw q across groups
             best_q, best_sf, best_bw = _winners[0]
         if os.environ.get('LORA_RESOLVE_DEBUG'):
-            print("    RESOLVE: "
+            print(f"    RESOLVE(w={width_hz and round(width_hz/1e3,1)}k): "
                   + " | ".join(f"SF{sf}/{bw/1e3:.0f}k q={q:.1f}"
                                for q, sf, bw in sorted(_quals, reverse=True))
                   + f" -> SF{best_sf}/{best_bw/1e3:.0f}k",
@@ -1738,7 +1755,8 @@ def _resolve_sf_bw_global(iq_1m, lag, pos=None, sc_scores=None, fft_cache=None):
 def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     ethresh=8.0, spur_db=SPUR_REJECT_DB,
                     dc_notch_mhz=0.0, spur_notch_hz=None, debug=0,
-                    cached_psd=None, cached_peaks=None, dechirp_chans=None):
+                    cached_psd=None, cached_peaks=None, dechirp_chans=None,
+                    only_bws=None):
     """Schmidl-Cox LoRa preamble detector.  Replaces the CNN detect() pipeline.
 
     1. Welch PSD → find energy peaks
@@ -1866,6 +1884,8 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
     # single-threaded (workers default) so the pool doesn't oversubscribe.
     def _process_one_peak(peak):
         cb, bw_bins, pwr = peak[0], peak[1], peak[2]
+        if only_bws is not None and bw_bins * fres > 100e3:
+            return []        # slow pass: narrow signals only
         # the emitting pass's own noise floor (4th element when present) —
         # the ONLY correct reference for this peak's elevation; absolute
         # peak_db stays in [2] because the cross-pass [SPUR-CULL] compares
@@ -1884,8 +1904,11 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         # its noise bandwidth (that mismatch alone cost ~10 dB of floor,
         # measured), and the total correlation math DROPS ~4x
         # (125k*6 + 250k*6 + 500k*6 + 1M*3 sample-lags vs 1M*15).
+        _bw_targets = ([500_000] + sorted(only_bws, reverse=True)
+                       if only_bws is not None else
+                       [500_000, 250_000, 125_000, 62_500, 41_667, 31_250])
         iq_1m_parts = extract_nb_fft_multi_bw(
-            iq, wb_fs, off_hz, [500_000, 250_000, 125_000, 62_500],
+            iq, wb_fs, off_hz, _bw_targets,
             chunk=_NB_CHUNK, fft_cache=_nb_fft_cache)
         if not iq_1m_parts:
             return _ld
@@ -1935,14 +1958,13 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     if 15_000.0 < abs(_delta) < 400_000.0:
                         off_hz += _delta
                         iq_1m_parts = extract_nb_fft_multi_bw(
-                            iq, wb_fs, off_hz,
-                            [500_000, 250_000, 125_000, 62_500],
+                            iq, wb_fs, off_hz, _bw_targets,
                             chunk=_NB_CHUNK, fft_cache=_nb_fft_cache)
                         if iq_1m_parts:
                             iq_1m, _rate1m = iq_1m_parts[0]
 
         _matched_nb = {500000.0: iq_1m_parts[0]}
-        for _bwx, _part in zip((250_000, 125_000, 62_500), iq_1m_parts[1:]):
+        for _bwx, _part in zip(_bw_targets[1:], iq_1m_parts[1:]):
             _matched_nb[float(_bwx)] = _part
 
         # Minimum length: 3 × worst-case symbol duration (SF12/125k at 1Msps = 32768)
@@ -2019,6 +2041,8 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         _by_bw = {}
         for _lag in _ALL_LAGS_1M:
             for _sf, _bwc in _SC_LAGS_1M[_lag]:
+                if only_bws is not None and int(_bwc) not in only_bws:
+                    continue     # long-window pass: slow families only
                 _by_bw.setdefault(float(_bwc), []).append((_sf, _lag))
         sc = {}
         sc_cache = {}   # nominal_lag -> (lag_used, curve, fs of that curve)
@@ -2031,6 +2055,36 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                         # or dechirp runs misaligned and real detections
                         # die at the gate (bwq ~7 flat, seen on SF10/500k).
         _wh_gate = bw_bins * fres
+        # PEAK-RELATIVE occupied width of this candidate (strength-
+        # invariant, unlike the gate's floor-relative width): PSD of the
+        # 1 Msps crop, walk from center while above peak-12 dB. Used by
+        # the resolver to separate same-slope families (e.g. (9,62.5k)
+        # vs (7,31.25k) — dechirp-degenerate AND SC-degenerate; the
+        # 31.25k table add made these flips real). Only trusted when the
+        # peak clears floor+18 (weak signals' width collapses).
+        _wh_peak = None
+        _nsegw = min(len(iq_1m) // 4096, 48)
+        if _nsegw >= 4:
+            _psw = np.abs(np.fft.fft(
+                iq_1m[:_nsegw * 4096].reshape(_nsegw, 4096), axis=1)) ** 2
+            _psw = np.fft.fftshift(_psw.mean(axis=0))
+            _flw = float(np.median(_psw))
+            # search the WHOLE crop for the strongest bin, not just the
+            # center: shoulder-peak crops carry the signal off-center by
+            # hundreds of kHz, and a center-only window returned None ->
+            # the width tie-break silently never engaged for exactly the
+            # resolves that needed it (seq-cluster misidentities).
+            _pkw = float(_psw[8:4088].max())
+            if _pkw > _flw * 63.0:            # >= +18 dB: measurable
+                _thw = _pkw / 15.85           # peak - 12 dB
+                _c0 = 8 + int(np.argmax(_psw[8:4088]))
+                _lo_w2 = _c0
+                while _lo_w2 > 0 and _psw[_lo_w2 - 1] > _thw:
+                    _lo_w2 -= 1
+                _hi_w2 = _c0
+                while _hi_w2 < 4095 and _psw[_hi_w2 + 1] > _thw:
+                    _hi_w2 += 1
+                _wh_peak = (_hi_w2 - _lo_w2 + 1) * ((_rate1m or 1e6) / 4096.0)
         for _bwc, _pairs in _by_bw.items():
             # width-gated BW evaluation, STRONG PEAKS ONLY: measured
             # width upper-bounds the true BW within ~2.5x when the peak
@@ -2101,6 +2155,9 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         if not hit_lags:
             return _ld
 
+        if os.environ.get('LORA_SLOW_DEBUG'):
+            print(f"  [TRACE] hit_lags={[(l, round(sv,2), pv) for l, sv, pv in hit_lags]}",
+                  file=sys.stderr)
         _wide = bool(os.environ.get('LORA_SCAN_FULL'))
 
         hit_lags.sort(key=lambda x: x[1], reverse=True)
@@ -2135,13 +2192,26 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 # position dechirps unfairly low — that bug flipped the
                 # vote toward same-slope aliases).
                 candidates = list(_SC_LAGS_1M[lag])
-                # alias chains run MULTIPLE levels (a strong fundamental
-                # scores at 2L and 4L too) — pull in both lower families
+                # alias chains run BOTH DIRECTIONS: a strong fundamental
+                # scores at 2L/4L/8L (harmonic aliases — pull in the lower
+                # families), AND at L/2 (identical preamble symbols
+                # correlate at HALF the symbol lag — fact 1), so a hit at
+                # THIS lag may be the half-lag phantom of a fundamental
+                # living at 2L (found live: (10,62.5k) truths emitting as
+                # (8,31.25k) via their lag-8192 half-lag hits once the
+                # 31.25k family gave that lag a table entry).
                 for _div in (2, 4, 8):
                     _fam = _SC_LAGS_1M.get(lag // _div)
                     if _fam:
                         candidates += [c for c in _fam
                                        if c not in candidates]
+                _fam_up = _SC_LAGS_1M.get(lag * 2)
+                if _fam_up:
+                    candidates += [c for c in _fam_up
+                                   if c not in candidates]
+                if only_bws is not None:
+                    candidates = [c for c in candidates
+                                  if int(c[1]) in only_bws] or candidates[:1]
                 if len(candidates) == 1:
                     sf, bw = candidates[0]
                 else:
@@ -2155,8 +2225,11 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                                                      pos=_pos_best,
                                                      nb_cache=_nb_by_bw,
                                                      pos_map=_pos_map,
-                                                     width_hz=bw_bins * fres)
+                                                     width_hz=_wh_peak)
 
+            if os.environ.get('LORA_SLOW_DEBUG'):
+                print(f"  [TRACE] lag={lag} resolved sf={sf} bw={bw}",
+                      file=sys.stderr)
             # Find ALL time-separated preamble plateaus at this lag — so a
             # SECOND packet that shares this carrier + SF/BW (a relay hop1
             # ~0.5 s later, or simply another packet shortly after the first)
@@ -2205,6 +2278,9 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 # bucket); genuinely distinct packets — including close
                 # back-to-back ones >20 ms apart — keep separate detections.
                 _tb = int((_pos / _rate1m) / 0.02) if _rate1m else int(_pos)
+                if os.environ.get('LORA_SLOW_DEBUG'):
+                    print(f"  [TRACE] plateau sc={sc_score:.2f} pos={_pos} tb-check",
+                          file=sys.stderr)
                 if (sf, bw, _tb) in seen:
                     continue
 
@@ -2279,7 +2355,14 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 # fit in this window the centroid is taken on a partial slice →
                 # off-centre capture.  50% overlap means a neighbouring window
                 # has the full preamble, so dropping the edge copy loses nothing.
-                if int(_pos) + 16 * _sym1m > len(iq_1m) or int(_pos) < 0:
+                # Slow-pass exception: at SF12/31.25k, 16 symbols = 2.1 s —
+                # demanding them beyond _pos overruns even a 4 s assembly,
+                # and unlike the 1 s path there is NO neighbouring window
+                # holding the full preamble (this assembly IS the retry).
+                # 10 symbols (preamble 8 + sync 2) centroid fine.
+                _need_syms = 16 if only_bws is None else 10
+                if (int(_pos) + _need_syms * _sym1m > len(iq_1m)
+                        or int(_pos) < 0):
                     continue
                 _ps = int(_pos)
                 _pre = iq_1m[_ps:_ps + 16 * _sym1m]
@@ -2372,6 +2455,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
     # (within the longer preamble span) AND frequency (within the wider
     # bandwidth).
     if len(dets) > 1:
+        _center_hz_arb = center_mhz * 1e6
         # RAW quality sort: up-aliases are already killed at resolve
         # (grouped vote), so the variants contesting here are the true
         # identity vs DOWN-aliases and spread shoulders — and a
@@ -2404,6 +2488,20 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                         and abs(_d['preamble_t_s'] - _k['preamble_t_s']) < 2.0
                         and 60_000.0 < abs(_d['freq_hz'] - _k['freq_hz'])
                         < 0.6 * _d['bw']):
+                    _dup = True
+                    break
+                # IQ MIRROR-IMAGE ghost: receiver I/Q imbalance images a
+                # strong signal to the CONJUGATE frequency (2*center - f) at
+                # ~-40 dB (HackRF IRR ~41-47 dB measured). The image passes
+                # SC + dechirp (it IS the signal, conjugated) — seen live as
+                # a phantom SF12/31.25k at 919.464 mirroring the real
+                # 910.535 beacon, and as the dcspur +/-491 kHz pairs. Same
+                # sf/bw, overlapping time, mirrored carriers (sum of offsets
+                # ~0), and the kept (better-bwq) one wins.
+                if (_d['sf'] == _k['sf'] and _d['bw'] == _k['bw']
+                        and abs(_d['preamble_t_s'] - _k['preamble_t_s']) < 2.0
+                        and abs((_d['freq_hz'] - _center_hz_arb)
+                                + (_k['freq_hz'] - _center_hz_arb)) < 30e3):
                     _dup = True
                     break
             if not _dup:
@@ -3564,6 +3662,8 @@ while True:
                 self._refs[fpath] = n
                 return
             self._refs.pop(fpath, None)
+        if os.environ.get('LORA_KEEP_IQ'):
+            return          # debugging: keep capture files for autopsy
         try:
             os.unlink(fpath)
         except OSError:
@@ -4763,6 +4863,10 @@ def main():
 
     buf = np.zeros(win_n, dtype=np.complex64)
     pre_hop = None   # wideband data immediately before buf — for recording lookback
+    from collections import deque as _deque
+    _slow_halves = _deque(maxlen=8)   # last 8 hops = contiguous 4 s for the slow pass
+    _slow_tick = 0
+    _slow_seeds = {}
     # Tail samples consumed last iter (for save).  Prepended to this iter's iq
     # so the audio timeline stays continuous — without this, every save creates
     # a `tail_n` audio gap between adjacent Welch windows and packets that land
@@ -4988,6 +5092,10 @@ def main():
                   _pp[max(0, _sb - _nb):min(4096, _sb + _nb + 1)] = np.median(_pp)
       while True:
         _t_step = time.time()
+        dets = []   # per-iteration default: the detect-pool path commits its
+                    # detections asynchronously and never binds `dets` in this
+                    # scope — the slow-pass block below reads it either way
+                    # (crashed the pool path with UnboundLocalError before)
         # ---- Live SDR control: pick up a center-freq change (~2x/sec) ----
         if _ctl_path and _t_step - _last_ctl_poll > 0.5:
             _last_ctl_poll = _t_step
@@ -5493,6 +5601,125 @@ def main():
             if recorder:
                 recorder.update(dets, buf, tot_s, tail=pre_tail, pre_hop=pre_hop)
             _prof['recorder'] += time.time() - _t_step
+        _t_step = time.time()
+
+        # ---- LONG-WINDOW SLOW-PRESET PASS (31.25 kHz + 41.67 kHz) ----
+        # Their preambles (0.5-1.6 s at SF11/12) are longer than one
+        # analysis window and can NEVER fully sit inside `buf` — the
+        # mirror of the short-window pass's fast-burst problem. A slow
+        # preamble's signature in the 1 s domain: a PERSISTENT NARROW
+        # peak across >=2 consecutive windows that the standard pass did
+        # not detect. Only that trigger pays for the 3 s scan (assembled
+        # from the last 6 hops), and only the triggering peaks are
+        # processed (cached_peaks seeds — no long-buffer PSD). Idle cost
+        # ~zero; ambient junk flickers and never accumulates the streak.
+        _slow_halves.append(buf[-hop_n:].copy())
+        _slow_tick += 1
+        _det_bins = set()
+        for d in dets:
+            _det_bins.add(int(round((d['freq_hz'] - _live_center_mhz * 1e6)
+                                    / (a.rate / 4096.0))) + 2048)
+        _floor_gate_db = float(np.median(_psd_gate))
+        _new_seeds = {}
+        for _p in _gate_peaks:
+            # PEAK-RELATIVE narrowness: the gate's contour width is floor-
+            # relative and useless for strong signals (a 55 dB same-room
+            # SF12/31.25k beacon spans 1.1 MHz at floor+6 via its phase-
+            # noise skirt — it was dismissed as 'wide' while its -41 dB IQ
+            # image seeded instead). A narrow signal is narrow at
+            # PEAK-12 dB at any strength: 31.25/41.67k span 7-9 bins
+            # there, 125 kHz spans ~26. Bound: 16 bins (78 kHz).
+            _b0 = int(_p[0])
+            if not (2 <= _b0 <= 4093):
+                continue
+            _pkdb = float(_psd_gate[_b0-2:_b0+3].max())
+            _wthr = max(_pkdb - 12.0, _floor_gate_db + 6.0)
+            _lo_w = _b0
+            while _lo_w > 0 and _psd_gate[_lo_w-1] > _wthr:
+                _lo_w -= 1
+            _hi_w = _b0
+            while _hi_w < 4095 and _psd_gate[_hi_w+1] > _wthr:
+                _hi_w += 1
+            if _hi_w - _lo_w + 1 > 16:
+                continue                      # not narrow at peak-12
+            if _p[2] - _floor_gate_db < 10.0:
+                continue                      # ambient-junk strength — slow
+                                              # preambles at usable SNR are
+                                              # >=10 dB elevated (ambient
+                                              # flicker hugs the threshold
+                                              # and fired the scan every
+                                              # tick before this gate)
+            _b = int(_p[0])
+            if any(abs(_b - _db) < 8 for _db in _det_bins):
+                continue                      # already detected/handled
+            _prev = _slow_seeds.get(_b, 0)
+            if _prev < 0:
+                _new_seeds[_b] = _prev + 1    # cooldown after a fired scan
+                continue
+            _new_seeds[_b] = _prev + 1
+        _slow_seeds = {_b: _c for _b, _c in _new_seeds.items()}
+        # >=3 consecutive windows: even the shortest straddler preamble
+        # (SF11/31.25k, 1.2 s) plus its packet body spans 3+ windows
+        _trig = [_b for _b, _c in _slow_seeds.items() if _c >= 3]
+        if os.environ.get('LORA_SLOW_DEBUG'):
+            print(f"[SLOW] tick={_slow_tick} halves={len(_slow_halves)} "
+                  f"seeds={_slow_seeds} trig={_trig}", file=sys.stderr)
+        if _trig and len(_slow_halves) == 8:
+            _iq_long = np.concatenate(_slow_halves)
+            if os.environ.get('LORA_SLOW_DEBUG'):
+                _iq_long.tofile(f'/tmp/claude-1000/slowdump_{_slow_tick}.cf32')
+            _seed_peaks = [(float(_b), 13, 20.0, None) for _b in _trig]
+            dets_slow = detect_preamble(
+                _iq_long, a.rate, a.bandwidth, _live_center_mhz,
+                sc_threshold=a.threshold, ethresh=a.energy_threshold,
+                spur_db=_spur_db, dc_notch_mhz=a.dc_notch,
+                spur_notch_hz=_spur_notch_hz or None, debug=a.debug,
+                cached_peaks=_seed_peaks, only_bws={31250, 41667})
+            for _b in _trig:
+                _slow_seeds[_b] = -4          # cooldown ~2 s (preamble can
+                                              # re-enter a later 4 s assembly)
+            if dets_slow:
+                for d in dets_slow:
+                    tot_d += 1
+                    _abst = ((tot_s - len(_iq_long)) / a.rate
+                             + d.get('preamble_t_s', 0.0))
+                    print(f"[{time.time() - t_start:6.1f}s] DETECTED "
+                          f"freq={d['freq_mhz']:.4f}MHz SF={d['sf']} "
+                          f"BW={fmt_bw(d['bw'])} sc={d['detect_conf']:.2f} "
+                          f"pwr={d['peak_power_db']:.1f}dB "
+                          f"abst={_abst:.2f}s [slow-pass]",
+                          flush=True)
+                if recorder:
+                    _slow_pkt_s = max(
+                        (148.25 * (2 ** d['sf']) / d['bw']) for d in dets_slow)
+                    # Slow frames are LONG (SF12/31.25k: ~10 s for a beacon,
+                    # 19 s worst-case) — the standard 3-window tail cap
+                    # truncated every capture at ~35% of the frame (real-RF
+                    # finding: detections perfect, decodes zero). Allow up
+                    # to 12 windows; the ring (16 s default) absorbs the
+                    # blocking read, and the trigger cooldown makes these
+                    # reads rare by construction.
+                    _slow_tail_n = min(int(_slow_pkt_s * a.rate), 12 * win_n,
+                                       (_ring_n_total // 2) if is_live
+                                       else 12 * win_n)
+                    _slow_tail = None
+                    if _slow_tail_n > 0:
+                        if is_live:
+                            _td, _tsk = reader.read(_slow_tail_n)
+                            if _td is not None:
+                                _slow_tail = _td
+                                tot_s += len(_td)
+                                _carry_tail = _td
+                            if _tsk:
+                                tot_skip += _tsk
+                        else:
+                            _td = reader.read(_slow_tail_n)
+                            if _td is not None:
+                                _slow_tail = _td
+                                tot_s += len(_td)
+                                _carry_tail = _td
+                    recorder.update(dets_slow, _iq_long, tot_s,
+                                    tail=_slow_tail, pre_hop=None)
         _t_step = time.time()
 
         # ---- Skip-ahead ONLY if the ring buffer is near wrap ----
