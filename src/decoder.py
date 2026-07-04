@@ -4946,6 +4946,27 @@ def process_file(fpath, relay_after=None, relay_before=None,
         _d = {}
         result = _decode_attempt(iq1_work.copy(), sf, bw, N, ppm, fs, dec, name, Counter,
                                  skip_bins=skip_bins, diag_out=_d)
+        if (attempt == 0 and result is not None and result[0] == 'FAIL'
+                and _d.get('header_decoded')):
+            # HALF-SYMBOL GRID PHANTOM: preamble symbols are identical, so
+            # a candidate aligned EXACTLY half a symbol off dechirps to a
+            # clean full-power tone at a bin displaced N/2, passes SFD and
+            # header, and dies only at payload CRC (windows straddle two
+            # different payload symbols). The finder re-locks this phantom
+            # at ANY carrier or input shift (measured — carrier rescue and
+            # time-shift retries are blind to it), so the ONLY reliable
+            # lever is banning the phantom BIN: re-attempt on the
+            # UN-masked signal with the failed bin in skip_bins, forcing
+            # the finder onto the true candidate (whose bin sits ~N/2
+            # away by construction).
+            print("\n  --- Phantom-grid retry (skip bin %d) ---" % result[3])
+            _d2 = {}
+            _r2 = _decode_attempt(iq1_work.copy(), sf, bw, N, ppm, fs, dec,
+                                  name, Counter,
+                                  skip_bins=list(skip_bins) + [result[3]],
+                                  diag_out=_d2)
+            if _r2 is not None and _r2[0] == 'OK':
+                result, _d = _r2, _d2
         if result is None:
             _residual_clear = True   # no preamble left in the masked residual
             break  # no preamble found
@@ -5962,6 +5983,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         off1, s1 = _batched_pass(range(fine_lo, fine_hi + 1), nscore_syms)
         if s1 > best_score:
             best_off = off1
+
         return int(best_off)
 
     cand_infos = []
