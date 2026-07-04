@@ -1231,7 +1231,7 @@ const ADV_TIPS = {
   iq_inverted: "Conjugate the input stream to decode IQ-inverted transmitters: LoRaWAN downlink and satellite / tinyGS configs with Invert-IQ enabled. MUTUALLY EXCLUSIVE — in this mode normal (non-inverted) traffic will NOT decode. Use only when monitoring a known-inverted source.",
   scan_all: "Adds SF11/500, SF12/500, SF12/250 and the 31.25 kHz set on top of Common. Catches niche signals at the cost of higher CPU and some spurious detections. Off by default.",
   scan_presets: "Curated SF×BW set: every SF 7–12 at 62.5/125/250 kHz plus SF7-9/500 kHz. Covers all Meshtastic + MeshCore presets (including 62.5 kHz MeshCore) and common LoRaWAN. Recommended.",
-  threshold: "Schmidl-Cox preamble-lock confidence. Default 0.55. Raise → 0.8 to suppress false positives in noisy RF. Lower → 0.4 to catch weak distant signals.",
+  threshold: "Schmidl-Cox preamble-lock confidence. Default 0.55. Raise → 0.8 to suppress false positives in noisy RF. Lowering is no longer how you catch weak signals — the detector automatically re-checks weak candidates at a bandwidth-matched, lower bar and confirms them by dechirp.",
   energy_threshold: "Energy gate, dB above noise floor. Below this, Schmidl-Cox is skipped. Default 6.0 (sensitive). Raise → 12-18 to filter spurs on noisy bands.",
   buf_seconds: "Ring-buffer headroom. ~120 MB/s at 28 Msps. Default 16. Raise to 32 if KEEP-UP warnings appear. Lower to 8 on RAM-constrained hosts."
 };
@@ -1298,6 +1298,7 @@ function renderAdvancedConfig(box){
     const num=(id,val,min,max,step,lbl,tip)=>`<label title="${esc(tip)}" style="display:flex;gap:10px;align-items:center;margin:6px 0;cursor:help"><span style="min-width:200px">${lbl}</span><input type="number" id="${id}" value="${val}" min="${min}" max="${max}" step="${step}" style="width:96px"><span class="muted" style="font-size:11px">range ${min}–${max}</span></label>`;
     box.innerHTML=`<details style="max-width:920px;margin-top:16px;border:1px solid var(--line);border-radius:6px;padding:6px 12px">
       <summary style="cursor:pointer;font-weight:600;font-size:15px;padding:4px 0">Advanced Options</summary>
+      <div class="muted" style="font-size:11px;margin:2px 0 6px">Defaults are tuned to their measured optimum — changes are rarely needed. Hover any field for what it does.</div>
       <div style="padding:8px 2px 4px">
         <p class="muted" style="font-size:11px;margin:2px 0 12px;line-height:1.5">Hover any option for a detailed explanation. Most users never need to touch these — the defaults are tuned for typical use. If you mess something up, use <b>Reset to defaults</b> at the bottom of this section.</p>
         <h4 style="margin:10px 0 2px">Pipeline tuning</h4>
