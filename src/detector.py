@@ -1183,7 +1183,7 @@ def hybrid_recenter(iq, fs, sf, bw):
     return (p['offset_hz'], p['pmr_db'], p['status'], p['time_sample'])
 
 
-def dechirp_peak_quality(iq, sf, bw):
+def dechirp_peak_quality(iq, sf, bw, agg='best8'):
     """Measure dechirp quality and carrier frequency offset.
 
     Returns (quality_dB, peak_bin) where:
@@ -1218,6 +1218,19 @@ def dechirp_peak_quality(iq, sf, bw):
     peaks = np.max(spectra, axis=1)
     means = np.mean(spectra, axis=1)
     all_ratios = np.where(means > 0, peaks / means, 0)
+
+    if agg == 'median':
+        # WHOLE-SLICE consistency metric for (sf, bw) IDENTITY
+        # arbitration: the true hypothesis dechirps cleanly on preamble
+        # AND payload, while a same-slope alias is clean ONLY on the
+        # preamble (its windows straddle two payload symbols and split).
+        # best8 would let the alias hide in its clean preamble stretch;
+        # the median exposes it. CFO bin from the strongest window's
+        # spectrum, same as below.
+        _med = float(np.median(all_ratios))
+        _bi = int(np.argmax(all_ratios))
+        peak_bin = int(np.argmax(spectra[_bi]))
+        return 10.0 * np.log10(_med + 1e-15), peak_bin
 
     # Quality metric: best 8-symbol window by sum of per-symbol PMRs.
     win = min(8, n_total_syms)
@@ -1564,7 +1577,7 @@ def schmidl_cox_multi(iq_1m, lags=None, n_sym=8):
 
 
 def _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=None, pos=None,
-                         nb_cache=None):
+                         nb_cache=None, pos_map=None, width_hz=None):
     """Pick best (sf, bw) from ambiguous Schmidl-Cox candidates via dechirp quality.
     fft_cache: reuses a single forward FFT across candidates with different BWs
     (same buffer, different narrowband extraction).  ~25 % per-call speedup when
@@ -1582,6 +1595,7 @@ def _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=None, pos=None,
     crop+IFFT per extraction was the dominant resolver cost on low-core hosts,
     not the dechirp vote."""
     best_sf, best_bw, best_q = candidates[0][0], candidates[0][1], -99.0
+    _quals = []
     for sf, bw in candidates:
         if nb_cache is not None and bw in nb_cache:
             nb = nb_cache[bw][0]
@@ -1591,15 +1605,59 @@ def _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=None, pos=None,
             if nb_cache is not None:
                 nb_cache[bw] = (nb, _fs)
         nb_use = nb
-        if pos:
-            _p = int(round(pos * (bw * 2) / 1_000_000.0))
+        _pos_c = (pos_map or {}).get((sf, bw), pos)
+        if _pos_c:
+            _p = int(round(_pos_c * (bw * 2) / 1_000_000.0))
             if 0 < _p < len(nb) - (2 ** sf) * 4:
                 nb_use = nb[_p:_p + 32 * (2 ** sf)]   # 16 syms at 2x oversampling
         if len(nb_use) < (2 ** sf) * 4:
             continue
         q, _ = dechirp_peak_quality(nb_use, sf, bw)
+        _quals.append((q, sf, bw))
         if q > best_q:
             best_q, best_sf, best_bw = q, sf, bw
+    # CROSS-SF COMPARABILITY: dechirp PMR is peak-to-mean over 2^sf bins,
+    # so a higher-SF hypothesis gets a systematic +3 dB/SF-step advantage
+    # on the SAME tone (more bins -> lower mean noise per bin). That bias
+    # is exactly why same-slope aliases (sf+2, 2x bw — mathematically
+    # degenerate under dechirp on preamble content) kept WINNING the raw
+    # vote. Compare on bin-count-normalized quality; the winner's
+    # REPORTED quality stays raw (the DECHIRP_MIN_DB gate downstream
+    # keeps its meaning).
+    if len(_quals) > 1:
+        import math as _m
+        # IDENTITY DECISION, three rules (each earned the hard way):
+        # 1. Only candidates that could actually be emitted compete —
+        #    raw best-8 q >= DECHIRP_MIN_DB. (Normalizing junk-level
+        #    scores inverts votes toward low SF; the winner then fails
+        #    the gate and a REAL detection dies silently.)
+        # 2. Same-slope groups — identical bw^2/2^sf, where dechirp on
+        #    preambles is mathematically near-degenerate and PMR's
+        #    bin-count bias (+3 dB per SF step) makes the (sf+2, 2bw)
+        #    alias win RAW votes — are decided WITHIN the group by
+        #    bin-normalized quality (measured: picks the truth by 1-6 dB
+        #    on the injected SF9/125 control and a real 75 dB beacon).
+        # 3. ACROSS groups raw best-8 decides (different slopes separate
+        #    by ~12 dB raw; global normalization would wreck this).
+        _viable = [t for t in _quals if t[0] >= DECHIRP_MIN_DB]
+        if _viable:
+            _groups = {}
+            for q, sf, bw in _viable:
+                _key = round(bw * bw / (2.0 ** sf) / 1e3)   # slope, kHz^2/s-ish
+                _groups.setdefault(_key, []).append((q, sf, bw))
+            _winners = []
+            for _g in _groups.values():
+                _g.sort(key=lambda t: t[0] - 10.0 * _m.log10(2.0 ** t[1]),
+                        reverse=True)
+                _winners.append(_g[0])
+            _winners.sort(reverse=True)          # raw q across groups
+            best_q, best_sf, best_bw = _winners[0]
+        if os.environ.get('LORA_RESOLVE_DEBUG'):
+            print("    RESOLVE: "
+                  + " | ".join(f"SF{sf}/{bw/1e3:.0f}k q={q:.1f}"
+                               for q, sf, bw in sorted(_quals, reverse=True))
+                  + f" -> SF{best_sf}/{best_bw/1e3:.0f}k",
+                  file=sys.stderr)
     return best_sf, best_bw, best_q
 
 
@@ -1791,12 +1849,70 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         off_hz = (cb - nfft_c / 2) * fres
         _ld = []
 
+        # MATCHED-PRIMARY: extract this peak at EVERY LoRa bandwidth in
+        # one batched crop of the cached wideband FFT.  SC then runs at
+        # each bandwidth's own rate (fs = 2xBW) instead of a single fixed
+        # 1 Msps pass: a narrow signal no longer correlates against 8-16x
+        # its noise bandwidth (that mismatch alone cost ~10 dB of floor,
+        # measured), and the total correlation math DROPS ~4x
+        # (125k*6 + 250k*6 + 500k*6 + 1M*3 sample-lags vs 1M*15).
         iq_1m_parts = extract_nb_fft_multi_bw(
-            iq, wb_fs, off_hz, [500_000], chunk=_NB_CHUNK,
-            fft_cache=_nb_fft_cache)
+            iq, wb_fs, off_hz, [500_000, 250_000, 125_000, 62_500],
+            chunk=_NB_CHUNK, fft_cache=_nb_fft_cache)
         if not iq_1m_parts:
             return _ld
         iq_1m, _rate1m = iq_1m_parts[0]
+
+        # SELF-RECENTERING: the gate's center bin is the run's argmax —
+        # on a chirp's flat-topped spectrum that is a ripple lottery
+        # anywhere within +/-bw/2, and a miscentered matched crop CLIPS
+        # the chirp edge (measured: a clean SF10/500k beacon reading
+        # sc 0.59 / bwq 7 at the pipeline's center vs sc 1.00 / bwq 26
+        # at the true carrier — also the long-standing 'SF12/500k
+        # captures 140-165 kHz off' mystery). The 1 Msps crop always
+        # contains the whole signal, and a chirp plateau has steep
+        # edges: the occupied-band edge-midpoint IS the carrier. Only
+        # engages on a solid (+6 dB) contour, so weak-signal floors
+        # (battery-validated) are untouched.
+        _nseg = min(len(iq_1m) // 4096, 64)
+        # No recentering in clip/overload-guard windows (spur_db pinned
+        # 35): a spur forest merges +6 dB contour runs and the bogus
+        # midpoint MIScenters captures that decoded fine at the gate
+        # centroid (cost a railed-window beacon decode in corpus g62).
+        if _nseg >= 4 and spur_db >= 100.0:
+            _ps = np.abs(np.fft.fft(
+                iq_1m[:_nseg * 4096].reshape(_nseg, 4096), axis=1)) ** 2
+            _ps = np.fft.fftshift(_ps.mean(axis=0))
+            _flr = float(np.median(_ps))
+            _abv = _ps > _flr * 3.98          # +6 dB
+            if _abv.any():
+                # the contiguous above-contour run nearest the crop center
+                _d = np.diff(_abv.astype(np.int8))
+                _st = list(np.flatnonzero(_d == 1) + 1)
+                _en = list(np.flatnonzero(_d == -1) + 1)
+                if _abv[0]:
+                    _st = [0] + _st
+                if _abv[-1]:
+                    _en = _en + [4096]
+                _best = None
+                for _a, _b in zip(_st, _en):
+                    _mid = (_a + _b) / 2.0
+                    if _best is None or abs(_mid - 2048) < abs(_best[0] - 2048):
+                        _best = (_mid, _a, _b)
+                if _best is not None:
+                    _delta = (_best[0] - 2048.0) * ((_rate1m or 1e6) / 4096.0)
+                    if 15_000.0 < abs(_delta) < 400_000.0:
+                        off_hz += _delta
+                        iq_1m_parts = extract_nb_fft_multi_bw(
+                            iq, wb_fs, off_hz,
+                            [500_000, 250_000, 125_000, 62_500],
+                            chunk=_NB_CHUNK, fft_cache=_nb_fft_cache)
+                        if iq_1m_parts:
+                            iq_1m, _rate1m = iq_1m_parts[0]
+
+        _matched_nb = {500000.0: iq_1m_parts[0]}
+        for _bwx, _part in zip((250_000, 125_000, 62_500), iq_1m_parts[1:]):
+            _matched_nb[float(_bwx)] = _part
 
         # Minimum length: 3 × worst-case symbol duration (SF12/125k at 1Msps = 32768)
         if len(iq_1m) < 32768 * 3:
@@ -1863,107 +1979,79 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         # still use the rate-scaled lag value the original loop computed
         # to keep SF12 sc=0.997 at the scaled lag (vs 0.091 at the
         # integer lag — the difference between detecting SF12 and not).
-        _lag_map = {}   # nominal_lag -> actual lag fed to SC
+        # Group the curated (sf, bw) set by bandwidth; each group gets a
+        # multilag pass on ITS OWN matched extraction.  Same-lag 1 Msps
+        # ambiguities (e.g. 2048 = SF7/62.5k or SF8/125k...) separate
+        # naturally at matched rates; scores fold back to the nominal-lag
+        # key (max wins) so everything downstream — hit_lags, plateau NMS,
+        # resolve's dechirp disambiguation — keeps its existing contract.
+        _by_bw = {}
         for _lag in _ALL_LAGS_1M:
-            if _lag <= 8192:
-                _lag_map[_lag] = _lag
-            else:
-                _lag_map[_lag] = (int(round(_lag * _rate1m / 1e6))
-                                  if _rate1m else _lag)
-        _curves = _schmidl_cox_curve_multilag(
-            iq_1m, list(_lag_map.values()), n_sym=8)
+            for _sf, _bwc in _SC_LAGS_1M[_lag]:
+                _by_bw.setdefault(float(_bwc), []).append((_sf, _lag))
         sc = {}
-        sc_cache = {}
-        for _lag in _ALL_LAGS_1M:
-            _la = _lag_map[_lag]
-            _curve = _curves.get(_la)
-            sc_cache[_lag] = (_la, _curve)
-            sc[_lag] = schmidl_cox_score(iq_1m, _la, n_sym=8, _curve=_curve)
+        sc_cache = {}   # nominal_lag -> (lag_used, curve, fs of that curve)
+        sc_pairs = {}   # (sf, bw) -> (score, pos_1m, lag_used, curve, fs):
+                        # EVERY pair's own analysis. The nominal-lag max
+                        # can be won by a different-BW pair whose crop
+                        # sees sweep-throughs of a wider signal (score
+                        # ~0.9 at a MID-SYMBOL position) — analyses for a
+                        # resolved identity must come from ITS OWN pair
+                        # or dechirp runs misaligned and real detections
+                        # die at the gate (bwq ~7 flat, seen on SF10/500k).
+        for _bwc, _pairs in _by_bw.items():
+            _nbp = _matched_nb.get(_bwc)
+            if _nbp is None:
+                continue
+            _nbx, _fsx = _nbp
+            _lagx = {}
+            for _sf, _lag in _pairs:
+                _lx = int(round((2 ** _sf) / _bwc * _fsx))
+                if len(_nbx) >= _lx * 10:
+                    _lagx[(_sf, _lag)] = _lx
+            if not _lagx:
+                continue
+            _curves = _schmidl_cox_curve_multilag(
+                _nbx, list(set(_lagx.values())), n_sym=8)
+            for (_sf, _lag), _lx in _lagx.items():
+                _curve = _curves.get(_lx)
+                _scv, _posv = schmidl_cox_score(_nbx, _lx, n_sym=8,
+                                                _curve=_curve)
+                _pos1m = int(round(_posv * (1e6 / _fsx))) if _fsx else _posv
+                sc_pairs[(_sf, _bwc)] = (_scv, _pos1m, _lx, _curve, _fsx)
+                if _lag not in sc or _scv > sc[_lag][0]:
+                    sc[_lag] = (_scv, _pos1m)
+                    sc_cache[_lag] = (_lx, _curve, _fsx)
 
+        # Acceptance bar: the shipped rescue's relaxed threshold
+        # (threshold - 0.15, floored at 0.30) — matched-rate SC scores are
+        # cleaner, and the dechirp confirm behind it is the stronger test
+        # (0 FPs measured on pure noise at this bar). EXCEPTION: in
+        # clip/overload-guard windows (spur_db pinned to the flat-35
+        # value) rail splatter can dechirp convincingly — keep the full
+        # user threshold there; weak-signal recovery in a clipped window
+        # is a lost cause anyway.
+        _thr_m = (max(0.30, sc_threshold - 0.15)
+                  if spur_db >= 100.0 else sc_threshold)
         hit_lags = [(lag, sc[lag][0], sc[lag][1])
-                    for lag in _ALL_LAGS_1M if sc[lag][0] >= sc_threshold]
+                    for lag in sc if sc[lag][0] >= _thr_m]
 
-        if debug >= 2:
-            best_lag = max(_ALL_LAGS_1M, key=lambda l: sc[l][0])
+        # NOTE: a pre-loop "drop 2L when L also hits" arbitration lived
+        # here and was REMOVED: it assumed only fundamentals score at L,
+        # but a strong signal ALSO scores at HALF its own lag in matched
+        # crops (fact 1), so for a true (sf, bw) signal the phantom
+        # half-lag hit survived and the REAL hit was dropped — its
+        # downward-only candidate chain could then never recover the
+        # truth (halved SF10/500k beacon decode live). Alias handling
+        # lives entirely in the grouped resolve + window arbitration.
+
+        if debug >= 2 and sc:
+            best_lag = max(sc, key=lambda l: sc[l][0])
             print(f"  Peak {off_hz / 1e6:+.3f}MHz pwr={pwr:.0f}dB  "
                   f"SC best lag={best_lag} score={sc[best_lag][0]:.3f}  "
                   f"hits={len(hit_lags)}",
                   file=sys.stderr)
 
-        if not hit_lags:
-            # ---- NARROW-BW SC RESCUE (additive: only when the standard
-            # 1 Msps pass found nothing) ----
-            # The fixed 1 Msps extraction makes a narrow signal correlate
-            # against up to 8-16x its own noise bandwidth: measured floors
-            # SC≥0.7 at ~16 dB in-band for 125 kHz presets while the
-            # dechirp confirm still shows 31+ dB PMR at 2 dB SNR — SC's
-            # noise-bandwidth mismatch is the ONLY binding gate.  Re-running
-            # SC on a bandwidth-MATCHED extraction (fs = 2xBW) recovers
-            # ~6 dB of floor (physics-tested: SC≥0.7 at ~10 dB).  Hits are
-            # mapped back onto the standard 1 Msps lag table and flow
-            # through the UNCHANGED resolve/dechirp/carrier path, so
-            # behavior above the old floor is identical, and the extra cost
-            # (3 cached crops + tiny-lag SC) is paid only by peaks that
-            # produced no standard hits.
-            _wh = bw_bins * fres          # peak's measured width (Hz)
-            # NOTE: a 0.18 pre-gate on the standard pass's best score was
-            # tried and REMOVED — it saved only ~1% CPU but cost SF9/125k
-            # its 4 dB battery tier (short-symbol SC scores at the floor
-            # sit right at the gate). The real cost control is the cached
-            # wideband-FFT crop + per-BW multilag below.
-            _resc = {}
-            _bws_h = [b for b in (62500.0, 125000.0, 250000.0)
-                      if _wh <= b * 2.5]
-            _nbs_h = (extract_nb_fft_multi_bw(
-                iq, wb_fs, off_hz, _bws_h, chunk=_NB_CHUNK,
-                fft_cache=_nb_fft_cache) if _bws_h else [])
-            for _bw_h, (_nb_h, _fs_h) in zip(_bws_h, _nbs_h):
-                # extraction crops the ALREADY-CACHED wideband FFT (same
-                # cache as the standard 1 Msps pass) — no new forward
-                # FFTs; the rescue's marginal cost is small iffts + the
-                # multilag correlation on 4-16x fewer samples
-                if len(_nb_h) < 1024:
-                    continue
-                _lags_h = []
-                for _sf_h in range(7, 13):
-                    _lag_nom = int(round((2 ** _sf_h) / _bw_h * 1e6))
-                    if _lag_nom not in _SC_LAGS_1M:
-                        continue
-                    _lag_h = int(round((2 ** _sf_h) / _bw_h * _fs_h))
-                    if len(_nb_h) < _lag_h * 10:
-                        continue
-                    _lags_h.append((_lag_nom, _lag_h))
-                if not _lags_h:
-                    continue
-                # one multilag curve per BW hypothesis (shared running
-                # sums), then cheap per-lag scoring — same trick as the
-                # standard pass; 6x cheaper than per-SF SC calls
-                _curve_h = _schmidl_cox_curve_multilag(
-                    _nb_h, [l[1] for l in _lags_h])
-                # The rescue accepts at a LOWER SC bar than the standard
-                # pass (threshold - 0.15, floored at 0.30): SC at 0.55
-                # mathematically bottoms at ~+4 dB in-band even in the
-                # matched extraction, while the dechirp confirm behind it
-                # still shows 31+ dB peak-to-noise at +2 dB — dechirp is
-                # the stronger test, so let it do the rejecting. Applies
-                # ONLY to rescue hits; the standard pass keeps the user's
-                # threshold untouched.
-                _thr_r = max(0.30, sc_threshold - 0.15)
-                for _lag_nom, _lag_h in _lags_h:
-                    _cv = _curve_h.get(_lag_h)
-                    if _cv is None:
-                        continue
-                    _sc_h, _pos_h = schmidl_cox_score(
-                        _nb_h, _lag_h, n_sym=8, _curve=_cv)
-                    if _sc_h >= _thr_r:
-                        _p1m = int(round(_pos_h * (1e6 / _fs_h)))
-                        if _lag_nom not in _resc or _sc_h > _resc[_lag_nom][0]:
-                            _resc[_lag_nom] = (_sc_h, _p1m)
-            for _lag_nom, (_sc_h, _p1m) in _resc.items():
-                hit_lags.append((_lag_nom, _sc_h, _p1m))
-            if hit_lags and debug >= 2:
-                print(f"  NARROW-RESCUE {len(hit_lags)} lag(s) at "
-                      f"{off_hz/1e6:+.3f}MHz", file=sys.stderr)
         if not hit_lags:
             return _ld
 
@@ -1990,14 +2078,38 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     continue
                 sf, bw, _ = _res
             else:
-                candidates = _SC_LAGS_1M[lag]
+                # Matched-rate SC is a PRESENCE detector, not an identity
+                # classifier: a strong chirp in its tight crop scores ~1.0
+                # at MANY lags (measured 0.999/0.999/0.875 at half/true/
+                # double lag on a real 75 dB beacon), so identity comes
+                # from the dechirp vote — run it across this lag's family
+                # PLUS the half-lag's (the 2-symbol-alias fundamentals),
+                # slicing each candidate at ITS OWN family's plateau
+                # position (a candidate sliced at another family's
+                # position dechirps unfairly low — that bug flipped the
+                # vote toward same-slope aliases).
+                candidates = list(_SC_LAGS_1M[lag])
+                # alias chains run MULTIPLE levels (a strong fundamental
+                # scores at 2L and 4L too) — pull in both lower families
+                for _div in (2, 4, 8):
+                    _fam = _SC_LAGS_1M.get(lag // _div)
+                    if _fam:
+                        candidates += [c for c in _fam
+                                       if c not in candidates]
                 if len(candidates) == 1:
                     sf, bw = candidates[0]
                 else:
+                    _pos_map = {}
+                    for _csf, _cbw in candidates:
+                        _pp = sc_pairs.get((_csf, float(_cbw)))
+                        if _pp is not None:
+                            _pos_map[(_csf, _cbw)] = _pp[1]
                     sf, bw, _ = _resolve_sf_bw_ambig(iq_1m, candidates,
                                                      fft_cache=_ffc,
                                                      pos=_pos_best,
-                                                     nb_cache=_nb_by_bw)
+                                                     nb_cache=_nb_by_bw,
+                                                     pos_map=_pos_map,
+                                                     width_hz=bw_bins * fres)
 
             # Find ALL time-separated preamble plateaus at this lag — so a
             # SECOND packet that shares this carrier + SF/BW (a relay hop1
@@ -2007,10 +2119,20 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             # the later packet was never detected → never captured → lost (the
             # last live-miss root).  Reuse the SC curve already computed for this
             # lag in the scan (cached) — same math, no recompute.
-            _lag_used, _curve = sc_cache[lag]
+            _pp_res = sc_pairs.get((sf, float(bw)))
+            if _pp_res is not None and _pp_res[3] is not None:
+                # the RESOLVED identity's own matched analysis
+                _lag_used, _curve, _fs_used = _pp_res[2], _pp_res[3], _pp_res[4]
+            else:
+                _lag_used, _curve, _fs_used = sc_cache[lag]
             _positions = schmidl_cox_peaks(iq_1m, _lag_used, n_sym=8,
-                                           thr=sc_threshold, max_peaks=6,
-                                           _curve=_curve)
+                                           thr=max(0.30, sc_threshold - 0.15),
+                                           max_peaks=6, _curve=_curve)
+            # curve positions are in the MATCHED extraction's samples —
+            # convert to 1 Msps coordinates for everything downstream
+            if _fs_used and _fs_used != 1e6:
+                _positions = [(_s, int(round(_p * (1e6 / _fs_used))))
+                              for _s, _p in _positions]
             if not _positions:
                 _positions = [(sc_score_best, _pos_best)]
 
@@ -2071,11 +2193,34 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 # false-positive on any narrowband/CW signal.  Require both SC
                 # and dechirp confirmation (also rejects wrong-SF lag aliases
                 # and any spurious extra SC plateau, so multi-peak adds no FP).
-                if bw_quality < DECHIRP_MIN_DB:
+                # Relaxed-tier hits (sc below the user's threshold — the
+                # matched-SC low bar) must clear the dechirp gate with
+                # margin: genuine weak LoRa measures 31+ dB PMR even at
+                # +2 dB SNR, while sidelobes of a strong same-window
+                # signal squeak by at 15-16 dB with borderline SC — the
+                # one FP class the low bar admits.
+                # +2 dB over the legacy gate: matched-crop SC scores run
+                # high even for intermod ghosts of strong co-transmissions
+                # (measured sc 0.89-0.90 with bwq exactly 15-16 at 907.4 in
+                # two60, spawned by 60+ dB parents), so dechirp is the only
+                # real gate and needs margin. Every verified-real signal
+                # today measures bwq >= 19; ghosts sit at 15-17. Floor-level
+                # battery signals measure 30+ (unaffected).
+                _need_bwq = (DECHIRP_MIN_DB + 2.0 if sc_score >= sc_threshold
+                             else DECHIRP_MIN_DB + 4.0)
+                if spur_db < 100.0:
+                    # clip/overload-guard window (flat-35): rail splatter
+                    # is chirp-like enough to pass matched SC at 0.9+ AND
+                    # ordinary dechirp gates (measured bwq 17-23 junk in
+                    # the railed g62 capture, where the old wideband SC's
+                    # dilution hid it by accident). Real signals strong
+                    # enough to matter in a railed window measure 30+.
+                    _need_bwq = max(_need_bwq, DECHIRP_MIN_DB + 9.0)
+                if bw_quality < _need_bwq:
                     if debug >= 2:
                         print(f"    Rejected SF{sf}/BW{bw/1000:.0f}k: "
                               f"sc={sc_score:.2f} bwq={bw_quality:.1f}dB "
-                              f"(need bwq>={DECHIRP_MIN_DB:.0f}dB)",
+                              f"(need bwq>={_need_bwq:.0f}dB)",
                               file=sys.stderr)
                     continue
 
@@ -2159,6 +2304,52 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         with ThreadPoolExecutor(max_workers=_nw) as _ex:
             for _r in _ex.map(_process_one_peak, peaks):
                 dets.extend(_r)
+
+    # ONE PHYSICAL SIGNAL -> ONE DETECTION (window level — the variants
+    # of one burst can come from DIFFERENT gate peaks: the fundamental's
+    # peak, a splatter shoulder, or a same-slope alias that survived its
+    # own resolve). Greedy best-first by bin-normalized dechirp quality;
+    # accept only detections not overlapping an accepted one in time
+    # (within the longer preamble span) AND frequency (within the wider
+    # bandwidth).
+    if len(dets) > 1:
+        # RAW quality sort: up-aliases are already killed at resolve
+        # (grouped vote), so the variants contesting here are the true
+        # identity vs DOWN-aliases and spread shoulders — and a
+        # normalized key would hand the down-alias a +3 dB/SF-step
+        # handicap and let it displace the truth (observed: SF9/62.5
+        # winning the merge against a real SF11/125 beacon).
+        dets.sort(key=lambda d: d['bw_quality_db'], reverse=True)
+        _kept = []
+        for _d in dets:
+            _span = 8.0 * (2.0 ** _d['sf']) / _d['bw']
+            _dup = False
+            for _k in _kept:
+                _kspan = 8.0 * (2.0 ** _k['sf']) / _k['bw']
+                if (abs(_d['preamble_t_s'] - _k['preamble_t_s'])
+                        < max(_span, _kspan)
+                        and abs(_d['freq_hz'] - _k['freq_hz'])
+                        < max(_d['bw'], _k['bw'], 60_000.0)):
+                    _dup = True
+                    break
+                # MID-PACKET duplicate: at strong SNR the payload's
+                # quasi-periodicity spawns a second detection later in
+                # the SAME burst with a corrupted carrier (measured
+                # cfo +396 kHz on an SF10/500k beacon). Distinguish from
+                # real back-to-back packets on one channel (DM
+                # handshakes, protected downstream): genuine ones sit
+                # within a few kHz of each other; the duplicate is
+                # >60 kHz off. Same sf/bw + within 2 s + off by
+                # (60 kHz .. 0.6 bw) => duplicate of the kept one.
+                if (_d['sf'] == _k['sf'] and _d['bw'] == _k['bw']
+                        and abs(_d['preamble_t_s'] - _k['preamble_t_s']) < 2.0
+                        and 60_000.0 < abs(_d['freq_hz'] - _k['freq_hz'])
+                        < 0.6 * _d['bw']):
+                    _dup = True
+                    break
+            if not _dup:
+                _kept.append(_d)
+        dets = _kept
 
     # Deduplicate by (SF, BW, freq-bucket).
     # PRIMARY SORT IS preamble_t_s ASC (earliest first) — critical for DM
