@@ -1411,7 +1411,16 @@ _SC_LAGS_1M = {
     # would share lag 8192 with SF10/125 + SF11/250, and the resolver may
     # mis-vote on 2-symbol harmonics of those fundamentals.  Re-add only after
     # the resolver is hardened against same-lag fundamental-vs-harmonic confusion.
-    8192:  [(9, 62500),  (10, 125000), (11, 250000)],
+    # SF12/500 RE-ADDED 2026-07-04: the historic omission ('resolver may
+    # mis-vote on same-lag harmonics') is addressed by the matched-primary
+    # resolver (grouped same-slope votes, half-lag candidate chains,
+    # bin-normalized within-group quality). Ground-truthed against a real
+    # MC beacon at SF12/500k config: the radio emits GENUINE SF12/500k
+    # (dechirp 35.0 dB at (12,500) vs 7-9.5 dB at every alternative —
+    # unlike SF11/500, which these radios transmit as ~250 kHz on-air).
+    # Without this entry, hits resolved to (10,250)-family junk with
+    # scattered carriers and zero decodes (measured live).
+    8192:  [(9, 62500),  (10, 125000), (11, 250000), (12, 500000)],
     # SF12/250 omitted on the same harmonic-confusion grounds (would share
     # lag 16384 with SF11/125).
     16384: [(10, 62500), (11, 125000)],
@@ -2306,6 +2315,19 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                           f"[off={off_hz/1e3:+.0f}k cfo={cfo_hz/1e3:+.0f}k]",
                           file=sys.stderr)
 
+                # fs/4 image-spur carrier veto: interleaved-ADC SDRs put
+                # constant tones at EXACTLY +/-rate/4; nearby candidates'
+                # analysis crops inherit the tone and the CFO snap lands
+                # the final carrier ON it (measured: phantom SF12/500k at
+                # center+5.0002 MHz from a peak 313 kHz away — PSD
+                # blanking cannot reach that). Vetoing a +/-25 kHz sliver
+                # at the two deterministic artifact frequencies costs
+                # 0.25% of band coverage.
+                if abs(abs(freq_hz - center_hz) - wb_fs / 4.0) < 25e3:
+                    if debug >= 2:
+                        print(f"    FS4-VETO {freq_hz/1e6:.4f}MHz",
+                              file=sys.stderr)
+                    continue
                 _ld.append({
                     'freq_hz':       freq_hz,
                     'freq_mhz':      freq_hz / 1e6,
@@ -5088,8 +5110,10 @@ def main():
         # unaffected.
         if _maxhold:
             _psd_gate, _psd_gmax = welch_psd(buf, nfft=4096, n_avg=50, also_max=True)
+            _notch_psd(_psd_gate)
         else:
             _psd_gate, _psd_gmax = welch_psd(buf, nfft=4096, n_avg=50), None
+            _notch_psd(_psd_gate)
         if a.dc_notch > 0:
             _fres = a.rate / 4096
             _dc_bins = max(1, int(round(a.dc_notch * 1e6 / _fres)))
@@ -5148,8 +5172,10 @@ def main():
             _seg = buf[_ss:_ss + _short_n]
             if _maxhold:
                 _p_short, _p_short_max = welch_psd(_seg, nfft=4096, n_avg=_SHORT_N_AVG, also_max=True)
+                _notch_psd(_p_short)
             else:
                 _p_short, _p_short_max = welch_psd(_seg, nfft=4096, n_avg=_SHORT_N_AVG), None
+                _notch_psd(_p_short)
             if a.dc_notch > 0:
                 _p_short[max(0, _dc_c - _dc_bins):min(4096, _dc_c + _dc_bins + 1)] = np.median(_p_short)
             if _spur_notch_hz:
