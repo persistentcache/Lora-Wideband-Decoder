@@ -482,8 +482,8 @@ def _emit_psd_frame(path, psd_db, out_bins=512, span_db=55.0):
 
 
 def find_peaks(psd_db, thresh_db=8.0, min_bins=3, max_peaks=MAX_ENERGY_PEAKS,
-               wide_run_bins=100, min_sep_bins=20,
-               base_contour_db=4.0, base_min_bins=4):
+               wide_run_bins=None, min_sep_bins=20,
+               base_contour_db=4.0, base_min_bins=4, fres_hz=None):
     """Find energy peaks in a PSD.
 
     Each contiguous above-threshold run normally maps to one signal — but
@@ -514,6 +514,14 @@ def find_peaks(psd_db, thresh_db=8.0, min_bins=3, max_peaks=MAX_ENERGY_PEAKS,
     Returns: list of (center_bin, width_bins, peak_db) tuples, sorted by
     peak_db descending, truncated to `max_peaks`.
     """
+    # wide_run_bins was a FIXED 100 - calibrated as '685 kHz at 28 Msps'.
+    # At the production 20 Msps a single 500 kHz signal spans 102 bins and
+    # was silently DECOMPOSED into shoulder fragments with arbitrary
+    # sub-centroids (the origin of the 500k-family center scatter and
+    # duplicate shoulder peaks). Scale by frequency: 700 kHz - wider than
+    # any single LoRa channel - whatever the sample rate.
+    if wide_run_bins is None:
+        wide_run_bins = int(round(700e3 / fres_hz)) if fres_hz else 100
     nf = np.median(psd_db)
     n = len(psd_db)
     peaks = []
@@ -547,10 +555,10 @@ def find_peaks(psd_db, thresh_db=8.0, min_bins=3, max_peaks=MAX_ENERGY_PEAKS,
             w = hi - lo + 1
             if w >= base_min_bins:
                 peaks.append((_power_centroid(psd_db, lo, hi + 1), w,
-                              float(psd_db[pk])))
+                              float(psd_db[pk]), nf))
                 rescued.append((lo, hi))
             continue
-        _emit_run_peaks(psd_db, s, e, min_bins, wide_run_bins, min_sep_bins, peaks)
+        _emit_run_peaks(psd_db, s, e, min_bins, wide_run_bins, min_sep_bins, peaks, nf_ref=nf)
     peaks.sort(key=lambda p: p[2], reverse=True)
     return peaks[:max_peaks]
 
@@ -580,7 +588,7 @@ def _power_centroid(seg_db, lo, hi):
     return float(np.sum(idx * lin) / s)
 
 
-def _emit_run_peaks(psd_db, start, end, min_bins, wide_run_bins, min_sep_bins, peaks):
+def _emit_run_peaks(psd_db, start, end, min_bins, wide_run_bins, min_sep_bins, peaks, nf_ref=0.0):
     """Emit one peak per contiguous above-threshold run, or multiple peaks if
     the run is suspiciously wide (likely two overlapping signals).  Each peak
     is centred on the power-weighted centroid of its band (see _power_centroid)
@@ -595,7 +603,7 @@ def _emit_run_peaks(psd_db, start, end, min_bins, wide_run_bins, min_sep_bins, p
     peak_db = float(seg[rel_seed])
     if width <= wide_run_bins:
         # Single signal: centroid over the whole run = carrier.
-        peaks.append((start + _power_centroid(seg, 0, len(seg)), width, peak_db))
+        peaks.append((start + _power_centroid(seg, 0, len(seg)), width, peak_db, nf_ref))
         return
     # Wide run: two (or more) merged signals.  Find a second clearly-separate
     # local max, split the run at the dip between the two maxima, and centroid
@@ -608,12 +616,12 @@ def _emit_run_peaks(psd_db, start, end, min_bins, wide_run_bins, min_sep_bins, p
     peak_db2 = float(seg2[rel2_seed])
     if not (peak_db2 > peak_db - 6.0 and peak_db2 > -1e8):
         # Only one real signal in a wide run — centroid the whole run.
-        peaks.append((start + _power_centroid(seg, 0, len(seg)), width, peak_db))
+        peaks.append((start + _power_centroid(seg, 0, len(seg)), width, peak_db, nf_ref))
         return
     a, b = sorted((rel_seed, rel2_seed))
     dip = a + int(np.argmin(seg[a:b + 1]))   # split at the trough between them
-    peaks.append((start + _power_centroid(seg, 0, dip), width, peak_db))
-    peaks.append((start + _power_centroid(seg, dip, len(seg)), width, peak_db2))
+    peaks.append((start + _power_centroid(seg, 0, dip), width, peak_db, nf_ref))
+    peaks.append((start + _power_centroid(seg, dip, len(seg)), width, peak_db2, nf_ref))
 
 
 # ---- Narrowband extraction ----
@@ -1777,7 +1785,10 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
     if cached_peaks is not None:
         peaks = list(cached_peaks)
     else:
-        peaks = find_peaks(psd, thresh_db=ethresh)
+        peaks = find_peaks(psd, thresh_db=ethresh, fres_hz=wb_fs / 4096.0)
+    # window floor for elevation math — needed on BOTH branches (the
+    # cached-peaks path is the main live/gate path)
+    _psd_floor_db = float(np.median(psd))
     if not peaks:
         return []
 
@@ -1845,7 +1856,15 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
     # by bw_quality, so peak order doesn't matter.  Per-peak FFTs stay
     # single-threaded (workers default) so the pool doesn't oversubscribe.
     def _process_one_peak(peak):
-        cb, bw_bins, pwr = peak
+        cb, bw_bins, pwr = peak[0], peak[1], peak[2]
+        # the emitting pass's own noise floor (4th element when present) —
+        # the ONLY correct reference for this peak's elevation; absolute
+        # peak_db stays in [2] because the cross-pass [SPUR-CULL] compares
+        # absolute signal power (per-pass elevations are NOT comparable —
+        # converting them broke cull decisions, lost anchor decodes and
+        # resurrected mirror-image ghosts before this was understood)
+        _src_floor = (peak[3] if len(peak) > 3 and peak[3] is not None
+                      else _psd_floor_db)
         off_hz = (cb - nfft_c / 2) * fres
         _ld = []
 
@@ -1875,6 +1894,9 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         # engages on a solid (+6 dB) contour, so weak-signal floors
         # (battery-validated) are untouched.
         _nseg = min(len(iq_1m) // 4096, 64)
+        if bw_bins * fres <= 150_000.0:
+            _nseg = 0   # narrow peak: centroid accurate, skip the FFT
+        
         # No recentering in clip/overload-guard windows (spur_db pinned
         # 35): a spur forest merges +6 dB contour runs and the bogus
         # midpoint MIScenters captures that decoded fine at the gate
@@ -1999,7 +2021,22 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                         # resolved identity must come from ITS OWN pair
                         # or dechirp runs misaligned and real detections
                         # die at the gate (bwq ~7 flat, seen on SF10/500k).
+        _wh_gate = bw_bins * fres
         for _bwc, _pairs in _by_bw.items():
+            # width-gated BW evaluation, STRONG PEAKS ONLY: measured
+            # width upper-bounds the true BW within ~2.5x when the peak
+            # is well above the floor, but UNDERESTIMATES wildly at low
+            # SNR (a floor-level SF7/500k pokes 2-6 bins = 10-30 kHz —
+            # an unconditional gate cost that preset +8 dB of battery
+            # floor). Weak peaks evaluate every class.
+            # pwr is ABSOLUTE PSD dB — subtract the window floor for
+            # true elevation (using pwr raw mis-gated floor-level
+            # battery signals whose absolute values sat above 15).
+            # true per-provenance elevation: absolute peak power minus
+            # the EMITTING pass's own floor. 15 dB is an honest bar:
+            # floor-level battery signals never gate; splatter does.
+            if (pwr - _src_floor) >= 15.0 and _bwc > _wh_gate * 2.5:
+                continue
             _nbp = _matched_nb.get(_bwc)
             if _nbp is None:
                 continue
@@ -5081,11 +5118,11 @@ def main():
         # bin CW/LO/clipping spikes; at higher rates it backs off (20 Msps -> 3 bins,
         # 61 Msps -> no-op) so a narrow channel spanning few bins is never at risk.
         _min_w = min(4, max(1, int(round(0.5 * 31250.0 / (a.rate / 4096.0)))))
-        _gate_peaks = [_p for _p in find_peaks(_psd_gate, thresh_db=a.energy_threshold)
+        _gate_peaks = [_p for _p in find_peaks(_psd_gate, thresh_db=a.energy_threshold, fres_hz=a.rate / 4096.0)
                        if _p[1] >= _min_w]
         if _psd_gmax is not None:
             _notch_psd(_psd_gmax)
-            for _mh in find_peaks(_psd_gmax, thresh_db=a.energy_threshold):
+            for _mh in find_peaks(_psd_gmax, thresh_db=a.energy_threshold, fres_hz=a.rate / 4096.0):
                 if _mh[1] >= _min_w and not any(abs(_mh[0] - _g[0]) < 15 for _g in _gate_peaks):
                     _gate_peaks.append(_mh)
 
@@ -5129,14 +5166,16 @@ def main():
             # Lower BWs (125 k, 62.5 k) produce narrower runs but they also
             # have long enough preambles to surface in the 1s pass already,
             # so the short-window contribution is only needed for ≥250 k.
-            for _bin, _w, _db in find_peaks(_p_short, thresh_db=a.energy_threshold):
+            for _bin, _w, _db, *_pkrest in find_peaks(_p_short, thresh_db=a.energy_threshold, fres_hz=a.rate / 4096.0):
                 if _w >= 30:
-                    _short_peaks_all.append((_bin, _w, _db))
+                    _short_peaks_all.append((_bin, _w, _db,
+                                             _pkrest[0] if _pkrest else None))
             if _p_short_max is not None:
                 _notch_psd(_p_short_max)
-                for _bin, _w, _db in find_peaks(_p_short_max, thresh_db=a.energy_threshold):
+                for _bin, _w, _db, *_pkrest in find_peaks(_p_short_max, thresh_db=a.energy_threshold, fres_hz=a.rate / 4096.0):
                     if _w >= 30:
-                        _short_peaks_all.append((_bin, _w, _db))
+                        _short_peaks_all.append((_bin, _w, _db,
+                                                 _pkrest[0] if _pkrest else None))
         # Dedup by bin proximity (±15 bins ≈ ±100kHz) — narrower than 30 bins
         # so adjacent-channel hop0/hop1 pairs (commonly ±175 kHz apart) are
         # not collapsed into a single candidate. Sort by power desc so the
@@ -5199,7 +5238,7 @@ def main():
                     _wbins = max(3, int(round(_bw_hz / _fres_gate)))
                     # carry the channel's REAL PSD value (not a placeholder) so the
                     # spur-reject / power ordering downstream treat it correctly
-                    _gate_peaks.append((_cbin, _wbins, float(_psd_gate[_cbin])))   # forced; dechirp decides
+                    _gate_peaks.append((_cbin, _wbins, float(_psd_gate[_cbin]), float(np.median(_psd_gate))))   # forced; dechirp decides
             # Fix #3 (per-channel compute): a strong signal's sidelobes each fall within
             # ±bw of a channel and would EACH fire the expensive forced dechirp + decode.
             # Keep only the peak NEAREST each channel centre (the carrier); drop the
