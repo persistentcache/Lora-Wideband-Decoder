@@ -5536,7 +5536,15 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         hi = min(len(iq_data) - N * max(1, n_score), coarse + _refine_half_range)
         if hi <= lo:
             return coarse
-        step = max(1, dec // 2)
+        # Hierarchical coarse step: dechirp-peak energy varies smoothly
+        # over a symbol (a 16-of-2048-sample misalignment costs ~1% of
+        # peak), so scanning every sample in the coarse pass is pure
+        # waste — at the common fs=2xBW exports dec//2 == 1 and this
+        # degenerated into a full-resolution scan (~4k offsets x 4 syms
+        # x N-point FFTs = the dominant decode cost). N//64 keeps the
+        # coarse grid at ~1.5% of a symbol; the existing fine pass at
+        # step=1 around the winner still lands the exact offset.
+        step = max(1, dec // 2, N // 64)
         # Reduced symbol count for the wide coarse search at large N where
         # FFT cost dominates (SF≥10, N≥1024).  At small N the FFT is cheap
         # so the reduced n_score doesn't save much wall but slightly
@@ -5865,7 +5873,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         hi = min(len(iq1) - N * max(1, nscore_syms), pre_loc + N)
         if hi < lo:
             return pre_loc
-        coarse_step = max(1, dec // 2)
+        # Same hierarchical rationale as _refine_start above.
+        coarse_step = max(1, dec // 2, N // 64)
         # SF-conditional: only reduce n_score at large N (SF≥10) where the
         # FFT cost is dominant.  At small N (SF7-9) the FFT is cheap and
         # the slightly noisier coarse pick can push borderline captures
