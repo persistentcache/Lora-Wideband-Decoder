@@ -2063,21 +2063,40 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         # 31.25k table add made these flips real). Only trusted when the
         # peak clears floor+18 (weak signals' width collapses).
         _wh_peak = None
-        _nsegw = min(len(iq_1m) // 4096, 48)
-        if _nsegw >= 4:
-            _psw = np.abs(np.fft.fft(
-                iq_1m[:_nsegw * 4096].reshape(_nsegw, 4096), axis=1)) ** 2
+        _nseg_tot = len(iq_1m) // 4096
+        if _nseg_tot >= 4:
+            # STRIDE segments across the WHOLE window: consecutive-only
+            # sampling covered just the first 0.2 s, so bursts starting
+            # later measured as noise (w=None -> tie-break silently off)
+            # or as a lone CW spur (w=0.2 kHz -> wrong family won; cost
+            # 11% of live decodes as alternating same-slope flips).
+            # CONSECUTIVE segments AT THE BURST: a chirp paints its full
+            # bandwidth only over >= 1 symbol of CONTIGUOUS time (each
+            # 4.1 ms segment sees ~16 kHz of sweep; strided/max-hold
+            # sampling hit phase-locked spots and measured 11-25 kHz on
+            # a 125 kHz signal). Find the burst by power profile, then
+            # mean-PSD over 48 consecutive segments (~196 ms >= 6 SF11
+            # symbols) inside it.
+            _pp_blk = np.abs(
+                iq_1m[:_nseg_tot * 4096].reshape(_nseg_tot, 4096)) ** 2
+            _pp_blk = _pp_blk.mean(axis=1)
+            _nwin = min(48, _nseg_tot)
+            _cum = np.concatenate(([0.0], np.cumsum(_pp_blk)))
+            _sums = _cum[_nwin:] - _cum[:-_nwin]
+            _b0 = int(np.argmax(_sums))
+            _segs_w = iq_1m[_b0 * 4096:(_b0 + _nwin) * 4096].reshape(
+                _nwin, 4096)
+            _psw = np.abs(np.fft.fft(_segs_w, axis=1)) ** 2
             _psw = np.fft.fftshift(_psw.mean(axis=0))
             _flw = float(np.median(_psw))
-            # search the WHOLE crop for the strongest bin, not just the
-            # center: shoulder-peak crops carry the signal off-center by
-            # hundreds of kHz, and a center-only window returned None ->
-            # the width tie-break silently never engaged for exactly the
-            # resolves that needed it (seq-cluster misidentities).
-            _pkw = float(_psw[8:4088].max())
+            # search near the CROP CENTER (+/-100 kHz — covers shoulder
+            # centroid error), not the global argmax (grabs unrelated
+            # spurs elsewhere in the +/-500 kHz crop).
+            _wlo, _whi = 2048 - 410, 2048 + 410
+            _pkw = float(_psw[_wlo:_whi].max())
             if _pkw > _flw * 63.0:            # >= +18 dB: measurable
                 _thw = _pkw / 15.85           # peak - 12 dB
-                _c0 = 8 + int(np.argmax(_psw[8:4088]))
+                _c0 = _wlo + int(np.argmax(_psw[_wlo:_whi]))
                 _lo_w2 = _c0
                 while _lo_w2 > 0 and _psw[_lo_w2 - 1] > _thw:
                     _lo_w2 -= 1
