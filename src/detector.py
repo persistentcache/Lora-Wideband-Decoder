@@ -210,6 +210,16 @@ class StreamBuffer:
         self._lock = threading.Lock()
         self._eof = False
         self._total_drops = 0
+        # CONVERT-AHEAD (2026-07-05): live reads are 100% uniform hop-sized
+        # since the deferred-tail work, so a dedicated thread converts the
+        # NEXT hop while the main loop processes the current one — read()
+        # becomes pure wait (the ~150 ms/hop conversion was the last live
+        # stall source). The prepared buffer is keyed by (rp, n); any
+        # mismatch (first read, size change, lap) falls back inline.
+        self._ahead = None            # (pos, n, complex64 buf) when ready
+        self._ahead_want = None       # (pos, n) the thread is working on
+        self._ahead_cv = threading.Condition(self._lock)
+        self._ahead_thread = None
 
         # Read in ~20 ms chunks.  Smaller chunks reduce pipe backpressure at
         # high sample rates while keeping per-call numpy conversion overhead low.
@@ -299,6 +309,83 @@ class StreamBuffer:
                     self._ring[:n_elem - split] = data[split:n_elem]
                 self._wp += n_samp
 
+    def _convert_span(self, pos, n):
+        """Convert ring span [pos, pos+n) to complex64 WITHOUT the lock.
+        Returns None if the writer lapped the span during conversion
+        (caller must re-claim). Safe because the writer only ADVANCES
+        _wp; we validate no-overwrite after converting."""
+        start = (pos * 2) % self._ring_elems
+        n_elem = n * 2
+        out = np.empty(n_elem, dtype=np.float32)
+        end = start + n_elem
+        if end <= self._ring_elems:
+            segs = [(start, end, 0)]
+        else:
+            split = self._ring_elems - start
+            segs = [(start, self._ring_elems, 0),
+                    (0, n_elem - split, split)]
+        jobs = []
+        for (ra, rb, oa) in segs:
+            ln = rb - ra
+            if ln > 4_000_000 and len(segs) == 1:
+                h = (ln // 2) & ~1
+                jobs.append((ra, ra + h, oa))
+                jobs.append((ra + h, rb, oa + h))
+            else:
+                jobs.append((ra, rb, oa))
+
+        def _cvt(job):
+            ra, rb, oa = job
+            dst = out[oa:oa + (rb - ra)]
+            np.multiply(self._ring[ra:rb], self._scale,
+                        out=dst, casting='unsafe')
+            if _IQ_INVERT:
+                dst[1::2] *= -1.0
+        if len(jobs) > 1 and n_elem > 4_000_000:
+            list(self._cvt_pool.map(_cvt, jobs))
+        else:
+            for j in jobs:
+                _cvt(j)
+        with self._lock:
+            if self._wp - pos > self._ring_n:
+                return None        # overwritten mid-convert — stale
+        return out.view(np.complex64)
+
+    def _ahead_worker(self):
+        while True:
+            with self._lock:
+                want = self._ahead_want
+                if want is None:
+                    self._ahead_cv.wait(0.5)
+                    if self._eof and self._ahead_want is None:
+                        return
+                    continue
+                pos, n = want
+                ready = (self._wp - pos) >= n
+                if self._eof and not ready:
+                    self._ahead_want = None
+                    continue
+            if not ready:
+                time.sleep(0.005)
+                continue
+            buf = self._convert_span(pos, n)
+            with self._lock:
+                if self._ahead_want == (pos, n):
+                    self._ahead = (pos, n, buf)   # buf None if lapped
+                    self._ahead_want = None
+                    self._ahead_cv.notify_all()
+
+    def _kick_ahead(self, pos, n):
+        """Ask the worker to prepare [pos, pos+n). Caller holds _lock."""
+        self._ahead = None
+        self._ahead_want = (pos, n)
+        if self._ahead_thread is None:
+            self._ahead_thread = threading.Thread(
+                target=self._ahead_worker, daemon=True,
+                name='iq-ahead')
+            self._ahead_thread.start()
+        self._ahead_cv.notify_all()
+
     def read(self, n):
         """Read n IQ samples as complex64.
 
@@ -309,66 +396,45 @@ class StreamBuffer:
         Each call returns temporally contiguous data. If samples were lost,
         `skipped` > 0 indicates a temporal gap since the previous read.
         """
+        # convert-ahead fast path: the prepared buffer matches our rp/n
         while True:
+            pos = None
             with self._lock:
+                if self._ahead is not None:
+                    apos, an, abuf = self._ahead
+                    if apos == self._rp and an == n and abuf is not None:
+                        self._ahead = None
+                        self._rp += n
+                        self._kick_ahead(self._rp, n)
+                        return abuf, 0
+                    self._ahead = None    # stale (skip/size change)
+                if (self._ahead_want is not None
+                        and self._ahead_want != (self._rp, n)):
+                    self._ahead_want = None   # cancel stale prepare
                 avail = self._wp - self._rp
                 if avail >= n:
                     skipped = 0
-                    # Check if write pointer lapped us
                     if avail > self._ring_n:
                         lost = avail - self._ring_n
                         self._rp += lost
                         self._total_drops += lost
                         skipped = lost
-                        avail = self._ring_n
-
-                    # Extract + convert from ring in ONE fused pass per slice:
-                    # np.multiply(int16_slice, 1/scale, out=float32, unsafe)
-                    # converts, scales and writes the output buffer without a
-                    # separate copy or astype pass.  Large reads are split
-                    # across the 2-thread pool (numpy releases the GIL), which
-                    # roughly halves wall time on multi-core hosts — measured
-                    # ~380 ms -> ~150 ms per 0.9 s hop on a Pi 4.  [I0,Q0,...]
-                    # float32 viewed as complex64 is the final zero-copy step.
-                    start = (self._rp * 2) % self._ring_elems
-                    n_elem = n * 2
-                    out = np.empty(n_elem, dtype=np.float32)
-                    end = start + n_elem
-                    if end <= self._ring_elems:
-                        segs = [(start, end, 0)]
-                    else:
-                        split = self._ring_elems - start
-                        segs = [(start, self._ring_elems, 0),
-                                (0, n_elem - split, split)]
-                    jobs = []
-                    for (ra, rb, oa) in segs:
-                        ln = rb - ra
-                        if ln > 4_000_000 and len(segs) == 1:
-                            h = (ln // 2) & ~1   # even split keeps I/Q pairs aligned
-                            jobs.append((ra, ra + h, oa))
-                            jobs.append((ra + h, rb, oa + h))
-                        else:
-                            jobs.append((ra, rb, oa))
-
-                    def _cvt(job):
-                        ra, rb, oa = job
-                        dst = out[oa:oa + (rb - ra)]
-                        np.multiply(self._ring[ra:rb], self._scale,
-                                    out=dst, casting='unsafe')
-                        if _IQ_INVERT:
-                            dst[1::2] *= -1.0
-                    if len(jobs) > 1 and n_elem > 4_000_000:
-                        list(self._cvt_pool.map(_cvt, jobs))
-                    else:
-                        for j in jobs:
-                            _cvt(j)
-
-                    self._rp += n
-                    return out.view(np.complex64), skipped
-
-                if self._eof:
+                    pos = self._rp
+                elif self._eof:
                     return None, 0
-            time.sleep(0.005)
+            if pos is None:
+                time.sleep(0.005)
+                continue
+            # inline conversion OUTSIDE the lock — holding it for the
+            # whole ~150 ms stalled the WRITER thread (pipe backpressure
+            # at exactly the moments the ring most needed draining)
+            data = self._convert_span(pos, n)
+            with self._lock:
+                if data is None or self._wp - pos > self._ring_n:
+                    continue          # lapped mid-convert: re-claim
+                self._rp = pos + n
+                self._kick_ahead(self._rp, n)
+            return data, skipped
 
     def available(self):
         """Samples available for reading."""
@@ -2912,6 +2978,17 @@ class SignalRecorder:
                     if (_d['sf'] == _jd['sf'] and _d['bw'] == _jd['bw']
                             and abs(_d['freq_hz'] - _jd['freq_hz'])
                             < max(_d['bw'], 60e3)):
+                        # FRAME-TIME AWARE: same carrier+sf but arriving
+                        # more than ~a frame-length after the filling
+                        # job's registration is the NEXT frame, not a
+                        # redetect — continuous back-to-back phases
+                        # (frame >= beacon interval) otherwise lose
+                        # EVERY second frame to this dedup.
+                        _air_n = int(148.25 * (2 ** _jd['sf'])
+                                     / _jd['bw'] * self.wb_fs)
+                        if (sample_pos - _j['sample_pos']
+                                > 0.8 * _air_n):
+                            continue
                         return []
         # copy ONLY what will be overwritten: the sliding window buf.
         # pre_hop and slow assemblies are already owned arrays — hold refs.
