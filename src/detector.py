@@ -2807,6 +2807,7 @@ class SignalRecorder:
         # memory without bound.  For offline file replay this only slows the
         # detector (no data lost); for live it caps memory at maxsize×window.
         self._save_queue = queue.Queue(maxsize=8)
+        self._pending = []   # deferred-tail jobs (live path)
         # Parallel save-worker pool.  Each gate-batch needs a 28-M-sample
         # forward FFT (~1 s wall-clock) plus find_all_preambles + per-
         # preamble extracts.  With a single worker thread, bursty gate
@@ -2870,6 +2871,65 @@ class SignalRecorder:
 
     def set_decoder(self, decoder):
         self._decoder = decoder
+
+    def update_deferred(self, detections, wideband_buf, sample_pos=0,
+                        pre_hop=None, need_tail_n=0):
+        """Register a save whose TAIL arrives later: instead of BLOCKING
+        the main loop for an airtime-sized ring read (2.4 s per SF11/125k
+        detection — measured as the dominant live-loop stall: CATCHUP
+        ring-wrap skips ate ~every 10th beacon in serial mode and still
+        bit under load in pool mode), hold the job and let feed_tail()
+        complete it from the hops that flow through the loop anyway —
+        the SAME samples the blocking read would have consumed, with
+        zero loop stall. Memory-bounded: max 3 pending; overflow
+        finalizes the oldest with whatever tail it has (== the old
+        truncation behavior at worst)."""
+        if not detections:
+            return []
+        parts = []
+        if pre_hop is not None and len(pre_hop) > 0:
+            parts.append(pre_hop)
+        parts.append(wideband_buf)
+        base = np.concatenate(parts)      # owned copy; buf recyclable
+        pre_hop_n = len(pre_hop) if pre_hop is not None else 0
+        job = {'base': base, 'dets': list(detections),
+               'pre_hop_n': pre_hop_n, 'wb_n': len(wideband_buf),
+               'sample_pos': sample_pos, 'tail': [],
+               'need': int(need_tail_n)}
+        self._pending.append(job)
+        if len(self._pending) > 3:
+            self._finalize(self._pending.pop(0))
+        return []
+
+    def feed_tail(self, hop):
+        """Give every pending deferred job the freshly-arrived hop; jobs
+        finalize once their tail requirement is met."""
+        if not self._pending:
+            return
+        done = []
+        for job in self._pending:
+            got = sum(len(t) for t in job['tail'])
+            if got < job['need']:
+                job['tail'].append(hop[:job['need'] - got].copy()
+                                   if len(hop) > job['need'] - got else hop.copy())
+            if sum(len(t) for t in job['tail']) >= job['need']:
+                done.append(job)
+        for job in done:
+            self._pending.remove(job)
+            self._finalize(job)
+
+    def flush_pending(self):
+        for job in self._pending:
+            self._finalize(job)
+        self._pending = []
+
+    def _finalize(self, job):
+        parts = [job['base']] + job['tail']
+        extended_full = np.concatenate(parts) if len(parts) > 1 else job['base']
+        dt_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        self._save_queue.put((extended_full, job['dets'], dt_str,
+                              job['pre_hop_n'], job['wb_n'],
+                              job['sample_pos']))
 
     def update(self, detections, wideband_buf, sample_pos=0, tail=None, pre_hop=None):
         """Queue a save job — returns immediately, work happens in background."""
@@ -4841,7 +4901,10 @@ def main():
         from detect_pool import DetectPool
         _win_n = int(a.rate * a.window)
         _pool = DetectPool(
-            n_workers=a.detect_workers, n_slots=a.detect_workers + 4,
+            n_workers=a.detect_workers, n_slots=a.detect_workers + 8,
+            # +8 not +4: slot exhaustion made dispatch spin in
+            # _commit_oldest during busy sweep phases (detect phase
+            # spiking to 787 ms avg -> ring wraps every ~2 min)
             win_n=_win_n,
             params=dict(wb_fs=a.rate, wb_bw=a.bandwidth, center=a.center,
                         sc_threshold=a.threshold, ethresh=a.energy_threshold,
@@ -4886,6 +4949,11 @@ def main():
     _slow_halves = _deque(maxlen=8)   # last 8 hops = contiguous 4 s for the slow pass
     _slow_tick = 0
     _slow_seeds = {}
+    _slow_backoff = {}   # bucket -> current fruitless-scan cooldown (windows)
+    _slow_fruitless = {} # bucket -> consecutive fruitless scans this streak
+    _slow_exact = {}     # bucket -> freshest exact peak bin (for seeding)
+    _slow_busy = [False] # background slow-scan in flight (drop-if-busy)
+    _slow_results = queue.Queue()   # (dets_slow, _iq_long, reg_tot_s, trig)
     # Tail samples consumed last iter (for save).  Prepended to this iter's iq
     # so the audio timeline stays continuous — without this, every save creates
     # a `tail_n` audio gap between adjacent Welch windows and packets that land
@@ -5024,7 +5092,12 @@ def main():
         hand it to the recorder.  Tail = the next window's forward overlap."""
         nonlocal tot_d
         it = _inflight.popleft()
+        _t_res0 = time.time()
         dets0 = _pool.result(it['seq'])
+        _res_wait = time.time() - _t_res0
+        if _res_wait > 0.2 and os.environ.get('LORA_SLOW_DEBUG'):
+            print(f"[COMMIT-WAIT] {_res_wait:.2f}s on seq {it['seq']}",
+                  file=sys.stderr, flush=True)
         _elapsed = time.time() - t_start
         for d in dets0:
             tot_d += 1
@@ -5571,38 +5644,30 @@ def main():
             # The tail provides additional IQ for the recorder to extract the
             # full LoRa frame when the preamble landed near the end of `buf`.
             if recorder and is_live and dets:
-                # Size the tail by the detected packet's AIRTIME and read it
-                # BLOCKING, exactly like file mode below.  The old code waited
-                # <=100 ms and took whatever had arrived in the ring — so every
-                # live capture of a long-airtime packet was TRUNCATED (an
-                # SF11/125k frame needs ~2.4 s of tail; captures came out
-                # 2.0-2.3 s total and the payload end was clipped -> CRC FAIL).
-                # How truncated depended on pipeline SPEED: a faster gate
-                # reaches this point sooner, finds less in the ring, and saves
-                # a SHORTER capture — so every gate optimization silently made
-                # live decode WORSE (caught in the 2026-07-03 live A/B: the
-                # optimized build's captures were ~120 ms shorter and its
-                # catch rate halved).  Blocking is safe and bounded: the
-                # samples arrive in real time (waiting T seconds yields T
-                # seconds of data, <=3 s at the cap), the ring (buf_seconds,
-                # default 16 s) absorbs the pause, and the data lands in
-                # _carry_tail so the audio timeline stays contiguous.
+                # DEFERRED TAIL (2026-07-05): the airtime-sized tail is no
+                # longer read BLOCKING here (2.4 s stall per SF11/125k
+                # detection — the dominant live-loop stall; see CATCHUP
+                # analysis in FOLLOWUP). The recorder holds the job and
+                # feed_tail() below completes it from the hops the loop
+                # processes anyway — identical samples, zero stall, and
+                # capture length no longer depends on pipeline speed.
                 _max_pkt_s = max(
                     (148.25 * (2 ** d['sf']) / d['bw']) for d in dets)
                 _max_tail_n = min(int(_max_pkt_s * a.rate), 3 * win_n,
                                   _ring_n_total // 2)
-                if _max_tail_n > 0:
+                if os.environ.get('LORA_NO_DEFER'):
                     tail_data, tail_skipped = reader.read(_max_tail_n)
                     if tail_data is not None:
                         pre_tail = tail_data
                         tot_s += len(pre_tail)
                         _carry_tail = pre_tail
-                    if tail_skipped > 0:
+                    if tail_skipped:
                         tot_skip += tail_skipped
-                        skip_s = tail_skipped / a.rate
-                        print(f"[{elapsed:6.1f}s] TAIL-SKIP {tail_skipped/1e6:.1f}M "
-                              f"samples ({skip_s:.2f}s) during tail read",
-                              file=sys.stderr)
+                else:
+                    recorder.update_deferred(dets, buf, tot_s,
+                                             pre_hop=pre_hop,
+                                             need_tail_n=_max_tail_n)
+                    dets = []   # consumed: skip the immediate update below
             elif recorder and not is_live and dets:
                 # File mode: size the tail to the actual frame duration.
                 _max_pkt_s = max(
@@ -5633,6 +5698,8 @@ def main():
         # processed (cached_peaks seeds — no long-buffer PSD). Idle cost
         # ~zero; ambient junk flickers and never accumulates the streak.
         _slow_halves.append(buf[-hop_n:].copy())
+        if recorder and is_live:
+            recorder.feed_tail(buf[-hop_n:])
         _slow_tick += 1
         _det_bins = set()
         for d in dets:
@@ -5671,36 +5738,116 @@ def main():
             _b = int(_p[0])
             if any(abs(_b - _db) < 8 for _db in _det_bins):
                 continue                      # already detected/handled
-            _prev = _slow_seeds.get(_b, 0)
+            # KEY BY 8-BIN BUCKET, not raw bin: power centroids jitter
+            # +/-1-2 bins window-to-window, so raw-bin keys minted fresh
+            # entries every window — streaks rebuilt in 3 windows and the
+            # cooldown/backoff NEVER engaged (measured: 304 scans in
+            # 10 min, before AND after the backoff patch — the giveaway).
+            _bk = _b // 8
+            _slow_exact[_bk] = _b             # freshest exact bin: SEEDS use
+                                              # this, never the bucket center
+                                              # (center is up to 4 bins =
+                                              # 19.5 kHz off — outside a
+                                              # 31.25k matched crop entirely;
+                                              # cost g31 its captures)
+            _prev = _slow_seeds.get(_bk, 0)
             if _prev < 0:
-                _new_seeds[_b] = _prev + 1    # cooldown after a fired scan
+                _new_seeds[_bk] = _prev + 1   # cooling down
                 continue
-            _new_seeds[_b] = _prev + 1
+            _new_seeds[_bk] = _prev + 1
+        # COOLDOWNS SURVIVE ABSENCE: rebuilt-from-current-peaks state let
+        # flickery junk (hovering at the 10 dB seed bar) drop out for one
+        # window, VANISH its negative cooldown entry, and re-trigger 3
+        # windows later — 282-304 scans/10 min through TWO prior fixes
+        # (keys were never the leak; state persistence was). Positive
+        # (streak) entries still evaporate on absence — that IS the
+        # streak-break reset that keeps real bursty slow packets
+        # triggering at base cooldown.
+        for _bk_c, _c_c in _slow_seeds.items():
+            if _c_c < 0 and _bk_c not in _new_seeds:
+                _new_seeds[_bk_c] = _c_c + 1
+        # STREAK BREAK resets punishment history: a real bucket that got
+        # one badly-timed fruitless scan starts fresh at its next burst
+        # (junk never breaks streak, so its history survives)
+        for _bk_c in list(_slow_backoff):
+            if _bk_c not in _new_seeds:
+                _slow_backoff.pop(_bk_c, None)
+                _slow_fruitless.pop(_bk_c, None)
         _slow_seeds = {_b: _c for _b, _c in _new_seeds.items()}
         # >=3 consecutive windows: even the shortest straddler preamble
         # (SF11/31.25k, 1.2 s) plus its packet body spans 3+ windows
-        _trig = [_b for _b, _c in _slow_seeds.items() if _c >= 3]
+        _trig = [_slow_exact.get(_bk, _bk * 8 + 4)
+                 for _bk, _c in _slow_seeds.items() if _c >= 3]
         if os.environ.get('LORA_SLOW_DEBUG'):
             print(f"[SLOW] tick={_slow_tick} halves={len(_slow_halves)} "
                   f"seeds={_slow_seeds} trig={_trig}", file=sys.stderr)
-        if _trig and len(_slow_halves) == 8:
-            _iq_long = np.concatenate(_slow_halves)
-            if os.environ.get('LORA_SLOW_DEBUG'):
-                _iq_long.tofile(f'/tmp/claude-1000/slowdump_{_slow_tick}.cf32')
-            _seed_peaks = [(float(_b), 13, 20.0, None) for _b in _trig]
-            dets_slow = detect_preamble(
-                _iq_long, a.rate, a.bandwidth, _live_center_mhz,
-                sc_threshold=a.threshold, ethresh=a.energy_threshold,
-                spur_db=_spur_db, dc_notch_mhz=a.dc_notch,
-                spur_notch_hz=_spur_notch_hz or None, debug=a.debug,
-                cached_peaks=_seed_peaks, only_bws={31250, 41667})
-            for _b in _trig:
-                _slow_seeds[_b] = -4          # cooldown ~2 s (preamble can
-                                              # re-enter a later 4 s assembly)
+        if _trig and len(_slow_halves) == 8 and not _slow_busy[0]:
+            _iq_long_bg = np.concatenate(_slow_halves)
+            _trig_bg = list(_trig)
+            _seedpk_bg = [(float(_b), 13, 20.0, None) for _b in _trig_bg]
+            _regpos_bg = tot_s
+            _slow_busy[0] = True
+
+            def _slow_scan_bg(_iql=_iq_long_bg, _spk=_seedpk_bg,
+                              _tg=_trig_bg, _rp=_regpos_bg):
+                # BACKGROUND slow scan (0.5-0.6 s of FFT work): ran on the
+                # main loop before and, stacked with p90 read+dispatch,
+                # pushed iterations past the 500 ms hop budget -> ring
+                # wraps. numpy FFTs release the GIL; drop-if-busy bounds
+                # cost to one scan in flight.
+                _t0 = time.time()
+                try:
+                    _ds = detect_preamble(
+                        _iql, a.rate, a.bandwidth, _live_center_mhz,
+                        sc_threshold=a.threshold,
+                        ethresh=a.energy_threshold,
+                        spur_db=_spur_db, dc_notch_mhz=a.dc_notch,
+                        spur_notch_hz=_spur_notch_hz or None, debug=a.debug,
+                        cached_peaks=_spk, only_bws={31250, 41667})
+                except Exception:
+                    _ds = []
+                if os.environ.get('LORA_SLOW_DEBUG'):
+                    print(f"[SLOW-SCAN] {time.time() - _t0:.2f}s "
+                          f"seeds={len(_tg)} hits={len(_ds or [])} (bg)",
+                          file=sys.stderr, flush=True)
+                _slow_results.put((_ds or [], _iql, _rp, _tg))
+                _slow_busy[0] = False
+
+            if is_live:
+                threading.Thread(target=_slow_scan_bg, daemon=True).start()
+            else:
+                _slow_scan_bg()   # file mode: no realtime deadline, and the
+                                  # loop outruns a background thread (stale
+                                  # assemblies, dropped triggers)
+
+        # consume finished background scans (bookkeeping on main thread)
+        while not _slow_results.empty():
+            dets_slow, _iq_long, _reg_tot_s, _trig_done = _slow_results.get()
+            _hit_bins = set()
+            for d in dets_slow:
+                _hit_bins.add(int(round((d['freq_hz'] - _live_center_mhz * 1e6)
+                                        / (a.rate / 4096.0))) + 2048)
+            for _b in _trig_done:
+                _bk = _b // 8
+                if any(abs(_b - _hb) < 8 for _hb in _hit_bins):
+                    _slow_seeds[_bk] = -4
+                    _slow_backoff[_bk] = 4
+                    _slow_fruitless[_bk] = 0
+                elif os.environ.get('LORA_NO_BACKOFF'):
+                    _slow_seeds[_bk] = -4
+                else:
+                    _fr = _slow_fruitless.get(_bk, 0) + 1
+                    _slow_fruitless[_bk] = _fr
+                    if _fr == 1:
+                        _slow_seeds[_bk] = -1
+                    else:
+                        _bo = min(256, _slow_backoff.get(_bk, 4) * 2)
+                        _slow_backoff[_bk] = _bo
+                        _slow_seeds[_bk] = -_bo
             if dets_slow:
                 for d in dets_slow:
                     tot_d += 1
-                    _abst = ((tot_s - len(_iq_long)) / a.rate
+                    _abst = ((_reg_tot_s - len(_iq_long)) / a.rate
                              + d.get('preamble_t_s', 0.0))
                     print(f"[{time.time() - t_start:6.1f}s] DETECTED "
                           f"freq={d['freq_mhz']:.4f}MHz SF={d['sf']} "
@@ -5711,34 +5858,29 @@ def main():
                 if recorder:
                     _slow_pkt_s = max(
                         (148.25 * (2 ** d['sf']) / d['bw']) for d in dets_slow)
-                    # Slow frames are LONG (SF12/31.25k: ~10 s for a beacon,
-                    # 19 s worst-case) — the standard 3-window tail cap
-                    # truncated every capture at ~35% of the frame (real-RF
-                    # finding: detections perfect, decodes zero). Allow up
-                    # to 12 windows; the ring (16 s default) absorbs the
-                    # blocking read, and the trigger cooldown makes these
-                    # reads rare by construction.
                     _slow_tail_n = min(int(_slow_pkt_s * a.rate), 12 * win_n,
                                        (_ring_n_total // 2) if is_live
                                        else 12 * win_n)
-                    _slow_tail = None
-                    if _slow_tail_n > 0:
-                        if is_live:
-                            _td, _tsk = reader.read(_slow_tail_n)
-                            if _td is not None:
-                                _slow_tail = _td
-                                tot_s += len(_td)
-                                _carry_tail = _td
-                            if _tsk:
-                                tot_skip += _tsk
-                        else:
+                    if is_live:
+                        recorder.update_deferred(dets_slow, _iq_long,
+                                                 _reg_tot_s, pre_hop=None,
+                                                 need_tail_n=_slow_tail_n)
+                    else:
+                        _slow_tail = None
+                        if _slow_tail_n > 0:
                             _td = reader.read(_slow_tail_n)
                             if _td is not None:
                                 _slow_tail = _td
                                 tot_s += len(_td)
                                 _carry_tail = _td
-                    recorder.update(dets_slow, _iq_long, tot_s,
-                                    tail=_slow_tail, pre_hop=None)
+                        if os.environ.get('LORA_SLOW_DEBUG'):
+                            print(f"[SLOW-HANDOFF] tot_s={tot_s} "
+                                  f"iqlong={len(_iq_long)} "
+                                  f"tail={len(_slow_tail) if _slow_tail is not None else 0} "
+                                  f"pre_t={[round(d.get('preamble_t_s',0),2) for d in dets_slow]}",
+                                  file=sys.stderr, flush=True)
+                        recorder.update(dets_slow, _iq_long, tot_s,
+                                        tail=_slow_tail, pre_hop=None)
         _t_step = time.time()
 
         # ---- Skip-ahead ONLY if the ring buffer is near wrap ----
@@ -5868,6 +6010,12 @@ def main():
                   file=sys.stderr)
         recorder.flush()
 
+    if recorder:
+        try:
+            recorder.flush_pending()   # deferred tails: finalize before the
+                                       # decoder drain so stragglers decode
+        except Exception:
+            pass
     if decoder:
         # Capture has ended (EOF) — move the deferred straggler queue into the
         # fast queue so the workers re-decode them now (big budget), without
