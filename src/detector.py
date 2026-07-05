@@ -1406,7 +1406,15 @@ _SC_LAGS_1M = {
     # detections per MEDIUM_FAST run (493 -> 878), bloating decode time. If a
     # genuine SF11/500 source is ever needed, re-add it AND tighten the dechirp
     # resolver so SF9 2-symbol content can't pass as SF11/500.
-    4096:  [(7, 31250),  (8, 62500),  (9, 125000), (10, 250000)],
+    # SF11/500 RE-ADDED 2026-07-05: ground-truthed on the CURRENT MeshCore
+    # radio (RAK4631) — it emits GENUINE SF11/500k (dechirp 30.2 dB at
+    # (11,500k) vs 4-9 dB at every alternative). The old 'transmits as
+    # ~250 kHz on-air' measurement was the earlier hardware; the historical
+    # mis-resolution fear (SF9/250 2-symbol harmonics) is addressed by the
+    # matched-primary grouped resolver + peak-width decider, as with
+    # SF12/500k. Soak evidence: 0/10 catch while omitted.
+    4096:  [(7, 31250),  (8, 62500),  (9, 125000), (10, 250000),
+            (11, 500000)],
     # SF12/500 omitted here for the same architectural reason as SF11/500: it
     # would share lag 8192 with SF10/125 + SF11/250, and the resolver may
     # mis-vote on 2-symbol harmonics of those fundamentals.  Re-add only after
@@ -1423,7 +1431,10 @@ _SC_LAGS_1M = {
     8192:  [(8, 31250),  (9, 62500),  (10, 125000), (11, 250000), (12, 500000)],
     # SF12/250 omitted on the same harmonic-confusion grounds (would share
     # lag 16384 with SF11/125).
-    16384: [(9, 31250),  (10, 62500), (11, 125000)],
+    # SF12/250 RE-ADDED 2026-07-05: ground-truthed genuine (34.4 dB at
+    # (12,250k) vs <=9.5 at alternatives); no same-slope partner in this
+    # family. Soak evidence: 0/5 catch while omitted.
+    16384: [(9, 31250),  (10, 62500), (11, 125000), (12, 250000)],
     32768: [(10, 31250), (11, 62500), (12, 125000)],
     65536: [(11, 31250), (12, 62500)],
     # 31.25 kHz family ADDED 2026-07-04: was entirely absent (the rig's own
@@ -2886,6 +2897,22 @@ class SignalRecorder:
         truncation behavior at worst)."""
         if not detections:
             return []
+        # ONE PENDING JOB PER PHYSICAL FRAME: overlapping windows re-detect
+        # the same long frame every hop, and each registration held a full
+        # wideband base (up to 640 MB for slow-pass assemblies) — the
+        # 3-job cap then EVICTED older jobs with truncated tails before
+        # their 14-19 s fill completed. Soak fingerprint: 131 slow-pass
+        # detections, ZERO long-frame decodes. A same-carrier same-sf
+        # registration while a matching job is still filling is the same
+        # frame — skip it (the save-side keep-2 dedup still sees the
+        # finalized captures).
+        for _j in self._pending:
+            for _jd in _j['dets']:
+                for _d in detections:
+                    if (_d['sf'] == _jd['sf'] and _d['bw'] == _jd['bw']
+                            and abs(_d['freq_hz'] - _jd['freq_hz'])
+                            < max(_d['bw'], 60e3)):
+                        return []
         parts = []
         if pre_hop is not None and len(pre_hop) > 0:
             parts.append(pre_hop)
@@ -5698,7 +5725,7 @@ def main():
         # processed (cached_peaks seeds — no long-buffer PSD). Idle cost
         # ~zero; ambient junk flickers and never accumulates the streak.
         _slow_halves.append(buf[-hop_n:].copy())
-        if recorder and is_live:
+        if recorder:
             recorder.feed_tail(buf[-hop_n:])
         _slow_tick += 1
         _det_bins = set()
@@ -5858,29 +5885,24 @@ def main():
                 if recorder:
                     _slow_pkt_s = max(
                         (148.25 * (2 ** d['sf']) / d['bw']) for d in dets_slow)
-                    _slow_tail_n = min(int(_slow_pkt_s * a.rate), 12 * win_n,
-                                       (_ring_n_total // 2) if is_live
-                                       else 12 * win_n)
-                    if is_live:
-                        recorder.update_deferred(dets_slow, _iq_long,
-                                                 _reg_tot_s, pre_hop=None,
-                                                 need_tail_n=_slow_tail_n)
-                    else:
-                        _slow_tail = None
-                        if _slow_tail_n > 0:
-                            _td = reader.read(_slow_tail_n)
-                            if _td is not None:
-                                _slow_tail = _td
-                                tot_s += len(_td)
-                                _carry_tail = _td
-                        if os.environ.get('LORA_SLOW_DEBUG'):
-                            print(f"[SLOW-HANDOFF] tot_s={tot_s} "
-                                  f"iqlong={len(_iq_long)} "
-                                  f"tail={len(_slow_tail) if _slow_tail is not None else 0} "
-                                  f"pre_t={[round(d.get('preamble_t_s',0),2) for d in dets_slow]}",
-                                  file=sys.stderr, flush=True)
-                        recorder.update(dets_slow, _iq_long, tot_s,
-                                        tail=_slow_tail, pre_hop=None)
+                    # 24-window cap, not 12: SF12/31.25k frames run up to
+                    # ~19.4 s and the 12 s cap GUARANTEED truncation (the
+                    # soak's zero-decode wall for every >=9 s-airtime
+                    # preset). Deferred tails accumulate from loop hops —
+                    # NOT ring reads — so the old ring/2 bound does not
+                    # apply to the live path.
+                    _slow_tail_n = min(int(_slow_pkt_s * a.rate),
+                                       24 * win_n)
+                    # DEFERRED IN BOTH MODES: the file-mode blocking read
+                    # CONSUMED stream the loop would otherwise process —
+                    # every long-frame tail literally ate the next
+                    # beacon's windows (12-window tails halved straddler
+                    # detections; 24 made it worse). feed_tail() runs
+                    # unconditionally below, so pending jobs complete
+                    # from the hops in either mode.
+                    recorder.update_deferred(dets_slow, _iq_long,
+                                             _reg_tot_s, pre_hop=None,
+                                             need_tail_n=_slow_tail_n)
         _t_step = time.time()
 
         # ---- Skip-ahead ONLY if the ring buffer is near wrap ----
