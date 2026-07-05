@@ -2884,7 +2884,7 @@ class SignalRecorder:
         self._decoder = decoder
 
     def update_deferred(self, detections, wideband_buf, sample_pos=0,
-                        pre_hop=None, need_tail_n=0):
+                        pre_hop=None, need_tail_n=0, owned_buf=False):
         """Register a save whose TAIL arrives later: instead of BLOCKING
         the main loop for an airtime-sized ring read (2.4 s per SF11/125k
         detection — measured as the dominant live-loop stall: CATCHUP
@@ -2913,15 +2913,18 @@ class SignalRecorder:
                             and abs(_d['freq_hz'] - _jd['freq_hz'])
                             < max(_d['bw'], 60e3)):
                         return []
+        # copy ONLY what will be overwritten: the sliding window buf.
+        # pre_hop and slow assemblies are already owned arrays — hold refs.
+        _own = (wideband_buf if owned_buf
+                else np.array(wideband_buf, copy=True))
         parts = []
         if pre_hop is not None and len(pre_hop) > 0:
             parts.append(pre_hop)
-        parts.append(wideband_buf)
-        base = np.concatenate(parts)      # owned copy; buf recyclable
+        parts.append(_own)
         pre_hop_n = len(pre_hop) if pre_hop is not None else 0
-        job = {'base': base, 'dets': list(detections),
+        job = {'base_parts': parts, 'dets': list(detections),
                'pre_hop_n': pre_hop_n, 'wb_n': len(wideband_buf),
-               'sample_pos': sample_pos, 'tail': [],
+               'sample_pos': sample_pos, 'tail': [], 'got': 0,
                'need': int(need_tail_n)}
         self._pending.append(job)
         if len(self._pending) > 3:
@@ -2930,16 +2933,19 @@ class SignalRecorder:
 
     def feed_tail(self, hop):
         """Give every pending deferred job the freshly-arrived hop; jobs
-        finalize once their tail requirement is met."""
+        finalize once their tail requirement is met. ZERO-COPY: the hop
+        is an owned array (the caller's per-hop copy) — jobs hold
+        REFERENCES; trimming and concatenation happen in the save
+        worker. (Per-job copies here cost 46 ms median / 1.48 s max on
+        the loop during long-frame phases — the top stall driver.)"""
         if not self._pending:
             return
         done = []
         for job in self._pending:
-            got = sum(len(t) for t in job['tail'])
-            if got < job['need']:
-                job['tail'].append(hop[:job['need'] - got].copy()
-                                   if len(hop) > job['need'] - got else hop.copy())
-            if sum(len(t) for t in job['tail']) >= job['need']:
+            if job['got'] < job['need']:
+                job['tail'].append(hop)
+                job['got'] += len(hop)
+            if job['got'] >= job['need']:
                 done.append(job)
         for job in done:
             self._pending.remove(job)
@@ -2951,10 +2957,11 @@ class SignalRecorder:
         self._pending = []
 
     def _finalize(self, job):
-        parts = [job['base']] + job['tail']
-        extended_full = np.concatenate(parts) if len(parts) > 1 else job['base']
+        # heavy concat happens in the SAVE WORKER (the queue item carries
+        # the parts list); trim the tail to 'need' there too
         dt_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        self._save_queue.put((extended_full, job['dets'], dt_str,
+        self._save_queue.put((('PARTS', job['base_parts'], job['tail'],
+                               job['need']), job['dets'], dt_str,
                               job['pre_hop_n'], job['wb_n'],
                               job['sample_pos']))
 
@@ -2987,6 +2994,18 @@ class SignalRecorder:
                 break
             try:
                 extended_full, detections, dt_str, pre_hop_n, wb_n, sample_pos = item
+                if (isinstance(extended_full, tuple)
+                        and extended_full[0] == 'PARTS'):
+                    _, _bparts, _tparts, _tneed = extended_full
+                    _tp, _tn = [], 0
+                    for _t in _tparts:
+                        if _tn >= _tneed:
+                            break
+                        _tp.append(_t[:_tneed - _tn]
+                                   if _tn + len(_t) > _tneed else _t)
+                        _tn += len(_tp[-1])
+                    extended_full = np.concatenate(_bparts + _tp) \
+                        if (_bparts or _tp) else np.empty(0, np.complex64)
                 pre_hop_s = pre_hop_n / self.wb_fs
 
                 # === Architectural shift ===
@@ -5168,7 +5187,7 @@ def main():
     try:
       _prof = {'read': 0.0, 'slide': 0.0, 'welch': 0.0, 'notch': 0.0,
                'sat': 0.0, 'detect': 0.0, 'tail': 0.0, 'recorder': 0.0,
-               'catchup': 0.0, 'n': 0}
+               'slow': 0.0, 'feed': 0.0, 'catchup': 0.0, 'n': 0}
       _t_iter_start = time.time()
       # Waterfall: opt-in via LORA_PSD_FILE (web sets a tmpfs path).  Throttled,
       # reuses _psd_gate below → no extra FFT.  A sibling '<file>.off' marker (set
@@ -5724,9 +5743,19 @@ def main():
         # from the last 6 hops), and only the triggering peaks are
         # processed (cached_peaks seeds — no long-buffer PSD). Idle cost
         # ~zero; ambient junk flickers and never accumulates the streak.
-        _slow_halves.append(buf[-hop_n:].copy())
+        _hop_own = buf[-hop_n:].copy()   # ONE owned copy per hop, shared
+                                         # by the slow assembly AND every
+                                         # pending tail (feed_tail holds
+                                         # REFS — a view of the sliding
+                                         # buf would mutate under them,
+                                         # which zeroed straddler decodes
+                                         # on the first zero-copy attempt)
+        _slow_halves.append(_hop_own)
         if recorder:
-            recorder.feed_tail(buf[-hop_n:])
+            _t_feed0 = time.time()
+            recorder.feed_tail(_hop_own)
+            _prof['feed'] += time.time() - _t_feed0
+        _t_slowblk0 = time.time()
         _slow_tick += 1
         _det_bins = set()
         for d in dets:
@@ -5809,13 +5838,15 @@ def main():
             print(f"[SLOW] tick={_slow_tick} halves={len(_slow_halves)} "
                   f"seeds={_slow_seeds} trig={_trig}", file=sys.stderr)
         if _trig and len(_slow_halves) == 8 and not _slow_busy[0]:
-            _iq_long_bg = np.concatenate(_slow_halves)
+            # parts refs only — the 640 MB concat happens IN THE THREAD
+            # (it was 92 ms median on the loop, second stall driver)
+            _halves_bg = list(_slow_halves)
             _trig_bg = list(_trig)
             _seedpk_bg = [(float(_b), 13, 20.0, None) for _b in _trig_bg]
             _regpos_bg = tot_s
             _slow_busy[0] = True
 
-            def _slow_scan_bg(_iql=_iq_long_bg, _spk=_seedpk_bg,
+            def _slow_scan_bg(_hv=_halves_bg, _spk=_seedpk_bg,
                               _tg=_trig_bg, _rp=_regpos_bg):
                 # BACKGROUND slow scan (0.5-0.6 s of FFT work): ran on the
                 # main loop before and, stacked with p90 read+dispatch,
@@ -5823,6 +5854,7 @@ def main():
                 # wraps. numpy FFTs release the GIL; drop-if-busy bounds
                 # cost to one scan in flight.
                 _t0 = time.time()
+                _iql = np.concatenate(_hv)   # off-loop
                 try:
                     _ds = detect_preamble(
                         _iql, a.rate, a.bandwidth, _live_center_mhz,
@@ -5902,7 +5934,9 @@ def main():
                     # from the hops in either mode.
                     recorder.update_deferred(dets_slow, _iq_long,
                                              _reg_tot_s, pre_hop=None,
-                                             need_tail_n=_slow_tail_n)
+                                             need_tail_n=_slow_tail_n,
+                                             owned_buf=True)
+        _prof['slow'] += time.time() - _t_slowblk0
         _t_step = time.time()
 
         # ---- Skip-ahead ONLY if the ring buffer is near wrap ----
@@ -6009,7 +6043,9 @@ def main():
                       f"sat={_prof['sat']/n*1000:.0f} "
                       f"detect={_prof['detect']/n*1000:.0f} "
                       f"tail={_prof['tail']/n*1000:.0f} "
-                      f"recorder={_prof['recorder']/n*1000:.0f}",
+                      f"recorder={_prof['recorder']/n*1000:.0f} "
+                      f"slow={_prof['slow']/n*1000:.0f} "
+                      f"feed={_prof['feed']/n*1000:.0f}",
                       file=sys.stderr)
                 for k in _prof: _prof[k] = 0
                 _prof['n'] = 0
