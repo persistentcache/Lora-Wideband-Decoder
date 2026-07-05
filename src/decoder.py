@@ -6046,6 +6046,17 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             best_run2, cur2 = [], []
             for i, b, p in strong2:
                 if not cur2:
+                    # LOCALITY (2026-07-05): refinement refines, it does
+                    # not RELOCATE. The rescan window is anchored at the
+                    # discovered run's own position, so a genuine chain
+                    # starts within a few symbols of it — chains that
+                    # start deep in the 30-sym window are DIFFERENT
+                    # structures (payload-region locks; the 10/10-FAIL
+                    # continuous-mode bench showed every candidate,
+                    # including the true front runs', converging onto
+                    # the same late chain through this loop).
+                    if i > 4:
+                        continue
                     cur2 = [(i, b, p)]
                 elif (circ_dist(b, (cur2[-1][1] if (bw <= 41667 and cur2)
                                     else effective_bin), N)
@@ -6153,13 +6164,25 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             # candidate when CRC fails on the chosen one).
             sfd_cfo_penalty = 0.0
 
+            # LATE-START PENALTY (2026-07-05): recorder-anchored captures
+            # place the true preamble at the FRONT (pre-roll <= ~16 sym).
+            # In continuous long-frame captures the finder produced
+            # 16-17-sym mid-capture chains (payload-region locks) whose
+            # LENGTH term (+12/sym) crushed the true front candidates
+            # (clipped to 4-12 syms by the pre-roll) — 10/10 bench
+            # captures showed a consistent front candidate (start 0-1,
+            # same CFO bin across all) losing to scattered-bin late
+            # chains. Beyond a 24-sym grace window, lateness now costs
+            # what length pays.
+            _late_sym = max(0.0, preamble_start_cand / N - 24.0)
             cand_score = (12.0 * min(pre_len_cand, 18) +
                           2.0 * run_mean_pmr +
                           18.0 * sfd_ok_cand +
                           sfd_metric +
                           sfd_cfo_penalty -
                           2.5 * max(0, 8 - pre_len_cand) -
-                          0.5 * preamble_start_cand / N)  # prefer earlier preambles (msg before ACK)
+                          0.5 * preamble_start_cand / N -
+                          12.0 * _late_sym)
             cand_infos.append((cand_score, pre_len_cand, run_mean_pmr, sfd_ok_cand,
                                sfd_metric, preamble_start_cand, preamble_bin_cand,
                                pre_last_i_cand, run))
@@ -6528,6 +6551,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             _hdr_mag_sq = uf ** 2
             pmr = 10*np.log10(float(np.max(uf)) / (float(np.mean(uf)) + 1e-30) + 1e-15)
             pmrs.append(float(pmr))
+
             hdr_llrs.append(soft_fft_demod(seg, downchirp, N, N // 4, ppm, 4,
                                             cfo_shift=cfo_shift,
                                             _precomp_mag_sq=_hdr_mag_sq))
