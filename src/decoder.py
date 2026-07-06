@@ -4946,8 +4946,11 @@ def process_file(fpath, relay_after=None, relay_before=None,
         _d = {}
         result = _decode_attempt(iq1_work.copy(), sf, bw, N, ppm, fs, dec, name, Counter,
                                  skip_bins=skip_bins, diag_out=_d)
-        if (attempt == 0 and result is not None and result[0] == 'FAIL'
-                and _d.get('header_decoded')):
+        if (attempt == 0 and result is not None and result[0] == 'FAIL'):
+            # broadened 2026-07-05: ANY failed first attempt with a found
+            # preamble enters the grid-hypothesis machinery (the old
+            # header_decoded gate missed most continuous-mode failures —
+            # their phantom-grid headers often don't even parse)
             # HALF-SYMBOL GRID PHANTOM: preamble symbols are identical, so
             # a candidate aligned EXACTLY half a symbol off dechirps to a
             # clean full-power tone at a bin displaced N/2, passes SFD and
@@ -4964,9 +4967,32 @@ def process_file(fpath, relay_after=None, relay_before=None,
             _r2 = _decode_attempt(iq1_work.copy(), sf, bw, N, ppm, fs, dec,
                                   name, Counter,
                                   skip_bins=list(skip_bins) + [result[3]],
+                                  grid_sweep=True,
                                   diag_out=_d2)
-            if _r2 is not None and _r2[0] == 'OK':
+            # ACCEPT only a CRC-VERIFIED retry (wrong fractional grids
+            # 'decode' CRC-less garbage that parses: PL=10/64/180
+            # headers all passed HDR_CHK on real captures)
+            if (_r2 is not None and _r2[0] == 'OK'
+                    and (_d2.get('crc_ok', False)
+                         or _d2.get('verified', False))):
                 result, _d = _r2, _d2
+            else:
+                # run the remaining ranked fractional-grid hypotheses
+                # THROUGH FULL PAYLOAD DECODE — payload CRC is the only
+                # arbiter the phantom class cannot fool
+                for _td in (_d2.get('grid_tds') or [])[1:6]:
+                    print("\n  --- Grid hypothesis td=%+d ---" % _td)
+                    _d3 = {}
+                    _r3 = _decode_attempt(
+                        iq1_work.copy(), sf, bw, N, ppm, fs, dec,
+                        name, Counter,
+                        skip_bins=list(skip_bins) + [result[3]],
+                        force_td=_td, diag_out=_d3)
+                    if (_r3 is not None and _r3[0] == 'OK'
+                            and (_d3.get('crc_ok', False)
+                                 or _d3.get('verified', False))):
+                        result, _d = _r3, _d3
+                        break
         if result is None:
             _residual_clear = True   # no preamble left in the masked residual
             break  # no preamble found
@@ -5377,6 +5403,7 @@ def process_file(fpath, relay_after=None, relay_before=None,
 
 
 def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
+                    grid_sweep=False, force_td=None,
                     sweep_budget=2.0, diag_out=None):
     if skip_bins is None:
         skip_bins = []
@@ -6594,6 +6621,19 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         _base_hdr_valid = bool(_bok and (4 <= _bpl <= 237) and (1 <= _bcr <= 4))
 
     valid_variants = []
+    if grid_sweep:
+        # MULTI-HYPOTHESIS GRID SWEEP (retry-only): identical preamble
+        # symbols are timing-degenerate, the SFD is too short to anchor
+        # precisely, and the few-bit header checksum validates garbage
+        # at multiple offsets — so decode the header across a full
+        # symbol of fractional offsets, RANK the plausible ones, and
+        # let process_file's hypothesis loop run each through FULL
+        # payload decode: payload CRC is the only arbiter that works.
+        _base_hdr_valid = False
+        header_offsets = list(range(-N // 2, N // 2, max(1, N // 128)))
+    if force_td is not None:
+        _base_hdr_valid = False
+        header_offsets = [force_td]
     if not _base_hdr_valid:
         for td in header_offsets:
             v = decode_header_variant(base_data_start + td)
@@ -6606,7 +6646,11 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             pmr_med2 = float(np.median(pmrs2)) if pmrs2 else 0.0
             plausible = (4 <= pl2 <= 237) and (1 <= cr2 <= 4)
             if ok2 and plausible:
-                score = 1000.0 + 4.0 * pmr_med2 - 0.10 * abs(td)
+                score = 1000.0 + 4.0 * pmr_med2 - (
+                    0.0 if (grid_sweep or force_td is not None)
+                    else 0.10 * abs(td))
+                if grid_sweep and crc2:
+                    score += 40.0    # true MC/MT frames carry CRC
                 valid_variants.append((score, td, v))
 
     # Be conservative with header realignment.
@@ -6632,11 +6676,16 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             vpl, vcr, vcrc, vok = vres
             pmr_med_v = float(np.median(vpmrs)) if vpmrs else 0.0
             # Prefer CRC-protected headers and nearby timing offsets.
-            adj = score - 0.40 * abs(td) - (20.0 if not vcrc else 0.0)
+            adj = score - (0.0 if (grid_sweep or force_td is not None)
+                           else 0.40 * abs(td)) \
+                - (20.0 if not vcrc else 0.0)
             ranked_valid.append((adj, abs(td), -pmr_med_v, td, v))
         if ranked_valid:
             ranked_valid.sort()
             _, _, _, chosen_td, chosen_variant = ranked_valid[-1]
+            if diag_out is not None and grid_sweep:
+                diag_out['grid_tds'] = [int(r[3])
+                                        for r in reversed(ranked_valid)]
 
     data_start = base_data_start + chosen_td
     n_data = (len(iq1) - data_start) // N
@@ -6678,6 +6727,38 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
     if chosen_td != 0 and hdr_ok:
         print(f"  HEADER ALIGN: timing={chosen_td:+d} samp pmr_med={float(np.median(hdr_pmrs)):.1f}dB")
+
+    # HEADER-DRIFT RE-ESTIMATION (grid hypotheses only, 2026-07-05): on a
+    # phantom-locked capture the preamble drift regression is measured on
+    # the WRONG grid and its error accumulates as a quadratic phase ramp —
+    # ~1.6 bins by the header (inside LDRO tolerance: header validates)
+    # but 2.5+ bins by payload byte 0 (dead on arrival; measured: true
+    # header PL=37 CR4/5 with payload garbage from byte 0). A VALIDATED
+    # header supplies 8 trustworthy fine-bin measurements at known symbol
+    # indices — regress the residual drift from them and re-rotate iq1
+    # from here on.
+    if (grid_sweep or force_td is not None) and hdr_ok and len(hdr_fines) >= 6:
+        _hx = np.arange(len(hdr_fines), dtype=np.float64)
+        _hy = np.array([((f + N / 2) % N) - N / 2 for f in hdr_fines],
+                       dtype=np.float64)
+        # header bins are data (arbitrary): drift lives in the FRACTIONAL
+        # parts' progression — wrap each fine to its nearest integer bin
+        _hy = np.array([((f + 0.5) % 1.0) - 0.5 for f in hdr_fines],
+                       dtype=np.float64)
+        _hy = np.unwrap(_hy * 2 * np.pi) / (2 * np.pi)
+        _nh = len(_hx)
+        _sx, _sy = _hx.sum(), _hy.sum()
+        _sxx, _sxy = (_hx * _hx).sum(), (_hx * _hy).sum()
+        _den = _nh * _sxx - _sx * _sx
+        if abs(_den) > 1e-9:
+            _resid_drift = (_nh * _sxy - _sx * _sy) / _den
+            if 0.005 < abs(_resid_drift) < 0.5:
+                _n_rd = np.arange(len(iq1), dtype=np.float64) - (
+                    base_data_start + chosen_td)
+                iq1 = (iq1 * np.exp(-1j * np.pi * _resid_drift
+                                    * (_n_rd / N) ** 2)).astype(np.complex64)
+                print("  HDR-DRIFT REFIT: %+.4f bins/sym (residual, "
+                      "re-rotated)" % _resid_drift)
 
     if not hdr_ok:
         pmr_med = float(np.median(hdr_pmrs)) if len(hdr_pmrs) else 0.0
@@ -6945,6 +7026,12 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     if crc_present and len(raw_bytes) >= payload_len + 2:
         crc_ok, crc_method = check_crc(raw_bytes, payload_len)
         _clean_crc = crc_ok
+        if diag_out is not None:
+            diag_out['crc_ok'] = bool(crc_ok)
+            try:
+                diag_out['pay_head'] = bytes(raw_bytes[:8]).hex()
+            except Exception:
+                pass
         print("  CRC: %s %s" % (crc_method, "OK" if crc_ok else ""))
 
     # TRY-BOTH DRIFT: if the drift-corrected payload failed CRC, re-decode it once
@@ -6963,6 +7050,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         if _ok2:
             raw_bytes, payload, pay_soft_info, decoded_nibs = _rb2, _pl2, _si2, _nb2
             crc_ok, crc_method, _clean_crc = True, _m2, True
+            if diag_out is not None:
+                diag_out['crc_ok'] = True
             print("  CRC: %s OK (drift correction removed by try-both)" % _m2)
         else:
             iq1 = _save_iq   # keep drift version for the chase
@@ -6986,6 +7075,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             if _lok:
                 raw_bytes, payload, pay_soft_info, decoded_nibs = _lr, _lp, _ls, _ln
                 crc_ok, crc_method, _clean_crc = True, _lm, True
+                if diag_out is not None:
+                    diag_out['crc_ok'] = True
                 print("  CRC: %s OK (LDRO fallback, ppm=%d)" % (_lm, ppm_pay))
             else:
                 ppm_pay, pay_levels, pay_bin_group = _sv
@@ -7097,6 +7188,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             _harness_emit('attempt_end', status='OK', via='early_dispatch',
                           payload_hex=''.join('%02x' % b for b in payload),
                           payload_len=int(len(payload)), crc_ok=bool(crc_ok))
+        if diag_out is not None and _LAST_EMIT_VERIFIED[0]:
+            diag_out['verified'] = True
         return ('OK', preamble_start, pkt_len_samples, preamble_bin)
 
     # ---- Plausibility gate on primary CRC OK ----
@@ -7395,6 +7488,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         _harness_emit('attempt_end', status='OK', via='full_path',
                       payload_hex=''.join('%02x' % b for b in payload),
                       payload_len=int(len(payload)), crc_ok=bool(crc_ok))
+    if diag_out is not None and _LAST_EMIT_VERIFIED[0]:
+        diag_out['verified'] = True
     return ('OK', preamble_start, pkt_len_samples, preamble_bin)
 
 # Module-level key config (set from command line)
