@@ -3742,6 +3742,17 @@ class BackgroundDecoder:
         # arrives a few seconds later instead of being dropped → 100% of
         # captured packets without slowing the realtime path.
         self._slow_queue = queue.Queue()
+        # CAPTURE-FIRST DECODE DEFERRAL (2026-07-06): under ring pressure
+        # the decode workers' memory-bandwidth load starves the reader
+        # (measured: 33 concurrent SF12 decodes -> 17.5 of 20 Msps
+        # sustained -> CATCHUP skips every ~47 s -> no contiguous frame
+        # windows). Captures are files already — decode is deferrable.
+        # The gate feeds ring occupancy each window; high pressure routes
+        # NEW jobs to the slow queue (drained by the existing idle-driven
+        # release + a pressure-clear release). Saturation becomes packet
+        # LATENCY instead of packet LOSS.
+        self._pressure = 0.0
+        self._defer_state = False
         self._slow_budget = float(os.environ.get('LORA_SLOW_BUDGET_S', '45'))
         # Slow mop-up runs ONLY when capture is not active.  A big-budget
         # re-decode running DURING live capture holds workers and starves the
@@ -3985,6 +3996,38 @@ while True:
                 return
             self._inflight_buckets.pop(bkey, None)
 
+    def set_pressure(self, frac):
+        self._pressure = float(frac)
+        _now = time.time()
+        if frac > 0.5 and not self._defer_state:
+            self._defer_state = True
+            self._defer_t = _now
+            print("         [DECODE-DEFER] ring pressure %.0f%% — new "
+                  "decodes deferred to idle" % (frac * 100), flush=True)
+        elif (frac < 0.20 and self._defer_state
+              and _now - getattr(self, '_defer_t', 0) > 20.0):
+            # min-dwell 20 s + deep-clear 20%: the first cut (50/30, no
+            # dwell) toggled 72 times in one leg — running decodes can't
+            # be recalled, so each release re-spiked pressure instantly
+            self._defer_state = False
+            print("         [DECODE-DEFER] pressure cleared — resuming",
+                  flush=True)
+
+    def maybe_release_pressure(self):
+        """Pressure-clear release: one deferred job at a time while the
+        ring is comfortable, without requiring full radio-idle."""
+        if self._defer_state or self._pressure > 0.20:
+            return
+        if self._slow_queue.qsize() == 0 or not self._queue.empty():
+            return
+        with self._lock:
+            if self._active_count >= 1:
+                return
+        try:
+            self._queue.put(self._slow_queue.get_nowait())
+        except queue.Empty:
+            pass
+
     def submit(self, fpath, fname, relay_after_syms=None, relay_before_syms=None,
                bucket_key=None):
         """Queue a capture file for background decoding.
@@ -4021,7 +4064,7 @@ while True:
         # The post-decode _packet_dedup collapses any duplicate RESULTS, so
         # submitting them all is safe (no FP / no double-count).
         self._ref_inc(fpath)
-        self._queue.put((fpath, fname, relay_after_syms, relay_before_syms, None))
+        (self._slow_queue if self._defer_state else self._queue).put((fpath, fname, relay_after_syms, relay_before_syms, None))
 
     def pending(self):
         with self._lock:
@@ -5640,6 +5683,12 @@ def main():
         # dropping samples; this call itself is just a few cheap checks.
         if decoder is not None:
             decoder.maybe_release_straggler()
+        if decoder and is_live and (wc & 3) == 0:
+            # every 4th window: available() takes the ring lock — per-
+            # window polling added measurable reader contention
+            _press = reader.available() / max(1, int(a.rate * a.buf_seconds))
+            decoder.set_pressure(_press)
+            decoder.maybe_release_pressure()
         _prof['notch'] += time.time() - _t_step
         _t_step = time.time()
 
