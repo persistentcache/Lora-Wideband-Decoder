@@ -4624,6 +4624,15 @@ def process_file(fpath, relay_after=None, relay_before=None,
     # fractional (MeshCore @ 62.5 kHz, sub-kHz LoRaWAN variants).  int() on a
     # decimal string raises, so MeshCore captures used to silently never decode.
     bw = int(round(float(parts[1].replace('k', '')) * 1000))
+    # EXACT-RATE correction (2026-07-06, closed-loop synthetic finding):
+    # '41.67k' in filenames is 125000/3 = 41666.667 Hz on air — parsing
+    # it as 41670 bakes in an 80 ppm symbol-RATE error that accumulates
+    # ~250 samples of grid slip across a 14 s SF12 frame (decode falls
+    # apart between 100 and 300 ppm; real crystal offsets add on top).
+    # The header decodes (early symbols), the payload dies — the exact
+    # real-capture signature. All other preset BWs are filename-exact.
+    if bw == 41670:
+        bw = 125000.0 / 3.0
     N = 1 << sf
     ppm = sf - 2  # reduced rate bits for header
 
