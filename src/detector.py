@@ -2984,10 +2984,19 @@ class SignalRecorder:
                         # redetect — continuous back-to-back phases
                         # (frame >= beacon interval) otherwise lose
                         # EVERY second frame to this dedup.
+                        # REDETECT window, not worst-case airtime: multi-
+                        # window redetects of ONE frame register within
+                        # ~2 s (hop cadence); genuine next-frames in
+                        # continuous phases arrive at the beacon interval.
+                        # The old 0.8x max-airtime bound (11.7 s at
+                        # 41.67k) swallowed every other REAL frame —
+                        # closed-loop synthetic pipeline measured 2/4
+                        # captures at 8.5 s spacing.
                         _air_n = int(148.25 * (2 ** _jd['sf'])
                                      / _jd['bw'] * self.wb_fs)
                         if (sample_pos - _j['sample_pos']
-                                > 0.8 * _air_n):
+                                > min(0.25 * _air_n,
+                                      int(3.0 * self.wb_fs))):
                             continue
                         return []
         # copy ONLY what will be overwritten: the sliding window buf.

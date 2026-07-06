@@ -6290,6 +6290,54 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
 
     # ---- CFO from preamble with linear regression for drift ----
+    # HALF-GRID SFD ARBITRATION (2026-07-06, closed-loop root fix): on
+    # real captures the onset ramp biases _refine_start_xcorr ~0.3 sym
+    # off, from where the scan's HALF-SYMBOL lattice is closer than the
+    # true one — every run then lives on the phantom lattice (minimal
+    # repro: capture rolled to bin 0 -> finder chooses bin 2047.98).
+    # The preamble cannot discriminate the two phases (identical
+    # symbols) but the SFD CAN: its neighbors differ (sync before,
+    # header after), so a half-shifted SFD window mixes up+down chirps
+    # and loses several dB of down-tone sharpness. Compare the two
+    # phases' SFD windows and adopt the sharper grid.
+    _sfd_anchor = preamble_start + (pre_last_i + 3) * N
+    if (bw <= 62500 and 0 <= _sfd_anchor - N
+            and _sfd_anchor + 3 * N + N // 2 <= len(iq1)):
+        # slow bandwidths only: the onset-bias/half-lattice class lives
+        # there; at 250-500k the refine is healthy and the descent's
+        # SFD metric on short symbols adds variance (cost one decode
+        # each at two 500k corpus entries when global)
+        def _sfdq(_g):
+            _q = 0.0
+            for _si in range(2):
+                _p0 = _sfd_anchor + _g + _si * N
+                _df = np.abs(_fft(iq1[_p0:_p0 + N] * upchirp))
+                _q += float(np.max(_df)) / (float(np.mean(_df)) + 1e-30)
+            return _q
+        # BINARY DESCENT on SFD sharpness: one ±N/2 arbitration halved
+        # the measured grid error (0.32 -> 0.18 sym: header nibs came
+        # out ONE BIT off); descending N/2, N/4, ... N/32 converges the
+        # phase to ~3% of a symbol — enough for clean header LLRs, which
+        # unlocks the pilot bootstrap (hdr_ok) and the whole chain.
+        _tot, _qcur = 0, _sfdq(0)
+        _q_start = _qcur
+        for _step in (N // 2, N // 4, N // 8, N // 16, N // 32):
+            _qp = _sfdq(_tot + _step)
+            _qm = _sfdq(_tot - _step)
+            if _qp > _qcur and _qp >= _qm:
+                _tot += _step; _qcur = _qp
+            elif _qm > _qcur:
+                _tot -= _step; _qcur = _qm
+        if _tot != 0 and _qcur > _q_start * 1.10:
+            preamble_start += _tot
+            # delaying the window by tau samples moves the dechirped
+            # tone UP by tau bins (mod N): update is +, not - (the -
+            # sign caused NO CFO -> recenter thrash)
+            preamble_bin = int(round(preamble_bin + _tot)) % N
+            print("  SFD GRID DESCENT: shift %+d samp "
+                  "(sfd q %.0f -> %.0f) — grid re-phased"
+                  % (_tot, _q_start, _qcur))
+
     cfo_vals, cfo_indices = [], []
     for i in range(min(20, (len(iq1) - preamble_start) // N)):
         seg = iq1[preamble_start + i*N:preamble_start + (i+1)*N]
@@ -6299,7 +6347,11 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         if d > N/2: d -= N
         if d < -N/2: d += N
         if abs(d) < 2.0:
-            cfo_vals.append(fb)
+            # store the WRAPPED offset, not the raw bin: raw fines that
+            # straddle the 0/N wrap average to garbage (measured
+            # 'fine: 4778, drift -341' on a wrap-adjacent preamble —
+            # recorder-centered captures live near bin 0 by design)
+            cfo_vals.append(preamble_bin + d)
             cfo_indices.append(i)
 
     if not cfo_vals:
