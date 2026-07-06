@@ -22,7 +22,7 @@ Usage:
 """
 
 import sys, os, time, json, argparse, numpy as np
-import threading, queue, io, subprocess, fcntl, collections
+import threading, queue, io, subprocess, fcntl, collections, itertools
 
 # Make the GIL hand off 5× more often.  Default 5ms means a Python-only
 # thread (MainThread doing numpy bookkeeping, _save_worker thread building
@@ -2840,6 +2840,137 @@ def estimate_and_correct_cfo(nb, nb_fs, sf, bw, debug=0):
     return nb, 0.0
 
 
+class _StreamDecimator:
+    """Streaming mix-to-DC + polyphase FIR decimator (integer factor D).
+
+    Purpose: NARROWBAND PENDING (2026-07-06).  Deferred capture jobs used
+    to hold WIDEBAND hop references (80 MB per 0.5 s hop at 20 Msps; a
+    24-window slow tail retained ~1.9 GB) and every finalize — including
+    each break_pending flush at a ring skip — dragged a multi-GB
+    assembly through concat + forward FFT in the save worker.  That
+    memory-bandwidth storm starved the SDR reader (14.8-17.5 of
+    20 Msps), causing the next skip: a feedback loop.  Cropping each
+    part to ±export_bw around the detection carrier AS IT ARRIVES makes
+    pending tails KB-scale and finalize trivial.
+
+    Chunk-fed but mathematically identical to filtering the whole
+    stream at once (FIR locality — no per-chunk spectral edge effects,
+    unlike chunked FFT crops, which would plant a seam artifact every
+    hop; the capture-splice arc proved how sensitive slow-SF decode is
+    to seam defects).  Definition, with X = input mixed to DC and taken
+    as zero outside the stream:
+
+        y[m] = sum_k h[k] * X[m*D + H - k],   k in [0, L)
+
+    h = firwin(20*D+1, 1/D, kaiser beta 5.0) — the same kernel family
+    scipy.signal.resample_poly uses; H = (L-1)/2 = 10*D exactly, so the
+    output grid sits on absolute input multiples of D (group delay
+    exactly compensated) and stays aligned across arbitrary chunk
+    boundaries.  Output rate = wb_fs / D — exactly 2*bw for every
+    standard preset at 20 Msps, matching the decoder's fs = bw*dec
+    reconstruction with zero rate error.
+    """
+
+    _MIX_BS = 8192   # mixer block size (see _mix)
+
+    def __init__(self, f_off_hz, wb_fs, D):
+        from scipy.signal import firwin
+        self.D = int(D)
+        self.fs = float(wb_fs)
+        self.f = float(f_off_hz)
+        self.h = firwin(20 * self.D + 1, 1.0 / self.D,
+                        window=('kaiser', 5.0)).astype(np.float32)
+        self.L = len(self.h)
+        self.H = (self.L - 1) // 2          # = 10*D, divisible by D
+        # Polyphase-as-GEMM decomposition (the naive per-output dot and
+        # scipy's upfirdn both ran ~0.5 s per 10 M-sample hop — too slow
+        # for the cropper to keep up with the hop cadence).  With h
+        # zero-padded to K*D taps and hp2[j, p] = h_pad[(j+1)*D - 1 - p],
+        #     y[m] = sum_j ( seg[c_m - (j+1)D + 1 : c_m - jD + 1] . hp2[j] )
+        # and the inner windows for consecutive m are consecutive D-sample
+        # rows of seg — so ONE contiguous reshape view of seg matmul'd
+        # against hp2.T computes every (m, j) partial in a single BLAS
+        # call, and y falls out as K diagonal slice-sums.  Exactly the
+        # same arithmetic, ~10x faster.
+        self._K = (self.L + self.D - 1) // self.D    # = 21
+        _hpad = np.zeros(self._K * self.D, np.float32)
+        _hpad[:self.L] = self.h
+        self._hp2T = np.ascontiguousarray(
+            _hpad.reshape(self._K, self.D)[:, ::-1].T).astype(np.complex64)
+        # K*D leading zeros so every GEMM row index stays in range from
+        # the first output on (the pad is X's zero-extension, explicit).
+        self._hist = np.zeros(self._K * self.D, np.complex64)
+        self._n0 = 0        # abs index of next input sample
+        self._m_next = 0    # next output index to emit
+        # invariant: abs index of _hist[0] is a multiple of D (H and K*D
+        # are too), so the reshape rows land on the global output grid.
+
+    def _mix(self, x):
+        # Phase-exact heterodyne without a full-rate cos/sin pass: the
+        # rotation at abs sample n0+b*BS+i factors into (per-block phasor)
+        # x (within-block phasor).  Both factors' phases are computed mod
+        # 1 in float64 — the absolute index (up to ~1e11 after hours)
+        # never loses fractional phase and block errors cannot accumulate
+        # (each block phasor is computed from scratch, not chained).
+        n = len(x)
+        d = self.f / self.fs
+        BS = self._MIX_BS
+        nb = (n + BS - 1) // BS
+        _bph = (np.arange(nb, dtype=np.float64) * (BS * d)
+                + self._n0 * d) % 1.0
+        Rb = np.exp((-2j * np.pi) * _bph).astype(np.complex64)
+        base = np.exp((-2j * np.pi) *
+                      ((np.arange(BS, dtype=np.float64) * d) % 1.0)
+                      ).astype(np.complex64)
+        xm = np.empty(n, np.complex64)
+        full = (n // BS) * BS
+        if full:
+            _v = xm[:full].reshape(-1, BS)
+            np.multiply(x[:full].reshape(-1, BS), base, out=_v)
+            _v *= Rb[:n // BS, None]
+        if n - full:
+            xm[full:] = x[full:] * base[:n - full] * Rb[n // BS]
+        return xm
+
+    def feed(self, x):
+        """Feed the next contiguous chunk; returns 0+ output samples."""
+        if len(x) == 0:
+            return np.empty(0, np.complex64)
+        xm = self._mix(np.ascontiguousarray(x, dtype=np.complex64))
+        s = self._n0 - len(self._hist)      # abs index of seg[0]
+        self._n0 += len(x)
+        e = self._n0
+        seg = np.concatenate((self._hist, xm))
+        D, H, L, K = self.D, self.H, self.L, self._K
+        m_hi = (e - 1 - H) // D             # last fully-supported output
+        if m_hi < self._m_next:
+            self._hist = seg
+            return np.empty(0, np.complex64)
+        n_y = m_hi - self._m_next + 1
+        c_min = self._m_next * D + H - s    # seg index of y's first center
+        n_rows = n_y - 1 + K
+        W = seg[1 + (c_min // D - K) * D:
+                1 + (c_min // D - K + n_rows) * D].reshape(n_rows, D)
+        G = W @ self._hp2T                  # (n_rows, K) partial sums
+        y = np.zeros(n_y, np.complex64)
+        for j in range(K):
+            y += G[K - 1 - j: K - 1 - j + n_y, j]
+        self._m_next = m_hi + 1
+        # keep L-1 (+ one extra D so the next GEMM's earliest row exists)
+        keep_abs = self._m_next * D + H - (L - 1) - D
+        keep_abs = min(keep_abs, e)
+        keep_abs -= keep_abs % D            # preserve D | s
+        keep_abs = max(keep_abs, s)
+        self._hist = seg[keep_abs - s:]
+        return y
+
+    def finish(self):
+        """Flush: emit every output whose center lies inside the stream."""
+        if self._n0 == 0:
+            return np.empty(0, np.complex64)
+        return self.feed(np.zeros(self.H, np.complex64))
+
+
 class SignalRecorder:
     """One file per detection, saved in a background thread.
 
@@ -2885,6 +3016,28 @@ class SignalRecorder:
         # detector (no data lost); for live it caps memory at maxsize×window.
         self._save_queue = queue.Queue(maxsize=8)
         self._pending = []   # deferred-tail jobs (live path)
+        # NARROWBAND PENDING (2026-07-06): deferred jobs crop every part
+        # to ±export_bw around each detection carrier in this background
+        # thread instead of retaining wideband hop refs until finalize.
+        # See _StreamDecimator's docstring for the bandwidth-storm
+        # mechanism this kills.  LORA_NB_PENDING=0 restores the legacy
+        # wideband PARTS path (also the automatic fallback if scipy is
+        # unavailable).  Queue items hold hop REFS only until cropped
+        # (~0.1-0.2 s), bounded so a drowning cropper can never retain
+        # unbounded wideband memory.
+        self._nb_mode = False
+        self._crop_queue = None
+        if os.environ.get('LORA_NB_PENDING', '1') != '0':
+            try:
+                from scipy.signal import firwin, upfirdn  # noqa: F401
+                self._crop_queue = queue.Queue(maxsize=48)
+                t = threading.Thread(target=self._crop_worker,
+                                     daemon=True, name='recorder-crop')
+                t.start()
+                self._crop_thread = t
+                self._nb_mode = True
+            except Exception:
+                self._nb_mode = False
         # Parallel save-worker pool.  Each gate-batch needs a 28-M-sample
         # forward FFT (~1 s wall-clock) plus find_all_preambles + per-
         # preamble extracts.  With a single worker thread, bursty gate
@@ -2945,6 +3098,16 @@ class SignalRecorder:
         # same RF time (images are simultaneous with their source).
         self._img_carriers: list = []
         self._img_lock = threading.Lock()
+        # Per-save filename uniquifier.  Different jobs finalized in the
+        # same tight loop (flush_pending at EOF / break_pending) get the
+        # same millisecond dt_str; same-carrier packets then collide on
+        # one filename and two parallel save workers write the same path
+        # CONCURRENTLY — one tofile truncates while the other is mid-
+        # write, corrupting the capture (observed: 5.5 s of real samples
+        # + a 15 s zero hole where frame 11 should be).  The legacy
+        # GB-scale extraction serialized saves by accident; the
+        # narrowband path made them fast enough to actually race.
+        self._fname_seq = itertools.count()
 
     def set_decoder(self, decoder):
         self._decoder = decoder
@@ -3012,6 +3175,19 @@ class SignalRecorder:
                'pre_hop_n': pre_hop_n, 'wb_n': len(wideband_buf),
                'sample_pos': sample_pos, 'tail': [], 'got': 0,
                'need': int(need_tail_n)}
+        if self._nb_mode:
+            _nb = self._nb_setup(job['dets'])
+            if _nb is not None:
+                try:
+                    job['nb'] = _nb
+                    # the cropper owns the base parts from here; the job
+                    # itself retains NO wideband references
+                    self._crop_queue.put_nowait(('BASE', job, parts))
+                    job['base_parts'] = []
+                except queue.Full:
+                    # cropper drowning — degrade this job to the legacy
+                    # wideband path rather than block the loop
+                    del job['nb']
         self._pending.append(job)
         if len(self._pending) > 3:
             self._finalize(self._pending.pop(0))
@@ -3029,18 +3205,39 @@ class SignalRecorder:
         done = []
         for job in self._pending:
             if job['got'] < job['need']:
-                job['tail'].append(hop)
-                job['got'] += len(hop)
+                if 'nb' in job:
+                    # pre-slice the overshoot (legacy trims via _tneed in
+                    # the save worker; the cropper must never see samples
+                    # past 'need' or the stream lengths diverge)
+                    _room = job['need'] - job['got']
+                    _h = hop if len(hop) <= _room else hop[:_room]
+                    try:
+                        self._crop_queue.put_nowait(('HOP', job, _h))
+                        job['got'] += len(_h)
+                    except queue.Full:
+                        # dropping a mid-stream hop would SPLICE the
+                        # capture (the exact defect the break_pending arc
+                        # fixed) — finalize now with the contiguous data
+                        # already cropped instead
+                        print("         [NB-CROP] queue full — early "
+                              "finalize of a pending job", flush=True)
+                        job['got'] = job['need']
+                else:
+                    job['tail'].append(hop)
+                    job['got'] += len(hop)
             if job['got'] >= job['need']:
                 done.append(job)
         for job in done:
             self._pending.remove(job)
             self._finalize(job)
 
-    def flush_pending(self):
+    def flush_pending(self, wait=False):
         for job in self._pending:
             self._finalize(job)
         self._pending = []
+        if wait and self._crop_queue is not None:
+            # shutdown path only — the live loop must never block here
+            self._crop_queue.join()
 
     def break_pending(self, reason=''):
         """Stream DISCONTINUITY (ring CATCHUP skip, sample drops): the
@@ -3058,13 +3255,96 @@ class SignalRecorder:
         self.flush_pending()
 
     def _finalize(self, job):
+        dt_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        if 'nb' in job:
+            # narrowband path: the cropper finishes the decimators and
+            # forwards a KB-scale NB item to the save queue.  FIFO on the
+            # crop queue guarantees every earlier BASE/HOP of this job is
+            # cropped first.  Blocking put (rare — FINAL items are one per
+            # capture): losing a FINAL would silently drop the capture.
+            self._crop_queue.put(('FINAL', job, dt_str))
+            return
         # heavy concat happens in the SAVE WORKER (the queue item carries
         # the parts list); trim the tail to 'need' there too
-        dt_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         self._save_queue.put((('PARTS', job['base_parts'], job['tail'],
                                job['need']), job['dets'], dt_str,
                               job['pre_hop_n'], job['wb_n'],
                               job['sample_pos']))
+
+    def _nb_setup(self, detections):
+        """Build per-detection streaming decimators for a deferred job.
+
+        D is anchored on the strongest detection's bw — the same rule the
+        save worker uses for export_bw — so every capture from this job
+        comes out at the rate the legacy full-array extraction would have
+        produced.  Returns None when decimation is degenerate (D < 2);
+        the caller then keeps the legacy wideband path.
+        """
+        anchor = max(detections, key=lambda x: x.get('peak_power_db', 0.0))
+        _exp_dec = int(os.environ.get('LORA_EXPORT_DEC', '2'))
+        export_bw = min(int(anchor['bw'] * _exp_dec / 2),
+                        int(self.wb_fs) // 2)
+        D = int(round(self.wb_fs / float(export_bw * 2)))
+        if D < 2:
+            return None
+        decs = {}
+        for _i, _d in enumerate(detections):
+            _d['_nb_ix'] = _i
+            decs[_i] = _StreamDecimator(_d['freq_hz'] - self.center_hz,
+                                        self.wb_fs, D)
+        return {'D': D, 'nb_fs': self.wb_fs / D, 'export_bw': export_bw,
+                'decs': decs, 'parts': {i: [] for i in decs}}
+
+    def _crop_worker(self):
+        """Background thread: crop deferred-job parts to narrowband as
+        they arrive, then hand finalized KB-scale streams to the save
+        queue.  Single thread == in-order processing per job (BASE, then
+        HOPs, then FINAL), which the decimator state requires."""
+        while True:
+            item = self._crop_queue.get()
+            if item is None:
+                self._crop_queue.task_done()
+                break
+            try:
+                kind, job = item[0], item[1]
+                nb = job.get('nb')
+                if nb is None:
+                    pass                      # job degraded to legacy
+                elif kind == 'BASE':
+                    for _p in item[2]:
+                        self._crop_feed(nb, _p)
+                elif kind == 'HOP':
+                    self._crop_feed(nb, item[2])
+                elif kind == 'FINAL':
+                    streams = {}
+                    for _ix, _dec in nb['decs'].items():
+                        _t = _dec.finish()
+                        if len(_t):
+                            nb['parts'][_ix].append(_t)
+                        _ps = nb['parts'][_ix]
+                        streams[_ix] = (np.concatenate(_ps) if _ps
+                                        else np.empty(0, np.complex64))
+                        nb['parts'][_ix] = []
+                    nb['decs'] = {}
+                    self._save_queue.put(
+                        (('NB', {'streams': streams,
+                                 'nb_fs': nb['nb_fs'],
+                                 'export_bw': nb['export_bw']}),
+                         job['dets'], item[2], job['pre_hop_n'],
+                         job['wb_n'], job['sample_pos']))
+            except Exception as e:
+                print(f"[NB-CROP] error: {e}", file=sys.stderr, flush=True)
+            finally:
+                self._crop_queue.task_done()
+
+    @staticmethod
+    def _crop_feed(nb, arr):
+        for _ix, _dec in nb['decs'].items():
+            _out = _dec.feed(arr)
+            if len(_out):
+                nb['parts'][_ix].append(_out)
+
+    _SPOOL_RAM_LIMIT = 600_000_000   # bytes; above this, spool to disk
 
     def update(self, detections, wideband_buf, sample_pos=0, tail=None, pre_hop=None):
         """Queue a save job — returns immediately, work happens in background."""
@@ -3095,6 +3375,16 @@ class SignalRecorder:
                 break
             try:
                 extended_full, detections, dt_str, pre_hop_n, wb_n, sample_pos = item
+                _spool_path = None
+                _nb_job = None
+                if (isinstance(extended_full, tuple)
+                        and extended_full[0] == 'NB'):
+                    # NARROWBAND PENDING: the cropper already extracted
+                    # one stream per detection — no wideband concat, no
+                    # forward FFT.  Everything below that touches
+                    # extended_full is skipped for these items.
+                    _nb_job = extended_full[1]
+                    extended_full = None
                 if (isinstance(extended_full, tuple)
                         and extended_full[0] == 'PARTS'):
                     _, _bparts, _tparts, _tneed = extended_full
@@ -3105,8 +3395,32 @@ class SignalRecorder:
                         _tp.append(_t[:_tneed - _tn]
                                    if _tn + len(_t) > _tneed else _t)
                         _tn += len(_tp[-1])
-                    extended_full = np.concatenate(_bparts + _tp) \
-                        if (_bparts or _tp) else np.empty(0, np.complex64)
+                    _all = _bparts + _tp
+                    _total_n = sum(len(p) for p in _all)
+                    if _total_n * 8 > self._SPOOL_RAM_LIMIT:
+                        # MEMMAP SPOOL (2026-07-06): multi-GB RAM concats of
+                        # wideband tails were the bandwidth bomb starving
+                        # the reader (14.8-17.5 of 20 Msps under load, skip
+                        # feedback loop). Spool parts sequentially to a
+                        # disk-backed memmap; the chunked extraction reads
+                        # from it and RAM traffic collapses to the
+                        # narrowband output.
+                        import tempfile as _tf
+                        _fd, _spool_path = _tf.mkstemp(
+                            suffix='.spool', dir=self.export_dir)
+                        os.close(_fd)
+                        _mm = np.memmap(_spool_path, dtype=np.complex64,
+                                        mode='w+', shape=(_total_n,))
+                        _o = 0
+                        for _p in _all:
+                            _mm[_o:_o + len(_p)] = _p
+                            _o += len(_p)
+                        _mm.flush()
+                        extended_full = _mm
+                    elif _all:
+                        extended_full = np.concatenate(_all)
+                    else:
+                        extended_full = np.empty(0, np.complex64)
                 pre_hop_s = pre_hop_n / self.wb_fs
 
                 # === Architectural shift ===
@@ -3168,7 +3482,8 @@ class SignalRecorder:
                 max_pkt_s = max_pkt_syms * sym_time
                 buf_dur_s = pre_hop_s + wb_n / self.wb_fs
                 max_record_n = int((buf_dur_s + max_pkt_s) * self.wb_fs)
-                extended = extended_full[:max_record_n]
+                extended = (extended_full[:max_record_n]
+                            if _nb_job is None else None)
                 # Export sample rate = bw * _exp_dec (nb_fs = export_bw*2).  Was
                 # hard-wired to 8*bw (export_bw=4*bw → 4 MHz at BW500), an 8x
                 # oversample that made every recenter-requiring decode ~4x slower
@@ -3195,7 +3510,11 @@ class SignalRecorder:
                 _ext_fft_cache = []
                 anchor_off = anchor['freq_hz'] - self.center_hz
                 # nb_fs and sym_n needed for filename + decoder hint math.
-                nb_fs = float(export_bw * 2)
+                # NB items carry the cropper's exact realized rate
+                # (wb_fs/D — equals export_bw*2 for standard presets at
+                # standard wideband rates).
+                nb_fs = (float(_nb_job['nb_fs']) if _nb_job is not None
+                         else float(export_bw * 2))
                 nb_fs_int = int(round(nb_fs))
                 sym_n = int(round(N_sf * nb_fs_int / bw))
                 # Build preamble list from gate detections, deduped by
@@ -3307,6 +3626,7 @@ class SignalRecorder:
                         'status':      'LOCK',
                         'preamble_t_s': float(d.get('preamble_t_s', 0.0)),
                         'forced_dechirp': bool(d.get('forced_dechirp')),  # carry through for the cooldown dedup
+                        'nb_ix':       d.get('_nb_ix'),  # cropped-stream key (NB items)
                     })
                 if not preambles:
                     self._save_queue.task_done()
@@ -3418,11 +3738,21 @@ class SignalRecorder:
                     d = dict(anchor)
                     d['freq_hz'] = anchor['freq_hz'] + carrier_hz
                     off = d['freq_hz'] - self.center_hz
-                    # Re-extract narrowband centred precisely on this
-                    # preamble's carrier — reuses cached forward FFT.
-                    nb, nb_fs = extract_narrowband_fft(
-                        extended, self.wb_fs, off, export_bw,
-                        fft_cache=_ext_fft_cache)
+                    if _nb_job is not None:
+                        # Already extracted by the cropper, centred on
+                        # this detection's own carrier (preambles come
+                        # 1:1 from gate detections, and the extraction
+                        # centre below is exactly the detection freq).
+                        nb = _nb_job['streams'].get(p.get('nb_ix'))
+                        if nb is None or len(nb) == 0:
+                            continue
+                        nb = nb[:int((buf_dur_s + max_pkt_s) * nb_fs)]
+                    else:
+                        # Re-extract narrowband centred precisely on this
+                        # preamble's carrier — reuses cached forward FFT.
+                        nb, nb_fs = extract_narrowband_fft(
+                            extended, self.wb_fs, off, export_bw,
+                            fft_cache=_ext_fft_cache)
                     _preamble_sym = _preamble_sample // sym_n if sym_n > 0 else 0
                     _relay_after_syms     = _preamble_sym + 149
                     _original_before_syms = max(0, _preamble_sym - 8)
@@ -3445,11 +3775,17 @@ class SignalRecorder:
                     # Encode the true capture rate so the decoder reads it
                     # exactly instead of GUESSING from file size (the guess is
                     # ambiguous and mis-read lower-rate captures as higher).
+                    # dt_str's millisecond digits are replaced by a global
+                    # save sequence — same token shape, but two saves can
+                    # never share a filename (same-ms finalizes of same-
+                    # carrier packets used to, and the 4 parallel save
+                    # workers then corrupted the file racing tofile).
+                    _sq = next(self._fname_seq)
                     fname = (f"SF{d['sf']}_{fmt_bw(d['bw'])}"
                              f"_{d['freq_hz'] / 1e6:.4f}MHz"
                              f"_{int(round(nb_fs / 1000))}ksps"
                              f"_pwr{int(round(d.get('peak_power_db', 0.0)))}"
-                             f"_{dt_str}.cf32")
+                             f"_{dt_str[:-3]}{_sq % 1000:03d}.cf32")
                     fpath = os.path.join(self.export_dir, fname)
                     nb.astype(np.complex64).tofile(fpath)
                     dur_ms = len(nb) / nb_fs * 1000
@@ -3497,6 +3833,12 @@ class SignalRecorder:
             except Exception as e:
                 print(f"[RECORDER] save error: {e}", file=sys.stderr, flush=True)
             finally:
+                if _spool_path is not None:
+                    try:
+                        del extended_full          # release the memmap
+                        os.unlink(_spool_path)
+                    except Exception:
+                        pass
                 self._save_queue.task_done()
 
     def _extract_nb(self, iq, offset_hz, target_bw):
@@ -3504,6 +3846,8 @@ class SignalRecorder:
 
     def flush(self):
         """Wait for all pending saves to complete."""
+        if self._crop_queue is not None:
+            self._crop_queue.join()
         self._save_queue.join()
 
     def reset_prev(self):
@@ -6225,8 +6569,9 @@ def main():
 
     if recorder:
         try:
-            recorder.flush_pending()   # deferred tails: finalize before the
-                                       # decoder drain so stragglers decode
+            recorder.flush_pending(wait=True)   # deferred tails: finalize
+                                       # (and crop) before the decoder
+                                       # drain so stragglers decode
         except Exception:
             pass
     if decoder:
