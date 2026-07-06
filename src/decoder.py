@@ -6708,6 +6708,33 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             if diag_out is not None and grid_sweep:
                 diag_out['grid_tds'] = [int(r[3])
                                         for r in reversed(ranked_valid)]
+            if grid_sweep or force_td is not None:
+                # FINE-TUNE to sample precision: the N/128 sweep leaves
+                # +/-16-sample residual, enough to flip the UNPROTECTED
+                # block-tail nibbles (first payload bytes) by one
+                # marginal bit each (measured: true nibs [10,14] vs
+                # decoded [11,12] — single-bit LLR coin-flips). Maximize
+                # the ALL-codeword min-margin locally.
+                _best_ft = (chosen_variant[6], chosen_td, chosen_variant)
+                for _dt in range(-N // 128, N // 128 + 1,
+                                 max(1, N // 1024)):
+                    if _dt == 0:
+                        continue
+                    _fv = decode_header_variant(
+                        base_data_start + chosen_td + _dt)
+                    if _fv is None or _fv[3] is None:
+                        continue
+                    _fpl, _fcr, _fcrc, _fok = _fv[3]
+                    if not (_fok and 4 <= _fpl <= 237 and 1 <= _fcr <= 4):
+                        continue
+                    if _fv[6] > _best_ft[0]:
+                        _best_ft = (_fv[6], chosen_td + _dt, _fv)
+                if _best_ft[1] != chosen_td:
+                    print("  GRID FINE-TUNE: td %+d -> %+d "
+                          "(min-margin %.2f -> %.2f)"
+                          % (chosen_td, _best_ft[1],
+                             chosen_variant[6], _best_ft[0]))
+                    chosen_td, chosen_variant = _best_ft[1], _best_ft[2]
 
     data_start = base_data_start + chosen_td
     n_data = (len(iq1) - data_start) // N
@@ -6782,6 +6809,20 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                                     * (_n_rd / N) ** 2)).astype(np.complex64)
                 print("  HDR-DRIFT REFIT: %+.4f bins/sym (residual, "
                       "re-rotated)" % _resid_drift)
+                # RE-DECODE the header block on the rotated samples: the
+                # block's TAIL nibbles are the first payload bytes
+                # (unprotected by HDR_CHK) and were extracted PRE-refit —
+                # their single-bit LLR coin-flips (measured: [11,12] vs
+                # true [10,14]) are exactly what the rotation cleans up.
+                _rv = decode_header_variant(base_data_start + chosen_td)
+                if _rv is not None and _rv[3] is not None:
+                    _rpl, _rcr, _rcrc, _rok = _rv[3]
+                    if (_rok and _rpl == payload_len and _rcr == cr
+                            and _rcrc == crc_present):
+                        (hdr_bins, hdr_pmrs, hdr_nibs, result, hdr_fines,
+                         hdr_raws, _hdr_minm) = _rv
+                        print("  HDR-BLOCK RE-DECODE: min-margin %.2f, "
+                              "nibs %s" % (_rv[6], _rv[2]))
 
     if not hdr_ok:
         pmr_med = float(np.median(hdr_pmrs)) if len(hdr_pmrs) else 0.0
