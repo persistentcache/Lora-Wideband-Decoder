@@ -3042,6 +3042,21 @@ class SignalRecorder:
             self._finalize(job)
         self._pending = []
 
+    def break_pending(self, reason=''):
+        """Stream DISCONTINUITY (ring CATCHUP skip, sample drops): the
+        hops that arrive next are NOT contiguous with pending tails —
+        appending them would SPLICE a multi-second gap invisibly into
+        the capture (measured: post-seam symbols land ~0.44 sym off the
+        frame grid; every continuous-mode bench capture carried such a
+        splice and decoded as structured garbage). Finalize everything
+        with the contiguous data collected so far — a truncated real
+        capture beats a spliced one."""
+        if self._pending:
+            print(f"         [PENDING-BREAK] finalizing "
+                  f"{len(self._pending)} job(s) at discontinuity "
+                  f"{reason}", flush=True)
+        self.flush_pending()
+
     def _finalize(self, job):
         # heavy concat happens in the SAVE WORKER (the queue item carries
         # the parts list); trim the tail to 'need' there too
@@ -5368,6 +5383,8 @@ def main():
                 print(f"[{elapsed:6.1f}s] SKIP {skipped/1e6:.1f}M samples "
                       f"({skip_s:.2f}s) — detection took too long, "
                       f"ring buffer wrapped", file=sys.stderr)
+                if recorder:
+                    recorder.break_pending(f"(ring skip {skip_s:.2f}s)")
                 if is_live and not _warned_slow:
                     _warned_slow = True
                     print(f"[{elapsed:6.1f}s] *** KEEP-UP WARNING: this machine "
@@ -6048,6 +6065,9 @@ def main():
                     print(f"[{elapsed:6.1f}s] CATCHUP skip {skipped_ahead/1e6:.1f}M "
                           f"samples ({skip_s:.2f}s) — ring buffer near wrap",
                           file=sys.stderr)
+                    if recorder:
+                        recorder.break_pending(
+                            f"(catchup {skip_s:.2f}s)")
                     buf_pos = 0
                     buf = np.zeros(win_n, dtype=np.complex64)
                     pre_hop = None  # stale after skip — reset for clean SC state
