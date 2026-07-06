@@ -3659,6 +3659,12 @@ def _compute_hw_fingerprint(iq, sf=None, bw=None, fs=None):
 _EMIT_COUNT = 0
 
 
+_LAST_EMIT_VERIFIED = [False]   # set by _emit_pkt on a verified record;
+                                # read by _decode_attempt so the retry
+                                # acceptance can count protocol-verified
+                                # decodes (MC decrypt+MAC has no LoRa-CRC)
+
+
 def _emit_pkt(rec):
     """Emit one structured packet record as a single `[PKT] {json}` line.  The
     gate's BackgroundDecoder enriches it (freq/sf/bw/rssi from the capture name),
@@ -3666,6 +3672,8 @@ def _emit_pkt(rec):
     a plain stdout line so it rides the existing decoder→gate→web stdout path."""
     global _EMIT_COUNT
     _EMIT_COUNT += 1
+    if rec.get('confidence') == 'verified' or rec.get('verified'):
+        _LAST_EMIT_VERIFIED[0] = True
     try:
         import json as _json
         print("[PKT] " + _json.dumps(rec, separators=(',', ':'), default=str))
@@ -5407,6 +5415,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     sweep_budget=2.0, diag_out=None):
     if skip_bins is None:
         skip_bins = []
+    _LAST_EMIT_VERIFIED[0] = False
 
     if _HARNESS_OUT:
         _HARNESS_ATTEMPT[0] += 1
@@ -6588,10 +6597,17 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         # Soft path: LLR-based deinterleave + ML Hamming over all 16 candidates.
         # More robust than hard-decision path under IQ imbalance (mirror interference).
         hdr_soft_cw = soft_deinterleave(hdr_llrs, 8, ppm)
-        _hb, _, _ = soft_hamming_decode_batch(hdr_soft_cw, 8)
+        _hb, _, _hmarg = soft_hamming_decode_batch(hdr_soft_cw, 8)
         hdr_nibs_var = [int(_hb[k]) for k in range(ppm)]
         res = parse_header(hdr_nibs_var)
-        return bins, pmrs, hdr_nibs_var, res, fines, raws
+        # min soft-Hamming margin across ALL ppm codewords: at SF11/12
+        # the header block CARRIES THE FIRST PAYLOAD NIBBLES (nibs 5+)
+        # UNPROTECTED by HDR_CHK — a marginal grid decodes the
+        # checksummed 5 while corrupting the tail 5 (the block-1
+        # poisoning measured on the continuous bench). The margin is
+        # the discriminator the checksum cannot be.
+        _minm = float(np.min(_hmarg)) if len(_hmarg) else 0.0
+        return bins, pmrs, hdr_nibs_var, res, fines, raws, _minm
 
     # ---- HEADER DECODE (soft, 8 symbols, reduced rate, CR 4/8) ----
     base_data_start = data_start
@@ -6639,7 +6655,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             v = decode_header_variant(base_data_start + td)
             if v is None:
                 continue
-            bins2, pmrs2, nibs2, res2, fines2, raws2 = v
+            bins2, pmrs2, nibs2, res2, fines2, raws2, minm2 = v
             if res2 is None:
                 continue
             pl2, cr2, crc2, ok2 = res2
@@ -6651,6 +6667,11 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     else 0.10 * abs(td))
                 if grid_sweep and crc2:
                     score += 40.0    # true MC/MT frames carry CRC
+                if grid_sweep:
+                    # rank primarily by ALL-codeword margin: separates the
+                    # true grid from checksum-collision grids whose block
+                    # tail (first payload nibs) is corrupt
+                    score += 60.0 * float(minm2)
                 valid_variants.append((score, td, v))
 
     # Be conservative with header realignment.
@@ -6659,7 +6680,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # huge PL/CR changes or bogus no-CRC frames. Prefer the base timing when it
     # already yields a plausible header, and only fall back to alternate timing
     # when the base header itself is invalid.
-    base_bins0, base_pmrs0, base_nibs0, base_result0, base_fines0, base_raws0 = base_variant
+    (base_bins0, base_pmrs0, base_nibs0, base_result0, base_fines0,
+     base_raws0, base_minm0) = base_variant
     base_hdr_valid = False
     if base_result0 is not None:
         bpl0, bcr0, bcrc0, bok0 = base_result0
@@ -6670,7 +6692,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     if not base_hdr_valid and valid_variants:
         ranked_valid = []
         for score, td, v in valid_variants:
-            vbins, vpmrs, vnibs, vres, vfines, vraws = v
+            vbins, vpmrs, vnibs, vres, vfines, vraws, vminm = v
             if vres is None:
                 continue
             vpl, vcr, vcrc, vok = vres
@@ -6690,7 +6712,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     data_start = base_data_start + chosen_td
     n_data = (len(iq1) - data_start) // N
 
-    hdr_bins, hdr_pmrs, hdr_nibs, result, hdr_fines, hdr_raws = chosen_variant
+    (hdr_bins, hdr_pmrs, hdr_nibs, result, hdr_fines, hdr_raws,
+     _hdr_minm) = chosen_variant
     if result is None:
         print("  HEADER PARSE FAILED")
         return ('FAIL', preamble_start, 20 * N, preamble_bin)
