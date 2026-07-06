@@ -4988,11 +4988,21 @@ def process_file(fpath, relay_after=None, relay_before=None,
         _d = {}
         result = _decode_attempt(iq1_work.copy(), sf, bw, N, ppm, fs, dec, name, Counter,
                                  skip_bins=skip_bins, diag_out=_d)
-        if (attempt == 0 and result is not None and result[0] == 'FAIL'):
+        if (attempt == 0 and result is not None and result[0] == 'FAIL'
+                and bw <= 62500):
             # broadened 2026-07-05: ANY failed first attempt with a found
             # preamble enters the grid-hypothesis machinery (the old
             # header_decoded gate missed most continuous-mode failures —
             # their phantom-grid headers often don't even parse)
+            # SLOW-BW GATE (2026-07-06): the half-symbol phantom class this
+            # machinery hunts was measured on slow-BW continuous captures
+            # (>=33 ms symbols); at fast BW the sweeps never rescued
+            # anything here and their budget cost starved the retry ladder
+            # — g500's SF10/500k counter-9 needed PASS 2's -250 kHz recrop
+            # (the documented 500k centroid-error recovery) and the budget
+            # died one stage short of it ([BUDGET] ... before PASS 2 —
+            # bail).  Same shape as the 0270a33 SFD-descent gate, same
+            # reason.
             # HALF-SYMBOL GRID PHANTOM: preamble symbols are identical, so
             # a candidate aligned EXACTLY half a symbol off dechirps to a
             # clean full-power tone at a bin displaced N/2, passes SFD and
@@ -6125,7 +6135,16 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     # continuous-mode bench showed every candidate,
                     # including the true front runs', converging onto
                     # the same late chain through this loop).
-                    if i > 4:
+                    # SLOW-BW ONLY (2026-07-06): at fast BW the anchored
+                    # candidates are often slightly-off grids of the true
+                    # packet and the relocation this bans was the very
+                    # move that recovered them (g500 SF10/500k counter-9:
+                    # PASS 2 -250 kHz decoded via a relocated chain at
+                    # bin 126/start 249 pre-0a4f2f7; the anchored bin-439
+                    # chain decodes a garbage header).  The payload-lock
+                    # convergence this rule fixes lives on slow-BW
+                    # continuous captures — gate it there.
+                    if bw <= 62500 and i > 4:
                         continue
                     cur2 = [(i, b, p)]
                 elif (circ_dist(b, (cur2[-1][1] if (bw <= 41667 and cur2)
@@ -6244,7 +6263,17 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             # same CFO bin across all) losing to scattered-bin late
             # chains. Beyond a 24-sym grace window, lateness now costs
             # what length pays.
-            _late_sym = max(0.0, preamble_start_cand / N - 24.0)
+            # SLOW-BW ONLY (2026-07-06): 24 symbols is 49 ms at SF10/500k
+            # — fast-preset captures legitimately carry their packet
+            # ~0.5-1 s deep (gate-window pre-roll), so at fast BW every
+            # real candidate eats the same ~-1300..-2700 and the penalty
+            # degenerates to +/-12-point noise between near-tied chains
+            # (measured: it coin-flipped g500_sf11 counter-11 IN and
+            # counter-12 OUT while killing g500's solid counter-9).  The
+            # front-anchored property it encodes holds in TIME, which
+            # only maps to a small symbol count on slow BW.
+            _late_sym = (max(0.0, preamble_start_cand / N - 24.0)
+                         if bw <= 62500 else 0.0)
             cand_score = (12.0 * min(pre_len_cand, 18) +
                           2.0 * run_mean_pmr +
                           18.0 * sfd_ok_cand +
