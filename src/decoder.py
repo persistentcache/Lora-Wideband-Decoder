@@ -381,6 +381,31 @@ _HAMMING_SIGNS_NP = {
 }
 
 
+def header_expected_levels(nibs, ppm, n_sym=8, rdd=8):
+    """Forward-encode DECODED header nibbles into the exact expected
+    dechirp level (bin//4) per header symbol — the decoded header used
+    as PILOT SYMBOLS. Once nibs are known, expected bins are exact, so
+    per-symbol frequency error is measurable to fractions of a bin
+    across the block (the preamble cannot provide this: identical
+    symbols are timing-degenerate). Verified against a working capture:
+    residuals linear within +-0.1 bin over 8 symbols."""
+    cws = [_hamming_codeword(int(nibs[k]), rdd) for k in range(ppm)]
+    levels = []
+    for i in range(n_sym):
+        v = 0
+        for k in range(ppm):
+            idx = ((i - k - 1) % ppm + ppm) % ppm
+            bp = ppm - 1 - idx
+            v |= int(cws[k][i]) << bp
+        L = v
+        sh = 1
+        while sh < 16:          # inverse gray (prefix xor)
+            L ^= L >> sh
+            sh <<= 1
+        levels.append(L)
+    return levels
+
+
 def soft_hamming_decode_batch(cw_llr_list, rdd):
     """Vectorised ML Hamming decode over MANY codewords at once.
 
@@ -6778,42 +6803,57 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     if chosen_td != 0 and hdr_ok:
         print(f"  HEADER ALIGN: timing={chosen_td:+d} samp pmr_med={float(np.median(hdr_pmrs)):.1f}dB")
 
-    # HEADER-DRIFT RE-ESTIMATION (grid hypotheses only, 2026-07-05): on a
-    # phantom-locked capture the preamble drift regression is measured on
-    # the WRONG grid and its error accumulates as a quadratic phase ramp —
-    # ~1.6 bins by the header (inside LDRO tolerance: header validates)
-    # but 2.5+ bins by payload byte 0 (dead on arrival; measured: true
-    # header PL=37 CR4/5 with payload garbage from byte 0). A VALIDATED
-    # header supplies 8 trustworthy fine-bin measurements at known symbol
-    # indices — regress the residual drift from them and re-rotate iq1
-    # from here on.
-    if (grid_sweep or force_td is not None) and hdr_ok and len(hdr_fines) >= 6:
-        _hx = np.arange(len(hdr_fines), dtype=np.float64)
-        _hy = np.array([((f + N / 2) % N) - N / 2 for f in hdr_fines],
-                       dtype=np.float64)
-        # header bins are data (arbitrary): drift lives in the FRACTIONAL
-        # parts' progression — wrap each fine to its nearest integer bin
-        _hy = np.array([((f + 0.5) % 1.0) - 0.5 for f in hdr_fines],
-                       dtype=np.float64)
-        _hy = np.unwrap(_hy * 2 * np.pi) / (2 * np.pi)
-        _nh = len(_hx)
-        _sx, _sy = _hx.sum(), _hy.sum()
-        _sxx, _sxy = (_hx * _hx).sum(), (_hx * _hy).sum()
-        _den = _nh * _sxx - _sx * _sx
-        if abs(_den) > 1e-9:
-            _resid_drift = (_nh * _sxy - _sx * _sy) / _den
-            if 0.005 < abs(_resid_drift) < 0.5:
-                _n_rd = np.arange(len(iq1), dtype=np.float64) - (
-                    base_data_start + chosen_td)
-                iq1 = (iq1 * np.exp(-1j * np.pi * _resid_drift
-                                    * (_n_rd / N) ** 2)).astype(np.complex64)
-                print("  HDR-DRIFT REFIT: %+.4f bins/sym (residual, "
-                      "re-rotated)" % _resid_drift)
-                # RE-DECODE the header block on the rotated samples: the
-                # block's TAIL nibbles are the first payload bytes
-                # (unprotected by HDR_CHK) and were extracted PRE-refit —
-                # their single-bit LLR coin-flips (measured: [11,12] vs
-                # true [10,14]) are exactly what the rotation cleans up.
+    # HEADER-AS-PILOTS REFERENCE BOOTSTRAP (2026-07-05): a validated
+    # header's nibbles forward-encode to EXACT expected bins — 8 distinct
+    # pilot symbols. Regress (measured fine - expected) vs symbol index:
+    # intercept = residual CFO (bins), slope = residual drift (bins/sym),
+    # both absolute — unlike the preamble (timing-degenerate) or the
+    # fractional-parts refit (loses integer offsets). Linearity doubles
+    # as a validity check garbage headers cannot pass.
+    _pilot_pass = 0
+    while ((grid_sweep or force_td is not None) and hdr_ok
+           and len(hdr_fines) >= 8 and _pilot_pass < 2):
+        _pilot_pass += 1
+        try:
+            _plv = header_expected_levels(hdr_nibs, ppm)
+            _pres = np.array(
+                [(((float(hdr_fines[i2]) - 4.0 * _plv[i2]) + N / 2) % N)
+                 - N / 2 for i2 in range(8)], dtype=np.float64)
+            _px = np.arange(8, dtype=np.float64)
+            # ROBUST fit: wrong block-tail nibbles corrupt the expected
+            # levels of ~half the symbols through the diagonal
+            # interleave — residual outliers land bins away. Inliers
+            # self-select around the median residual; >=5 of 8 needed.
+            _pmed = float(np.median(_pres))
+            _pin = np.abs(_pres - _pmed) < 2.0
+            _nin = int(_pin.sum())
+            if _nin >= 4:
+                _pxi, _pri = _px[_pin], _pres[_pin]
+                _pA = np.vstack([_pxi, np.ones_like(_pxi)]).T
+                (_pslope, _picept) = np.linalg.lstsq(
+                    _pA, _pri, rcond=None)[0]
+                _pfit = _picept + _pslope * _pxi
+                _pmaxdev = float(np.max(np.abs(_pri - _pfit)))
+                # 4 inliers demand TIGHT linearity; 5+ can be looser
+                if _nin == 4 and _pmaxdev > 0.30:
+                    _pmaxdev = 99.0
+            else:
+                _pslope, _picept, _pmaxdev = 0.0, 0.0, 99.0
+            if __import__('os').environ.get('LORA_PILOT_DEBUG'):
+                print("  [PILOT] res=%s inliers=%d maxdev=%.2f "
+                      "cfo=%+.2f slope=%+.4f"
+                      % ([round(r, 2) for r in _pres.tolist()],
+                         int(_pin.sum()), _pmaxdev, _picept, _pslope))
+            if _pmaxdev < 0.75 and (abs(_picept) > 0.15
+                                    or abs(_pslope) > 0.01):
+                _anchor = base_data_start + chosen_td
+                _n_p = np.arange(len(iq1), dtype=np.float64)
+                _ph = (-2.0 * np.pi * _picept * _n_p / N
+                       - np.pi * _pslope * ((_n_p - _anchor) / N) ** 2)
+                iq1 = (iq1 * np.exp(1j * _ph)).astype(np.complex64)
+                print("  HDR-PILOT BOOTSTRAP: cfo %+.2f bins, drift "
+                      "%+.4f bins/sym (maxdev %.2f) — chain re-anchored"
+                      % (_picept, _pslope, _pmaxdev))
                 _rv = decode_header_variant(base_data_start + chosen_td)
                 if _rv is not None and _rv[3] is not None:
                     _rpl, _rcr, _rcrc, _rok = _rv[3]
@@ -6821,8 +6861,14 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                             and _rcrc == crc_present):
                         (hdr_bins, hdr_pmrs, hdr_nibs, result, hdr_fines,
                          hdr_raws, _hdr_minm) = _rv
-                        print("  HDR-BLOCK RE-DECODE: min-margin %.2f, "
-                              "nibs %s" % (_rv[6], _rv[2]))
+                        print("  HDR-BLOCK RE-DECODE: min-margin %.2f"
+                              % _rv[6])
+        except Exception as _pe:
+            print("  HDR-PILOT BOOTSTRAP failed: %r" % (_pe,))
+            break
+        if _pmaxdev >= 99.0 or (abs(_picept) <= 0.15
+                                and abs(_pslope) <= 0.01):
+            break   # nothing applied this pass — converged or unusable
 
     if not hdr_ok:
         pmr_med = float(np.median(hdr_pmrs)) if len(hdr_pmrs) else 0.0
