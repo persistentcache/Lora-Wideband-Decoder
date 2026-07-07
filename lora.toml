@@ -41,7 +41,10 @@ overlap          = 0.5       # window overlap (0.5 = 50%)
 
 detect_workers   = -1        # -1 = auto-scale from cpu_count. Changing this to something such as 2 pins usage to only 2 cores.
 
-buf_seconds      = 16        # ring buffer seconds (bigger = more burst headroom)
+buf_seconds      = 45        # ring buffer seconds — bridges the measured 5-15 s
+                             # slow-preset overload bursts (catchup root cause;
+                             # 45 s -> 0 catchups, A/B 2026-07-07). ~3.6 GB at
+                             # 20 Msps sc16; low-RAM hosts auto-scale down.
 # buf_seconds    = 8         # ALT: smaller ring buffer (less RAM, less burst headroom).
 # buf_seconds    = 32        # ALT: bigger buffer for very bursty traffic.
 

@@ -199,6 +199,27 @@ class StreamBuffer:
         self._cvt_pool = ThreadPoolExecutor(max_workers=2,
                                             thread_name_prefix='iq-cvt')
 
+        # Low-RAM guard: the default ring is sized to bridge the
+        # measured 5-15 s slow-preset overload bursts (catchup root
+        # cause, 2026-07-07 — a 45 s ring produced 0 catchups vs 2-6
+        # per leg at 6-16 s), which is multi-GB at wideband rates.
+        # Hosts that cannot hold it get the largest ring that fits in
+        # 40% of MemAvailable instead of an allocation failure.
+        try:
+            with open('/proc/meminfo') as _mi:
+                _avail_kb = next(int(l.split()[1]) for l in _mi
+                                 if l.startswith('MemAvailable'))
+            _budget = _avail_kb * 1024 * 0.40
+            _need = rate * buf_seconds * (4 if self.sc16 else 2)
+            if _need > _budget:
+                _fit = max(3.0, _budget / (rate * (4 if self.sc16
+                                                   else 2)))
+                print(f"[RING] buf_seconds {buf_seconds:.0f}s needs "
+                      f"{_need/1e9:.1f} GB — scaling to {_fit:.0f}s "
+                      f"to fit 40% of available RAM", file=sys.stderr)
+                buf_seconds = _fit
+        except Exception:
+            pass
         ring_n = int(rate * buf_seconds)
         dtype = np.int16 if self.sc16 else np.int8
         self._ring = np.zeros(ring_n * 2, dtype=dtype)  # ×2 for I + Q
@@ -5316,7 +5337,7 @@ def main():
                         'parallelism, no GIL) for sustained full-rate live. '
                         '-1 = AUTO-SCALE from cpu_count (plug-and-play: ~ncpu/4, '
                         'capped 2..8) — use this so it adapts to any machine.')
-    p.add_argument('--buf-seconds', type=float, default=6.0,
+    p.add_argument('--buf-seconds', type=float, default=45.0,
                    help='Ring buffer size in seconds for live input (default: 6.0). '
                         'Larger = fewer skips but more RAM (28Msps sc16: ~112MB/sec)')
     p.add_argument('--cooldown', type=float, default=0.0,
