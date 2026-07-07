@@ -7181,14 +7181,12 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         else:
             _dcx = downchirp
         _nd = max(0, (len(iq1) - (data_start + int(ds_off))) // N)
-        _r = 0.0
-        _curve = []
-        for _si in range(min(_nd, 96)):
+
+        def _fine_at(_si, _r):
             _adj = int(round(float(ds_off) + float(slope) * _si))
             _p = data_start + _si * N + _adj
             if not (0 <= _p and _p + N <= len(iq1)):
-                _curve.append(_r)
-                continue
+                return None, 0.0
             _seg = iq1[_p:_p + N]
             if abs(_r) > 1e-3:
                 _seg = _seg * np.exp(-1j * 2.0 * np.pi * _r * _t / N
@@ -7196,10 +7194,33 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             _S = np.abs(_fft(_seg * _dcx, n=8 * N))
             _pk = int(np.argmax(_S))
             _pmr = float(_S[_pk]) / (float(_S.mean()) + 1e-30)
-            if _pmr > 15.0:
-                _fb = (_pk / 8.0 - cfo_shift) % N
+            return (_pk / 8.0 - cfo_shift) % N, _pmr
+
+        # Sub-group lattice offset phi: the LDRO lattice is 4v + phi,
+        # NOT multiples of 4 — phi is set by the grid's integer-bin
+        # remainder after the cfo_shift roll.  Tracking against
+        # round(fb/4)*4 with phi ~= +/-2 chases a phantom half-group
+        # offset at the clamp rate forever (measured: 7-8 bin runaway
+        # spans on holdouts 17/34 whose raw drift is a normal ~0.04
+        # bins/sym).  The 8 header symbols are decision-safe (their
+        # block decoded HDR_CHK-clean), so phi = circular median of
+        # their fine offsets mod group.
+        _phis = []
+        for _si in range(min(8, _nd)):
+            _fb, _pmr = _fine_at(_si, 0.0)
+            if _fb is not None and _pmr > 15.0:
+                _ph = _fb % 4.0
+                _phis.append(_ph if _ph < 2.0 else _ph - 4.0)
+        _phi = float(np.median(_phis)) if len(_phis) >= 4 else 0.0
+
+        _r = 0.0
+        _curve = []
+        for _si in range(min(_nd, 96)):
+            _fb, _pmr = _fine_at(_si, _r)
+            if _fb is not None and _pmr > 15.0:
                 _grp = 4 if _si < 8 else pay_bin_group
-                _e = _fb - _grp * round(_fb / _grp)
+                _e = _fb - _phi
+                _e = _e - _grp * round(_e / _grp)
                 _e = ((_e + _grp / 2.0) % _grp) - _grp / 2.0
                 _r += max(-0.3, min(0.3, _e))
             _curve.append(_r)
