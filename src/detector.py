@@ -6419,7 +6419,24 @@ def main():
                 else:
                     _fr = _slow_fruitless.get(_bk, 0) + 1
                     _slow_fruitless[_bk] = _fr
-                    if _fr == 1:
+                    if _fr <= 2:
+                        # FALSE-EARLY TRIGGER GRACE (2026-07-06): the frame's
+                        # own early preamble builds the trigger streak, but
+                        # the first scan often fires while the 4 s assembly
+                        # holds only ~0.5 s of frame -> fruitless.  The old
+                        # escalation then backed the bin off longer than the
+                        # REMAINING preamble (seeds only accumulate on
+                        # preamble-like windows; payload never re-triggers)
+                        # -> the real bin died for its own frame and the
+                        # un-backed IQ-image bucket won the trigger instead
+                        # (or nobody did).  Seed-state autopsy: bucket 141
+                        # streak 1..6 pre-frame, fruitless at fr=2 -> -8
+                        # ticks, image bucket 370 triggers, image-only
+                        # detection; 4-5 of 29 frames lost per leg.  Two
+                        # mild retries give the assembly +0.5 s of preamble
+                        # each; real escalation starts at strike three, so
+                        # persistent junk spurs cost at most two extra
+                        # background scans per episode.
                         _slow_seeds[_bk] = -1
                     else:
                         _bo = min(256, _slow_backoff.get(_bk, 4) * 2)
