@@ -3113,7 +3113,8 @@ class SignalRecorder:
         self._decoder = decoder
 
     def update_deferred(self, detections, wideband_buf, sample_pos=0,
-                        pre_hop=None, need_tail_n=0, owned_buf=False):
+                        pre_hop=None, need_tail_n=0, owned_buf=False,
+                        gap_parts=None):
         """Register a save whose TAIL arrives later: instead of BLOCKING
         the main loop for an airtime-sized ring read (2.4 s per SF11/125k
         detection — measured as the dominant live-loop stall: CATCHUP
@@ -3170,9 +3171,27 @@ class SignalRecorder:
         if pre_hop is not None and len(pre_hop) > 0:
             parts.append(pre_hop)
         parts.append(_own)
+        if gap_parts:
+            # ASYNC-SCAN GAP FILL (2026-07-06): the background slow scan
+            # registers 1-2 iterations after its assembly snapshot; the
+            # hops that streamed through DURING the scan were never fed
+            # (feed_tail predates the job) — every live slow-pass capture
+            # carried a 0.5-1.0 s HOLE at the base|tail seam, exactly
+            # where slow frames' SFDs land (SEAMDBG-measured: gap =
+            # 10,000,000 samples). File mode runs the scan inline (no
+            # gap) — this single defect was the file-clean/live-broken
+            # decode split. The caller passes the missed hops (still in
+            # its deque) as owned refs; they extend the base seamlessly.
+            parts.extend(gap_parts)
         pre_hop_n = len(pre_hop) if pre_hop is not None else 0
+        if os.environ.get('LORA_SEAM_DEBUG'):
+            print(f"[SEAMDBG] register: sample_pos={sample_pos} "
+                  f"base_n={sum(len(p) for p in parts)} "
+                  f"base_span=[{sample_pos - sum(len(p) for p in parts)},"
+                  f"{sample_pos})", flush=True)
+        _gap_n = sum(len(g) for g in gap_parts) if gap_parts else 0
         job = {'base_parts': parts, 'dets': list(detections),
-               'pre_hop_n': pre_hop_n, 'wb_n': len(wideband_buf),
+               'pre_hop_n': pre_hop_n, 'wb_n': len(wideband_buf) + _gap_n,
                'sample_pos': sample_pos, 'tail': [], 'got': 0,
                'need': int(need_tail_n)}
         if self._nb_mode:
@@ -3205,6 +3224,12 @@ class SignalRecorder:
         done = []
         for job in self._pending:
             if job['got'] < job['need']:
+                if job['got'] == 0 and os.environ.get('LORA_SEAM_DEBUG'):
+                    _ff = getattr(self, '_dbg_tot_s', 0) - len(hop)
+                    print(f"[SEAMDBG] first-feed: base_end={job['sample_pos']} "
+                          f"feed_start={_ff} gap={_ff - job['sample_pos']} "
+                          f"({(_ff - job['sample_pos'])/self.wb_fs*1000:.2f} ms)",
+                          flush=True)
                 if 'nb' in job:
                     # pre-slice the overshoot (legacy trims via _tneed in
                     # the save worker; the cropper must never see samples
@@ -6249,6 +6274,7 @@ def main():
         _slow_halves.append(_hop_own)
         if recorder:
             _t_feed0 = time.time()
+            recorder._dbg_tot_s = tot_s
             recorder.feed_tail(_hop_own)
             _prof['feed'] += time.time() - _t_feed0
         _t_slowblk0 = time.time()
@@ -6428,10 +6454,36 @@ def main():
                     # detections; 24 made it worse). feed_tail() runs
                     # unconditionally below, so pending jobs complete
                     # from the hops in either mode.
+                    # ASYNC-SCAN GAP FILL: hops that streamed while the
+                    # background scan ran are still in _slow_halves —
+                    # hand them to the job so the base abuts the first
+                    # feed_tail hop (they were silently MISSING before:
+                    # 0.5-1.0 s hole at every live slow capture's seam).
+                    _gap_n = tot_s - _reg_tot_s
+                    _gap_parts = None
+                    _reg_pos = _reg_tot_s
+                    if _gap_n > 0 and hop_n > 0:
+                        _k = int(_gap_n) // hop_n
+                        if (_k * hop_n == _gap_n
+                                and 0 < _k <= len(_slow_halves)):
+                            _gap_parts = list(_slow_halves)[-_k:]
+                            _reg_pos = tot_s
+                            _slow_tail_n = max(0, _slow_tail_n
+                                               - _k * hop_n)
+                        else:
+                            # catchup/discontinuity between snapshot and
+                            # registration — cannot fill seamlessly; the
+                            # tail would splice. Register with the base
+                            # only and let it truncate.
+                            print(f"         [SLOW-GAP] unfillable gap "
+                                  f"{_gap_n} samples — truncated base "
+                                  f"capture", flush=True)
+                            _slow_tail_n = 0
                     recorder.update_deferred(dets_slow, _iq_long,
-                                             _reg_tot_s, pre_hop=None,
+                                             _reg_pos, pre_hop=None,
                                              need_tail_n=_slow_tail_n,
-                                             owned_buf=True)
+                                             owned_buf=True,
+                                             gap_parts=_gap_parts)
         _prof['slow'] += time.time() - _t_slowblk0
         _t_step = time.time()
 
