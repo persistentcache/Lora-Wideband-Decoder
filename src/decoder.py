@@ -6918,6 +6918,18 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # both absolute — unlike the preamble (timing-degenerate) or the
     # fractional-parts refit (loses integer offsets). Linearity doubles
     # as a validity check garbage headers cannot pass.
+    # Unpoisoned snapshot for the DD retry: the pilot bootstrap can
+    # accept a garbage fit (drift +0.32..0.36 passing the 0.75 maxdev
+    # gate) and bake a bogus quadratic into iq1 — the DD tracker then
+    # chases a ~0.3 bins/sym phantom at clamp rate (holdouts 17/34,
+    # whose standalone DD at the clean grid tracks span ~1.3).  The
+    # cascade is path-dependent (capture 008 decodes only BECAUSE a
+    # bogus pass lands a later corrective pass somewhere lucky), so
+    # gating slopes regresses it; instead the DD retry gets one extra
+    # trial on this pre-bootstrap copy.  16 MB, retry-path only.
+    _iq1_pre_pilot = None
+    if (grid_sweep or force_td is not None) and hdr_ok:
+        _iq1_pre_pilot = iq1.copy()
     _pilot_pass = 0
     while ((grid_sweep or force_td is not None) and hdr_ok
            and len(hdr_fines) >= 8 and _pilot_pass < 2):
@@ -7818,6 +7830,45 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                         break
             if crc_ok:
                 break
+        # LAST TRIAL — DD on the unpoisoned pre-bootstrap snapshot:
+        # phi (from the snapshot's own header symbols) plus the
+        # tracked curve absorb what the pilot derotation would have
+        # supplied, so tau=0 on the clean copy is a valid base even
+        # when the poisoned trials above were not.
+        if (not crc_ok) and _iq1_pre_pilot is not None:
+            _iq1_saved = iq1
+            iq1 = _iq1_pre_pilot
+            try:
+                _cv = _dd_resid_curve(0, 0.0, 0.0)
+                if _cv and (max(_cv) - min(_cv)) >= 0.12:
+                    print("  === CURVED-DRIFT RETRY (dd/snapshot "
+                          "span=%.2f) ===" % (max(_cv) - min(_cv)))
+                    tr_raw, tr_pay, tr_soft, tr_nibs = \
+                        soft_decode_payload(0, 0.0, frac_tau=0.0,
+                                            resid_curve=_cv)
+                    if len(tr_raw) >= payload_len + 2:
+                        ok, method = check_crc(tr_raw, payload_len,
+                                               strict=True)
+                        if ok and _is_chase_acceptable_uni(tr_raw):
+                            print("  curved-drift(dd/snapshot): "
+                                  "CRC %s OK!" % method)
+                            crc_ok, crc_method = True, method
+                            _clean_crc = True
+                            raw_bytes, payload = tr_raw, tr_pay
+                            pay_soft_info = tr_soft
+                        else:
+                            ok, method, tr2, flipped = chase_decode(
+                                tr_nibs, tr_soft, max_flips=1,
+                                k=CHASE_K)
+                            if ok:
+                                print("  curved-drift(dd/snapshot)+"
+                                      "chase(%d): CRC %s OK!"
+                                      % (len(flipped), method))
+                                crc_ok, crc_method = True, method
+                                raw_bytes = tr2
+                                payload = tr2[:payload_len]
+            finally:
+                iq1 = _iq1_saved
 
     # ---- Final result ----
     print("\n  === RESULT ===")
