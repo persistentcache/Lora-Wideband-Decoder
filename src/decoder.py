@@ -7154,6 +7154,57 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         trial_raw = dewhiten(assemble(trial_nibs))
         return trial_raw, trial_raw[:payload_len], trial_soft, trial_nibs
 
+    def _dd_resid_curve(ds_off, slope, frac_tau):
+        """DECISION-DIRECTED per-symbol tracker (the receiver's way).
+        The open-loop chain estimates the grid ONCE from the preamble
+        and demodulates the whole payload against it; drifting crystals
+        (measured: continuous ~0.05 bins/sym, U-curves after node init)
+        walk the tone across LDRO group boundaries and the demod reads
+        confidently-wrong levels no global retry can fix.  A hardware
+        receiver instead tracks symbol-by-symbol.  This does the same:
+        demod one symbol under the accumulated correction, DECIDE its
+        lattice point, measure the residual against that decision (in
+        the same rolled-by-cfo_shift frame the decision was made in —
+        self-consistent by construction, immune to the convention
+        ambiguities that sank the pilot-anchored variant), fold it into
+        the correction for the next symbol.  Wrong-decision safety: the
+        residual is wrapped to +/- group/2 and the step is clamped, so
+        one bad symbol nudges the loop by <=0.3 bin and the next good
+        symbol pulls it back.  Output is resid_curve-compatible:
+        curve[k] = total correction (bins) for data symbol k, consumed
+        by soft_decode_payload's per-row ramps.
+        """
+        _t = np.arange(N, dtype=np.float64)
+        if abs(frac_tau) > 1e-4:
+            _dcx = (downchirp * np.exp(-1j * 2.0 * np.pi * frac_tau
+                                       * _t / N)).astype(np.complex64)
+        else:
+            _dcx = downchirp
+        _nd = max(0, (len(iq1) - (data_start + int(ds_off))) // N)
+        _r = 0.0
+        _curve = []
+        for _si in range(min(_nd, 96)):
+            _adj = int(round(float(ds_off) + float(slope) * _si))
+            _p = data_start + _si * N + _adj
+            if not (0 <= _p and _p + N <= len(iq1)):
+                _curve.append(_r)
+                continue
+            _seg = iq1[_p:_p + N]
+            if abs(_r) > 1e-3:
+                _seg = _seg * np.exp(-1j * 2.0 * np.pi * _r * _t / N
+                                     ).astype(np.complex64)
+            _S = np.abs(_fft(_seg * _dcx, n=8 * N))
+            _pk = int(np.argmax(_S))
+            _pmr = float(_S[_pk]) / (float(_S.mean()) + 1e-30)
+            if _pmr > 15.0:
+                _fb = (_pk / 8.0 - cfo_shift) % N
+                _grp = 4 if _si < 8 else pay_bin_group
+                _e = _fb - _grp * round(_fb / _grp)
+                _e = ((_e + _grp / 2.0) % _grp) - _grp / 2.0
+                _r += max(-0.3, min(0.3, _e))
+            _curve.append(_r)
+        return _curve
+
     def _measure_resid_curve(ds_off, slope, frac_tau):
         """Per-symbol fractional-bin drift, tracked mod 1 and unwrapped.
         Data-independent: only the FRACTIONAL part of each symbol's fine
@@ -7709,32 +7760,43 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             if _k2 in _seen_lin:
                 continue
             _seen_lin.add(_k2)
-            _cv = _measure_resid_curve(_ds, _sl, _ft)
-            if not _cv or (max(_cv) - min(_cv)) < 0.12:
-                continue
-            print("  === CURVED-DRIFT RETRY (%s ds=%+d slope=%+.3f "
-                  "tau=%+.4f span=%.2f bins) ===" % (
-                      _lb, _ds, _sl, _ft, max(_cv) - min(_cv)))
-            tr_raw, tr_pay, tr_soft, tr_nibs = soft_decode_payload(
-                _ds, _sl, frac_tau=_ft, resid_curve=_cv)
-            if len(tr_raw) >= payload_len + 2:
-                ok, method = check_crc(tr_raw, payload_len, strict=True)
-                if ok and _is_chase_acceptable_uni(tr_raw):
-                    print("  curved-drift: CRC %s OK!" % method)
-                    crc_ok, crc_method = True, method
-                    _clean_crc = True
-                    raw_bytes, payload = tr_raw, tr_pay
-                    pay_soft_info = tr_soft
-                    break
-                ok, method, tr2, flipped = chase_decode(
-                    tr_nibs, tr_soft, max_flips=1, k=CHASE_K)
-                if ok:
-                    print("  curved-drift + chase(%d flips): CRC %s OK!"
-                          % (len(flipped), method))
-                    crc_ok, crc_method = True, method
-                    raw_bytes = tr2
-                    payload = tr2[:payload_len]
-                    break
+            # Decision-directed tracker first (the receiver's way; wins
+            # whenever decisions are mostly right), blind mod-1 curve as
+            # the fallback shape when DD's span gate does not fire.
+            for _kind, _cv in (("dd", _dd_resid_curve(_ds, _sl, _ft)),
+                               ("blind", _measure_resid_curve(_ds, _sl,
+                                                              _ft))):
+                if not _cv or (max(_cv) - min(_cv)) < 0.12:
+                    continue
+                print("  === CURVED-DRIFT RETRY (%s/%s ds=%+d "
+                      "slope=%+.3f tau=%+.4f span=%.2f bins) ===" % (
+                          _kind, _lb, _ds, _sl, _ft,
+                          max(_cv) - min(_cv)))
+                tr_raw, tr_pay, tr_soft, tr_nibs = soft_decode_payload(
+                    _ds, _sl, frac_tau=_ft, resid_curve=_cv)
+                if len(tr_raw) >= payload_len + 2:
+                    ok, method = check_crc(tr_raw, payload_len,
+                                           strict=True)
+                    if ok and _is_chase_acceptable_uni(tr_raw):
+                        print("  curved-drift(%s): CRC %s OK!"
+                              % (_kind, method))
+                        crc_ok, crc_method = True, method
+                        _clean_crc = True
+                        raw_bytes, payload = tr_raw, tr_pay
+                        pay_soft_info = tr_soft
+                        break
+                    ok, method, tr2, flipped = chase_decode(
+                        tr_nibs, tr_soft, max_flips=1, k=CHASE_K)
+                    if ok:
+                        print("  curved-drift(%s) + chase(%d flips): "
+                              "CRC %s OK!" % (_kind, len(flipped),
+                                              method))
+                        crc_ok, crc_method = True, method
+                        raw_bytes = tr2
+                        payload = tr2[:payload_len]
+                        break
+            if crc_ok:
+                break
 
     # ---- Final result ----
     print("\n  === RESULT ===")
