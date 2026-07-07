@@ -5079,7 +5079,25 @@ def process_file(fpath, relay_after=None, relay_before=None,
         if preamble_bin is not None:
             cfo_hz_raw = preamble_bin * bw / N
             found_cfos_hz.append(cfo_hz_raw)
-            skip_bins.append(preamble_bin)
+            # Do NOT ban a bin whose HEADER decoded and checked (hdr_ok):
+            # that is a CONFIRMED true grid whose payload failed for
+            # payload-side reasons (drift/margins) — the retry-only
+            # HDR-PILOT bootstrap exists exactly for it and needs the
+            # SAME bin re-chosen on the next attempt.  The unconditional
+            # append sent attempt 2 to junk-family candidates -> NO
+            # PREAMBLE and lost confirmed frames (set6 008/012/018:
+            # header PL=37 HDR_CHK=OK, confident payload, CRC fail;
+            # siblings with no junk family survived only via the
+            # all-filtered fallback resurrecting their banned bin).
+            # skip_bins keeps its original job: wrong-cyclic-shift and
+            # noise candidates that produced no valid header.
+            # slow-BW only: at fast BW plausible-garbage headers are
+            # common (the documented collision class) and retaining
+            # their bins burns the retry budget re-choosing them —
+            # measured: gsf12_500k 2/2 -> 1/2, g500_sf11 4/5 -> 3/5
+            # with unconditional retention.
+            if not (_d.get('hdr_ok') and bw <= 62500):
+                skip_bins.append(preamble_bin)
             # Recrop to baseband now instead of after exhausting the retry
             # budget.  Fires when the signal is well off-centre (SC peak can
             # land on an aliased bin on attempt 0 and the true carrier bin on
@@ -7026,12 +7044,35 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         print("  Fractional timing offset est: %+.4f bins" % tau_frac)
 
     # ---- Core soft decode function ----
-    def soft_decode_payload(ds_offset, slope=0.0, frac_tau=0.0):
+    def soft_decode_payload(ds_offset, slope=0.0, frac_tau=0.0,
+                            resid_curve=None):
         """Soft decode with given data_start offset, optional per-symbol
         timing slope (samples / symbol), and optional fractional timing
         correction frac_tau (bins) applied as exp(-j2πτt/N) to the downchirp.
+        resid_curve: optional per-symbol fractional-bin corrections applied
+        as per-row exp ramps — carries the demod through NONLINEAR drift
+        the single (slope, tau) linear model cannot represent.  Measured
+        need: freshly-initialized nodes drift 4x faster (-0.07 bins/sym,
+        thermal settle, CURVED) and accumulate ~3 bins over a 40-symbol
+        SF12/41.67k payload — confident demod of consistently wrong
+        levels, CRC dead (set6 captures 008/012/018).
         Returns (raw_bytes, payload, soft_info, nibs)."""
         base = data_start + int(ds_offset)
+
+        _rc_n = np.arange(N, dtype=np.float64) if resid_curve is not None else None
+
+        def _apply_resid(mat, si0):
+            if resid_curve is None:
+                return mat
+            out = np.array(mat, dtype=np.complex64, copy=True)
+            for _j in range(out.shape[0]):
+                _si = si0 + _j
+                _r = (resid_curve[_si] if _si < len(resid_curve)
+                      else (resid_curve[-1] if resid_curve else 0.0))
+                if abs(_r) > 1e-3:
+                    out[_j] *= np.exp(-1j * 2.0 * np.pi * _r * _rc_n / N
+                                      ).astype(np.complex64)
+            return out
 
         # Fractional timing correction: exp(-j2πτt/N) applied to the downchirp
         # moves the dechirped peak from bin s+τ back to bin s.
@@ -7060,7 +7101,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 break
             _hdr_segs.append(seg)
         if len(_hdr_segs) == 8:
-            _H = soft_fft_demod_batch(np.stack(_hdr_segs), dc, N, N // 4, ppm, 4,
+            _H = soft_fft_demod_batch(_apply_resid(np.stack(_hdr_segs), 0),
+                                      dc, N, N // 4, ppm, 4,
                                       cfo_shift=cfo_shift)
             hdr_llrs = [_H[i] for i in range(8)]
         if len(hdr_llrs) == 8:
@@ -7094,7 +7136,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 _pay_segs.append(seg)
             if len(_pay_segs) < rdd:
                 break
-            _P = soft_fft_demod_batch(np.stack(_pay_segs), dc, N, pay_levels,
+            _P = soft_fft_demod_batch(_apply_resid(np.stack(_pay_segs), sp),
+                                      dc, N, pay_levels,
                                       ppm_pay, pay_bin_group, cfo_shift=cfo_shift)
             pay_llrs = [_P[i] for i in range(rdd)]
             sp += rdd
@@ -7110,6 +7153,53 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
         trial_raw = dewhiten(assemble(trial_nibs))
         return trial_raw, trial_raw[:payload_len], trial_soft, trial_nibs
+
+    def _measure_resid_curve(ds_off, slope, frac_tau):
+        """Per-symbol fractional-bin drift, tracked mod 1 and unwrapped.
+        Data-independent: only the FRACTIONAL part of each symbol's fine
+        dechirp peak is used (the integer part is the data), so the frac
+        trajectory IS the grid error evolution — any shape.  Two-pass:
+        raw unwrap with a 0.2 bins/sym step clamp (collision/noise yanks
+        otherwise run the unwrap away), then NON-CAUSAL centered-median
+        smoothing (a causal tracker lags the thermal ramp by its own
+        time constant and leaves exactly the tail residual that kills
+        the CRC).  Baselined on the first 8 symbols so it composes with
+        the already-applied (ds, slope, tau)."""
+        _t = np.arange(N, dtype=np.float64)
+        if abs(frac_tau) > 1e-4:
+            _dcx = (downchirp * np.exp(-1j * 2.0 * np.pi * frac_tau * _t / N)
+                    ).astype(np.complex64)
+        else:
+            _dcx = downchirp
+        _nd = max(0, (len(iq1) - (data_start + int(ds_off))) // N)
+        _vals = []
+        _r = 0.0
+        _started = False
+        for _si in range(min(_nd, 96)):
+            _adj = int(round(float(ds_off) + float(slope) * _si))
+            _p = data_start + _si * N + _adj
+            if 0 <= _p and _p + N <= len(iq1):
+                _S = np.abs(_fft(iq1[_p:_p + N] * _dcx, n=8 * N))
+                _pk = int(np.argmax(_S))
+                _pmr = float(_S[_pk]) / (float(_S.mean()) + 1e-30)
+                if _pmr > 20.0:
+                    _m = (_pk / 8.0) % 1.0
+                    _d = ((_m - _r + 0.5) % 1.0) - 0.5
+                    if not _started:
+                        _r = _r + _d
+                    else:
+                        _r = _r + max(-0.2, min(0.2, _d))
+                    _started = True
+            _vals.append(_r)
+        _curve = []
+        for _i in range(len(_vals)):
+            _lo = max(0, _i - 2)
+            _hi = min(len(_vals), _i + 3)
+            _curve.append(float(np.median(_vals[_lo:_hi])))
+        if len(_curve) >= 8:
+            _base = float(np.median(_curve[:8]))
+            _curve = [c - _base for c in _curve]
+        return _curve
 
     # ---- Chase decoder function ----
     # CRC-16 has only 65536 codes.  Each chase trial flips a candidate
@@ -7466,6 +7556,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 diag_out['no_rescue'] = True
 
     # ---- Combined timing sweep with chase ----
+    best_candidates = []
     if crc_present and not crc_ok and not _skip_sweep:
         print("\n  === SWEEP (timing × chase) ===")
         # Limited sweep: ~20 timing offsets × decode-only + chase(1 flip)
@@ -7485,7 +7576,6 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         # fast; the thorough full-budget PASS 2 remains as the fallback.
         SWEEP_BUDGET = sweep_budget
         sweep_count = 0
-        best_candidates = []
 
         def record_candidate(label, ds_off, slope, frac_tau, tr_raw, tr_soft):
             if len(tr_raw) < payload_len + 2:
@@ -7592,12 +7682,59 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         sweep_elapsed = time.time() - sweep_start
         if not crc_ok:
             print("  sweep: %d combos in %.1fs — no CRC match" % (sweep_count, sweep_elapsed))
+        if not crc_ok:
             if best_candidates:
                 best_candidates.sort(key=lambda x: x[0])
                 print("  DIAG sweep: lowest-margin candidates:")
                 for margin_score, label, ds_off, slope, frac_tau, hx in best_candidates[:5]:
                     print("    %s ds=%+d slope=%+.3f tau=%+.4f worst8avg=%.2f head=%s" % (
                         label, ds_off, slope, frac_tau, margin_score, hx))
+
+    # ---- CURVED-DRIFT RETRY (2026-07-06) ----
+    # Nonlinear (thermal-settle) drift breaks the linear (slope, tau)
+    # family: the payload demods CONFIDENTLY at consistently-wrong
+    # levels and CRC dies.  Measure the actual residual trajectory
+    # and re-demod once with per-symbol correction.  The PRIMARY
+    # demod's base goes first: on drift-tail captures every sweep
+    # trial's worst8avg is ~0, so sweep-margin ordering carries no
+    # signal.  Slow-BW long-symbol frames only.
+    if crc_present and (not crc_ok) and bw <= 62500 and sym_time_ms > 16.0:
+        _retry_bases = [(0.0, 'primary', 0, 0.0, tau_frac, '')]
+        if best_candidates:
+            _retry_bases += sorted(best_candidates,
+                                   key=lambda x: -x[0])[:2]
+        _seen_lin = set()
+        for _ms, _lb, _ds, _sl, _ft, _hx in _retry_bases:
+            _k2 = (_ds, round(_sl, 3), round(_ft, 4))
+            if _k2 in _seen_lin:
+                continue
+            _seen_lin.add(_k2)
+            _cv = _measure_resid_curve(_ds, _sl, _ft)
+            if not _cv or (max(_cv) - min(_cv)) < 0.12:
+                continue
+            print("  === CURVED-DRIFT RETRY (%s ds=%+d slope=%+.3f "
+                  "tau=%+.4f span=%.2f bins) ===" % (
+                      _lb, _ds, _sl, _ft, max(_cv) - min(_cv)))
+            tr_raw, tr_pay, tr_soft, tr_nibs = soft_decode_payload(
+                _ds, _sl, frac_tau=_ft, resid_curve=_cv)
+            if len(tr_raw) >= payload_len + 2:
+                ok, method = check_crc(tr_raw, payload_len, strict=True)
+                if ok and _is_chase_acceptable_uni(tr_raw):
+                    print("  curved-drift: CRC %s OK!" % method)
+                    crc_ok, crc_method = True, method
+                    _clean_crc = True
+                    raw_bytes, payload = tr_raw, tr_pay
+                    pay_soft_info = tr_soft
+                    break
+                ok, method, tr2, flipped = chase_decode(
+                    tr_nibs, tr_soft, max_flips=1, k=CHASE_K)
+                if ok:
+                    print("  curved-drift + chase(%d flips): CRC %s OK!"
+                          % (len(flipped), method))
+                    crc_ok, crc_method = True, method
+                    raw_bytes = tr2
+                    payload = tr2[:payload_len]
+                    break
 
     # ---- Final result ----
     print("\n  === RESULT ===")
