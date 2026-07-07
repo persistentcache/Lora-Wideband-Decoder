@@ -4989,17 +4989,35 @@ while True:
                 elif s:
                     mesh_lines.append(s)
 
+        # Decode evidence beyond the Meshtastic block / RESULT CRC line.
+        # A MeshCore (or LoRaWAN) frame that decodes MID-LADDER (e.g. attempt 0
+        # wins via try-both) emits its packet block + [PKT] inline and the
+        # ladder then continues into retries, so the job's output has NO
+        # '=== RESULT ===' section and NO '--- Meshtastic Packet ---' block.
+        # The old predicates below only looked at crc_line/mesh_lines and
+        # rendered such jobs as "(no CRC/mesh parsed)" — hiding a VERIFIED
+        # decode from the terminal (the [PKT] record still reached the packet
+        # log, which is why the log and the compact stdout disagreed: the
+        # 2026-07-02 counting trap, re-discovered 2026-07-07 after it burned
+        # a full day of leg benches showing a phantom live-vs-offline gap).
+        # Gate on verification evidence: the packet blocks also print for
+        # structural-only 'candidate' frames (garbage sharing the 0x12 sync),
+        # which must keep rendering as failures.
+        _decoded_blocks = (bool(meshcore_lines or lorawan_lines)
+                           and ('[DECRYPTED' in output
+                                or '"confidence":"verified"' in output))
+
         # Secondary pass: suppress all error/failure output — finding nothing is normal.
         _crc_bad = (not crc_line
                     or 'FAIL' in (crc_line or '')
                     or 'not present' in (crc_line or ''))
-        if _is_secondary and _crc_bad and not mesh_lines:
+        if _is_secondary and _crc_bad and not mesh_lines and not _decoded_blocks:
             return ''
 
         # If a later attempt produced a real CRC result, prefer it over an
         # early-attempt error (e.g. HEADER CHECKSUM FAILED from attempt 0
         # shouldn't mask a CRC FAIL from attempt 3 that got further).
-        if error and not crc_line and not mesh_lines:
+        if error and not crc_line and not mesh_lines and not _decoded_blocks:
             parts = [f"         [DECODE {elapsed:.0f}s] {fname}: {error}"]
             for el in error_lines[:10]:
                 parts.append(f"           {el}")
@@ -5014,7 +5032,7 @@ while True:
                     parts.append(f"           {header_summary}")
             return '\n'.join(parts) + '\n'
 
-        if not crc_line and not mesh_lines:
+        if not crc_line and not mesh_lines and not _decoded_blocks:
             if _is_secondary:
                 return ''  # secondary pass found nothing — expected, stay quiet
             # Decoder produced output but we didn't recognize it; surface a hint.
@@ -5100,6 +5118,14 @@ while True:
 
         _decode_tag = ('RELAY' if _is_relay else 'PRE' if _is_pre else 'DECODE')
         parts = []
+        if not crc_line and _decoded_blocks:
+            # Mid-ladder decode (no RESULT section in this attempt): label the
+            # block so the terminal shows the frame instead of "(no CRC/mesh
+            # parsed)".  Verified status is carried by the [DECRYPTED]/packet
+            # lines that follow.
+            parts.append(f"         [{_decode_tag} {elapsed:.0f}s] "
+                         f"{'MeshCore' if meshcore_lines else 'LoRaWAN'} "
+                         f"packet decoded (mid-ladder)")
         if crc_line:
             suffix = ' (no preamble lock — preamble absent or corrupted in capture)' if (no_preamble_lock and 'FAIL' in crc_line) else ''
             parts.append(f"         [{_decode_tag} {elapsed:.0f}s] {crc_line}{suffix}")
