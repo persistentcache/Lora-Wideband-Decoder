@@ -2699,6 +2699,27 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                         print(f"    FS4-VETO {freq_hz/1e6:.4f}MHz",
                               file=sys.stderr)
                     continue
+                # Whole-slice consistency metric for the cross-preset
+                # contested-bucket arbitration below (2026-07-08): the true
+                # (sf, bw) dechirps cleanly on preamble AND payload, while
+                # an alias/sliver-steal is clean only on its preamble
+                # stretch (or nowhere) — its MEDIAN collapses.  Raw best-8
+                # bwq cannot arbitrate cross-preset: bin-count bias hands
+                # up-aliases +3 dB/SF-step (a CW-birdie sliver-steal at
+                # (11,500k) measured bwq 25 vs the REAL SF7/125k's honest
+                # 19-20 and displaced it in the tight carrier+time dedup —
+                # burst-1 class of the MC-SF7 ground truth), while a
+                # normalized key hands DOWN-aliases the same handicap
+                # (the dedup comment's SF9/62.5-vs-SF11/125 case).  The
+                # median metric kills both directions categorically.
+                _med_end = _pos_nb + 192 * N_sf
+                _nb_med = (nb[_pos_nb:_med_end]
+                           if 0 < _pos_nb < len(nb) - N_sf * 8 else nb_al)
+                if len(_nb_med) >= N_sf * 8:
+                    _bwq_med, _ = dechirp_peak_quality(_nb_med, sf, bw,
+                                                       agg='median')
+                else:
+                    _bwq_med = bw_quality
                 _ld.append({
                     'freq_hz':       freq_hz,
                     'freq_mhz':      freq_hz / 1e6,
@@ -2708,6 +2729,8 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     'detect_conf':   float(sc_score),
                     'sf_conf':       float(sc_score),
                     'bw_quality_db': bw_quality,
+                    'bwq_med_db':    float(_bwq_med),
+                    'width_hz':      (float(_wh_peak) if _wh_peak else None),
                     'peak_power_db': pwr,
                     # Preamble start time WITHIN this window (seconds), combined
                     # downstream with the window sample position for an absolute
@@ -2744,23 +2767,52 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
     # bandwidth).
     if len(dets) > 1:
         _center_hz_arb = center_mhz * 1e6
-        # RAW quality sort: up-aliases are already killed at resolve
-        # (grouped vote), so the variants contesting here are the true
-        # identity vs DOWN-aliases and spread shoulders — and a
-        # normalized key would hand the down-alias a +3 dB/SF-step
-        # handicap and let it displace the truth (observed: SF9/62.5
-        # winning the merge against a real SF11/125 beacon).
+        # RAW quality sort — DELIBERATELY unchanged (the pre-2026-07-08
+        # order): same-preset copies of one packet must keep their
+        # historical survivor (a marginal two60 Meshtastic decode flips
+        # deterministically under ANY reordering of its copies).  Cross-
+        # preset contests are arbitrated pairwise in the keep-loop below
+        # via WIDTH-CONSISTENCY, because no per-window PMR metric can do
+        # it: raw best-8 hands UP-aliases the +3 dB/SF-step bin-count
+        # bias (a sliver-steal at (11,500k) measured bwq 23-25 vs the
+        # real SF7/125k's honest 19-20 and displaced it here);
+        # SF-normalizing hands DOWN-aliases the same handicap (observed:
+        # SF9/62.5 beating a real SF11/125); the whole-slice median is
+        # DEGENERATE for same-slope up-aliases (k tones per wider window
+        # lose exactly the 10*log10(k) the bin count gains).
         dets.sort(key=lambda d: d['bw_quality_db'], reverse=True)
+
+        def _width_cls(d):
+            # 2 = claimed bw consistent with the peak's measured occupied
+            # width; 1 = width unmeasurable; 0 = inconsistent.  Ground
+            # truth: the real SF7/125k det carries w=121.8k (consistent);
+            # every sliver-steal SF11/500k det carried w=None or a
+            # sub-kHz junk contour.
+            _w = d.get('width_hz')
+            if not _w:
+                return 1
+            import math as _m2
+            return 2 if abs(_m2.log2(d['bw'] / _w)) <= 0.85 else 0
         _kept = []
         for _d in dets:
             _span = 8.0 * (2.0 ** _d['sf']) / _d['bw']
             _dup = False
-            for _k in _kept:
+            for _ki, _k in enumerate(_kept):
                 _kspan = 8.0 * (2.0 ** _k['sf']) / _k['bw']
                 if (abs(_d['preamble_t_s'] - _k['preamble_t_s'])
                         < max(_span, _kspan)
                         and abs(_d['freq_hz'] - _k['freq_hz'])
                         < max(_d['bw'], _k['bw'], 60_000.0)):
+                    # CROSS-PRESET width arbitration (2026-07-08): when a
+                    # kept det and a later (lower raw-bwq) det claim
+                    # DIFFERENT (sf, bw) for the same carrier+time, the
+                    # one whose claim matches the measured occupied width
+                    # wins regardless of raw bwq — the raw order is
+                    # bin-count-biased across presets (see sort note).
+                    # Same-preset copies keep the historical order.
+                    if ((_d['sf'], _d['bw']) != (_k['sf'], _k['bw'])
+                            and _width_cls(_d) > _width_cls(_k)):
+                        _kept[_ki] = _d
                     _dup = True
                     break
                 # MID-PACKET duplicate: at strong SNR the payload's
