@@ -5120,37 +5120,57 @@ while True:
         # hop1.  Hop0 and hop1 carry nearly-identical payloads (only the flags byte
         # differs), so the FP-DEDUP Hamming-cluster check would falsely suppress every
         # legitimate relay copy.
-        _crc_ok_for_fp = crc_line and 'OK' in crc_line and 'FAIL' not in crc_line
-        if _crc_ok_for_fp and payload_hex_line and _pkt_id is None:
-            _m_fp = _re.search(r'Payload \(\d+ bytes\): ([0-9a-fA-F]+)', payload_hex_line)
-            if _m_fp:
-                try:
-                    _raw_fp = bytes.fromhex(_m_fp.group(1))
-                    if len(_raw_fp) >= 4:
-                        _fp = BackgroundDecoder._payload_fingerprint(_raw_fp)
-                        _now_fp = time.time()
-                        _FP_WINDOW = 30.0
-                        _FP_THRESH = 14
-                        with self._fp_dedup_lock:
-                            # Prune stale entries
-                            for _k in [k for k, t in self._fp_dedup.items()
-                                       if _now_fp - t > _FP_WINDOW]:
-                                del self._fp_dedup[_k]
-                            # Check for a matching cluster (same payload ± bit errors)
-                            if any(BackgroundDecoder._hamming64(_fp, _k) <= _FP_THRESH
-                                   for _k in self._fp_dedup):
-                                _tag_fp = ('RELAY' if _is_relay else 'PRE' if _is_pre
-                                           else 'DECODE')
-                                return (f"         [{_tag_fp} {elapsed:.0f}s] "
-                                        f"[FP-DEDUP] duplicate payload suppressed\n")
-                            if len(self._fp_dedup) < 512:
-                                self._fp_dedup[_fp] = _now_fp
-                                # Phase-2: same as for _packet_dedup admit —
-                                # bucket is now covered; sibling captures
-                                # skip decode at dispatch.
-                                self._mark_bucket_decoded(fname)
-                except Exception:
-                    pass
+        _crc_ok_for_fp = bool(crc_line and 'OK' in crc_line
+                              and 'FAIL' not in crc_line)
+        # Phase-2 admit-gap fix (2026-07-08): a mid-ladder verified decode
+        # (MeshCore via try-both, etc.) has NO RESULT-block crc_line, so it
+        # never reached this path — its bucket was never admitted and every
+        # sibling capture decoded redundantly (measured: 0 real-carrier
+        # SKIP-BUCKET events across whole SF12 MeshCore legs while SF11
+        # Meshtastic siblings deduped fine).  A verified decrypt/MAC is at
+        # least as strong an identity as a bare CRC-16 pass, so let it
+        # drive the same fingerprint dedup + bucket admit.  Fingerprint the
+        # verified [PKT] record's raw_hex — canonical across siblings —
+        # NOT the section's "Payload hex:" line (that prints the pre-
+        # try-both drift-on bytes, which differ per capture).
+        # _decoded_blocks requires verification evidence, so candidate-only
+        # frames still never admit.
+        _fp_hex = None
+        if _crc_ok_for_fp and payload_hex_line:
+            _m_fp = _re.search(r'Payload \(\d+ bytes\): ([0-9a-fA-F]+)',
+                               payload_hex_line)
+            _fp_hex = _m_fp.group(1) if _m_fp else None
+        elif _decoded_blocks:
+            _m_fp = _re.search(r'"raw_hex":"([0-9a-fA-F]+)"', output)
+            _fp_hex = _m_fp.group(1) if _m_fp else None
+        if _fp_hex and _pkt_id is None:
+            try:
+                _raw_fp = bytes.fromhex(_fp_hex)
+                if len(_raw_fp) >= 4:
+                    _fp = BackgroundDecoder._payload_fingerprint(_raw_fp)
+                    _now_fp = time.time()
+                    _FP_WINDOW = 30.0
+                    _FP_THRESH = 14
+                    with self._fp_dedup_lock:
+                        # Prune stale entries
+                        for _k in [k for k, t in self._fp_dedup.items()
+                                   if _now_fp - t > _FP_WINDOW]:
+                            del self._fp_dedup[_k]
+                        # Check for a matching cluster (same payload ± bit errors)
+                        if any(BackgroundDecoder._hamming64(_fp, _k) <= _FP_THRESH
+                               for _k in self._fp_dedup):
+                            _tag_fp = ('RELAY' if _is_relay else 'PRE' if _is_pre
+                                       else 'DECODE')
+                            return (f"         [{_tag_fp} {elapsed:.0f}s] "
+                                    f"[FP-DEDUP] duplicate payload suppressed\n")
+                        if len(self._fp_dedup) < 512:
+                            self._fp_dedup[_fp] = _now_fp
+                            # Phase-2: same as for _packet_dedup admit —
+                            # bucket is now covered; sibling captures
+                            # skip decode at dispatch.
+                            self._mark_bucket_decoded(fname)
+            except Exception:
+                pass
 
         _decode_tag = ('RELAY' if _is_relay else 'PRE' if _is_pre else 'DECODE')
         parts = []
