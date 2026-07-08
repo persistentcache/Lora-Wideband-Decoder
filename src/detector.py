@@ -1697,7 +1697,8 @@ def schmidl_cox_multi(iq_1m, lags=None, n_sym=8):
 
 
 def _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=None, pos=None,
-                         nb_cache=None, pos_map=None, width_hz=None):
+                         nb_cache=None, pos_map=None, width_hz=None,
+                         off_hz=0.0):
     """Pick best (sf, bw) from ambiguous Schmidl-Cox candidates via dechirp quality.
     fft_cache: reuses a single forward FFT across candidates with different BWs
     (same buffer, different narrowband extraction).  ~25 % per-call speedup when
@@ -1720,7 +1721,11 @@ def _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=None, pos=None,
         if nb_cache is not None and bw in nb_cache:
             nb = nb_cache[bw][0]
         else:
-            nb, _fs = extract_narrowband_fft(iq_1m, 1_000_000, 0.0, bw,
+            # off_hz: occupied-band centroid measured by the caller — see
+            # the 2026-07-08 note at the hit_lags loop (PSD nomination can
+            # sit ±BW/2 off-carrier; a mis-centred crop halves the chirp
+            # and collapses the dechirp vote to noise level).
+            nb, _fs = extract_narrowband_fft(iq_1m, 1_000_000, off_hz, bw,
                                              fft_cache=fft_cache)
             if nb_cache is not None:
                 nb_cache[bw] = (nb, _fs)
@@ -1729,7 +1734,28 @@ def _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=None, pos=None,
         if _pos_c:
             _p = int(round(_pos_c * (bw * 2) / 1_000_000.0))
             if 0 < _p < len(nb) - (2 ** sf) * 4:
-                nb_use = nb[_p:_p + 32 * (2 ** sf)]   # 16 syms at 2x oversampling
+                # POSITION-ROBUST slice (2026-07-08): the old 16-sym slice
+                # assumed the SC plateau position lands ON the preamble,
+                # but plateau centers sit up to ~50 ms off the preamble
+                # start (lag-dependent skew; measured on the MC-SF7/125k
+                # ground-truth recording).  A candidate evaluated on the
+                # wrong 16 syms dechirps at junk level (3-7 dB vs 19-22 dB
+                # at the right spot), so NO candidate reached
+                # DECHIRP_MIN_DB, rule 1 emptied _viable, and the vote
+                # fell back to the raw argmax — whose +3 dB/SF-step
+                # bin-count bias then crowned same-slope harmonics
+                # (17 of 24 windows classified SF11/500k+SF12/500k on a
+                # pure SF7/125k burst train → captures saved with wrong
+                # SF/BW in the fname → 2/12 frames decoded).  Widen the
+                # slice to [-16, +112] symbols around the plateau:
+                # dechirp_peak_quality's internal best-8 run finds the
+                # preamble anywhere inside, restoring sane measurements
+                # for every candidate at bounded cost (still sliced —
+                # ~13% of the buffer at SF7, whole-buffer at SF12 which
+                # simply matches the pre-optimization behaviour).
+                _n2 = (2 ** sf) * 2
+                _s0 = max(0, _p - 16 * _n2)
+                nb_use = nb[_s0:_p + 112 * _n2]
         if len(nb_use) < (2 ** sf) * 4:
             continue
         q, _ = dechirp_peak_quality(nb_use, sf, bw)
@@ -1760,6 +1786,28 @@ def _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=None, pos=None,
         # 3. ACROSS groups raw best-8 decides (different slopes separate
         #    by ~12 dB raw; global normalization would wreck this).
         _viable = [t for t in _quals if t[0] >= DECHIRP_MIN_DB]
+        if not _viable:
+            # NO candidate dechirps like LoRa (2026-07-08): a real preamble
+            # measures >= DECHIRP_MIN_DB at its own (sf, bw) here; when
+            # EVERY hypothesis sits at noise level the content is not a
+            # LoRa preamble at any of them — reject the peak instead of
+            # returning the raw argmax, whose +3 dB/SF-step bin-count bias
+            # crowns the widest/highest-SF candidate.  Ground truth: the
+            # HackRF ±5 MHz CW birdies SC-hit at EVERY lag (0.74-0.97 flat
+            # across four octaves — CW autocorrelates at any lag), resolved
+            # to SF11/SF12/500k whose ±500 kHz crops swallowed a REAL
+            # neighbouring beacon's edge energy (910.525 sits +525 kHz
+            # from the 910.000 birdie), squeaked past the bwq gate on that
+            # stolen energy, and emitted junk detections at ~910.53 that
+            # out-competed the real SF7/125k frame's own detection — the
+            # MC-SF7 leg lost ~65% of its frames this way.  The downstream
+            # bwq gate still protects the accepted path; this just stops
+            # known-junk from being handed a preset label.
+            if os.environ.get('LORA_RESOLVE_DEBUG'):
+                print(f"    RESOLVE: all {len(_quals)} candidates < "
+                      f"{DECHIRP_MIN_DB} dB — peak rejected (no viable)",
+                      file=sys.stderr)
+            return None, None, best_q
         if _viable:
             _groups = {}
             for q, sf, bw in _viable:
@@ -1769,7 +1817,15 @@ def _resolve_sf_bw_ambig(iq_1m, candidates, fft_cache=None, pos=None,
             for _g in _groups.values():
                 _g.sort(key=lambda t: t[0] - 10.0 * _m.log10(2.0 ** t[1]),
                         reverse=True)
-                if width_hz and len(_g) > 1:
+                if width_hz and width_hz >= 20000 and len(_g) > 1:
+                    # width gate (2026-07-08): only trust the width
+                    # tie-break when the measurement is physically
+                    # plausible for LoRa (narrowest preset 31.25 kHz;
+                    # skirt-narrowed measurements bottom out ~0.6x bw).
+                    # The MC-SF7/125k ground truth measured w=0.2-0.5 kHz
+                    # — a junk contour — while the position-robust
+                    # normalized order (4+ dB separation within the
+                    # same-slope group) picks the truth; let it.
                     # same-slope members are dechirp- AND SC-degenerate BY
                     # CONSTRUCTION (identical bw^2/2^sf) — their normalized
                     # qualities differ only by noise, so no q-window: the
@@ -2279,6 +2335,84 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
 
         hit_lags.sort(key=lambda x: x[1], reverse=True)
 
+        # ---- Occupied-band centroid for this peak (2026-07-08) ----
+        # The PSD peak that nominated this candidate can sit up to ±BW/2
+        # off-carrier: the max-hold is built from ~0.2 ms FFT snapshots, and
+        # a slow-sweep short burst (SF7/125k: 1.024 ms/sweep, ~110 ms burst)
+        # gets caught at a handful of random instantaneous chirp positions
+        # (measured: jagged 24 kHz contour on a 125 kHz chirp, peak +61 kHz
+        # off-carrier).  Every narrowband crop below (resolver vote AND the
+        # bw_quality gate) was extracted at that bad centre, so the TRUE
+        # preset lost half its chirp and dechirped at noise level while
+        # same-slope harmonics in wider crops kept the whole signal —
+        # 17 of 24 windows of an MC-SF7/125k ground-truth burst train
+        # classified as SF11/500k+SF12/500k (fname SF/BW wrong → 2/12
+        # frames decoded).  Fix: Welch-average a ~260 ms slice at the
+        # strongest plateau, take the dominant contiguous region's
+        # centroid, and centre every crop there.  Guarded: only applied
+        # when the region is clearly elevated (>9 dB over the median), so
+        # floor-level signals keep the exact old behaviour.
+        # LAZY: computed on first rescue-eligibility check only — the
+        # unconditional per-peak version cost +36% CPU on the dense spur
+        # band (~254 FFTs per peak, dozens of junk peaks per window) while
+        # its value is consumed only by the rescue branch.
+        _off_c_memo = [None]
+
+        def _band_centroid():
+            if _off_c_memo[0] is not None:
+                return _off_c_memo[0]
+            _off_c_memo[0] = 0.0
+            try:
+                _cs = int(max(0, hit_lags[0][2] - 8192))
+                _seg_c = iq_1m[_cs:_cs + 262144]
+                if len(_seg_c) >= 8192:
+                    _wc = np.hanning(2048).astype(np.complex64)
+                    _accc = None
+                    for _oc in range(0, len(_seg_c) - 2048, 1024):
+                        _Sc = np.abs(_fft(_seg_c[_oc:_oc + 2048] * _wc)) ** 2
+                        _accc = _Sc if _accc is None else _accc + _Sc
+                    if _accc is not None:
+                        _accc = np.fft.fftshift(_accc)
+                        _fqc = np.fft.fftshift(np.fft.fftfreq(2048, 1.0 / 1e6))
+                        _pkc = int(np.argmax(_accc))
+                        if _accc[_pkc] > 8.0 * float(np.median(_accc)):
+                            _thrc = _accc[_pkc] * 0.25
+                            _loc = _pkc
+                            while _loc > 0 and _accc[_loc - 1] > _thrc:
+                                _loc -= 1
+                            _hic = _pkc
+                            while (_hic < len(_accc) - 1
+                                   and _accc[_hic + 1] > _thrc):
+                                _hic += 1
+                            _wcv = _accc[_loc:_hic + 1]
+                            _c = float(np.sum(_fqc[_loc:_hic + 1] * _wcv)
+                                       / _wcv.sum())
+                            # Correction band for the RESCUE pass (the
+                            # centroid is only consulted AFTER a primary
+                            # resolve at the nominated centre comes back
+                            # dead or marginal — see the call site).
+                            # 10 kHz floor: if the primary died, a
+                            # sub-10 kHz nudge won't revive it (birdie
+                            # peaks measure ±105 Hz — they stay dead).
+                            # 100 kHz cap: larger pulls mean the dominant
+                            # energy is a DIFFERENT signal — latching it
+                            # made junk peaks viable on stolen energy
+                            # (harness: new spurious dets 270-1400 kHz
+                            # off-carrier), and sub-kHz nudges flipped a
+                            # marginal two60 decode in the always-on
+                            # design.
+                            if 10e3 <= abs(_c) <= 100e3:
+                                _off_c_memo[0] = _c
+            except Exception:
+                _off_c_memo[0] = 0.0
+            if os.environ.get('LORA_SLOW_DEBUG'):
+                print(f"  [TRACE] peak {off_hz/1e6:+.3f}MHz pwr={pwr:.0f}dB "
+                      f"w={_wh_peak and round(_wh_peak/1e3,1)}k "
+                      f"centroid={_off_c_memo[0]:+.0f}Hz "
+                      f"lags={[(l, round(s,2)) for l, s, _ in hit_lags[:5]]}",
+                      file=sys.stderr)
+            return _off_c_memo[0]
+
         seen = set()
         tried = set()      # exact (sf, bw, pos) dechirps already evaluated —
                            # different lags often resolve to the same candidate
@@ -2337,12 +2471,46 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                         _pp = sc_pairs.get((_csf, float(_cbw)))
                         if _pp is not None:
                             _pos_map[(_csf, _cbw)] = _pp[1]
-                    sf, bw, _ = _resolve_sf_bw_ambig(iq_1m, candidates,
-                                                     fft_cache=_ffc,
-                                                     pos=_pos_best,
-                                                     nb_cache=_nb_by_bw,
-                                                     pos_map=_pos_map,
-                                                     width_hz=_wh_peak)
+                    # PRIMARY resolve at the nominated centre — byte-
+                    # identical inputs to the pre-fix behaviour.
+                    sf, bw, _q1 = _resolve_sf_bw_ambig(iq_1m, candidates,
+                                                       fft_cache=_ffc,
+                                                       pos=_pos_best,
+                                                       nb_cache=_nb_by_bw,
+                                                       pos_map=_pos_map,
+                                                       width_hz=_wh_peak)
+                    if ((sf is None or _q1 < DECHIRP_MIN_DB + 6.0)
+                            and _band_centroid()):
+                        # RESCUE: the primary verdict is DEAD (all
+                        # candidates junk) or MARGINAL, and the occupied-
+                        # band centroid says the energy sits 10-100 kHz
+                        # off the nomination.  The snapshot max-hold
+                        # nominates a slow-sweep short burst up to ±BW/2
+                        # off its carrier; a crop there starves the TRUE
+                        # preset below the viable bar while a same-slope
+                        # harmonic's wider crop keeps the signal and can
+                        # win a MARGINAL vote at 15-18 dB (measured:
+                        # SF7/125k MC bursts classified SF11/500k in 17
+                        # of 24 windows).  Re-vote once on crops centred
+                        # at the centroid, in a PRIVATE cache so the
+                        # shared nb (and every healthy detection's
+                        # bw_quality) is untouched; keep whichever vote
+                        # MEASURED higher.  Well-nominated real signals
+                        # resolve at 25-35 dB and never enter this path.
+                        _nb_rescue = {}
+                        _sf2, _bw2, _q2 = _resolve_sf_bw_ambig(
+                            iq_1m, candidates, fft_cache=_ffc,
+                            pos=_pos_best, nb_cache=_nb_rescue,
+                            pos_map=_pos_map, width_hz=_wh_peak,
+                            off_hz=_band_centroid())
+                        if _sf2 is not None and (sf is None or _q2 > _q1):
+                            sf, bw = _sf2, _bw2
+                            _nb_by_bw = _nb_rescue   # downstream bw_quality
+                                                     # must see the crop the
+                                                     # vote was won on
+                    if sf is None:
+                        continue    # no candidate dechirps like LoRa — junk
+                                    # (CW birdie / flat-lag class); next lag
 
             if os.environ.get('LORA_SLOW_DEBUG'):
                 print(f"  [TRACE] lag={lag} resolved sf={sf} bw={bw}",
@@ -2386,6 +2554,9 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             if bw in _nb_by_bw:
                 nb, _nbfs = _nb_by_bw[bw]
             else:
+                # 0.0 = the nominated centre: the shared cache must stay
+                # byte-identical to pre-fix behaviour; a rescue that WINS
+                # swaps in its own centred cache above.
                 nb, _nbfs = extract_narrowband_fft(iq_1m, 1_000_000, 0.0, bw,
                                                     fft_cache=_ffc)
                 _nb_by_bw[bw] = (nb, _nbfs)
