@@ -3920,6 +3920,18 @@ class BackgroundDecoder:
         self._pkt_log_path = os.environ.get('LORA_PKT_LOG', '/tmp/lora_packets.jsonl')
         self._pkt_log_lock = threading.Lock()
 
+        # Opt-in raw decode-job log (LORA_DECODE_RAWLOG=path): appends every
+        # job lifecycle event (SUBMIT, SKIP-*, JOB with the worker's full raw
+        # output, REQUEUE-SLOW) so a capture's live outcome is always
+        # attributable.  The compact stdout is a lossy display — it hides
+        # mid-ladder results, drops [BUDGET] markers, and renders some
+        # failures unlabeled — which made "decoded but hidden", "ran and
+        # failed", and "job silently lost" indistinguishable post-hoc (the
+        # 2026-07-07 phantom live-vs-offline gap cost a full day exactly
+        # this way).  Default off; zero cost besides one branch per event.
+        self._rawlog_path = os.environ.get('LORA_DECODE_RAWLOG', '')
+        self._rawlog_lock = threading.Lock()
+
         # Post-decode dedup: suppress same (PacketID, hops_taken) within 60s.
         # Prevents the same relay hop from being reported twice when the Welch
         # PSD finds the chirp at two different instantaneous frequencies.
@@ -4271,6 +4283,21 @@ while True:
                   file=sys.stderr, flush=True)
             return None
 
+    def _rawlog(self, tag, what, text=''):
+        """Append one job-lifecycle event to the raw decode log (no-op unless
+        LORA_DECODE_RAWLOG is set).  `text` (the worker's raw output) is
+        framed so multi-line records stay parseable."""
+        if not self._rawlog_path:
+            return
+        try:
+            with self._rawlog_lock:
+                with open(self._rawlog_path, 'a') as f:
+                    f.write(f"@@@ {time.time():.3f} {tag} {what}\n")
+                    if text:
+                        f.write(text.rstrip('\n') + "\n@@@ END\n")
+        except Exception:
+            pass
+
     def _ref_inc(self, fpath):
         """Increment outstanding-job count for `fpath`.  Called on every
         enqueue (submit() + slow re-queue) so the file is held until every
@@ -4454,6 +4481,8 @@ while True:
         # The post-decode _packet_dedup collapses any duplicate RESULTS, so
         # submitting them all is safe (no FP / no double-count).
         self._ref_inc(fpath)
+        self._rawlog('SUBMIT', f"{fname} relay={relay_after_syms},{relay_before_syms} "
+                               f"tier={'slow' if self._defer_state else 'fast'}")
         (self._slow_queue if self._defer_state else self._queue).put((fpath, fname, relay_after_syms, relay_before_syms, None))
 
     def pending(self):
@@ -4592,6 +4621,7 @@ while True:
             # imports the IQ, never builds FFT plans, never allocates the
             # (n_sym, N) symbol matrices.
             if self._bucket_already_decoded(fpath):
+                self._rawlog('SKIP-BUCKET', os.path.basename(fpath))
                 self._ref_dec_and_maybe_unlink(fpath)
                 self._queue.task_done()
                 if self._verbose:
@@ -4620,6 +4650,7 @@ while True:
                     time.sleep(0.1)
                     if self._bucket_already_decoded(fpath):
                         # Sibling admitted while we waited — skip cleanly.
+                        self._rawlog('SKIP-INFLIGHT-ADMIT', os.path.basename(fpath))
                         self._ref_dec_and_maybe_unlink(fpath)
                         self._queue.task_done()
                         if self._verbose:
@@ -4714,6 +4745,9 @@ while True:
 
                 output = '\n'.join(output_lines)
                 elapsed = time.time() - t_start
+                self._rawlog('JOB', f"{fname} mode={relay_field or '-'} "
+                                    f"budget={job_budget} elapsed={elapsed:.1f}s "
+                                    f"timed_out={timed_out}", output or '(empty)')
 
                 # Structured packet log: append each [PKT] record (decoded or
                 # encrypted-header-only) with a receive timestamp to the JSONL the
@@ -4762,6 +4796,7 @@ while True:
                         and relay_after_syms is None
                         and relay_before_syms is None):
                     self._ref_inc(fpath)
+                    self._rawlog('REQUEUE-SLOW', fname)
                     self._slow_queue.put((fpath, fname, None, None,
                                           self._slow_budget))
 
@@ -4798,6 +4833,7 @@ while True:
                         sys.stdout.flush()
 
             except Exception as e:
+                self._rawlog('JOB-ERROR', f"{fname} exc={e!r}")
                 sys.stdout.write(
                     f"         [DECODE ERROR] {fname}: {e}\n")
                 sys.stdout.flush()
