@@ -7649,7 +7649,14 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             [0] + list(range(-8, 9)) + [-(dec // 2), dec // 2, -dec, dec]
         )
 
-        sweep_start = time.time()
+        # CPU-time budget (2026-07-08; was wall-clock): the wall version
+        # made the sweep's candidate count depend on host load and pool
+        # scheduling — the same file's decode flipped run-to-run in whole-
+        # pipeline replays (the g31 'CRC luck' item: 3/3, 2/3, 3/3) and
+        # marginal sweep-won frames were silently load-sensitive live.
+        # Workers are single-threaded, so process_time == on-CPU work —
+        # the same semantics the global _BUDGET_S conversion established.
+        sweep_start = time.process_time()
         # Sweep is the last-resort recovery path for the rare LoRa packet
         # whose tau-frac estimate from the preamble doesn't quite align the
         # payload symbols.  2 s is a balance: long enough to recover real
@@ -7673,7 +7680,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
         def try_candidate(label, ds_off, slope, frac_tau=0.0):
             nonlocal crc_ok, crc_method, _clean_crc, raw_bytes, payload, sweep_count
-            if crc_ok or time.time() - sweep_start > SWEEP_BUDGET:
+            if crc_ok or time.process_time() - sweep_start > SWEEP_BUDGET:
                 return True
             tr_raw, tr_pay, tr_soft, tr_nibs = soft_decode_payload(ds_off, slope, frac_tau=frac_tau)
             sweep_count += 1
@@ -7763,7 +7770,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 if crc_ok:
                     break
 
-        sweep_elapsed = time.time() - sweep_start
+        sweep_elapsed = time.process_time() - sweep_start
         if not crc_ok:
             print("  sweep: %d combos in %.1fs — no CRC match" % (sweep_count, sweep_elapsed))
         if not crc_ok:
