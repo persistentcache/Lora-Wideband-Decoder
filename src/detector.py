@@ -5559,6 +5559,12 @@ def main():
     _slow_fruitless = {} # bucket -> consecutive fruitless scans this streak
     _slow_exact = {}     # bucket -> freshest exact peak bin (for seeding)
     _slow_busy = [False] # background slow-scan in flight (drop-if-busy)
+    _slow_pending = {}   # bucket -> (exact_bin, expiry_tick): triggers that
+                         # fired while a scan was in flight, deferred instead
+                         # of dropped (the drop-if-busy race lost ~2/29 real
+                         # SF12 frames per leg whose trigger ticks all landed
+                         # in another bucket's busy shadow — typically their
+                         # own IQ-image's scan)
     _slow_results = queue.Queue()   # (dets_slow, _iq_long, reg_tot_s, trig)
     # Tail samples consumed last iter (for save).  Prepended to this iter's iq
     # so the audio timeline stays continuous — without this, every save creates
@@ -6384,13 +6390,26 @@ def main():
         # flickery junk (hovering at the 10 dB seed bar) drop out for one
         # window, VANISH its negative cooldown entry, and re-trigger 3
         # windows later — 282-304 scans/10 min through TWO prior fixes
-        # (keys were never the leak; state persistence was). Positive
-        # (streak) entries still evaporate on absence — that IS the
-        # streak-break reset that keeps real bursty slow packets
-        # triggering at base cooldown.
+        # (keys were never the leak; state persistence was).
+        # POSITIVE streaks DECAY by 1 on absence instead of evaporating
+        # (2026-07-07): a GATE-THROTTLE shed can drop the real carrier's
+        # peak for ONE window mid-preamble; full evaporation then reset
+        # the streak to 0 with only ~3-4 seeding ticks in an SF12/41.67k
+        # preamble — the frame's trigger never fired (set10 counter 14,
+        # sheds observed in-window).  Decay keeps a one-window dropout
+        # recoverable (3 -> 2 -> present -> 3 -> trigger) while junk that
+        # flickers every other window oscillates 1-2 and never reaches
+        # the >=3 trigger bar — same FP cadence as full evaporation.
+        # Two absent windows still zero the streak (the streak-break
+        # reset below then clears punishment history one window later
+        # than before — same between-frames behaviour).
         for _bk_c, _c_c in _slow_seeds.items():
-            if _c_c < 0 and _bk_c not in _new_seeds:
+            if _bk_c in _new_seeds:
+                continue
+            if _c_c < 0:
                 _new_seeds[_bk_c] = _c_c + 1
+            elif _c_c > 1:
+                _new_seeds[_bk_c] = _c_c - 1
         # STREAK BREAK resets punishment history: a real bucket that got
         # one badly-timed fruitless scan starts fresh at its next burst
         # (junk never breaks streak, so its history survives)
@@ -6403,14 +6422,33 @@ def main():
         # (SF11/31.25k, 1.2 s) plus its packet body spans 3+ windows
         _trig = [_slow_exact.get(_bk, _bk * 8 + 4)
                  for _bk, _c in _slow_seeds.items() if _c >= 3]
+        # DEFER-NOT-DROP (2026-07-07): a trigger that lands while another
+        # scan is in flight used to be silently discarded; with only ~3-4
+        # seeding ticks per SF12/41.67k preamble (and streaks decaying on
+        # absence) the busy shadow of a NEIGHBOR bucket's scan — typically
+        # the frame's own IQ image, which triggers off the same beacon —
+        # could consume every trigger opportunity for the REAL carrier
+        # (set10 counter 17: image detected, real carrier never scanned).
+        # Stash busy-blocked triggers and fire them on the next free tick:
+        # the 4 s assembly still contains the full 1.8 s preamble after a
+        # few 0.5 s hops, so a deferred scan sees the same signal.  Expiry
+        # 4 ticks keeps a stale trigger from scanning an assembly whose
+        # preamble has already scrolled out.
+        _slow_pending = {k: v for k, v in _slow_pending.items()
+                         if v[1] >= _slow_tick}
+        _trig_bks = {int(_b) // 8 for _b in _trig}
+        _fire = list(_trig) + [v[0] for k, v in _slow_pending.items()
+                               if k not in _trig_bks]
         if os.environ.get('LORA_SLOW_DEBUG'):
             print(f"[SLOW] tick={_slow_tick} halves={len(_slow_halves)} "
-                  f"seeds={_slow_seeds} trig={_trig}", file=sys.stderr)
-        if _trig and len(_slow_halves) == 8 and not _slow_busy[0]:
+                  f"seeds={_slow_seeds} trig={_trig} "
+                  f"pending={_slow_pending}", file=sys.stderr)
+        if _fire and len(_slow_halves) == 8 and not _slow_busy[0]:
+            _slow_pending.clear()
             # parts refs only — the 640 MB concat happens IN THE THREAD
             # (it was 92 ms median on the loop, second stall driver)
             _halves_bg = list(_slow_halves)
-            _trig_bg = list(_trig)
+            _trig_bg = list(_fire)
             _seedpk_bg = [(float(_b), 13, 20.0, None) for _b in _trig_bg]
             _regpos_bg = tot_s
             _slow_busy[0] = True
@@ -6447,18 +6485,46 @@ def main():
                 _slow_scan_bg()   # file mode: no realtime deadline, and the
                                   # loop outruns a background thread (stale
                                   # assemblies, dropped triggers)
+        elif _trig:
+            # Busy (or assembly still filling): defer this tick's fresh
+            # triggers instead of dropping them.  A re-trigger refreshes
+            # the pending entry (newest exact bin + expiry).
+            for _b in _trig:
+                _slow_pending[int(_b) // 8] = (_b, _slow_tick + 4)
 
         # consume finished background scans (bookkeeping on main thread)
         while not _slow_results.empty():
             dets_slow, _iq_long, _reg_tot_s, _trig_done = _slow_results.get()
             _hit_bins = set()
+            _hit_cool = {}       # hit bin -> post-hit cooldown (ticks)
             for d in dets_slow:
-                _hit_bins.add(int(round((d['freq_hz'] - _live_center_mhz * 1e6)
-                                        / (a.rate / 4096.0))) + 2048)
+                _hb = int(round((d['freq_hz'] - _live_center_mhz * 1e6)
+                                / (a.rate / 4096.0))) + 2048
+                _hit_bins.add(_hb)
+                # AIRTIME-SCALED HIT COOLDOWN (2026-07-07): the flat -4
+                # (~2 s) re-armed the bucket MID-PACKET; the packet's own
+                # tail then re-built the streak, the re-scan found no
+                # preamble (long gone), and the fruitless ESCALATION
+                # (fr=3 -> -8 -> -16 -> -32) punished the REAL carrier's
+                # bucket into a hole its NEXT frame arrived inside of
+                # (set12 live autopsy: bucket 141 at seeds=-6 as the new
+                # preamble landed; image bucket 370 at streak 6 won the
+                # trigger — image-only detection, frame lost, ~2/29 per
+                # leg).  Sleep through the tail instead: half the max-PL
+                # airtime in 0.5 s hop-ticks (full beacon tails are ~45%
+                # of max-PL; a genuinely full-length packet's remaining
+                # tail costs <=2 fruitless scans, which the fr<=2 grace
+                # absorbs at -1 each).  A same-carrier follow-up frame
+                # (relay hop, ACK) can't start before the current frame
+                # ends, so the half-airtime sleep never eats one.
+                _cool = int(np.ceil(0.5 * 148.25 * (2 ** d['sf'])
+                                    / d['bw'] / 0.5))
+                _hit_cool[_hb] = max(4, min(64, _cool))
             for _b in _trig_done:
                 _bk = _b // 8
-                if any(abs(_b - _hb) < 8 for _hb in _hit_bins):
-                    _slow_seeds[_bk] = -4
+                _hits = [_hb for _hb in _hit_bins if abs(_b - _hb) < 8]
+                if _hits:
+                    _slow_seeds[_bk] = -max(_hit_cool[_hb] for _hb in _hits)
                     _slow_backoff[_bk] = 4
                     _slow_fruitless[_bk] = 0
                 elif os.environ.get('LORA_NO_BACKOFF'):
