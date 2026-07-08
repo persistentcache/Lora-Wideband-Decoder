@@ -2809,10 +2809,23 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     # one whose claim matches the measured occupied width
                     # wins regardless of raw bwq — the raw order is
                     # bin-count-biased across presets (see sort note).
+                    # Within the consistent class the CLOSER width wins:
+                    # a 125 kHz burst whose width over-measured at 163 kHz
+                    # made BOTH 125k (0.39) and 250k (0.61) 'consistent',
+                    # and the raw-bwq tie-break crowned the SF9/250k
+                    # mislabel (ctr-5 class of the ground truth).
                     # Same-preset copies keep the historical order.
-                    if ((_d['sf'], _d['bw']) != (_k['sf'], _k['bw'])
-                            and _width_cls(_d) > _width_cls(_k)):
-                        _kept[_ki] = _d
+                    if (_d['sf'], _d['bw']) != (_k['sf'], _k['bw']):
+                        _cd, _ck = _width_cls(_d), _width_cls(_k)
+                        _swap = _cd > _ck
+                        if (not _swap and _cd == _ck == 2
+                                and _d.get('width_hz')):
+                            import math as _m3
+                            _swap = (abs(_m3.log2(_d['bw'] / _d['width_hz']))
+                                     < abs(_m3.log2(_k['bw'] / _k['width_hz']))
+                                     - 0.15)
+                        if _swap:
+                            _kept[_ki] = _d
                     _dup = True
                     break
                 # MID-PACKET duplicate: at strong SNR the payload's
