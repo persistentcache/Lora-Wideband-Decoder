@@ -161,6 +161,36 @@ def _validate_capture_dir(path):
     except Exception as e:
         return False, resolved, '%s: %s' % (type(e).__name__, e)
 
+def _sweep_capture_dir(path):
+    """Remove orphaned capture artifacts (SF*.cf32, *.spool) from `path`.
+    PATTERN-RESTRICTED on purpose: the path is user-configurable, so an
+    all-files sweep could destroy the contents of a mistyped directory.
+    Disk-backed captures survive reboots (unlike the old tmpfs default), so
+    orphans from a crashed run must be cleaned by us, not by the OS: called
+    at web-server start, after pipeline stop, and on the OLD directory when
+    the capture path changes (otherwise its orphans are stranded forever).
+    Returns bytes reclaimed."""
+    freed = 0
+    try:
+        for _f in os.listdir(path):
+            if not ((_f.startswith('SF') and _f.endswith('.cf32'))
+                    or _f.endswith('.spool') or _f == '.lora_write_test'):
+                continue
+            _p = os.path.join(path, _f)
+            try:
+                if os.path.isfile(_p):
+                    freed += os.path.getsize(_p)
+                    os.unlink(_p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    if freed:
+        print('[CAPTURES] swept %.0f MB of orphaned captures from %s'
+              % (freed / 1e6, path), file=sys.stderr)
+    return freed
+
+
 def _capture_budget_mb(resolved_dir):
     """Pending-capture byte budget passed to the detector (0 = unbounded).
     RAM mode: 25% of MemAvailable (tmpfs eats RAM directly).  Disk mode: a
@@ -2291,6 +2321,9 @@ def stop_pipeline():
     _kill_stale_pipeline()          # also reap detached gate/bladeRF children
     PIPELINE.update(proc=None, running=False)
     HEALTH.update(msps=None, warn=None)   # gate gone → clear live readout
+    # In-flight captures whose decode jobs died with the process are orphans
+    # now — sweep them so a stopped session leaves no disk residue.
+    _sweep_capture_dir(_effective_capture_dir())
     _broadcast({'type': 'stats', 'data': _stats()})
     _broadcast({'type': 'health', 'data': HEALTH})
     return {'ok': True}
@@ -2558,6 +2591,7 @@ def api_settings():
         # --- Capture storage (disk default / RAM opt-in / custom path) ---
         _cap_changed = False
         _cap_error = None
+        _cap_old_dir = _effective_capture_dir()   # for orphan sweep on change
         if 'capture_ram' in d:
             _new_ram = bool(d['capture_ram'])
             if _new_ram != bool(SETTINGS.get('capture_ram')):
@@ -2600,6 +2634,13 @@ def api_settings():
             save_settings(SETTINGS)
             _apply_waterfall_flag()
             _apply_unknown_flag()
+        # A capture-storage change abandons the OLD directory — sweep its
+        # orphaned captures now or they are stranded forever (nothing else
+        # ever looks at that path again).
+        if _cap_changed:
+            _new_dir = _effective_capture_dir()
+            if _cap_old_dir != _new_dir:
+                _sweep_capture_dir(_cap_old_dir)
         # A channelize_* or capture-storage change alters the detector launch flags
         # (--channels / --export-iq), so restart the running pipeline (background
         # thread) to apply it.  No-op if not running.
@@ -3432,6 +3473,14 @@ def main():
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
     threading.Thread(target=tail_packet_log, args=(log_path,), daemon=True).start()
+    # Server boot: sweep crash orphans from the capture dir.  Disk-backed
+    # captures survive reboots (unlike the old tmpfs default), and a user who
+    # hit a crash may never press Start again — the detector's own start-time
+    # reap would then never run.
+    try:
+        _sweep_capture_dir(_effective_capture_dir())
+    except Exception:
+        pass
     try:
         open(PIPELINE_LOG, 'w').close()   # fresh session: drop any prior run's health log
     except Exception:

@@ -3342,13 +3342,21 @@ class SignalRecorder:
         self.debug = debug
         os.makedirs(export_dir, exist_ok=True)
         # Reap orphan captures from a previous crashed run.  The pipeline holds
-        # captures live in /dev/shm only as long as the decoder refcount is
-        # non-zero; if the prior process was killed (OOM, Ctrl-C, etc.) those
-        # files have no live refcount and are dead weight on tmpfs.  At a fresh
-        # start nothing is in flight, so any pre-existing file is by definition
-        # orphaned and safe to unlink.
+        # captures live only as long as the decoder refcount is non-zero; if
+        # the prior process was killed (OOM, Ctrl-C, etc.) those files have no
+        # live refcount and are dead weight.  At a fresh start nothing is in
+        # flight, so any pre-existing CAPTURE is by definition orphaned.
+        # PATTERN-RESTRICTED (2026-07-09): the export dir is user-configurable
+        # now (web Advanced → Capture Storage) — an indiscriminate all-files
+        # sweep would DELETE THE CONTENTS of any mistyped/shared directory the
+        # user points it at.  Only remove what this pipeline writes: SF*.cf32
+        # captures and .spool temporaries.
         try:
             for _f in os.listdir(export_dir):
+                if not ((_f.startswith('SF') and _f.endswith('.cf32'))
+                        or _f.endswith('.spool')
+                        or _f == '.lora_write_test'):
+                    continue
                 _p = os.path.join(export_dir, _f)
                 if os.path.isfile(_p):
                     try:
