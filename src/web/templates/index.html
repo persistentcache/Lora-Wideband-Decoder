@@ -1210,6 +1210,8 @@ const ADV_DEFAULTS = {
   ldro_fallback: true,
   iq_invert: false,
   wide_scan: false,
+  capture_ram: false,
+  capture_dir: '',
   tune: {threshold: 0.55, energy_threshold: 6.0, buf_seconds: 16}
 };
 // Hover-tooltip text for every advanced option.  Terse, fact-first — what it
@@ -1227,6 +1229,8 @@ const ADV_TIPS = {
   unknown: "Surface good-CRC LoRa frames matching no enabled protocol. Off by default. When off, decoder skips them entirely (saves CPU).",
   fingerprint: "Extract UMOP features (CFO jitter, AM ripple, PLL phase, I/Q balance) from the preamble. Feeds Mystery Devices and per-node clustering. ~10–15 % extra decode CPU. Header decode coverage unchanged.",
   ldro_fallback: "When a payload fails CRC, retry it once with the opposite Low Data Rate Optimization (LDRO) setting. LDRO is normally inferred from symbol time (auto-on above 16 ms), but some transmitters force it against that default (e.g. satellite / tinyGS at SF8/41.7 kHz) — without this, those packets never decode or even surface as unknown. The CRC arbitrates, so it only adds decodes. On by default; runs only on CRC-fail, negligible cost.",
+  capture_ram: "Store IQ captures in RAM (/dev/shm tmpfs) instead of on disk. Higher throughput ceiling on RAM-rich hosts, but tmpfs can't spill under memory pressure — a sustained decode backlog fills RAM and the OOM killer terminates the pipeline. OFF (disk) is recommended: the OS page cache serves the read-soon-after-write pattern at RAM speed and short-lived captures often never touch the physical device, while staying evictable to disk under pressure (graceful slowdown, not a crash). Changing this restarts a running pipeline.",
+  capture_dir: "Directory the pipeline writes IQ captures to (disk mode). Blank = a default folder next to the app data. Must be on a writable filesystem; the path is permission-checked when you set it and again at pipeline start. Prefer a real disk (NVMe/SSD) — avoid /tmp if it is tmpfs on your system, which reintroduces the RAM-fill risk.",
   iq_normal: "Standard LoRa IQ orientation — Meshtastic, MeshCore, LoRaWAN uplink, and virtually all terrestrial LoRa. Leave here unless you are specifically receiving an inverted source.",
   iq_inverted: "Conjugate the input stream to decode IQ-inverted transmitters: LoRaWAN downlink and satellite / tinyGS configs with Invert-IQ enabled. MUTUALLY EXCLUSIVE — in this mode normal (non-inverted) traffic will NOT decode. Use only when monitoring a known-inverted source.",
   scan_all: "Adds SF11/500, SF12/500, SF12/250 and the 31.25 kHz set on top of Common. Catches niche signals at the cost of higher CPU and some spurious detections. Off by default.",
@@ -1324,9 +1328,17 @@ function renderAdvancedConfig(box){
         ${num('chanaftern',s.channelize_after_n||10,3,500,1,'Min intercepts per channel','How many decoded packets a channel must accumulate before it is fed to the dechirp matched-filter. Lower = faster to channelize, higher = only well-established channels.')}
         ${num('chanmax',s.channelize_max_channels||10,1,20,1,'Max channels','Cap on how many learned channels run the dechirp matched-filter at once (busiest first). Higher = more coverage, more CPU.')}
         <div id="chanlist" class="muted" style="font-size:11px;margin:6px 0 0;line-height:1.6">loading channels…</div>
+        <h4 style="margin:18px 0 2px">Capture storage</h4>
+        ${cb('capram',s.capture_ram===true,'<b>RAM-only captures (/dev/shm)</b><br><span class="muted" style="font-size:11px">Store IQ captures in RAM instead of disk. Faster ceiling on RAM-rich hosts, but a sustained decode backlog can fill RAM and OOM-kill the pipeline. <b>Off (disk) is recommended</b> — the page cache makes disk RAM-fast for the read-soon pattern and spills under pressure instead of crashing. Changing this restarts a running pipeline.</span>',ADV_TIPS.capture_ram)}
+        <div id="caprow" style="display:${s.capture_ram?'none':'flex'};gap:8px;align-items:center;margin:6px 0 0">
+          <span class="muted" style="font-size:11px;min-width:80px">Capture path</span>
+          <input id="capdir" type="text" placeholder="${esc(s.capture_default_dir||'(default)')}" value="${esc(s.capture_dir||'')}" title="${esc(ADV_TIPS.capture_dir)}" style="flex:1;min-width:0;cursor:text">
+          <button id="capsave" title="Validate + set the capture directory. Restarts a running pipeline.">Set path</button>
+        </div>
+        <p class="muted" id="capstatus" style="font-size:11px;margin:5px 0 0;line-height:1.5">Captures → <code>${esc(s.capture_effective_dir||'…')}</code>. Blank = default. The path is permission-checked; changing storage restarts a running pipeline.</p>
         <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--line);display:flex;gap:10px;align-items:center">
-          <button id="advreset" title="Restore every Protocols and Advanced option to its built-in default. Does NOT touch SDR/Radio or Channel keys.">Reset to defaults</button>
-          <span class="muted" style="font-size:11px">Restores all Protocols + Advanced options (protocols, unknown, scan, fingerprint, LDRO, IQ, tuning). Doesn't affect SDR/Radio or Channel keys.</span>
+          <button id="advreset" title="Restore every Protocols and Advanced option to its built-in default (including capture storage — may restart a running pipeline). Does NOT touch SDR/Radio or Channel keys.">Reset to defaults</button>
+          <span class="muted" style="font-size:11px">Restores all Protocols + Advanced options (protocols, unknown, scan, fingerprint, LDRO, IQ, tuning, capture storage — may restart a running pipeline). Doesn't affect SDR/Radio or Channel keys.</span>
         </div>
       </div>
     </details>`;
@@ -1335,6 +1347,12 @@ function renderAdvancedConfig(box){
     q('#fp').onchange=e=>post({fingerprint:e.target.checked});
     q('#ldro').onchange=e=>post({ldro_fallback:e.target.checked});
     q('#iqmode').onchange=e=>post({iq_invert:e.target.value==='inverted'});
+    const capStatus=(j)=>{const st=q('#capstatus');if(!st)return;
+      if(j&&j.capture_error){st.innerHTML='<span style="color:#e5534b">'+esc(j.capture_error)+'</span>';}
+      else{st.innerHTML='Captures → <code>'+esc((j&&j.capture_effective_dir)||'')+'</code>. Blank = default. The path is permission-checked; changing storage restarts a running pipeline.';}};
+    q('#capram').onchange=e=>{const on=e.target.checked;const row=q('#caprow');if(row)row.style.display=on?'none':'flex';
+      post({capture_ram:on}).then(r=>r.json()).then(capStatus);};
+    q('#capsave').onclick=()=>post({capture_dir:q('#capdir').value}).then(r=>r.json()).then(capStatus);
     const saveTune=()=>post({tune:{
       threshold:parseFloat(q('#tunethresh').value),
       energy_threshold:parseFloat(q('#tuneeth').value),
@@ -1355,7 +1373,7 @@ function renderAdvancedConfig(box){
     }).catch(()=>{});
     renderChans();
     q('#advreset').onclick=()=>{
-      if(!confirm('Reset every Protocols and Advanced option to defaults? Channel keys and SDR/Radio settings are NOT touched.'))return;
+      if(!confirm('Reset every Protocols and Advanced option to defaults (including capture storage — this may restart a running pipeline)? Channel keys and SDR/Radio settings are NOT touched.'))return;
       post(ADV_DEFAULTS).then(()=>_renderConfigBody());
     };
   }).catch(()=>{});

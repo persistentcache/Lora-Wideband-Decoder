@@ -4220,7 +4220,41 @@ class SignalRecorder:
                              f"_pwr{int(round(d.get('peak_power_db', 0.0)))}"
                              f"_{dt_str[:-3]}{_sq % 1000:03d}.cf32")
                     fpath = os.path.join(self.export_dir, fname)
-                    nb.astype(np.complex64).tofile(fpath)
+                    # Capacity guard: shed this capture if the undecoded backlog
+                    # already fills the byte budget.  Only in decode mode — the
+                    # files are ref-counted and unlinked, so their bytes release
+                    # as decodes finish; export-only keeps files by design.
+                    # Policy is DROP-NEWEST: once the backlog is full, arriving
+                    # captures are shed regardless of strength (already-queued
+                    # weaker ones are not evicted — they hold worker jobs that
+                    # are hard to claw back).  Simple and safe; the [CAPTURE-
+                    # DROP] log line makes the shedding visible.
+                    _fsize = len(nb) * 8          # complex64 = 8 bytes/sample
+                    if self._decoder is not None:
+                        _admit, _drop, _pend = self._decoder._cap_try_reserve(
+                            fpath, _fsize)
+                        if not _admit:
+                            if _drop == 1 or _drop % 25 == 0:
+                                print(f"         → [CAPTURE-DROP] backlog "
+                                      f"{_pend/1e6:.0f}MB ≥ budget "
+                                      f"{self._decoder._cap_budget/1e6:.0f}MB — "
+                                      f"shedding captures ({_drop} dropped; "
+                                      f"decode can't drain fast enough)",
+                                      flush=True)
+                            continue
+                    try:
+                        nb.astype(np.complex64).tofile(fpath)
+                    except Exception:
+                        # Failed write (disk full / perms): release the budget
+                        # reservation — no decode will ever _ref_dec it — and
+                        # drop any partial file, then let the outer handler log.
+                        if self._decoder is not None:
+                            self._decoder._cap_release(fpath)
+                        try:
+                            os.unlink(fpath)
+                        except OSError:
+                            pass
+                        raise
                     dur_ms = len(nb) / nb_fs * 1000
                     print(f"         → Saved {fname} "
                           f"({dur_ms:.0f}ms, {len(nb)} samples "
@@ -4412,6 +4446,25 @@ class BackgroundDecoder:
         # Deterministic — no time-based reaper guessing safe intervals.
         self._refs = {}
         self._refs_lock = threading.Lock()
+
+        # ---- Pending-capture byte budget (backpressure the unbounded decode
+        # queues never provided) ----
+        # Captures accumulate on the export FS until their decode finishes; if
+        # they arrive faster than the workers drain them, an unbounded backlog
+        # fills the backing store (tmpfs → OOM; disk → page-cache pressure).
+        # LORA_CAPTURE_BUDGET_MB caps the total bytes of UNDECODED captures on
+        # disk: over budget, a new capture is dropped at the recorder (the
+        # weakest-quality ones are shed first because detections are saved
+        # strongest-first) instead of growing the backlog without bound.
+        # 0/unset = unbounded (legacy behaviour).
+        try:
+            self._cap_budget = int(os.environ.get('LORA_CAPTURE_BUDGET_MB', '0')) * 1024 * 1024
+        except ValueError:
+            self._cap_budget = 0
+        self._cap_bytes = {}          # fpath -> file size (counted ONCE per file)
+        self._pending_bytes = 0
+        self._cap_lock = threading.Lock()
+        self._cap_dropped = 0
 
         # Find decoder.py next to this script
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -4685,6 +4738,36 @@ while True:
         except Exception:
             pass
 
+    def _cap_try_reserve(self, fpath, size):
+        """Reserve `size` bytes for a new capture against the pending-capture
+        budget.  Returns (admitted, dropped_total, pending_bytes).  admitted=
+        False → the caller must NOT write the capture (backlog full).  Budget 0
+        → always admitted.  The reserved bytes are released in
+        `_ref_dec_and_maybe_unlink` when the capture's decodes all finish."""
+        if not self._cap_budget:
+            return True, 0, 0
+        with self._cap_lock:
+            if self._pending_bytes + size > self._cap_budget:
+                self._cap_dropped += 1
+                return False, self._cap_dropped, self._pending_bytes
+            self._pending_bytes += size
+            self._cap_bytes[fpath] = size
+            return True, 0, self._pending_bytes
+
+    def _cap_release(self, fpath):
+        """Release a reservation made by `_cap_try_reserve` WITHOUT a decode
+        having run — the write failed (disk full, perms) so no _ref_dec will
+        ever fire for it.  Without this, every failed write ratchets
+        _pending_bytes upward until the budget reads permanently full and the
+        guard silently drops ALL future captures — a worse failure than the
+        one it guards against."""
+        if not self._cap_budget:
+            return
+        with self._cap_lock:
+            _sz = self._cap_bytes.pop(fpath, None)
+            if _sz:
+                self._pending_bytes -= _sz
+
     def _ref_inc(self, fpath):
         """Increment outstanding-job count for `fpath`.  Called on every
         enqueue (submit() + slow re-queue) so the file is held until every
@@ -4703,6 +4786,13 @@ while True:
                 self._refs[fpath] = n
                 return
             self._refs.pop(fpath, None)
+        # Release this file's reserved bytes from the capacity budget (whether or
+        # not the file is actually unlinked below — its decode is done either way).
+        if self._cap_budget:
+            with self._cap_lock:
+                _sz = self._cap_bytes.pop(fpath, None)
+                if _sz:
+                    self._pending_bytes -= _sz
         if os.environ.get('LORA_KEEP_IQ'):
             return          # debugging: keep capture files for autopsy
         try:
@@ -7148,10 +7238,21 @@ def main():
                     active = recorder._decoder._active_count
                 _dec_t, _dec_u = recorder._decoder.decoded_counts()
             drops = reader.drops if is_live else 0
+            # rss= : main-process resident memory, for OOM forensics (issue #6
+            # follow-up: a 24/7 host was OOM-killed with 4.5 GB ANON in one
+            # python3 — this pins WHICH run grows and how fast).  One 5-second
+            # /proc read; the web health parser extracts fields by name, so
+            # the insertion is format-safe.
+            try:
+                with open('/proc/self/statm') as _sm:
+                    _rss_mb = int(_sm.read().split()[1]) * (os.sysconf('SC_PAGE_SIZE') // 1024) / 1024.0
+            except Exception:
+                _rss_mb = 0.0
             print(f"[STAT] {elapsed:.1f}s | {msps:.1f}Msps | win={wc} det={tot_d} "
                   f"decoded={_dec_u}u/{_dec_t} "
                   f"save_q={save_q} dec_q={dec_q} active={active} "
                   f"pipe={dt * 1000:.0f}ms"
+                  + (f" rss={_rss_mb:.0f}M" if _rss_mb else "")
                   + (f" drops={drops/1e6:.1f}M" if drops else "")
                   + (f" clip={_sat_max*100:.1f}%" if _sat_max > 0.005 else "")
                   + (f" gain={_agc.gain:.0f}" if _agc is not None and _agc.enabled

@@ -64,8 +64,16 @@ workers     = -1                         # -1 = auto-scale from cpu_count. Set a
 # workers   = 4                          # ALT: pin to 4 decode workers (reserve cores for other apps).
 # workers   = 12                         # ALT: pin to 12 — useful on dedicated hosts when you've measured a different sweet spot than the auto-scaler.
 
-export_dir   = "/dev/shm/live_caps"       # where captures are written (tmpfs)
-# export_dir = "/tmp/live_caps"          # ALT: disk-backed captures (slower, but persists across reboot).
+# Where captures are written.  NOTE: the web GUI now defaults capture storage
+# to REAL DISK (Advanced → Capture storage) and treats a customized NON-tmpfs
+# export_dir here as its fallback path; the tmpfs value below only applies to
+# direct CLI runs.  Disk is NOT meaningfully slower for this workload — the
+# page cache serves the write-then-read-soon pattern at RAM speed (measured
+# <1% wall-time difference) — and unlike tmpfs it cannot fill RAM and OOM-kill
+# the pipeline under a sustained decode backlog.  Prefer a real-disk path; use
+# the GUI's RAM-only toggle (or /dev/shm here) only on RAM-rich hosts.
+export_dir   = "/dev/shm/live_caps"       # CLI default (tmpfs; see note above)
+# export_dir = "/var/tmp/live_caps"      # ALT: disk-backed captures (recommended for 24/7 hosts)
 
 
 packet_log  = "/tmp/lora_packets.jsonl"  # structured packet log the web tails
