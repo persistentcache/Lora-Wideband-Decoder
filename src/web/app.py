@@ -1668,9 +1668,29 @@ HEALTH = {'msps': None, 'rate_msps': None, 'drops_m': 0.0, 'save_q': None,
           'warn': None, 'detect_workers': None, 'preflight_note': None,
           'clip_pct': None}
 import re as _re
-_RE_STAT = _re.compile(r'\[STAT\]\s+([\d.]+)s\s+\|\s+([\d.]+)Msps\s+\|\s+win=(\d+)\s+'
-                       r'det=(\d+)\s+save_q=(\d+)\s+dec_q=(\d+)\s+active=(\d+)\s+'
-                       r'pipe=(\d+)ms(?:\s+drops=([\d.]+)M)?')
+# Anchor only on the invariant head of the [STAT] line (marker + elapsed +
+# Msps).  Every other field is pulled BY NAME via _stat_field below rather than
+# by a fixed positional pattern: the detector's [STAT] line has grown fields
+# over time (decoded=Nu/M added in 0afe44b, gain= later) and a rigid full-line
+# regex silently stops matching the instant a field is inserted mid-line —
+# which breaks HEALTH telemetry and fires a false "no telemetry — overloaded"
+# warning while the pipeline is actually healthy (issue #6).  Name-based
+# extraction is order- and insertion-independent.
+_RE_STAT = _re.compile(r'\[STAT\]\s+([\d.]+)s\s+\|\s+([\d.]+)Msps')
+
+
+def _stat_field(ln, name, cast=int):
+    """Extract `name=<number>` from a [STAT] line regardless of position.
+    Returns None if the field is absent.  The value pattern stops at the first
+    non-numeric char, so unit/suffix forms (pipe=11ms, drops=1.0M, decoded=0u/0)
+    yield just the leading number (or None where there is no leading number)."""
+    m = _re.search(r'\b' + name + r'=([\d.]+)', ln)
+    if not m:
+        return None
+    try:
+        return cast(m.group(1))
+    except ValueError:
+        return None
 _RE_CLIP = _re.compile(r'clip=([\d.]+)%')   # ADC saturation, appended to [STAT] when clipping
 _RE_AUTO = _re.compile(r'Detect workers: AUTO = (\d+)')
 # CATCHUP appears when the detector falls so far behind the ring buffer it has
@@ -1741,10 +1761,18 @@ def _tail_health():
                     continue
                 m = _RE_STAT.search(ln)
                 if m:
-                    HEALTH.update(elapsed=float(m.group(1)), msps=float(m.group(2)),
-                                  det=int(m.group(4)), save_q=int(m.group(5)),
-                                  dec_q=int(m.group(6)), pipe_ms=int(m.group(8)),
-                                  drops_m=float(m.group(9)) if m.group(9) else HEALTH['drops_m'])
+                    _f_det = _stat_field(ln, 'det')
+                    _f_sq = _stat_field(ln, 'save_q')
+                    _f_dq = _stat_field(ln, 'dec_q')
+                    _f_pm = _stat_field(ln, 'pipe')
+                    _f_dr = _stat_field(ln, 'drops', float)
+                    HEALTH.update(
+                        elapsed=float(m.group(1)), msps=float(m.group(2)),
+                        det=_f_det if _f_det is not None else HEALTH['det'],
+                        save_q=_f_sq if _f_sq is not None else HEALTH['save_q'],
+                        dec_q=_f_dq if _f_dq is not None else HEALTH['dec_q'],
+                        pipe_ms=_f_pm if _f_pm is not None else HEALTH['pipe_ms'],
+                        drops_m=_f_dr if _f_dr is not None else HEALTH['drops_m'])
                     changed = True
                     last_stat_at = now
                     # A fresh STAT line means we got telemetry — clear any
