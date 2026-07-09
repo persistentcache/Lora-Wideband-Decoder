@@ -2530,6 +2530,43 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                         continue    # no candidate dechirps like LoRa — junk
                                     # (CW birdie / flat-lag class); next lag
 
+            # SAME-SLOPE FAMILY MATCHED-SC OVERRIDE (2026-07-09, matrix
+            # counter-5 class): at weak SNR the dechirp vote between
+            # same-slope family siblings (bw <-> 2bw @ sf+2) COIN-FLIPS
+            # scan to scan — the 62.5k-slice replay shows lag-65536
+            # resolves alternating SF10/31.25k vs SF12/62.5k all session,
+            # and whichever label the frame's single preamble-covering
+            # scan happened to draw became the save (a wrong draw = a
+            # 62ksps/8s crop that can never decode a 62.5kHz/12s frame).
+            # The MATCHED SC score separates the pair decisively where the
+            # vote cannot: true SF12/62.5k frames measure 0.94-0.98 under
+            # the 62.5k matched extraction vs 0.67-0.72 under the 31.25k
+            # one (and vice versa for true 31.25k frames).  When the vote
+            # winner's own matched score is materially below a same-slope
+            # sibling's, trust the matched filter over the marginal vote.
+            # Slow pass only — the 1 s path has its own frozen arbitration.
+            if only_bws is not None and sf is not None:
+                _own_pp = sc_pairs.get((sf, float(bw)))
+                if _own_pp is not None:
+                    for _ssf, _sbw in ((sf + 2, bw * 2), (sf - 2, bw // 2)):
+                        # Evidence bar is an sc_pairs entry (the sibling's
+                        # matched analysis ran and scored) — NOT membership
+                        # in `candidates`: the up-family sibling reaches a
+                        # half-lag bucket only via the down-lag pull, which
+                        # the only_bws filter strips, so a candidates check
+                        # can never pass in exactly the case that matters.
+                        if not (7 <= _ssf <= 12):
+                            continue
+                        _sib_pp = sc_pairs.get((_ssf, float(_sbw)))
+                        if _sib_pp is not None and _sib_pp[0] > _own_pp[0] + 0.15:
+                            if os.environ.get('LORA_SLOW_DEBUG'):
+                                print(f"  [TRACE] lag={lag} family SC override "
+                                      f"SF{sf}/{bw} (sc={_own_pp[0]:.2f}) -> "
+                                      f"SF{_ssf}/{_sbw} (sc={_sib_pp[0]:.2f})",
+                                      file=sys.stderr)
+                            sf, bw = _ssf, _sbw
+                            break
+
             if os.environ.get('LORA_SLOW_DEBUG'):
                 print(f"  [TRACE] lag={lag} resolved sf={sf} bw={bw}",
                       file=sys.stderr)
@@ -2645,7 +2682,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     # enough to matter in a railed window measure 30+.
                     _need_bwq = max(_need_bwq, DECHIRP_MIN_DB + 9.0)
                 if bw_quality < _need_bwq:
-                    if debug >= 2:
+                    if debug >= 2 or os.environ.get('LORA_SLOW_DEBUG'):
                         print(f"    Rejected SF{sf}/BW{bw/1000:.0f}k: "
                               f"sc={sc_score:.2f} bwq={bw_quality:.1f}dB "
                               f"(need bwq>={_need_bwq:.0f}dB)",
@@ -2667,8 +2704,25 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 # holding the full preamble (this assembly IS the retry).
                 # 10 symbols (preamble 8 + sync 2) centroid fine.
                 _need_syms = 16 if only_bws is None else 10
+                if (only_bws is not None
+                        and int(_pos) + _need_syms * _sym1m > len(iq_1m)):
+                    # SLOW-PASS EDGE RELAXATION (2026-07-09, matrix ctr-5
+                    # kill chain): a late-in-assembly slow preamble has NO
+                    # neighbouring window to re-catch it — this assembly IS
+                    # the only look.  Ground truth: the true SF12/62.5k det
+                    # (plateau sc 0.99) missed the 10-sym bar by 816 samples
+                    # (0.05 sym) and the frame fell to its half-lag alias.
+                    # 8 symbols is the preamble core — centroid quality is
+                    # marginally worse than 10 but the alternative is TOTAL
+                    # loss of the frame.  Every downstream slice is already
+                    # length-guarded.
+                    _need_syms = 8
                 if (int(_pos) + _need_syms * _sym1m > len(iq_1m)
                         or int(_pos) < 0):
+                    if os.environ.get('LORA_SLOW_DEBUG'):
+                        print(f"  [TRACE] EDGE-DROP SF{sf}/{bw} pos={int(_pos)} "
+                              f"need={_need_syms * _sym1m} len={len(iq_1m)}",
+                              file=sys.stderr)
                     continue
                 _ps = int(_pos)
                 _pre = iq_1m[_ps:_ps + 16 * _sym1m]
@@ -3786,7 +3840,8 @@ class SignalRecorder:
                         self._img_carriers.append((
                             float(_d['freq_hz']),
                             float(_d.get('peak_power_db', 0.0)),
-                            _batch_t0 + float(_d.get('preamble_t_s', 0.0))))
+                            _batch_t0 + float(_d.get('preamble_t_s', 0.0)),
+                            float(_d.get('bw_quality_db', -99.0))))
                     if len(self._img_carriers) > 4000:
                         _cut = _batch_t0 - 3.0
                         self._img_carriers = [
@@ -4083,11 +4138,30 @@ class SignalRecorder:
                             (c[1] for c in self._img_carriers
                              if abs(c[0] - _mirror_f) < 60000.0
                              and abs(c[2] - _abs_t_s) < 1.5), default=-99.0)
-                    if _mir_pwr > _cand_pwr + 10.0:
+                        # bwq companion metric (2026-07-09): slow-pass dets
+                        # carry a FLOOR-CLAMPED placeholder power (pwr20 on
+                        # both the real carrier and its image), so the 10 dB
+                        # power test can never fire for them.  Dechirp
+                        # quality separates the pair robustly instead — the
+                        # conjugated image loses ~6 dB of dechirp coherence
+                        # (measured g42: real 33.8-35.3 dB vs image
+                        # 27.5-28.6 dB; same split on the 62.5k slice).
+                        _cand_bwq = max(
+                            (c[3] for c in self._img_carriers if len(c) > 3
+                             and abs(c[0] - _cand_freq) < 60000.0
+                             and abs(c[2] - _abs_t_s) < 1.5), default=-99.0)
+                        _mir_bwq = max(
+                            (c[3] for c in self._img_carriers if len(c) > 3
+                             and abs(c[0] - _mirror_f) < 60000.0
+                             and abs(c[2] - _abs_t_s) < 1.5), default=-99.0)
+                    if (_mir_pwr > _cand_pwr + 10.0
+                            or (_mir_bwq > -99.0 and _cand_bwq > -99.0
+                                and _mir_bwq > _cand_bwq + 4.5)):
                         if self.debug >= 1:
                             print(f"         [IMG-REJECT] {_cand_freq / 1e6:.4f}"
-                                  f"MHz ({_cand_pwr:.0f}dB) mirror of "
-                                  f"{_mirror_f / 1e6:.4f}MHz ({_mir_pwr:.0f}dB)",
+                                  f"MHz ({_cand_pwr:.0f}dB bwq={_cand_bwq:.0f}) "
+                                  f"mirror of {_mirror_f / 1e6:.4f}MHz "
+                                  f"({_mir_pwr:.0f}dB bwq={_mir_bwq:.0f})",
                                   flush=True)
                         continue
 
