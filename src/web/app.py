@@ -71,6 +71,15 @@ def load_settings():
                  'fingerprint': True,       # RF hardware fingerprinting (Mystery Devices + clustering)
                  'ldro_fallback': True,     # retry payload with opposite LDRO on CRC fail (forced-LDRO TX)
                  'iq_invert': False,        # conjugate the input stream to decode IQ-inverted (satellite/downlink) TX
+                 # Capture storage — where the pipeline writes IQ captures for the
+                 # decode workers.  Default DISK: page-cache-served (RAM-fast for the
+                 # read-soon-after-write pattern) but spills to disk under memory
+                 # pressure instead of OOM-killing on 24/7 / low-RAM hosts.  RAM mode
+                 # (/dev/shm tmpfs) is opt-in for max throughput on RAM-rich hosts —
+                 # faster in theory but fills RAM to OOM under a sustained decode
+                 # backlog (see issue #6 follow-up).
+                 'capture_ram': False,      # Advanced: True = /dev/shm (RAM), False = disk
+                 'capture_dir': '',         # disk-mode write path; '' = default (<data>/captures)
                  'time_format': '12',       # display: '12' (AM/PM) or '24' — rows + exports
                  'date_format': 'MMDDYY',   # display: MMDDYY|MMDDYYYY|DDMMYY|DDMMYYYY|YYYYMMDD
                  'sdr': 'bladerf',          # selected SDR profile (persists across sessions)
@@ -103,6 +112,69 @@ def save_settings(s):
     except Exception:
         pass
 SETTINGS = load_settings()
+
+# ---------------------------------------------------------------- capture storage
+# Captures are written by the pipeline, read seconds later by the decode workers,
+# then unlinked.  On disk the read is page-cache-served (RAM speed) and the write
+# is lazy — short-lived captures often never touch the physical device — while
+# staying evictable under memory pressure (graceful slowdown, not OOM).  RAM mode
+# keeps them in tmpfs (/dev/shm): faster ceiling, but no eviction → OOM under a
+# sustained backlog.
+_RAM_CAPTURE_DIR = '/dev/shm/lora_caps'
+def _default_capture_dir():
+    """Disk default.  A user-customized lora.toml [decode] export_dir is
+    honored as the fallback (below the GUI setting) — EXCEPT the legacy
+    tmpfs default, which is exactly what the disk default exists to replace
+    (RAM mode is the explicit opt-in for tmpfs now).  Otherwise a real-disk,
+    user-owned dir co-located with the app data."""
+    try:
+        _toml = (CFG.get('decode', {}).get('export_dir') or '').strip()
+    except Exception:
+        _toml = ''
+    if _toml and not _toml.startswith('/dev/shm'):
+        return _resolve_path(_toml)
+    return os.path.join(_DATA_DIR, 'captures')
+
+def _resolve_path(p):
+    return os.path.abspath(os.path.expanduser(os.path.expandvars((p or '').strip())))
+
+def _effective_capture_dir():
+    """The capture write path implied by the current SETTINGS (RAM toggle wins,
+    else the custom dir, else the disk default)."""
+    if SETTINGS.get('capture_ram'):
+        return _RAM_CAPTURE_DIR
+    d = (SETTINGS.get('capture_dir') or '').strip()
+    return _resolve_path(d) if d else _default_capture_dir()
+
+def _validate_capture_dir(path):
+    """Create `path` if needed and verify it is writable by writing+removing a
+    probe file.  Returns (ok, resolved_path, error_or_None) — the permission
+    guard the user asked for, run before any pipeline start and on every save."""
+    resolved = _resolve_path(path) or _default_capture_dir()
+    try:
+        os.makedirs(resolved, exist_ok=True)
+        _probe = os.path.join(resolved, '.lora_write_test')
+        with open(_probe, 'w') as _f:
+            _f.write('ok')
+        os.unlink(_probe)
+        return True, resolved, None
+    except Exception as e:
+        return False, resolved, '%s: %s' % (type(e).__name__, e)
+
+def _capture_budget_mb(resolved_dir):
+    """Pending-capture byte budget passed to the detector (0 = unbounded).
+    RAM mode: 25% of MemAvailable (tmpfs eats RAM directly).  Disk mode: a
+    generous backlog sanity cap — the page cache handles memory, so this only
+    stops a runaway backlog, not normal operation."""
+    if SETTINGS.get('capture_ram'):
+        try:
+            with open('/proc/meminfo') as _mi:
+                _avail_kb = next(int(l.split()[1]) for l in _mi
+                                 if l.startswith('MemAvailable'))
+            return max(256, int(_avail_kb / 1024 * 0.25))
+        except Exception:
+            return 1024
+    return 8192
 
 # ---------------------------------------------------------------- channel keys
 # Persistent key list (survives all sessions) the decoder reads via LORA_KEYS.
@@ -2061,7 +2133,7 @@ def _build_pipeline_cmd():
             f'-t {fmt} --threshold {_thresh} '
             f'--overlap {d["overlap"]} --energy-threshold {_eth} '
             f'--detect-workers {d["detect_workers"]} --buf-seconds {_bufs} '
-            f'--decode --export-iq {shlex.quote(dec["export_dir"])} -d 1')
+            f'--decode --export-iq {shlex.quote(_effective_capture_dir())} -d 1')
     # Channelizer (ADDITIVE / AUTO): force the dechirp matched-filter on the busiest
     # learned channels, ON TOP of the wideband gate.  Always-on when channelize_enabled
     # — no narrowing, no mask, no accept.  Fed set = ≥ channelize_after_n intercepts,
@@ -2183,7 +2255,16 @@ def start_pipeline():
     _apply_unknown_flag()
     if CFG['detect'].get('commit_lag') is not None:
         env['LORA_COMMIT_LAG'] = str(CFG['detect']['commit_lag'])
-    os.makedirs(dec['export_dir'], exist_ok=True)
+    # Capture storage: validate the resolved write path is creatable + writable
+    # BEFORE launching — a bad path (typo, unmounted disk, perms) otherwise fails
+    # silently deep in the detector with no captures ever landing.
+    _cap_ok, _cap_dir, _cap_err = _validate_capture_dir(_effective_capture_dir())
+    if not _cap_ok:
+        _msg = ('Capture path not writable: %s (%s). Fix the path in '
+                'Advanced → Capture Storage.' % (_cap_dir, _cap_err))
+        PIPELINE['err'] = _msg
+        return {'ok': False, 'error': _msg}
+    env['LORA_CAPTURE_BUDGET_MB'] = str(_capture_budget_mb(_cap_dir))
     cmd = _build_pipeline_cmd()
     try:
         proc = subprocess.Popen(cmd, shell=True, env=env, preexec_fn=os.setsid,
@@ -2474,6 +2555,25 @@ def api_settings():
             SETTINGS['time_format'] = str(d['time_format'])
         if 'date_format' in d and str(d['date_format']) in _DATE_STRFTIME:
             SETTINGS['date_format'] = str(d['date_format'])
+        # --- Capture storage (disk default / RAM opt-in / custom path) ---
+        _cap_changed = False
+        _cap_error = None
+        if 'capture_ram' in d:
+            _new_ram = bool(d['capture_ram'])
+            if _new_ram != bool(SETTINGS.get('capture_ram')):
+                SETTINGS['capture_ram'] = _new_ram
+                _cap_changed = True
+        if 'capture_dir' in d:
+            _cd = str(d['capture_dir']).strip()
+            # Empty = use the disk default; otherwise validate writability now so
+            # the user gets an immediate error instead of a silent no-capture run.
+            _ok, _res, _err = _validate_capture_dir(_cd or _default_capture_dir())
+            if _ok:
+                if _cd != (SETTINGS.get('capture_dir') or ''):
+                    SETTINGS['capture_dir'] = _cd
+                    _cap_changed = True
+            else:
+                _cap_error = 'Capture path not writable: %s (%s)' % (_res, _err)
         # --- Channelizer settings (ADDITIVE / AUTO) ---
         _chan_changed = False
         if 'channelize_enabled' in d:
@@ -2493,17 +2593,29 @@ def api_settings():
         _chan_keys = ('channelize_enabled', 'channelize_after_n', 'channelize_max_channels')
         if any(k in d for k in ('autosave', 'waterfall', 'unknown', 'fingerprint',
                                 'protocols', 'wide_scan', 'sdr', 'radio', 'tune',
-                                'ldro_fallback', 'iq_invert', 'time_format', 'date_format')
+                                'ldro_fallback', 'iq_invert', 'auto_gain',
+                                'time_format', 'date_format',
+                                'capture_ram', 'capture_dir')
                + _chan_keys):
             save_settings(SETTINGS)
             _apply_waterfall_flag()
             _apply_unknown_flag()
-        # A channelize_* change alters the detector's --channels at launch — restart
-        # the running pipeline (background thread) so the new feed applies.  No-op if
-        # not running.
-        if _chan_changed:
+        # A channelize_* or capture-storage change alters the detector launch flags
+        # (--channels / --export-iq), so restart the running pipeline (background
+        # thread) to apply it.  No-op if not running.
+        if _chan_changed or _cap_changed:
             _restart_pipeline_bg()
-    return jsonify(SETTINGS)
+        # Surface a bad capture path to the UI without failing the whole save.
+        if _cap_error:
+            _resp = dict(SETTINGS)
+            _resp['capture_error'] = _cap_error
+            return jsonify(_resp)
+    # Expose the resolved effective capture path + default so the UI can show
+    # where captures actually land (and what the default would be).
+    _s = dict(SETTINGS)
+    _s['capture_effective_dir'] = _effective_capture_dir()
+    _s['capture_default_dir'] = _default_capture_dir()
+    return jsonify(_s)
 
 
 @app.route('/api/channelize')
