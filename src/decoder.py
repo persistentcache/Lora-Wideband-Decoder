@@ -4126,6 +4126,17 @@ def _proto_candidates(sync):
 
 # Tier rank used by both dispatcher sites and the helper below.  Module-scope so
 # the helper, SITE 1 (early dispatch), and SITE 2 (post-chase) all agree.
+#
+# WARNING — tiers gate PIPELINE BEHAVIOR, not just display (2026-07-08):
+#   'verified' drives (1) _LAST_EMIT_VERIFIED → the phantom-grid retry's
+#   acceptance of a CRC-less decode, (2) the detector's Phase-2 RF-bucket
+#   admit ('"confidence":"verified"' scanned in raw worker output) →
+#   sibling captures of that bucket are SKIPPED at dispatch, and (3) the
+#   non-MT preempt below (whitelist-gated).  A parser that over-grades to
+#   'verified' can therefore suppress real frames' decodes, not merely
+#   mislabel a row in the UI.  Any NEW parser emitting 'verified' must
+#   satisfy the _NONMT_PREEMPT_PROTOS criteria (a)/(b)/(c) below even if
+#   it is never whitelisted for preempt.
 _TIER_RANK = {'verified': 3, 'confirmed': 2, 'candidate': 1}
 
 
