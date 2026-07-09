@@ -21,7 +21,29 @@ Usage:
   | python detector.py -r 40000000 -b 28000000 -c 915 -t sc16 -d 1
 """
 
-import sys, os, time, json, argparse, numpy as np
+import sys, os
+# Pin BLAS/FFT pools to ONE thread — MUST precede the numpy import.
+# Two reasons:
+# 1. DEADLOCK (found live 2026-07-09, py-spy): scipy-OpenBLAS registers a
+#    pthread_atfork handler that quiesces its worker pool.  This process both
+#    runs GEMMs on background threads (polyphase crop feed) AND forks decode
+#    workers via subprocess — when a fork lands while a GEMM is in flight, the
+#    fork handler suspends the pool the GEMM is waiting on: the GEMM spins at
+#    100% of one core forever, fork_exec never returns, the fork's before-
+#    hooks keep concurrent.futures' _global_shutdown_lock held, and the main
+#    loop freezes at the next executor submit.  Whole pipeline wedges,
+#    intermittently (needs the fork↔GEMM race).  No pool → no fork handler →
+#    the class is gone.
+# 2. OVERSUBSCRIPTION: parallelism here is at the process/thread level
+#    (detect workers, decode workers, save/crop workers) — a 24-thread BLAS
+#    pool underneath multiplies threads for no gain on our small per-call
+#    FFTs/GEMMs (same reasoning as soft_fft_demod_batch's single-thread FFT
+#    note, and the A/B harness already pinned these for determinism).
+# setdefault: an explicit user override in the environment still wins.
+for _v in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS',
+           'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+    os.environ.setdefault(_v, '1')
+import time, json, argparse, numpy as np
 import threading, queue, io, subprocess, fcntl, collections, itertools
 
 # Make the GIL hand off 5× more often.  Default 5ms means a Python-only

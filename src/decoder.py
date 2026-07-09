@@ -11,8 +11,16 @@ Run on .cf32 captures:
   python3 decoder.py -k NOKEY captures/*.cf32       # HAM mode (no encryption)
   python3 decoder.py -k '1PG7OiApB1nwvP+rz05pAQ==' captures/*.cf32  # custom key
 """
+import os
+# Pin BLAS/FFT pools to ONE thread BEFORE numpy loads — see the detector.py
+# header note (OpenBLAS pthread_atfork deadlock + oversubscription).  Decode
+# workers are single-purpose processes; per-worker BLAS pools would multiply
+# 24 threads × N workers for small FFTs.  setdefault: user override wins.
+for _v in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS',
+           'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
+    os.environ.setdefault(_v, '1')
 import numpy as np
-import glob, sys, os, time
+import glob, sys, time
 from itertools import combinations
 try:
     from scipy.fft import next_fast_len as _next_fast_len
