@@ -2461,8 +2461,26 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     candidates += [c for c in _fam_up
                                    if c not in candidates]
                 if only_bws is not None:
+                    # Restrict which ALIAS-CHAIN families the slow-pass vote
+                    # may pull in, but NEVER filter the hit lag's OWN family
+                    # or its UP-LAG (2L) family: the slow families share lags
+                    # with faster presets whose preambles ALSO straddle the
+                    # 1 s window and are therefore only ever seen HERE, and a
+                    # hit at THIS lag may be the half-lag phantom of a
+                    # fundamental at 2L (fact 1) whose true preset must stay
+                    # votable.  Ground truth 2026-07-08 matrix: SF12/62.5k
+                    # (preamble 1.05 s, lag 65536) hit this filter — the
+                    # 65536-bucket scans were FORCED onto the same-slope
+                    # half-lag alias SF10/31.25k, and the 32768-bucket scans
+                    # (where the truth arrives via the 2L chain) likewise —
+                    # every capture mislabeled, 0/5 decoded, the only zero in
+                    # the 36-combo matrix; the mislabeled copies then STOLE
+                    # the RFDEDUP keep-2 slots from correct-label siblings.
+                    _keep_fams = list(_SC_LAGS_1M.get(lag, []))
+                    _keep_fams += _SC_LAGS_1M.get(lag * 2, [])
                     candidates = [c for c in candidates
-                                  if int(c[1]) in only_bws] or candidates[:1]
+                                  if int(c[1]) in only_bws
+                                  or c in _keep_fams] or candidates[:1]
                 if len(candidates) == 1:
                     sf, bw = candidates[0]
                 else:
@@ -3384,6 +3402,29 @@ class SignalRecorder:
         truncation behavior at worst)."""
         if not detections:
             return []
+        # CONFLICTING-LABEL PRE-RESOLVE (2026-07-08): a slow-scan result can
+        # carry the SAME burst under two labels (matrix ground truth,
+        # SF12/62.5k: true label at sc 0.98 + its half-lag alias SF10/31.25k
+        # at sc 0.67 from the same assembly's two lag buckets).  The NB crop
+        # is set up at job creation from the det list — BEFORE the finalize
+        # batch-dedup picks a winner — so the job was cropped at the FIRST
+        # det's rate and the save came out a chimera (winner's freq, loser's
+        # label/rate) that could never decode.  Resolve same-carrier label
+        # conflicts HERE with the same (power, detect_conf) order the
+        # finalize uses; time-separated packets inside one capture are
+        # handled downstream by per-det plateaus, not by this list.
+        if len(detections) > 1:
+            _srt = sorted(detections,
+                          key=lambda d: (-d.get('peak_power_db', 0.0),
+                                         -d.get('detect_conf', 0.0)))
+            _pre = []
+            for _d in _srt:
+                if any(abs(_d['freq_hz'] - _k['freq_hz']) < 6e3
+                       and (_d['sf'], _d['bw']) != (_k['sf'], _k['bw'])
+                       for _k in _pre):
+                    continue
+                _pre.append(_d)
+            detections = _pre
         # ONE PENDING JOB PER PHYSICAL FRAME: overlapping windows re-detect
         # the same long frame every hop, and each registration held a full
         # wideband base (up to 640 MB for slow-pass assemblies) — the
@@ -3419,6 +3460,9 @@ class SignalRecorder:
                                 > min(0.25 * _air_n,
                                       int(3.0 * self.wb_fs))):
                             continue
+                        import os as _os_dbg
+                        if _os_dbg.environ.get('LORA_SLOW_DEBUG'):
+                            print(f"[UPDEF-SKIP] new SF{_d['sf']}/{_d['bw']} vs pending SF{_jd['sf']}/{_jd['bw']} f={_d['freq_hz']/1e6:.4f}", flush=True)
                         return []
         # copy ONLY what will be overwritten: the sliding window buf.
         # pre_hop and slow assemblies are already owned arrays — hold refs.
@@ -3464,8 +3508,12 @@ class SignalRecorder:
                     # cropper drowning — degrade this job to the legacy
                     # wideband path rather than block the loop
                     del job['nb']
+        if os.environ.get('LORA_SLOW_DEBUG'):
+            print(f"[UPDEF-JOB] created dets={[(d['sf'], d['bw'], round(d['freq_hz']/1e6,4)) for d in job['dets']]} need={job['need']}", flush=True)
         self._pending.append(job)
         if len(self._pending) > 3:
+            if os.environ.get('LORA_SLOW_DEBUG'):
+                print(f"[UPDEF-EVICT] cap overflow — finalizing oldest early", flush=True)
             self._finalize(self._pending.pop(0))
         return []
 
@@ -3833,8 +3881,17 @@ class SignalRecorder:
                 # adjacent transmitters almost always have different RSSI).
                 _bw_edge_tol_hz = 10000.0
                 _bw_pmr_tol_db = 1.5
+                # Power-descending; detect_conf breaks POWER TIES (2026-07-08):
+                # a slow-pass batch can hold the same burst under two labels
+                # from different assemblies (matrix ground truth, SF12/62.5k:
+                # true label at sc 0.98 vs its half-lag alias SF10/31.25k at
+                # sc 0.67, both pwr 20.0) — the stable sort then kept
+                # whichever was ENQUEUED first and the batch dedup below
+                # dropped the truth.  Distinct-power cases sort exactly as
+                # before.
                 _dets_sorted = sorted(detections,
-                                      key=lambda d: -d.get('peak_power_db', 0.0))
+                                      key=lambda d: (-d.get('peak_power_db', 0.0),
+                                                     -d.get('detect_conf', 0.0)))
                 preambles = []
                 for d in _dets_sorted:
                     d_off = d['freq_hz'] - anchor['freq_hz']
@@ -3971,17 +4028,37 @@ class SignalRecorder:
                         _dt_win = DECHIRP_DEDUP_WIN_S
                     _match = 0
                     with self._saved_abs_t_lock:
-                        for _sf_hz, _st in self._saved_abs_t:
+                        # PER-LABEL keep-N (2026-07-08): the cluster key now
+                        # includes (sf, bw).  Same-label re-detections of one
+                        # frame across overlapping windows still collapse to
+                        # keep-N exactly as before — but a CONFLICTING-label
+                        # detection of the same frame gets its own slots.
+                        # Ground truth (matrix, SF12/62.5k = the only 0/5
+                        # combo): separate slow-scan assemblies emitted the
+                        # same burst as SF10/31.25k (partial-burst evidence,
+                        # sc 0.67) and SF12/62.5k (full evidence, sc 0.98);
+                        # first-arriving mislabels consumed both (freq, time)
+                        # slots and the correct-label save was REFUSED —
+                        # whichever label arrived first won regardless of
+                        # merit.  With per-label slots both are captured and
+                        # the decoder's CRC arbitrates (mislabeled captures
+                        # fail fast; the post-decode dedup absorbs the
+                        # duplicate emit).  Bounded cost: one extra capture
+                        # pair per label-conflict, which only slow-pass
+                        # straddle presets exhibit.
+                        for _sf_hz, _st, _ssf, _sbw in self._saved_abs_t:
                             if (abs(_cand_freq - _sf_hz) < _ftol
-                                    and abs(_abs_t_s - _st) < _dt_win):
+                                    and abs(_abs_t_s - _st) < _dt_win
+                                    and _ssf == d['sf'] and _sbw == d['bw']):
                                 _match += 1
                         if _match < self._dedup_keep:
-                            self._saved_abs_t.append((_cand_freq, _abs_t_s))
+                            self._saved_abs_t.append(
+                                (_cand_freq, _abs_t_s, d['sf'], d['bw']))
                             if len(self._saved_abs_t) > 4000:
                                 _cut = _abs_t_s - 10.0
                                 self._saved_abs_t = [
-                                    (f, t) for f, t in self._saved_abs_t
-                                    if t > _cut]
+                                    e for e in self._saved_abs_t
+                                    if e[1] > _cut]
                     if _match >= self._dedup_keep:
                         if self.debug >= 1:
                             print(f"         [RFDEDUP] skip "
