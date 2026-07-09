@@ -1407,8 +1407,18 @@ def parse_lorawan_packet(payload, rf=None):
         if n not in (17, 33): return None
     elif mtype in (0b010, 0b011, 0b100, 0b101):     # Data up/down
         if n < 12 or 8 + (payload[5] & 0x0F) + 4 > n: return None  # FOpts + MIC must fit
+        # Spec-forbidden combo (LoRaWAN L2 4.3.1.6): MAC commands may ride
+        # in FOpts OR in FRMPayload at FPort 0, never both — FOptsLen > 0
+        # with FPort == 0 is invalid.  Free structural tightening.
+        _fol = payload[5] & 0x0F
+        _rem = payload[8 + _fol:-4]
+        if _fol > 0 and len(_rem) >= 1 and _rem[0] == 0:
+            return None
     elif mtype == 0b110:                            # Rejoin Request
-        if n < 18: return None
+        # Type 0/2: MHDR+RejoinType(1)+NetID(3)+DevEUI(8)+RJcount(2)+MIC(4)=19;
+        # type 1 swaps NetID for JoinEUI(8) -> 24.  (Was n<18: accepted an
+        # 18-byte frame no Rejoin variant can produce.)
+        if n not in (19, 24): return None
     else:                                           # 0b111 Proprietary — unvalidatable w/o keys
         return None
     msg_type = _LORAWAN_MTYPE.get(mtype, "Unknown (%d)" % mtype)
@@ -1429,9 +1439,16 @@ def parse_lorawan_packet(payload, rf=None):
             rec['on_grid'] = _og
     print("\n  --- LoRaWAN Frame ---")
     print("  MsgType: %s" % msg_type)
-    if major:
-        print("  Major: %d" % major)
-    if mtype in (0b000, 0b110):             # Join Request / Rejoin
+    if mtype == 0b110:                      # Rejoin Request (1.1) — its layout
+        # differs from Join Request: RejoinType(1) then NetID|JoinEUI, DevEUI.
+        _rjt = payload[1]
+        _dev_off = 2 + (8 if _rjt == 1 else 3)
+        dev_eui = payload[_dev_off:_dev_off + 8][::-1].hex().upper()
+        print("  RejoinType: %d" % _rjt)
+        print("  DevEUI:   %s" % ':'.join(dev_eui[i:i+2] for i in range(0, 16, 2)))
+        rec['deveui'] = dev_eui
+        rec['summary'] = 'Rejoin type %d · DevEUI %s' % (_rjt, dev_eui)
+    elif mtype == 0b000:                    # Join Request
         if len(payload) >= 19:
             join_eui = payload[1:9][::-1].hex().upper()
             dev_eui  = payload[9:17][::-1].hex().upper()
