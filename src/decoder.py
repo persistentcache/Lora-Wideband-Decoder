@@ -2029,6 +2029,59 @@ def _shannon_entropy(data):
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
+def _meshcore_frame_plausible(body):
+    """CRC-independent structural gate: could `body` (PHY payload, CRC bytes
+    stripped) be a real MeshCore frame?
+
+    Pure/print-free mirror of parse_meshcore_packet's validity checks, used by
+    the chase decoder to accept a nibble-flip trial whose PHY CRC matched.
+    Chase CRC-16 coincidences are the FP risk (dozens of trials per decode),
+    so this stays strict: header bits + path fit + AES block-aligned body
+    length for the encrypted payload types.  MULTIPART/RAW_CUSTOM — the types
+    with no checkable wire format — are deliberately REJECTED here (unlike the
+    parser, which content-gates them): a flip trial that can only land on an
+    unfalsifiable payload type is exactly the coincidence class this gate
+    exists to stop.
+    """
+    if len(body) < 2:
+        return False
+    header       = body[0]
+    route_type   = header & 0x03
+    payload_type = (header >> 2) & 0x0F
+    version      = (header >> 6) & 0x03
+    if version != 0 or payload_type not in _MESHCORE_PAYLOAD_TYPES:
+        return False
+    if payload_type in (0x0A, 0x0F):        # MULTIPART / RAW_CUSTOM: unfalsifiable
+        return False
+    offset = 1
+    if route_type in (0x00, 0x03):          # FLOOD / DIRECT_OOB transport codes
+        offset += 4
+    if len(body) <= offset:
+        return False
+    path_byte = body[offset]
+    if ((path_byte >> 6) & 0x03) == 3:      # reserved hash-size marker
+        return False
+    hash_count = path_byte & 0x3F
+    hash_size  = ((path_byte >> 6) & 0x03) + 1
+    if hash_count > 16:
+        return False
+    offset += 1 + hash_count * hash_size
+    if len(body) < offset:
+        return False
+    body_len = len(body) - offset
+    if payload_type in (0x00, 0x01, 0x02):  # REQ / RESPONSE / TXT_MSG
+        return body_len >= 20 and (body_len - 4) % 16 == 0
+    if payload_type == 0x07:                # ANON_REQ
+        return body_len >= 51 and (body_len - 35) % 16 == 0
+    if payload_type in (0x05, 0x06):        # GRP_TXT / GRP_DATA
+        return body_len >= 19 and (body_len - 3) % 16 == 0
+    if payload_type == 0x03:                # ACK
+        return 4 <= body_len <= 16
+    if payload_type == 0x04:                # ADVERT: pubkey(32)+ts(4)+sig(64)
+        return body_len >= 100
+    return body_len >= 1                    # PATH / TRACE / CONTROL
+
+
 def parse_meshcore_packet(payload):
     """Parse a MeshCore packet: print human-readable fields AND return a normalized
     record dict (proto='meshcore') for the [PKT] stream, or None."""
@@ -7180,6 +7233,19 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                                       dc, N, pay_levels,
                                       ppm_pay, pay_bin_group, cfo_shift=cfo_shift)
             pay_llrs = [_P[i] for i in range(rdd)]
+            if os.environ.get('LORA_DUMP_SYMS'):
+                _S = _apply_resid(np.stack(_pay_segs), sp)
+                _X = np.abs(np.fft.fft(_S * dc, axis=1)) ** 2
+                if cfo_shift != 0:
+                    _X = np.roll(_X, -cfo_shift, axis=1)
+                _M = (_X[:, :pay_levels * pay_bin_group]
+                      .reshape(len(_pay_segs), pay_levels, pay_bin_group)
+                      .max(axis=2))
+                for _i in range(len(_pay_segs)):
+                    _o = np.argsort(_M[_i])[::-1]
+                    print("  SYMDUMP sym=%d lvl=%d lvl2=%d pk=%.0f margin=%.3f"
+                          % (sp + _i, int(_o[0]), int(_o[1]), float(_M[_i][_o[0]]),
+                             float(1.0 - _M[_i][_o[1]] / max(_M[_i][_o[0]], 1e-9))))
             sp += rdd
             pay_cw = soft_deinterleave(pay_llrs, rdd, ppm_pay)
             # Vectorised batched Hamming decode over all ppm_pay codewords —
@@ -7365,11 +7431,12 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         """Try flipping up to max_flips of the k least confident nibbles.
         Returns (ok, method, corrected_raw_bytes, flipped_list).
 
-        Each CRC pass is gated by `_is_plausible_mesh_header` (dst==
-        0xFFFFFFFF for broadcast).  Without that gate, chase finds CRC-16
-        coincidence matches on random byte patterns at ~10⁻³ rate and
-        emits confidently wrong PacketIDs — the failure mode that made
-        non-Meshtastic flag values (hop_start=7 etc.) appear in the log
+        Each CRC pass is gated by structural plausibility: Meshtastic
+        broadcast (`_is_plausible_mesh_header`, dst==0xFFFFFFFF) OR MeshCore
+        wire grammar (`_meshcore_frame_plausible`).  Without a gate, chase
+        finds CRC-16 coincidence matches on random byte patterns at ~10⁻³
+        rate and emits confidently wrong PacketIDs — the failure mode that
+        made non-Meshtastic flag values (hop_start=7 etc.) appear in the log
         from misdecoded captures."""
         if not soft_info:
             return False, '', None, []
@@ -7410,7 +7477,17 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 tr = dewhiten(assemble(trial))
                 if len(tr) >= payload_len + 2:
                     ok, method = check_crc(tr, payload_len, strict=True)
-                    if ok and _is_plausible_mesh_header(tr):
+                    # Accept a CRC-passing trial only if the corrected frame is
+                    # structurally plausible under a protocol we can check:
+                    # Meshtastic broadcast (dst==0xFFFFFFFF) or MeshCore wire
+                    # grammar (header bits + path fit + AES block-aligned body).
+                    # The MeshCore arm is what lets chase recover non-Meshtastic
+                    # frames at all — matrix ground truth (2026-07-08) showed
+                    # SF11/500k MeshCore beacons landing 1-2 low-margin nibbles
+                    # off with the right values as second choice, and the old
+                    # broadcast-only gate vetoing every fix.
+                    if ok and (_is_plausible_mesh_header(tr)
+                               or _meshcore_frame_plausible(bytes(tr[:payload_len]))):
                         flipped = [(sorted_soft[b][0], sorted_soft[b][1],
                                     sorted_soft[b][2], sorted_soft[b][3])
                                    for b in positions]
@@ -7484,6 +7561,95 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 ppm_pay, pay_levels, pay_bin_group = _sv
         else:
             ppm_pay, pay_levels, pay_bin_group = _sv
+
+    # ---- FRAC-PARK RESCUE (2026-07-08) ----
+    # Matrix ground truth caught a failure class the whole recovery ladder
+    # missed: payload symbol peaks parked ~half a bin off the demod grid
+    # (preamble frac-tau estimate fine, payload timing walked), so every
+    # symbol decision is a coin flip that tips the same way — 30+ wrong
+    # symbols on a 25 dB capture (SF11/500k keep-2 pairs: the STRONGER twin
+    # failed).  The tau sweep (TAU_DELTAS ±0.5) was built for this but never
+    # ran on these captures: the SKIP-SWEEP "confident demod" gate uses
+    # ABSOLUTE LLR thresholds that scale with capture power, so a strong
+    # parked capture looks "confident" (3% of a huge peak ≫ the 2000 floor).
+    # Measure the park directly from the payload FFT peaks and re-decode
+    # ONCE at the corrected grid — CRC arbitrates, can only ADD recoveries.
+    # The measured value also gates SKIP-SWEEP below (a parked capture is
+    # never "confident").
+    _park_delta = 0.0
+    def _measure_payload_frac(_ft):
+        """Median fractional-bin offset of the payload symbol peaks, measured
+        AFTER the _ft frac-tau correction.  Amplitude-ratio interpolation
+        (delta = a1/(a0+a1) toward the larger neighbor) — exact for the
+        Dirichlet kernel of a rect-window tone, unlike parabolic fits which
+        badly underestimate mid-range offsets on |X|^2.  Returns
+        (delta_bins in (-0.5, 0.5], n_syms_used)."""
+        if abs(_ft) > 1e-4:
+            _t = np.arange(N, dtype=np.float64)
+            _dcm = (downchirp * np.exp(-1j * 2.0 * np.pi * _ft * _t / N)
+                    ).astype(np.complex64)
+        else:
+            _dcm = downchirp
+        _segs = []
+        for _i in range(8, 72):
+            _p = data_start + _i * N
+            if _p + N > len(iq1):
+                break
+            _segs.append(iq1[_p:_p + N])
+        if len(_segs) < 6:
+            return 0.0, 0
+        _X = np.abs(_fft(np.stack(_segs) * _dcm, axis=1))
+        if cfo_shift != 0:
+            _X = np.roll(_X, -cfo_shift, axis=1)
+        _rs = []
+        for _row in _X:
+            _b = int(np.argmax(_row))
+            _a0 = float(_row[_b])
+            _am = float(_row[(_b - 1) % N])
+            _ap = float(_row[(_b + 1) % N])
+            if _a0 <= 0.0:
+                continue
+            if _ap >= _am:
+                _rs.append(_ap / (_a0 + _ap))
+            else:
+                _rs.append(-_am / (_a0 + _am))
+        if len(_rs) < 6:
+            return 0.0, 0
+        return float(np.median(_rs)), len(_rs)
+
+    if crc_present and not crc_ok:
+        _park_delta, _park_n = _measure_payload_frac(tau_frac)
+        if abs(_park_delta) >= 0.15:
+            print("  FRAC PARK: payload peaks %+.3f bins off the demod grid "
+                  "(%d syms) — re-decoding at corrected tau" % (_park_delta, _park_n))
+            _first = None
+            for _dt in (_park_delta,
+                        _park_delta - 1.0 if _park_delta > 0 else _park_delta + 1.0):
+                _pr, _pp, _ps, _pn = soft_decode_payload(0, 0.0,
+                                                         frac_tau=tau_frac + _dt)
+                _pok, _pm = False, ''
+                if len(_pr) >= payload_len + 2:
+                    _pok, _pm = check_crc(_pr, payload_len)
+                if _pok:
+                    raw_bytes, payload, pay_soft_info, decoded_nibs = _pr, _pp, _ps, _pn
+                    crc_ok, crc_method, _clean_crc = True, _pm, True
+                    tau_frac += _dt
+                    if diag_out is not None:
+                        diag_out['crc_ok'] = True
+                    print("  CRC: %s OK (frac-park rescue, tau %+.3f)" % (_pm, _dt))
+                    break
+                if _first is None:
+                    _first = (_pr, _pp, _ps, _pn, _dt)
+            if not crc_ok and _first is not None:
+                # Neither aligned variant passed CRC outright — adopt the
+                # smaller-|dt| aligned decode (park removed) so chase and the
+                # sweep below work on a sane grid instead of coin flips.
+                raw_bytes, payload, pay_soft_info, decoded_nibs = _first[:4]
+                tau_frac += _first[4]
+                _park_delta, _ = _measure_payload_frac(tau_frac)
+                print("  FRAC PARK: no clean CRC — keeping aligned decode "
+                      "(tau %+.3f, residual %+.3f) for chase/sweep"
+                      % (_first[4], _park_delta))
 
     if _HARNESS_OUT:
         _margins = [float(s[3]) for s in pay_soft_info] if pay_soft_info else []
@@ -7657,7 +7823,10 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         # Confident demod: median margin well above noise, no near-zero outliers.
         # Chase decoder (above) already tried bit-flipping the lowest-margin nibbles —
         # if it didn't find a CRC match, sweep timing tweaks won't either.
-        if _med_m > 50000.0 and _min_m > 2000.0:
+        # _park_delta guard (2026-07-08): a capture whose payload peaks sit
+        # off the bin grid is NEVER confident regardless of absolute margins
+        # — the tau sweep is exactly what fixes it (see FRAC-PARK RESCUE).
+        if _med_m > 50000.0 and _min_m > 2000.0 and abs(_park_delta) < 0.15:
             print("  SKIP SWEEP: confident demod (med=%.0f min=%.0f) — "
                   "chase failed, sweep timing tweaks won't recover bits" % (_med_m, _min_m))
             _skip_sweep = True
