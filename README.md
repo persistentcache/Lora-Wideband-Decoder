@@ -15,7 +15,7 @@ every frame it can hear, in near-real-time, on a normal multi-core PC.
   LoRaWAN are recognized and decoded automatically, including node
   identities and channel labeling.
 - **All spreading factors, all bandwidths** — SF7 through SF12 at
-  62.5 / 125 / 250 / 500 kHz, concurrently.
+  41.7 / 62.5 / 125 / 250 / 500 kHz, concurrently.
 - **Live web UI** — decoded packets, node identities, and a spectrum
   waterfall stream into a local Flask app as they happen.
 - **Unknown-protocol forensics** — frames that decode but do not match
