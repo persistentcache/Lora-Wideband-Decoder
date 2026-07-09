@@ -3198,11 +3198,24 @@ def parse_disaster_radio_packet(payload, rf=None):
 # ============================================================================
 _EBYTE_BROADCAST = b'\xff\xff'
 
+# EByte behavioral registry (board item 6b): fixed-mode broadcasts carry NO
+# sender ID over the air, so identity = (channel, stable text prefix).  A
+# single 0xFFFF+chan+ASCII frame is structurally weak next to every other
+# 'confirmed' path (radiohead needs 2+ sequential ids, loramesher 2+
+# sightings, lorawan DevAddr+FCnt) — any text-bearing protocol starting
+# 0xFFFF would get branded confirmed-ebyte from one packet.  Promote to
+# 'confirmed' only on a repeat sighting of the same key (process lifetime,
+# same as _KNOWN_RADIOHEAD_NODES).
+_EBYTE_SEEN_KEYS = {}                           # (chan, text[:8]) -> sightings
+_KNOWN_EBYTE_KEYS = set()                       # keys seen 2+ times
+
+
 def parse_lora_p2p_packet(payload, rf=None):
     """Parse an EByte E22/E220/E32 fixed-mode broadcast frame.
 
-    Returns proto='ebyte_lora' (confirmed when user payload is ASCII-rich)
-    or None when the structure doesn't match.
+    Returns proto='ebyte_lora' — 'candidate' on first sighting, promoted to
+    'confirmed' on a repeat sighting of (chan, text-prefix) — or None when
+    the structure doesn't match.
     """
     if len(payload) < 4:                        # 3-byte prefix + ≥1 data byte
         return None
@@ -3253,7 +3266,19 @@ def parse_lora_p2p_packet(payload, rf=None):
         print("  Type/version bytes: %s" % type_bytes.hex())
     print("  User payload (%d bytes, %d%% ASCII): %r" % (
         len(user), int(ratio*100), text))
-    is_confirmed = (ratio >= 0.80)
+    # 6b: ASCII-rich structure alone is only ever 'candidate'.  'confirmed'
+    # requires behavioral evidence — a repeat sighting of the same
+    # (channel, text-prefix) key, mirroring the other confirmed paths.
+    _shape_ok = (ratio >= 0.80)
+    # 4-char prefix: telemetry strings lead with a stable tag ("TEMP",
+    # "node") and vary in the numeric tail — 8 chars already crossed into
+    # the varying part on realistic payloads.
+    _key = (chan, text[:4])
+    _seen = _EBYTE_SEEN_KEYS.get(_key, 0) + 1
+    _EBYTE_SEEN_KEYS[_key] = _seen
+    if _shape_ok and _seen >= 2:
+        _KNOWN_EBYTE_KEYS.add(_key)
+    is_confirmed = _shape_ok and _key in _KNOWN_EBYTE_KEYS
     return {
         'proto': 'ebyte_lora' if is_confirmed else 'unknown',
         'hint': None if is_confirmed else 'ebyte_lora',
@@ -4251,6 +4276,32 @@ _TIER_RANK = {'verified': 3, 'confirmed': 2, 'candidate': 1}
 _NONMT_PREEMPT_PROTOS = frozenset({'meshcore', 'lora_aprs'})
 
 
+def _phy_prior_score(pname, ctx, sync_word, sf, cr):
+    """PHY-consistency prior for same-tier tie-breaks (board item 6c rule 4).
+
+    Small nudges ONLY: radio configs are user-changeable, so PHY facts may
+    order equally-confident claims but never mint or drop a confidence tier.
+    Facts consulted (all measured by the demod, threaded in via ctx):
+    preamble run length (noisy LOWER bound — only the >=24 split at SF<=8 is
+    trusted), demodulated sync word (1 byte, configurable — weak hint), header
+    CR, header CRC-present flag."""
+    s = 0.0
+    pre = ctx.get('pre_len')
+    if pname == 'meshcore':
+        if pre is not None and sf is not None and sf <= 8 and pre >= 24:
+            s += 2.0    # MC preambleLengthForSF(): 32 syms @SF<=8 (MT fixed 16)
+        if sync_word == 0x12:
+            s += 0.5
+        if cr == 4:
+            s -= 1.0    # MC default is 4/5; CR 4/8 is the MT Long-family signature
+    elif pname == 'lorawan':
+        if sync_word == 0x34:
+            s += 0.5
+        if ctx.get('crc_present') is False:
+            s += 0.5    # CRC-off = downlink prior (hint-grade; see 6d IQ-inversion limit)
+    return s
+
+
 def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
                                   meshtastic_handler, meshtastic_shape_ok,
                                   print_on_tie):
@@ -4288,6 +4339,20 @@ def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
     stdout line) and False at SITE 2 (silent ambiguous flag only — preserves
     SITE 2's existing behavior so the harness_ref jsonl does not drift).
     """
+    # 6c rule 1 — mesh-shape PHY veto: Meshtastic's preamble is FIXED at 16
+    # symbols; MeshCore transmits 32 at SF<=8.  The measured run length is a
+    # noisy LOWER bound (window/detection truncation), so a measured >=24 at
+    # SF<=8 is trustworthy evidence the frame cannot be Meshtastic — block
+    # the shape fallback from stealing it.  The frame still reaches every
+    # non-Meshtastic parser below (and falls to unknown if none claims it),
+    # so nothing is dropped, only mis-branding is prevented.
+    _pre_len = ctx.get('pre_len')
+    if (meshtastic_shape_ok and _pre_len is not None
+            and sf is not None and sf <= 8 and _pre_len >= 24):
+        print("  PHY VETO: measured preamble %d syms @SF%d — Meshtastic is "
+              "fixed-16; mt-shape fallback blocked" % (_pre_len, sf))
+        meshtastic_shape_ok = False
+
     matches = []
     for pname, handler in _proto_candidates(sync_word):
         if pname not in _PROTO_ENABLED:
@@ -4307,7 +4372,13 @@ def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
         if rec is not None:
             matches.append((pname, rec))
     if matches:
-        matches.sort(key=lambda m: -_TIER_RANK.get(m[1].get('confidence', 'candidate'), 0))
+        # 6c rule 4: order by confidence tier first (unchanged backbone),
+        # then by PHY-consistency prior so same-tier ties resolve on measured
+        # radio facts instead of registry order.  Registry order remains the
+        # final deterministic tiebreaker (stable sort).
+        matches.sort(key=lambda m: (
+            -_TIER_RANK.get(m[1].get('confidence', 'candidate'), 0),
+            -_phy_prior_score(m[0], ctx, sync_word, sf, cr)))
 
     # Non-MT preempt: scan ALL verified-tier matches (matches is sorted desc,
     # so verified entries are contiguous at the front).  Skip non-whitelisted
@@ -4346,12 +4417,18 @@ def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
             _tier_top = _TIER_RANK.get(matches[0][1].get('confidence', 'candidate'), 0)
             _tier_2nd = _TIER_RANK.get(matches[1][1].get('confidence', 'candidate'), 0)
             if _tier_top == _tier_2nd:
-                _winner['ambiguous'] = True
-                if print_on_tie:
-                    print("  AMBIGUOUS: %d parsers claimed at tier '%s' — "
-                          "emitting %s, listing alternatives" % (
-                              len(matches), _winner.get('confidence', 'candidate'),
-                              _winner.get('proto', _pname)))
+                _phy_top = _phy_prior_score(matches[0][0], ctx, sync_word, sf, cr)
+                _phy_2nd = _phy_prior_score(matches[1][0], ctx, sync_word, sf, cr)
+                if _phy_top != _phy_2nd:
+                    # PHY prior resolved the tier tie — audit-tag, not ambiguous.
+                    _winner['phy_tiebreak'] = round(_phy_top - _phy_2nd, 2)
+                else:
+                    _winner['ambiguous'] = True
+                    if print_on_tie:
+                        print("  AMBIGUOUS: %d parsers claimed at tier '%s' — "
+                              "emitting %s, listing alternatives" % (
+                                  len(matches), _winner.get('confidence', 'candidate'),
+                                  _winner.get('proto', _pname)))
         _emit_proto(_winner, payload, sf, bw, cr, sync_word, rf)
         return True, _winner, 'nonmt_candidate'
 
@@ -7710,7 +7787,9 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
     if crc_ok:
         _early_ctx = {'aes_key': _mesh_aes_key, 'no_key': _mesh_no_key,
-                      'clean_crc': True, 'rf': _rf, 'is_mesh': True}
+                      'clean_crc': True, 'rf': _rf, 'is_mesh': True,
+                      # 6c PHY facts for the dispatcher's veto/priors
+                      'pre_len': int(best_pre_len), 'crc_present': bool(crc_present)}
         # Single dispatch helper shared with SITE 2 (post-chase).  Order:
         # non-MT preempt → Meshtastic shape-match → best non-mt candidate.
         # The preempt is the fix for the MeshCore-vs-mt-shape collision: ~50 %
@@ -8131,7 +8210,9 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # print_on_tie=False preserves SITE 2's silent ambiguous behavior so the
     # harness_ref jsonl does not drift (SITE 1 prints; SITE 2 does not).
     _ctx = {'aes_key': _mesh_aes_key, 'no_key': _mesh_no_key,
-            'clean_crc': _clean_crc, 'rf': _rf, 'is_mesh': _is_meshtastic}
+            'clean_crc': _clean_crc, 'rf': _rf, 'is_mesh': _is_meshtastic,
+            # 6c PHY facts for the dispatcher's veto/priors
+            'pre_len': int(best_pre_len), 'crc_present': bool(crc_present)}
     _mt_shape_ok = bool(_ctx['is_mesh'] and len(payload) >= 16)
     _handled, _, _ = _dispatch_nonmt_or_meshtastic(
         payload, _ctx, _sync_word, _rf, sf, bw, cr,
@@ -8144,10 +8225,16 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         # developer report (so unimplemented protocols can be added over time).
         # Only when the user has turned Unknown reporting ON.
         _report_unknown(payload, sf, bw, cr, _sync_word, name)
-        _emit_proto({'proto': 'unknown', 'from': None, 'to': None, 'decrypted': False,
-                     'summary': '%d bytes · sync %s' % (
-                         len(payload), ('0x%02x' % _sync_word) if _sync_word is not None else '?')},
-                    payload, sf, bw, cr, _sync_word, _rf)
+        _unk = {'proto': 'unknown', 'from': None, 'to': None, 'decrypted': False,
+                'summary': '%d bytes · sync %s' % (
+                    len(payload), ('0x%02x' % _sync_word) if _sync_word is not None else '?')}
+        # 6c rule 3: CRC-off + sync 0x34 is the LoRaWAN DOWNLINK signature.
+        # Hint only — real downlinks are also IQ-inverted and thus invisible
+        # to this demod chain (see 6d), so anything landing here is either a
+        # rare non-inverted oddity or a sync misread worth flagging.
+        if not crc_present and _sync_word == 0x34:
+            _unk['hint'] = 'lorawan_downlink_prior'
+        _emit_proto(_unk, payload, sf, bw, cr, _sync_word, _rf)
 
     print()
     # Compute the packet's total length so the caller can mask it from
