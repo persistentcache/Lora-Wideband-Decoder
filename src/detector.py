@@ -161,7 +161,90 @@ DECHIRP_DEDUP_WIN_S = 1.5
 # compute fix, fix #3); the cap bounds worst-case work if the channelizer learns many
 # channels.  This is the user-facing "max dechirp channels" (default 10); app.py passes
 # the learned set.  Channels beyond this are still energy-gated, just not dechirp-boosted.
-DECHIRP_MAX_CHANS = 10
+# 16 (was 10): the web's SEEDED channels (regional defaults / user-pinned, up to 6) ride
+# alongside the learned set (up to 10) — the old cap silently trimmed the learned tail
+# whenever seeds were present.
+DECHIRP_MAX_CHANS = 16
+
+
+def _parse_chan_tokens(s):
+    """Parse a --channels token string ('center_MHz:bw_kHz[:sf],...') into
+    [(center_hz, bw_hz, sf)].  Shared by the startup arg and the live ctl-file
+    apply path so both accept exactly the same format."""
+    out = []
+    for tok in (s or '').split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            _cp = tok.split(':')   # center_MHz:bw_kHz[:sf]
+            _csf = int(_cp[2]) if len(_cp) > 2 and _cp[2] else 7
+            out.append((float(_cp[0]) * 1e6, float(_cp[1]) * 1e3, _csf))
+        except (ValueError, IndexError):
+            pass
+    return out
+
+
+# ---- Patience gate (channel-acquisition range, phase C) -------------------
+# Acquire UNKNOWN channels BELOW the energy gate's floor by trading time for
+# SNR: a too-weak beacon still deposits max-hold PSD energy at the same bin,
+# periodically, forever.  Count per-bin floor-relative exceedances over a
+# long horizon; a bin whose hits pile up (but whose duty cycle is far from
+# 100% — that's a CW birdie) gets PROMOTED: a forced peak is injected at its
+# carrier every window, which hands it to the same matched-SC + dechirp
+# pipeline the channelizer uses (that pipeline identifies SF/BW from the
+# signal itself, so promotion needs only a carrier).  Wrong promotions cost
+# bounded CPU and expire; they cannot mask anything (additive, like the
+# channelizer).  All knobs env-tunable for calibration.
+# DEFAULT ON (validated 2026-07-09): end-to-end synthetic A/B on a FULL
+# 24-beacon file — an unknown carrier at 0 dB in-band SNR that the energy
+# gate NEVER detects (baseline 0/24) is promoted within ~30 s and every
+# subsequent beacon detects (12 dets, sc=1.00, bwq 24-26 dB, correct
+# SF11/125k).  Pure-noise guard: zero promotions at production defaults
+# (margin calibrated at 6 dB).  An earlier "experimental-off" verdict was
+# based on a TRUNCATED test file (writer killed mid-generation — only 8 of
+# 24 beacons existed) plus two integration bugs since fixed: promotions now
+# join dechirp_chans with a rotating (sf,bw) trial ladder, and the detect
+# pool receives channels per-task instead of frozen spawn-time params.
+PATIENCE_ON = os.environ.get('LORA_PATIENCE', '1') != '0'
+# 6.0 dB CALIBRATED on pure noise (2026-07-09): the max-hold PSD's upper tail
+# is fat — at 3 dB noise bins exceed ~1%/window (≈12 hits/horizon, ABOVE the
+# promotion bar: 1634/4096 bins would false-promote), at 5 dB a few bins still
+# cross, at 6 dB zero exceedances in 100 windows x 4096 bins.  The gain over
+# the energy gate is NOT a lower instantaneous bar — it's that a single-bin,
+# occasional poke (which the gate's >=3-bin width floor and per-window logic
+# deliberately ignore) accumulates here across many beacon periods.
+PATIENCE_MARGIN_DB = float(os.environ.get('LORA_PATIENCE_MARGIN_DB', '6.0'))
+PATIENCE_MIN_HITS = float(os.environ.get('LORA_PATIENCE_HITS', '8'))
+PATIENCE_HORIZON_WIN = int(os.environ.get('LORA_PATIENCE_HORIZON', '1200'))
+# 0.35 (was 0.6): a carrier worth patient acquisition is a SPARSE beacon —
+# the validated far-node case measures ~11% duty; even a 9 s slow frame at a
+# 60 s interval is 15%.  Strong LOCAL slow-family traffic (9 s frames every
+# ~18 s ≈ 50-57% duty) slipped under 0.6 and its spur field (beyond the
+# ±1 MHz masks) got promoted — g31_sf12 grew 4 junk promotions at 53-57%
+# duty whose trial jobs destabilized that entry's knife-edge decodes.
+# 0.30 (was 0.35, was 0.6): two60 (dense band) grew four junk promotions —
+# near-DC skirt + intermod artifacts — ALL at exactly 33% duty, sneaking
+# under 0.35; their trial jobs perturbed the decode ordering of knife-edge
+# decodes (nondeterministically LOSING MT-9 in some runs and GAINING seq
+# 3+5 in others).  The legitimate acquisition case measures 11% and the
+# theoretical ceiling (9 s frame @ 60 s interval) is 15% — 0.30 keeps 2x
+# headroom while excluding the artifact band.
+PATIENCE_DUTY_MAX = float(os.environ.get('LORA_PATIENCE_DUTY_MAX', '0.30'))
+PATIENCE_CAP = 4          # max simultaneously-promoted carriers
+PATIENCE_TTL_WIN = int(os.environ.get('LORA_PATIENCE_TTL', '1200'))
+PATIENCE_SCAN_EVERY = 16  # promotion scan cadence (windows)
+# (sf, bw) trial ladder for promoted carriers.  The despread matched filter
+# (CHAN-DECHIRP, the channelizer's sensitive path — measured 8/8 beacons at
+# 0 dB in-band where the plain SC chain floors at ~+2 dB) needs the channel's
+# SF/BW, which patience does not know.  Each promoted carrier trials TWO
+# ladder combos per window (rotating), so the full ladder sweeps in 6 windows
+# (~3 s) — a beacon spanning 2-3 windows meets its true combo within a few
+# transmissions.  Ordered most-likely-first for long-range use.
+PATIENCE_TRIALS = [(11, 125e3), (12, 125e3), (10, 125e3), (9, 125e3),
+                   (12, 62.5e3), (11, 62.5e3), (10, 62.5e3), (11, 250e3),
+                   (10, 250e3), (12, 250e3), (9, 250e3), (8, 125e3)]
+PATIENCE_TRIALS_PER_WIN = 2
 
 # IQ inversion: when set, conjugate the input stream (negate Q) so an IQ-inverted
 # transmitter — LoRaWAN downlink, satellite / tinyGS configs with Invert-IQ on —
@@ -2104,6 +2187,14 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         _nseg = min(len(iq_1m) // 4096, 64)
         if bw_bins * fres <= 150_000.0:
             _nseg = 0   # narrow peak: centroid accurate, skip the FFT
+        # Never self-recenter a peak inside a dechirp CHANNEL: the channel
+        # carrier is ground truth (learned/seeded/promoted), while at low SNR
+        # the +6 dB contour pass can only latch OTHER energy in the crop and
+        # drag off_hz 15-400 kHz off the known carrier — disqualifying the
+        # peak from its own channel's despread branch (audit mechanism #2).
+        if _nseg and dechirp_chans:
+            if any(abs(off_hz - _dc[0]) < _dc[2] for _dc in dechirp_chans):
+                _nseg = 0
         
         # No recentering in clip/overload-guard windows (spur_db pinned
         # 35): a spur forest merges +6 dB contour runs and the bogus
@@ -2154,11 +2245,35 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         # positives).  When it fires we skip SC for this peak (dechirp is more sensitive).
         _dech = None
         for _dc in (dechirp_chans or ()):
-            if abs(off_hz - _dc[0]) < _dc[2]:   # _dc = (offset_hz, sf, bw)
+            if abs(off_hz - _dc[0]) < _dc[2]:   # _dc = (offset_hz, sf, bw[, trial])
                 _dech = _dc
                 break
         if _dech is not None:
-            _ldoff, _ldsf, _ldbw = _dech
+            _ldoff, _ldsf, _ldbw = _dech[0], _dech[1], _dech[2]
+            # Patience TRIAL channel (4th field): the (sf, bw) is a rotating
+            # HYPOTHESIS, not a learned identity — same-slope aliases clear
+            # the 12 dB despread bar by +10-18 dB and can even beat the true
+            # combo (measured 2026-07-09), so a trial's label is untrustworthy
+            # by construction.  Trial detections are ACQUISITION-INTERNAL:
+            # they cut a capture and feed the decoder (whose CRC/parse
+            # arbitrates the identity), but are never published as DETECTED
+            # and never counted (soundness review: rotating labels turned one
+            # strong carrier into N phantom detections and starved real
+            # decodes on 10/14 corpus entries).
+            _ltrial = bool(len(_dech) > 3 and _dech[3])
+            # A TRIAL may only process the patience PLACEHOLDER peak (floor-
+            # level power at the promoted bin) — never a peak with real
+            # elevation.  Otherwise a promotion near live traffic eats every
+            # real peak in a predator-prey loop: trial despread fires, the
+            # (unpublished) trial det early-returns, the real detection is
+            # never published, so the retire-on-detection guard never fires
+            # and the promotion holds the carrier until TTL (two60: the
+            # continuous 'seq' transmitter lost dets + a decode this way,
+            # deterministically).  Real energy falls through to the normal
+            # SC chain, which publishes, which retires the promotion.
+            if _ltrial and (pwr - _src_floor) >= 5.0:
+                _dech = None
+        if _dech is not None:
             try:
                 _nbq, _nbqfs = extract_narrowband_fft(iq_1m, _rate1m, 0.0, _ldbw)
                 _r = _dechirp_scan(_nbq, _ldsf, _ldbw, _nbqfs)
@@ -2181,6 +2296,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                         'peak_power_db': pwr,
                         'preamble_t_s': float(_ts),
                         'forced_dechirp': True,   # Fix #2: collapse repeats via wide cooldown dedup
+                        'patience_trial': _ltrial,  # acquisition-internal: never published/counted
                     })
                     return _ld
             except Exception:
@@ -3498,8 +3614,14 @@ class SignalRecorder:
         # finalize uses; time-separated packets inside one capture are
         # handled downstream by per-det plateaus, not by this list.
         if len(detections) > 1:
+            # patience_trial dets sort LAST regardless of their (saturated)
+            # placeholder conf/power — a rotating trial HYPOTHESIS must never
+            # evict a real detection's job for the same frame (soundness
+            # review follow-up: trial jobs beat g31_sf12's real slow-pass
+            # jobs in this arbitration and 2 of 3 decodes vanished).
             _srt = sorted(detections,
-                          key=lambda d: (-d.get('peak_power_db', 0.0),
+                          key=lambda d: (bool(d.get('patience_trial')),
+                                         -d.get('peak_power_db', 0.0),
                                          -d.get('detect_conf', 0.0)))
             _pre = []
             for _d in _srt:
@@ -4050,6 +4172,7 @@ class SignalRecorder:
                         'status':      'LOCK',
                         'preamble_t_s': float(d.get('preamble_t_s', 0.0)),
                         'forced_dechirp': bool(d.get('forced_dechirp')),  # carry through for the cooldown dedup
+                        'patience_trial': bool(d.get('patience_trial')),
                         'nb_ix':       d.get('_nb_ix'),  # cropped-stream key (NB items)
                     })
                 if not preambles:
@@ -4131,10 +4254,17 @@ class SignalRecorder:
                         # duplicate emit).  Bounded cost: one extra capture
                         # pair per label-conflict, which only slow-pass
                         # straddle presets exhibit.
+                        # Patience-trial dets dedup by CARRIER ONLY: the
+                        # rotating (sf,bw) hypothesis must not hand each rung
+                        # its own keep-N slots (soundness review: one promoted
+                        # carrier fanned out into N differently-labeled
+                        # captures per packet).
+                        _lbl_blind = bool(d.get('patience_trial'))
                         for _sf_hz, _st, _ssf, _sbw in self._saved_abs_t:
                             if (abs(_cand_freq - _sf_hz) < _ftol
                                     and abs(_abs_t_s - _st) < _dt_win
-                                    and _ssf == d['sf'] and _sbw == d['bw']):
+                                    and (_lbl_blind
+                                         or (_ssf == d['sf'] and _sbw == d['bw']))):
                                 _match += 1
                         if _match < self._dedup_keep:
                             self._saved_abs_t.append(
@@ -4184,7 +4314,19 @@ class SignalRecorder:
                             (c[3] for c in self._img_carriers if len(c) > 3
                              and abs(c[0] - _mirror_f) < 60000.0
                              and abs(c[2] - _abs_t_s) < 1.5), default=-99.0)
-                    if (_mir_pwr > _cand_pwr + 10.0
+                    # CHAN-DECHIRP (forced_dechirp) detections are exempt: the
+                    # carrier was independently confirmed by the despread
+                    # matched filter at a KNOWN channel (learned/seeded/
+                    # promoted), and their placeholder floor-level power/bwq
+                    # make both mirror tests trivially (and wrongly) satisfied
+                    # whenever any strong carrier sits near the mirror.
+                    _forced_here = any(
+                        _dd.get('forced_dechirp')
+                        and not _dd.get('patience_trial')
+                        and abs(_dd['freq_hz'] - _cand_freq) < 60e3
+                        for _dd in detections)
+                    if not _forced_here and (
+                            _mir_pwr > _cand_pwr + 10.0
                             or (_mir_bwq > -99.0 and _cand_bwq > -99.0
                                 and _mir_bwq > _cand_bwq + 4.5)):
                         if self.debug >= 1:
@@ -4304,7 +4446,8 @@ class SignalRecorder:
                         # its reconstructed signal, and re-searches the
                         # residual.  Catches multi-packet files when SIC
                         # cancellation is clean (per-symbol amplitude OK).
-                        self._decoder.submit(fpath, fname, bucket_key=_bkey)
+                        self._decoder.submit(fpath, fname, bucket_key=_bkey,
+                                             slow=bool(d.get('patience_trial')))
                         # Pass 2 — TIME-ISOLATED on this preamble.  Useful at
                         # FAST SF where the hop1 relay arrives ~50-200 ms
                         # after hop0 and they share a single capture file;
@@ -4326,7 +4469,8 @@ class SignalRecorder:
                                 fpath, fname,
                                 relay_after_syms=_iso_after,
                                 relay_before_syms=_iso_before,
-                                bucket_key=_bkey)
+                                bucket_key=_bkey,
+                                slow=bool(d.get('patience_trial')))
             except Exception as e:
                 print(f"[RECORDER] save error: {e}", file=sys.stderr, flush=True)
             finally:
@@ -4953,7 +5097,7 @@ while True:
             pass
 
     def submit(self, fpath, fname, relay_after_syms=None, relay_before_syms=None,
-               bucket_key=None):
+               bucket_key=None, slow=False):
         """Queue a capture file for background decoding.
 
         relay_after_syms:  blank first N BW-rate symbols → find hop AFTER primary.
@@ -4988,9 +5132,15 @@ while True:
         # The post-decode _packet_dedup collapses any duplicate RESULTS, so
         # submitting them all is safe (no FP / no double-count).
         self._ref_inc(fpath)
+        # slow=True (patience trials): a trial capture is a HYPOTHESIS — it
+        # must never compete with real traffic for the fast decode workers
+        # (measured: trial jobs reordered a knife-edge marginal decode's
+        # worker assignment and flipped it).  The slow tier drains in idle
+        # gaps, which is exactly the right priority for acquisition probes.
+        _slow_tier = slow or self._defer_state
         self._rawlog('SUBMIT', f"{fname} relay={relay_after_syms},{relay_before_syms} "
-                               f"tier={'slow' if self._defer_state else 'fast'}")
-        (self._slow_queue if self._defer_state else self._queue).put((fpath, fname, relay_after_syms, relay_before_syms, None))
+                               f"tier={'slow' if _slow_tier else 'fast'}")
+        (self._slow_queue if _slow_tier else self._queue).put((fpath, fname, relay_after_syms, relay_before_syms, None))
 
     def pending(self):
         with self._lock:
@@ -6014,18 +6164,7 @@ def main():
     # channels (--channels).  ADDITIVE — these ride ON TOP of the full wideband energy
     # gate (no mask, no narrowing), so the gate keeps discovering everything else while
     # the dechirp tracks known channels at negative SNR.  Each is (center_hz, bw_hz, sf).
-    _chan_sf = []
-    if a.channels:
-        for tok in a.channels.split(','):
-            tok = tok.strip()
-            if not tok:
-                continue
-            try:
-                _cp = tok.split(':')   # center_MHz:bw_kHz[:sf]
-                _csf = int(_cp[2]) if len(_cp) > 2 and _cp[2] else 7
-                _chan_sf.append((float(_cp[0]) * 1e6, float(_cp[1]) * 1e3, _csf))
-            except (ValueError, IndexError):
-                pass
+    _chan_sf = _parse_chan_tokens(a.channels)
 
     # Channels to run the dechirp matched-filter on (the channelizer's learned channels,
     # capped).  Each gets a forced per-window dechirp scan so weak/far packets the energy
@@ -6034,6 +6173,48 @@ def main():
     if _dechirp_src:
         print('[GATE] channelizer dechirp matched-filter on %d/%d channel(s)' % (
             len(_dechirp_src), len(_chan_sf)), file=sys.stderr, flush=True)
+
+    # Patience-gate state (see constants at top).  _pat_hits: per-bin
+    # exponentially-decayed exceedance counts on the max-hold PSD; _pat_seen:
+    # the matching effective window count (for duty-cycle math); _pat_promoted:
+    # carrier_bin -> (expire_wc, center_hz) of active promotions.
+    _pat_hits = np.zeros(4096, np.float32)
+    # Per-BIN effective observation count (not a scalar): masked bins (strong
+    # peaks / recent detections) do not tick, and _pat_note_detection zeroes
+    # seen alongside hits — otherwise duty = hits/seen is systematically
+    # UNDERESTIMATED for bins whose clocks keep resetting, and spur-field
+    # junk ducks any duty cap (g31: 7 junk promotions reappeared this way).
+    _pat_seen = np.zeros(4096, np.float32)
+    _pat_promoted = {}
+    _pat_det_bins = {}   # bin -> last wc a REAL detection published there (any path
+                         # incl. slow-pass); patience must never pursue carriers
+                         # that are being detected — mask + expire around them.
+    def _pat_note_detection(_freq_hz):
+        """A REAL detection published at _freq_hz: zero accumulated hits and
+        expire any promotion within ±1 MHz — patience only pursues carriers
+        nothing else is detecting (this covers the slow-pass, which the
+        strong-peak accumulation mask cannot see)."""
+        if not PATIENCE_ON:
+            return
+        _b = 2048 + int(round((_freq_hz - _live_center_mhz * 1e6)
+                              / (a.rate / 4096.0)))
+        if not (0 <= _b < 4096):
+            return
+        _pat_det_bins[_b] = wc
+        _pat_hits[max(0, _b - 410):min(4096, _b + 411)] = 0.0
+        _pat_seen[max(0, _b - 410):min(4096, _b + 411)] = 0.0
+        for _pb in [p for p in _pat_promoted if abs(p - _b) <= 410]:
+            print('[PATIENCE] retired %.4fMHz — carrier is being detected '
+                  'normally' % (_pat_promoted[_pb][1] / 1e6),
+                  file=sys.stderr, flush=True)
+            del _pat_promoted[_pb]
+
+    if PATIENCE_ON:
+        print('[GATE] patience gate: margin %+.1f dB, promote at %.0f hits '
+              '(~%d-win horizon), duty<%d%%, cap %d, ttl %d win'
+              % (PATIENCE_MARGIN_DB, PATIENCE_MIN_HITS, PATIENCE_HORIZON_WIN,
+                 int(PATIENCE_DUTY_MAX * 100), PATIENCE_CAP, PATIENCE_TTL_WIN),
+              file=sys.stderr, flush=True)
 
     # Build the multiprocess detect pool FIRST — before any reader/recorder/
     # decoder THREAD starts.  Forking a multithreaded process inherits the
@@ -6275,6 +6456,9 @@ def main():
                   file=sys.stderr, flush=True)
         _elapsed = time.time() - t_start
         for d in dets0:
+            if d.get('patience_trial'):
+                continue   # acquisition-internal: publish only on decode confirm
+            _pat_note_detection(d['freq_hz'])
             tot_d += 1
             _abst = it['tot_s'] / a.rate + d.get('preamble_t_s', 0.0)
             _bwq = (f" bwq={d['bw_quality_db']:.0f}dB abst={_abst:.2f}s"
@@ -6386,6 +6570,30 @@ def main():
                                 recorder.center_hz = _live_center_mhz * 1e6
                             sys.stderr.write('detector: live center -> %.4f MHz\n'
                                              % _live_center_mhz); sys.stderr.flush()
+                            # Patience accumulator is indexed by ABSOLUTE PSD
+                            # bin — a retune shifts every carrier's bin, so
+                            # stale counts would alias onto wrong frequencies
+                            # and promoted-cluster bookkeeping would zero the
+                            # wrong bins.  Reset; carriers re-earn quickly.
+                            _pat_hits[:] = 0.0
+                            _pat_seen[:] = 0.0
+                            _pat_promoted.clear()
+                    # LIVE CHANNEL APPLY (channel-acquisition phase B): the web
+                    # writes the channelizer's fed set here so a changed set
+                    # (new learn, seed edit, enable toggle) takes effect WITHOUT
+                    # a pipeline restart (the old path dropped in-flight frames
+                    # on every re-channelize).  The ctl file's mtime changes on
+                    # every AGC gain write too, so compare before announcing.
+                    if _cc.get('channels') is not None:
+                        _new_ch = _parse_chan_tokens(_cc['channels'])
+                        if ([(c[0], c[2]) for c in _new_ch]
+                                != [(c[0], c[2]) for c in _chan_sf]):
+                            _chan_sf = _new_ch
+                            _dechirp_src = _chan_sf[:DECHIRP_MAX_CHANS]
+                            print('[GATE] channelizer live-apply: dechirp '
+                                  'matched-filter on %d/%d channel(s)'
+                                  % (len(_dechirp_src), len(_chan_sf)),
+                                  file=sys.stderr, flush=True)
             except (OSError, ValueError):
                 pass
         # ---- Read hop_n samples ----
@@ -6527,6 +6735,7 @@ def main():
                 if _mh[1] >= _min_w and not any(abs(_mh[0] - _g[0]) < 15 for _g in _gate_peaks):
                     _gate_peaks.append(_mh)
 
+
         # ---- Multi-resolution Welch: short-window sweep ----
         # The 1s Welch above dilutes a 25ms SF7/500k burst by 40x, so its
         # per-bin peak above median can drop below the 5dB threshold when
@@ -6588,6 +6797,54 @@ def main():
         for _sp in _short_peaks_all:
             if not any(abs(_sp[0] - _mp[0]) < _DEDUP_BINS for _mp in _gate_peaks):
                 _gate_peaks.append(_sp)
+
+        # ---- Patience gate: accumulate per-bin exceedances ----
+        # A beacon too weak for the energy gate still concentrates max-hold
+        # energy at its carrier bin (a slow chirp sweeps ~one 4.9 kHz bin per
+        # short Welch segment), at the SAME bin every transmission.  Noise
+        # exceedances scatter over 4096 bins; a real repeating source piles
+        # them onto one bin cluster.  dB-domain, floor-relative (median), so
+        # AGC gain moves don't poison the statistic.
+        # SPLATTER GUARD (soundness review 2026-07-09): mask ±1 MHz around
+        # every REAL gate peak this window before accumulating — patience is
+        # for carriers the gate CANNOT see, and a strong signal's adjacent-
+        # channel splatter otherwise accumulates at its own bins and promotes
+        # (measured: a 10-beacon SF11/500k recording promoted its splatter at
+        # -530 kHz and phantom-detected it under rotating trial labels).
+        # Runs AFTER the full real-peak assembly (1s + max-hold + short-sweep
+        # merge), BEFORE any forced/synthetic peaks are appended.
+        if PATIENCE_ON:
+            _pp_pat = _psd_gmax if _psd_gmax is not None else _psd_gate
+            _pat_decay = 1.0 - 1.0 / PATIENCE_HORIZON_WIN
+            _pat_hits *= _pat_decay
+            _pat_seen *= _pat_decay
+            _pat_obs = np.ones(4096, np.float32)
+            _pat_med = float(np.median(_pp_pat))
+            _exc_pat = _pp_pat > (_pat_med + PATIENCE_MARGIN_DB)
+            # STRONG peaks only (elevation >= 15 dB — the codebase's
+            # established strong-peak bar): splatter implies a strong
+            # parent.  Masking around EVERY peak (incl. transient noise
+            # peaks at 6-8 dB) starved genuinely-invisible weak carriers
+            # below the promotion bar (measured on the 0 dB A/B).
+            for _rpk in _gate_peaks:
+                if float(_rpk[2]) - _pat_med < 15.0:
+                    continue
+                _rb = int(_rpk[0])
+                _exc_pat[max(0, _rb - 205):min(4096, _rb + 206)] = False
+                _pat_obs[max(0, _rb - 205):min(4096, _rb + 206)] = 0.0
+            # ...and ±2 MHz around anything REALLY detected in the last ~5 min
+            # (any path, incl. slow-pass): far-node acquisition targets are
+            # ISOLATED carriers; everything inside an active carrier's spur
+            # field is the gate's business, not patience's (g31's junk sat at
+            # 1.1-1.4 MHz — just outside the old ±1 MHz radius).
+            for _db_, _dwc in list(_pat_det_bins.items()):
+                if wc - _dwc > 600:
+                    del _pat_det_bins[_db_]
+                    continue
+                _exc_pat[max(0, _db_ - 410):min(4096, _db_ + 411)] = False
+                _pat_obs[max(0, _db_ - 410):min(4096, _db_ + 411)] = 0.0
+            _pat_hits += _exc_pat
+            _pat_seen += _pat_obs
 
         # ---- Keep-up-driven peak throttle ----
         # The energy gate's job is bounding COMPUTE, not judging what's real —
@@ -6655,6 +6912,93 @@ def main():
                     _keep = min(_in, key=lambda _pk: abs(_pk[0] - _cbin))
                     _drop = {id(_pk) for _pk in _in if _pk is not _keep}
                     _gate_peaks = [_pk for _pk in _gate_peaks if id(_pk) not in _drop]
+
+        # ---- Patience gate: promote + force ----
+        # Promotion scan (cheap, every PATIENCE_SCAN_EVERY windows): pick the
+        # highest-hit bins that cleared the bar, veto near-DC / CW-duty /
+        # already-channelized carriers, and register a promotion with a TTL.
+        # A promotion is ONLY a carrier — the forced peak below hands it to
+        # the same matched-SC + dechirp pipeline the channelizer uses, which
+        # identifies SF/BW from the signal itself and rejects non-LoRa within
+        # seconds of windows (bounded CPU, additive, nothing masked).
+        if PATIENCE_ON and wc % PATIENCE_SCAN_EVERY == 0:
+            _fres_pat = a.rate / 4096.0
+            _cen_pat = _live_center_mhz * 1e6
+            for _pb in [b for b, (e, _h) in _pat_promoted.items() if wc >= e]:
+                print('[PATIENCE] expired %.4fMHz — no confirmed acquisition '
+                      'within TTL; re-earning' % (_pat_promoted[_pb][1] / 1e6),
+                      file=sys.stderr, flush=True)
+                _pat_hits[max(0, _pb - 4):_pb + 5] = 0.0
+                del _pat_promoted[_pb]
+            if len(_pat_promoted) < PATIENCE_CAP:
+                _pcand = np.where(_pat_hits >= PATIENCE_MIN_HITS)[0]
+                for _cb in _pcand[np.argsort(-_pat_hits[_pcand])]:
+                    if len(_pat_promoted) >= PATIENCE_CAP:
+                        break
+                    _cb = int(_cb)
+                    if abs(_cb - 2048) < 25:
+                        continue                    # DC/LO skirt (±122 kHz —
+                                                    # ±6 missed skirt bins at
+                                                    # +11/-24 on two60)
+                    if any(abs(_cb - _pb0) < 12 for _pb0 in _pat_promoted):
+                        continue                    # already promoted (cluster)
+                    if any(abs(_cb - _db0) <= 205 and wc - _dwc0 <= 600
+                           for _db0, _dwc0 in _pat_det_bins.items()):
+                        continue                    # being detected normally
+                    if float(_pat_seen[_cb]) < 45.0:
+                        continue    # < ~22 s of CLEAN observation: a bin whose
+                                    # clock keeps resetting (spur field) never
+                                    # earns promotion on a fresh hit burst
+                    _duty = float(_pat_hits[_cb]) / max(float(_pat_seen[_cb]), 1.0)
+                    if _duty > PATIENCE_DUTY_MAX:
+                        continue                    # CW/continuous — not a beacon
+                    if any(abs((_cc0 - _cen_pat) / _fres_pat + 2048 - _cb)
+                           < max(3.0, _bw0 / _fres_pat)
+                           for _cc0, _bw0, _sf0 in _dechirp_src):
+                        continue                    # a channel already covers it
+                    _lo = max(0, _cb - 4); _hi = min(4096, _cb + 5)
+                    _wv = _pat_hits[_lo:_hi].astype(np.float64)
+                    _cbin_f = float((_wv * np.arange(_lo, _hi)).sum()
+                                    / max(_wv.sum(), 1e-9))
+                    _phz = _cen_pat + (_cbin_f - 2048.0) * _fres_pat
+                    _pat_promoted[_cb] = (wc + PATIENCE_TTL_WIN, _phz)
+                    print('[PATIENCE] promoted %.4fMHz (hits %.1f, duty %d%%, '
+                          '%d/%d slots) — forcing dechirp until confirmed or TTL'
+                          % (_phz / 1e6, float(_pat_hits[_cb]),
+                             int(_duty * 100), len(_pat_promoted), PATIENCE_CAP),
+                          file=sys.stderr, flush=True)
+        # Forced peak per active promotion, every window (mirrors the
+        # channelizer force above; 125 kHz width placeholder — the per-peak
+        # pipeline measures the real width/preset itself).
+        if _pat_promoted:
+            _fres_pat = a.rate / 4096.0
+            _cen_pat = _live_center_mhz * 1e6
+            for _pb, (_pexp, _phz) in _pat_promoted.items():
+                _cbin = 2048 + int(round((_phz - _cen_pat) / _fres_pat))
+                if (0 <= _cbin < 4096
+                        and not any(abs(_pk[0] - _cbin) < 15 for _pk in _gate_peaks)):
+                    _gate_peaks.append((_cbin,
+                                        max(3, int(round(125e3 / _fres_pat))),
+                                        float(_psd_gate[_cbin]),
+                                        float(np.median(_psd_gate))))
+
+        # Per-window dechirp channel list: the channelizer's fed set PLUS a
+        # rotating (sf, bw) trial pair per patience promotion.  This is what
+        # routes a promoted carrier into the CHAN-DECHIRP despread path (the
+        # sensitive one) — without it the promotion's forced peak runs only
+        # the plain SC chain and the promotion is pointless below ~+2 dB.
+        # Rebuilt every window; handed to BOTH detect paths (pool dispatch
+        # carries it per-task so live channel changes reach the workers too).
+        _win_chans = [(_c - _live_center_mhz * 1e6, _s, _b)
+                      for (_c, _b, _s) in _dechirp_src]
+        if _pat_promoted:
+            _cen_pat = _live_center_mhz * 1e6
+            for _pi, (_pb, (_pexp, _phz)) in enumerate(_pat_promoted.items()):
+                for _k in range(PATIENCE_TRIALS_PER_WIN):
+                    _tsf, _tbw = PATIENCE_TRIALS[
+                        (wc * PATIENCE_TRIALS_PER_WIN + _pi + _k)
+                        % len(PATIENCE_TRIALS)]
+                    _win_chans.append((_phz - _cen_pat, _tsf, _tbw, True))
 
         # Try to release ONE deferred straggler for a big-budget re-decode.  Drive
         # this off the decode system's ACTUAL idle state — maybe_release_straggler
@@ -6764,7 +7108,8 @@ def main():
             _slot = _pool.acquire_slot()
             _pool.slot_array(_slot)[:len(buf)] = buf
             _pool.dispatch(_slot, _seq, len(buf), _psd_gate, _gate_peaks,
-                           spur_db=_spur_db, center=_live_center_mhz)
+                           spur_db=_spur_db, center=_live_center_mhz,
+                           dechirp_chans=(_win_chans or None))
             _inflight.append({'seq': _seq, 'slot': _slot,
                               'pre_hop': pre_hop, 'tot_s': tot_s})
             _seq += 1
@@ -6799,8 +7144,7 @@ def main():
                                    debug=a.debug,
                                    cached_psd=_psd_gate,
                                    cached_peaks=_gate_peaks,
-                                   dechirp_chans=([(_c - _live_center_mhz * 1e6, _s, _b)
-                                                   for (_c, _b, _s) in _dechirp_src] or None))
+                                   dechirp_chans=(_win_chans or None))
             dt = time.time() - tw; elapsed = time.time() - t_start
             _prof['detect'] += dt
             _t_step = time.time()
@@ -6815,6 +7159,9 @@ def main():
             # values to pass through as distinct packets.
 
             for d in dets:
+                if d.get('patience_trial'):
+                    continue   # acquisition-internal: publish only on decode confirm
+                _pat_note_detection(d['freq_hz'])
                 tot_d += 1
                 bwq = f" bwq={d['bw_quality_db']:.0f}dB" if a.debug >= 1 else ""
                 print(f"[{elapsed:6.1f}s] DETECTED freq={d['freq_mhz']:.4f}MHz "
@@ -7120,6 +7467,7 @@ def main():
                         _slow_seeds[_bk] = -_bo
             if dets_slow:
                 for d in dets_slow:
+                    _pat_note_detection(d['freq_hz'])
                     tot_d += 1
                     _abst = ((_reg_tot_s - len(_iq_long)) / a.rate
                              + d.get('preamble_t_s', 0.0))

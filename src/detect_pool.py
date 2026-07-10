@@ -58,13 +58,18 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
         task = task_q.get()
         if task is None:
             break
-        slot, seq, n, psd, peaks, spur_db, task_center = task
+        slot, seq, n, psd, peaks, spur_db, task_center, task_chans = task
         iq = views[slot][:n]
         try:
             kw = dict(sc_threshold=sc_thr, ethresh=ethr,
                       dc_notch_mhz=dc_notch, spur_notch_hz=spur_notch,
                       debug=_dbg, cached_psd=psd, cached_peaks=peaks,
-                      dechirp_chans=dechirp_chans)
+                      # Per-task channels (same pattern as task_center): the
+                      # live ctl-file channel apply and the patience gate's
+                      # rotating (sf,bw) trials change the fed set MID-RUN —
+                      # spawn-time params are stale the moment either fires.
+                      dechirp_chans=(task_chans if task_chans is not None
+                                     else dechirp_chans))
             if spur_db is not None:
                 kw['spur_db'] = spur_db
             _c = task_center if task_center is not None else center
@@ -124,10 +129,13 @@ class DetectPool:
     def n_free(self):
         return len(self._free)
 
-    def dispatch(self, slot, seq, n, psd, peaks, spur_db=None, center=None):
-        # center (MHz) is passed per-task so a live center-frequency change takes
-        # effect without re-spawning workers; None → use the spawn-time params center.
-        self._task_q.put((slot, seq, n, psd, peaks, spur_db, center))
+    def dispatch(self, slot, seq, n, psd, peaks, spur_db=None, center=None,
+                 dechirp_chans=None):
+        # center (MHz) and dechirp_chans are passed per-task so a live
+        # center-frequency change / live channel apply / patience trial takes
+        # effect without re-spawning workers; None → use the spawn-time params.
+        self._task_q.put((slot, seq, n, psd, peaks, spur_db, center,
+                          dechirp_chans))
 
     def result(self, seq):
         """Block until window `seq`'s detection is available; return dets."""
