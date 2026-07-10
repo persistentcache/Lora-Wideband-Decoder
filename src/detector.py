@@ -410,30 +410,38 @@ class StreamBuffer:
         while not self._eof:
             try:
                 raw = self._fp.read(self._chunk_bytes)
-            except (OSError, ValueError):
-                self._eof = True
-                break
-            if not raw or len(raw) < self.bps:
-                self._eof = True
-                break
-            n_samp = len(raw) // self.bps
+                if not raw or len(raw) < self.bps:
+                    self._eof = True
+                    break
+                n_samp = len(raw) // self.bps
 
-            if self.sc16:
-                data = np.frombuffer(raw[:n_samp * self.bps], dtype=np.int16)
-            else:
-                data = np.frombuffer(raw[:n_samp * self.bps], dtype=np.int8)
-
-            n_elem = n_samp * 2
-            with self._lock:
-                start = (self._wp * 2) % self._ring_elems
-                end = start + n_elem
-                if end <= self._ring_elems:
-                    self._ring[start:end] = data[:n_elem]
+                if self.sc16:
+                    data = np.frombuffer(raw[:n_samp * self.bps],
+                                         dtype=np.int16)
                 else:
-                    split = self._ring_elems - start
-                    self._ring[start:] = data[:split]
-                    self._ring[:n_elem - split] = data[split:n_elem]
-                self._wp += n_samp
+                    data = np.frombuffer(raw[:n_samp * self.bps],
+                                         dtype=np.int8)
+
+                n_elem = n_samp * 2
+                with self._lock:
+                    start = (self._wp * 2) % self._ring_elems
+                    end = start + n_elem
+                    if end <= self._ring_elems:
+                        self._ring[start:end] = data[:n_elem]
+                    else:
+                        split = self._ring_elems - start
+                        self._ring[start:] = data[:split]
+                        self._ring[:n_elem - split] = data[split:n_elem]
+                    self._wp += n_samp
+            except Exception as _re:
+                # ANY reader-thread failure must end the stream as EOF: a
+                # death without _eof leaves read() spinning forever on a
+                # silently-frozen pipeline (UC audit) — as EOF the process
+                # exits and the outage is at least visible upstream.
+                print(f"[READER] reader thread failed: {_re!r} — "
+                      f"treating as EOF", file=sys.stderr, flush=True)
+                self._eof = True
+                break
 
     def _convert_span(self, pos, n):
         """Convert ring span [pos, pos+n) to complex64 WITHOUT the lock.
@@ -2951,10 +2959,14 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 seen.add((sf, bw, _tb))
         return _ld
 
-    if len(peaks) <= 1 or os.environ.get('LORA_DETECT_SERIAL'):
+    if (len(peaks) <= 1 or os.environ.get('LORA_DETECT_SERIAL')
+            or (os.cpu_count() or 8) < 8):
         # Serial per-peak — used when a higher level already parallelises
         # (e.g. a pool of single-threaded detect worker processes), so the
-        # thread pool here would only oversubscribe.
+        # thread pool here would only oversubscribe.  ALSO forced on <8-core
+        # hosts (UC audit, measured A/B on a 4-core taskset: the thread pool
+        # is pure GIL contention there — serial 91.3s/3.29GB vs threaded
+        # 111.4s/4.04GB, identical detections).
         for _pk in peaks:
             dets.extend(_process_one_peak(_pk))
     else:
@@ -3798,7 +3810,14 @@ class SignalRecorder:
             # crop queue guarantees every earlier BASE/HOP of this job is
             # cropped first.  Blocking put (rare — FINAL items are one per
             # capture): losing a FINAL would silently drop the capture.
-            self._crop_queue.put(('FINAL', job, dt_str))
+            try:
+                self._crop_queue.put(('FINAL', job, dt_str), timeout=30.0)
+            except queue.Full:
+                # Cropper dead/stuck (UC audit: unsupervised single point of
+                # failure): losing this capture beats wedging the gate's
+                # finalize path forever behind a blocking put.
+                print('[RECORDER] crop queue stuck 30s — DROPPING capture '
+                      'finalize (cropper dead?)', file=sys.stderr, flush=True)
             return
         # heavy concat happens in the SAVE WORKER (the queue item carries
         # the parts list); trim the tail to 'need' there too
@@ -3971,8 +3990,9 @@ class SignalRecorder:
                 # SF-agnostic — lag, bin width, and cluster thresholds all
                 # scale with sf/bw.
                 if not detections:
-                    self._save_queue.task_done()
-                    continue
+                    continue   # finally balances task_done — an inner call
+                               # double-counts and RAISES, silently killing
+                               # the worker thread (UC audit d)
 
                 # Pick anchor sf/bw from the strongest detection.  We rely
                 # on the gate stage to have picked the right preset for the
@@ -4166,7 +4186,16 @@ class SignalRecorder:
                         continue
                     preambles.append({
                         'offset_hz':   float(d_off),
-                        'time_sample': 0,
+                        # Preamble position IN THE SAVED FILE, in nb samples:
+                        # the file starts pre_hop_s BEFORE the window, and
+                        # preamble_t_s is the gate's within-window time.
+                        # Hardcoded 0 made the PASS-2 time-isolated resubmit
+                        # below dead code for every gate save — the sf<=9
+                        # hop0/hop1 same-capture recovery never ran (UC
+                        # audit g).
+                        'time_sample': int(max(
+                            0.0, pre_hop_s + float(d.get('preamble_t_s', 0.0)))
+                            * nb_fs),
                         'pmr_db':      float(d.get('bw_quality_db', 0.0)),
                         'peak_pwr_db': d_pwr,
                         'status':      'LOCK',
@@ -4174,10 +4203,12 @@ class SignalRecorder:
                         'forced_dechirp': bool(d.get('forced_dechirp')),  # carry through for the cooldown dedup
                         'patience_trial': bool(d.get('patience_trial')),
                         'nb_ix':       d.get('_nb_ix'),  # cropped-stream key (NB items)
+                        'src_det':     d,   # the ORIGINATING detection — the
+                                            # save must carry ITS sf/bw label,
+                                            # not the anchor's (UC audit c)
                     })
                 if not preambles:
-                    self._save_queue.task_done()
-                    continue
+                    continue   # finally balances task_done (see above)
                 if self.debug >= 1:
                     print(
                         f"         RECENTRE {len(preambles)} gate "
@@ -4190,6 +4221,11 @@ class SignalRecorder:
                     _recenter_status = p['status']
                     _recenter_pmr = p['pmr_db']
                     _preamble_sample = p['time_sample']
+                    # The detection this preamble came from (1:1).  Anchor-
+                    # only labelling gave every co-window frame the ANCHOR's
+                    # sf/bw — chimera saves that are undecodable at their
+                    # true preset (UC audit c).
+                    _src = p.get('src_det') or anchor
                     if _recenter_status == 'NO_LOCK':
                         continue
                     if self.debug >= 1:
@@ -4259,16 +4295,22 @@ class SignalRecorder:
                         # its own keep-N slots (soundness review: one promoted
                         # carrier fanned out into N differently-labeled
                         # captures per packet).
-                        _lbl_blind = bool(d.get('patience_trial'))
+                        # _src label, not the stale loop variable `d` (the
+                        # WEAKEST det from the batch power-sort — UC audit a):
+                        # the registry must match/register under the label
+                        # the save actually carries.
+                        _lbl_blind = bool(_src.get('patience_trial'))
                         for _sf_hz, _st, _ssf, _sbw in self._saved_abs_t:
                             if (abs(_cand_freq - _sf_hz) < _ftol
                                     and abs(_abs_t_s - _st) < _dt_win
                                     and (_lbl_blind
-                                         or (_ssf == d['sf'] and _sbw == d['bw']))):
+                                         or (_ssf == _src['sf']
+                                             and _sbw == _src['bw']))):
                                 _match += 1
                         if _match < self._dedup_keep:
                             self._saved_abs_t.append(
-                                (_cand_freq, _abs_t_s, d['sf'], d['bw']))
+                                (_cand_freq, _abs_t_s,
+                                 _src['sf'], _src['bw']))
                             if len(self._saved_abs_t) > 4000:
                                 _cut = _abs_t_s - 10.0
                                 self._saved_abs_t = [
@@ -4339,8 +4381,11 @@ class SignalRecorder:
 
                     # Build a per-preamble synthetic detection dict so the
                     # rest of the save-worker (POSTDEDUP, filename, decoder
-                    # submission) works unchanged.
-                    d = dict(anchor)
+                    # submission) works unchanged.  From _src, NOT anchor:
+                    # the filename's SF/BW label must be this detection's
+                    # own (UC audit c).  freq is identical either way
+                    # (carrier_hz was measured relative to the anchor).
+                    d = dict(_src)
                     d['freq_hz'] = anchor['freq_hz'] + carrier_hz
                     off = d['freq_hz'] - self.center_hz
                     if _nb_job is not None:
@@ -4480,6 +4525,15 @@ class SignalRecorder:
                         os.unlink(_spool_path)
                     except Exception:
                         pass
+                # Release the batch's big arrays BEFORE blocking on the next
+                # get(): an idle save worker otherwise pins the last
+                # capture's wideband/narrowband buffers (hundreds of MB) in
+                # dead locals for the whole quiet period (UC audit q) — x4
+                # workers on a 4 GB Pi.
+                item = extended_full = nb = None
+                extended = _ext_fft_cache = None
+                _all = _bparts = _tparts = _tp = _mm = None
+                detections = _nb_job = _dets_sorted = preambles = None
                 self._save_queue.task_done()
 
     def _extract_nb(self, iq, offset_hz, target_bw):
@@ -5377,12 +5431,40 @@ while True:
                 output_lines = []
                 deadline = time.time() + _wall
                 timed_out = True
+                worker_died = False
+                import select as _select
+                # Raw-fd line reader: a bare readline() blocks with no
+                # deadline at all, so a worker that hangs WITHOUT printing
+                # (the common OpenBLAS/fork wedge) stalled this manager
+                # thread forever — the deadline was only ever checked
+                # between lines (UC audit e).  select()+readline() is NOT
+                # the fix (readline's buffer can hold lines the fd no
+                # longer shows, faking a timeout on a healthy worker), so
+                # read the fd raw into our own buffer and split lines.
+                # worker.stdout is read NOWHERE else, so its text-layer
+                # buffer stays empty and can't steal bytes from us.
+                _rbuf = b''
+                _wfd = worker.stdout.fileno()
                 while time.time() < deadline:
-                    line = worker.stdout.readline()
-                    if not line:
-                        worker = None
-                        break
-                    line = line.rstrip('\n')
+                    _nl = _rbuf.find(b'\n')
+                    if _nl < 0:
+                        _rdy, _, _ = _select.select(
+                            [_wfd], [], [],
+                            min(1.0, max(0.05, deadline - time.time())))
+                        if not _rdy:
+                            continue
+                        try:
+                            _chunk = os.read(_wfd, 65536)
+                        except OSError:
+                            _chunk = b''
+                        if not _chunk:
+                            worker_died = True
+                            worker = None
+                            break
+                        _rbuf += _chunk
+                        continue
+                    line = _rbuf[:_nl].decode('utf-8', 'replace').rstrip('\r')
+                    _rbuf = _rbuf[_nl + 1:]
                     if line == '__END__':
                         timed_out = False
                         break
@@ -5391,8 +5473,16 @@ while True:
                     output_lines.append(line)
 
                 if timed_out:
-                    # Worker didn't finish within deadline; kill to avoid desync.
-                    output_lines.append('ERROR: DECODE TIMEOUT (90s)')
+                    # Distinguish worker death (EOF mid-job) from a genuine
+                    # wall-deadline overrun: both used to report the same
+                    # "TIMEOUT (90s)" even when the worker crashed instantly
+                    # or the deadline wasn't 90 s (UC audit e).
+                    if worker_died:
+                        output_lines.append(
+                            'ERROR: DECODE WORKER DIED (EOF mid-job)')
+                    else:
+                        output_lines.append(
+                            f'ERROR: DECODE TIMEOUT ({_wall:.0f}s wall)')
                     try:
                         if worker:
                             worker.kill()
@@ -5501,6 +5591,35 @@ while True:
                         pass
                     worker = None
             finally:
+                # RSS-bound worker recycle: decode workers ratchet to ~2 GB
+                # anon each (numpy scratch never returned to the OS) and
+                # nothing ever recycled them — the measured OOM driver on
+                # 24/7 hosts (UC audit q).  A graceful stdin-close between
+                # jobs costs one lazy respawn (~1-2 s, already the crash
+                # path) only when the bound is actually exceeded.
+                if worker is not None and worker.poll() is None:
+                    try:
+                        with open(f'/proc/{worker.pid}/statm') as _sm:
+                            _wrss_mb = (int(_sm.read().split()[1])
+                                        * (os.sysconf('SC_PAGE_SIZE') // 1024)
+                                        / 1024.0)
+                        _rss_lim = float(os.environ.get(
+                            'LORA_DECODE_WORKER_RSS_MB', '1500') or 0)
+                        if _rss_lim > 0 and _wrss_mb > _rss_lim:
+                            print(f"[DECODER] worker rss {_wrss_mb:.0f}MB > "
+                                  f"{_rss_lim:.0f}MB — recycling",
+                                  file=sys.stderr, flush=True)
+                            try:
+                                worker.stdin.close()
+                                worker.wait(timeout=5)
+                            except Exception:
+                                try:
+                                    worker.kill()
+                                except Exception:
+                                    pass
+                            worker = None
+                    except Exception:
+                        pass
                 with self._lock:
                     self._active_count -= 1
                 self._queue.task_done()
@@ -6262,7 +6381,7 @@ def main():
                         dechirp_chans=([(_c - a.center * 1e6, _s, _b)
                                         for (_c, _b, _s) in _dechirp_src] or None)))
         print(f"Detect pool: {a.detect_workers} worker processes "
-              f"({a.detect_workers + 4} slots)", flush=True)
+              f"({a.detect_workers + 8} slots)", flush=True)
 
     fp = open(a.file, 'rb') if a.file else sys.stdin.buffer
 
@@ -7371,23 +7490,34 @@ def main():
                 # wraps. numpy FFTs release the GIL; drop-if-busy bounds
                 # cost to one scan in flight.
                 _t0 = time.time()
-                _iql = np.concatenate(_hv)   # off-loop
                 try:
-                    _ds = detect_preamble(
-                        _iql, a.rate, a.bandwidth, _live_center_mhz,
-                        sc_threshold=a.threshold,
-                        ethresh=a.energy_threshold,
-                        spur_db=_spur_db, dc_notch_mhz=a.dc_notch,
-                        spur_notch_hz=_spur_notch_hz or None, debug=a.debug,
-                        cached_peaks=_spk, only_bws={31250, 41667})
-                except Exception:
-                    _ds = []
-                if os.environ.get('LORA_SLOW_DEBUG'):
-                    print(f"[SLOW-SCAN] {time.time() - _t0:.2f}s "
-                          f"seeds={len(_tg)} hits={len(_ds or [])} (bg)",
+                    # concat INSIDE the guard, busy-flag cleared in finally:
+                    # a MemoryError in the 640 MB concat (or anything else
+                    # unexpected) used to leak _slow_busy=True forever,
+                    # silently disabling the slow scan — i.e. all 31.25k /
+                    # 41.67k detection — for the rest of the run (UC audit).
+                    _iql = np.concatenate(_hv)   # off-loop
+                    try:
+                        _ds = detect_preamble(
+                            _iql, a.rate, a.bandwidth, _live_center_mhz,
+                            sc_threshold=a.threshold,
+                            ethresh=a.energy_threshold,
+                            spur_db=_spur_db, dc_notch_mhz=a.dc_notch,
+                            spur_notch_hz=_spur_notch_hz or None,
+                            debug=a.debug,
+                            cached_peaks=_spk, only_bws={31250, 41667})
+                    except Exception:
+                        _ds = []
+                    if os.environ.get('LORA_SLOW_DEBUG'):
+                        print(f"[SLOW-SCAN] {time.time() - _t0:.2f}s "
+                              f"seeds={len(_tg)} hits={len(_ds or [])} (bg)",
+                              file=sys.stderr, flush=True)
+                    _slow_results.put((_ds or [], _iql, _rp, _tg))
+                except Exception as _se:
+                    print(f"[SLOW-SCAN] bg scan failed: {_se!r}",
                           file=sys.stderr, flush=True)
-                _slow_results.put((_ds or [], _iql, _rp, _tg))
-                _slow_busy[0] = False
+                finally:
+                    _slow_busy[0] = False
 
             if is_live:
                 threading.Thread(target=_slow_scan_bg, daemon=True).start()
@@ -7624,6 +7754,18 @@ def main():
             try:
                 with open('/proc/self/statm') as _sm:
                     _rss_mb = int(_sm.read().split()[1]) * (os.sysconf('SC_PAGE_SIZE') // 1024) / 1024.0
+                # Detect-pool workers hold the big per-process buffers, so
+                # main-only rss= under-reports real footprint several-fold
+                # on OOM-prone hosts (UC audit) — fold their RSS in too.
+                if _pool is not None:
+                    for _wp_ in getattr(_pool, '_workers', []):
+                        try:
+                            with open(f'/proc/{_wp_.pid}/statm') as _sm:
+                                _rss_mb += (int(_sm.read().split()[1])
+                                            * (os.sysconf('SC_PAGE_SIZE')
+                                               // 1024) / 1024.0)
+                        except Exception:
+                            pass
             except Exception:
                 _rss_mb = 0.0
             print(f"[STAT] {elapsed:.1f}s | {msps:.1f}Msps | win={wc} det={tot_d} "
@@ -7642,13 +7784,15 @@ def main():
                 print(f"  PROF (avg ms over {n} wins): "
                       f"read={_prof['read']/n*1000:.0f} "
                       f"welch={_prof['welch']/n*1000:.0f} "
-                      f"notch+peaks={_prof['notch']/n*1000:.0f} "
+                      f"gate+sweep={_prof['notch']/n*1000:.0f} "
                       f"sat={_prof['sat']/n*1000:.0f} "
                       f"detect={_prof['detect']/n*1000:.0f} "
                       f"tail={_prof['tail']/n*1000:.0f} "
                       f"recorder={_prof['recorder']/n*1000:.0f} "
                       f"slow={_prof['slow']/n*1000:.0f} "
-                      f"feed={_prof['feed']/n*1000:.0f}",
+                      f"feed={_prof['feed']/n*1000:.0f}"
+                      + (f" catchup={_prof['catchup']/n*1000:.0f}"
+                         if _prof['catchup'] else ""),
                       file=sys.stderr)
                 for k in _prof: _prof[k] = 0
                 _prof['n'] = 0

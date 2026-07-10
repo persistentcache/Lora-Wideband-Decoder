@@ -137,11 +137,36 @@ class DetectPool:
         self._task_q.put((slot, seq, n, psd, peaks, spur_db, center,
                           dechirp_chans))
 
+    def _absorb(self, rseq, dets, err):
+        if err is not None:
+            # Worker-side detect exceptions used to vanish silently (the
+            # third tuple field was read and dropped): a systematic failure
+            # looked identical to "no signal" (UC audit b).
+            import sys
+            print(f"[POOL] worker error on window {rseq}: {err}",
+                  file=sys.stderr, flush=True)
+        self._results[rseq] = dets
+
     def result(self, seq):
-        """Block until window `seq`'s detection is available; return dets."""
+        """Block until window `seq`'s detection is available; return dets.
+
+        Bounded: if no result arrives for 10 s and a worker has died, the
+        window is abandoned as no-detections — a dead worker's tasks never
+        produce a result, and the unbounded get() froze the whole gate loop
+        forever (UC audit b).  Losing one window beats losing the pipeline.
+        """
         while seq not in self._results:
-            rseq, dets, err = self._result_q.get()
-            self._results[rseq] = dets
+            try:
+                rseq, dets, err = self._result_q.get(timeout=10.0)
+            except queue.Empty:
+                if all(p.is_alive() for p in self._workers):
+                    continue   # slow window (big SF sweep) — keep waiting
+                import sys
+                print(f"[POOL] worker died; abandoning window {seq} "
+                      f"(no detections)", file=sys.stderr, flush=True)
+                self._results[seq] = []
+                break
+            self._absorb(rseq, dets, err)
         return self._results.pop(seq)
 
     def ready(self, seq):
@@ -151,7 +176,7 @@ class DetectPool:
         try:
             while True:
                 rseq, dets, err = self._result_q.get_nowait()
-                self._results[rseq] = dets
+                self._absorb(rseq, dets, err)
         except queue.Empty:
             pass
         return seq in self._results
@@ -162,11 +187,23 @@ class DetectPool:
 
     def close(self):
         for _ in self._workers:
-            self._task_q.put(None)
+            try:
+                self._task_q.put(None)
+            except Exception:
+                pass
         for p in self._workers:
             p.join(timeout=5)
             if p.is_alive():
                 p.terminate()
         for s in self._shms:
-            s.close()
-            s.unlink()
+            # unlink() must run even when close() raises, or a partial
+            # teardown leaks the shm segments in /dev/shm until reboot
+            # (UC audit b) — real RAM on a Pi, gone across restarts.
+            try:
+                s.close()
+            except Exception:
+                pass
+            try:
+                s.unlink()
+            except Exception:
+                pass
