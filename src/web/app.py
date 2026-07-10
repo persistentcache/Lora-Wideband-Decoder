@@ -94,6 +94,19 @@ def load_settings():
                  'channelize_enabled': True,    # master on/off (always-on when True)
                  'channelize_after_n': 10,      # min intercepts before a channel is fed
                  'channelize_max_channels': 10, # cap on channels fed (top by count)
+                 # Channel SEEDS (channel-acquisition phase A): user-pinned or
+                 # regional-default channels fed to the dechirp matched-filter
+                 # WITHOUT needing prior decodes — a distant node on a known
+                 # channel gets matched-filter range from minute zero instead
+                 # of never bootstrapping.  Each: {center_mhz, bw_khz, sf,
+                 # label}.  Capped at 6 (own allowance — cannot starve the
+                 # learned set); exempt from the busiest-N ranking.
+                 'channels_seed': [],
+                 # Patience gate (phase C): acquire UNKNOWN channels below the
+                 # energy-gate floor by long-horizon per-bin persistence
+                 # statistics; promotions force the dechirp matched-filter on
+                 # the carrier (additive, bounded, auto-expiring).
+                 'patience_enabled': True,
                  # Pipeline tuning — overrides lora.toml [detect] when set.  Defaults
                  # match the well-tuned values; users only edit these to chase weak
                  # signals, suppress false positives in noisy RF, or absorb bursts.
@@ -1574,6 +1587,41 @@ def _freq_sf(center_mhz, default=7):
     return default
 
 
+# ---- Channel seeds (channel-acquisition phase A) ---------------------------
+# Firmware-default channels for the common mesh networks — DETERMINISTIC per
+# region+preset, so a stock-configured network is seedable without ever having
+# decoded it.  Static table on purpose (sourcing from firmware defaults beats
+# reimplementing the channel-name hash — fewer ways to be subtly wrong).
+# LoRaWAN regional plans are deliberately ABSENT: 64+ channels vs the dechirp
+# CPU cap makes them un-seedable; LoRaWAN discovery stays with the wideband
+# gate + patience.
+REGIONAL_SEED_PRESETS = [
+    {'id': 'us_mt_longfast', 'label': 'US915 Meshtastic LongFast',
+     'center_mhz': 906.875, 'bw_khz': 250.0, 'sf': 11},
+    {'id': 'us_mc_default', 'label': 'US915 MeshCore default',
+     'center_mhz': 910.525, 'bw_khz': 250.0, 'sf': 10},
+    {'id': 'eu_mt_longfast', 'label': 'EU868 Meshtastic LongFast',
+     'center_mhz': 869.525, 'bw_khz': 250.0, 'sf': 11},
+    {'id': 'eu_mc_default', 'label': 'EU868 MeshCore default',
+     'center_mhz': 869.525, 'bw_khz': 250.0, 'sf': 11},
+]
+SEED_CAP = 6      # seeds' own allowance — they never starve the learned cap
+
+
+def _seed_list():
+    """Validated seed channels from SETTINGS (capped)."""
+    out = []
+    for s in (SETTINGS.get('channels_seed') or [])[:SEED_CAP]:
+        try:
+            c = float(s['center_mhz']); b = float(s['bw_khz']); f = int(s['sf'])
+            if 100.0 <= c <= 6000.0 and 7.8 <= b <= 500.0 and 7 <= f <= 12:
+                out.append({'center_mhz': c, 'bw_khz': b, 'sf': f,
+                            'label': str(s.get('label') or '')[:40]})
+        except (KeyError, TypeError, ValueError):
+            pass
+    return out
+
+
 class ChannelTracker:
     """Learns the live LoRa channels from decoded packets (clustered by carrier
     frequency) so the channelizer can FORCE the dechirp matched-filter on the busy
@@ -1643,24 +1691,50 @@ class ChannelTracker:
         return eligible[:cap]
 
     def channel_tokens(self):
-        """center_MHz:bw_kHz:sf tokens for the detector --channels arg (the fed set).
-        The SF lets the detector run the dechirp matched-filter on each channel."""
+        """center_MHz:bw_kHz:sf tokens for the detector --channels arg: SEEDS
+        first (pinned, exempt from the busiest-N ranking — a far node's one
+        packet a day must not evict them), then the learned fed set.  A seed
+        within ~50 kHz of a learned channel is dropped in favour of the
+        learned one (its running-average centre tracks the live carrier)."""
         with self._lock:
-            return ','.join('%.5f:%.1f:%d' % (
-                c['center_mhz'], c['bw_khz'], int(c.get('sf') or _freq_sf(c['center_mhz'])))
-                for c in self._fed())
+            _fed = self._fed()
+        _toks = []
+        _grid = set()
+        for c in _fed:
+            _grid.add(round(c['center_mhz'] / 0.05))
+            _toks.append('%.5f:%.1f:%d' % (
+                c['center_mhz'], c['bw_khz'],
+                int(c.get('sf') or _freq_sf(c['center_mhz']))))
+        for s in _seed_list():
+            if round(s['center_mhz'] / 0.05) in _grid:
+                continue
+            _toks.append('%.5f:%.1f:%d' % (s['center_mhz'], s['bw_khz'], s['sf']))
+        return ','.join(_toks)
 
     def status(self):
         with self._lock:
             chans = sorted(self.channels, key=lambda x: -x['count'])
-            return {'enabled': bool(SETTINGS.get('channelize_enabled', True)),
-                    'after_n': int(SETTINGS.get('channelize_after_n', 10) or 10),
-                    'max_channels': int(SETTINGS.get('channelize_max_channels', 10) or 10),
-                    'total': self.total, 'n_channels': len(self.channels),
-                    'channels': [{'center_mhz': round(c['center_mhz'], 4),
-                                  'bw_khz': round(c['bw_khz'], 1),
-                                  'sf': int(c.get('sf') or _freq_sf(c['center_mhz'])),
-                                  'count': c['count']} for c in chans]}
+            _learned = [{'center_mhz': round(c['center_mhz'], 4),
+                         'bw_khz': round(c['bw_khz'], 1),
+                         'sf': int(c.get('sf') or _freq_sf(c['center_mhz'])),
+                         'count': c['count']} for c in chans]
+            # per-seed live intercept count = the matching learned channel's
+            # count (within ~one channel bw), so a dead seed is visible
+            _seeds = []
+            for s in _seed_list():
+                _cnt = 0
+                for c in self.channels:
+                    if abs(c['center_mhz'] - s['center_mhz']) <= max(
+                            c['bw_khz'], 200.0) / 1e3:
+                        _cnt = max(_cnt, c['count'])
+                _seeds.append({**s, 'count': _cnt})
+        return {'enabled': bool(SETTINGS.get('channelize_enabled', True)),
+                'after_n': int(SETTINGS.get('channelize_after_n', 10) or 10),
+                'max_channels': int(SETTINGS.get('channelize_max_channels', 10) or 10),
+                'total': self.total, 'n_channels': len(self.channels),
+                'channels': _learned, 'seeds': _seeds,
+                'regional_presets': REGIONAL_SEED_PRESETS,
+                'patience': bool(SETTINGS.get('patience_enabled', True))}
 
 CHAN = ChannelTracker()
 
@@ -1699,22 +1773,51 @@ def _restart_pipeline_bg():
     threading.Thread(target=_do, daemon=True).start()
 
 
+def _write_chan_ctl(tokens):
+    """LIVE channel apply (channel-acquisition phase B): write the fed-channel
+    token string into the SDR ctl file the detector already polls (~2x/s) for
+    gain/freq.  Read-modify-write + atomic replace, same as the AGC governor's
+    writer, so concurrent gain writes are never clobbered.  Replaces the old
+    restart-based apply, which dropped in-flight frames on every re-channelize."""
+    global _APPLIED_CHAN_TOKENS
+    cur = {}
+    try:
+        with open(SDR_CTL_PATH) as f:
+            cur = json.load(f)
+    except (OSError, ValueError):
+        pass
+    cur['channels'] = tokens
+    tmp = SDR_CTL_PATH + '.tmp'
+    try:
+        with open(tmp, 'w') as f:
+            json.dump(cur, f)
+        os.replace(tmp, SDR_CTL_PATH)
+        _APPLIED_CHAN_TOKENS = tokens
+        return True
+    except OSError as e:
+        print('[CHAN] ctl write failed: %s' % e, file=sys.stderr, flush=True)
+        return False
+
+
 def _channelize_apply_loop():
-    """Auto-apply: when the channelizer's fed set changes (a new channel crossed
-    channelize_after_n, or the busiest-N set shifted) from what the running gate is
-    actually dechirping, restart the pipeline in the background so the new --channels take
-    effect — no manual restart.  Periodic (debounced) so a burst of new learns costs at
-    most one restart per interval.  No-op when channelizing is off / pipeline stopped."""
+    """Auto-apply: when the channelizer's fed set (seeds + learned) diverges from
+    what the running gate is actually dechirping, write the new set into the live
+    ctl file (no restart — phase B).  Periodic (debounced) so a burst of new
+    learns costs at most one write per interval.  No-op when the pipeline is
+    stopped; when channelizing is disabled, an empty set is applied once so the
+    gate stops forcing stale channels."""
     while True:
         try:
-            time.sleep(75)
-            if not (SETTINGS.get('channelize_enabled', True) and PIPELINE.get('running')):
+            time.sleep(20)
+            if not PIPELINE.get('running'):
                 continue
-            _cur = CHAN.channel_tokens()
-            if _cur and _chan_sig(_cur) != _chan_sig(_APPLIED_CHAN_TOKENS):
-                print('[CHAN] learned channel set changed → re-channelizing',
+            _cur = (CHAN.channel_tokens()
+                    if SETTINGS.get('channelize_enabled', True) else '')
+            if _chan_sig(_cur) != _chan_sig(_APPLIED_CHAN_TOKENS):
+                print('[CHAN] fed channel set changed → live apply (%d channel(s))'
+                      % (len([t for t in _cur.split(',') if t]) if _cur else 0),
                       file=sys.stderr, flush=True)
-                _restart_pipeline_bg()
+                _write_chan_ctl(_cur)
         except Exception:
             time.sleep(15)
 
@@ -2264,6 +2367,9 @@ def start_pipeline():
     # (normal IQ).  Mutually exclusive with normal traffic, so it's an explicit
     # mode the user selects, not an automatic fallback.
     env['LORA_IQ_INVERT'] = '1' if SETTINGS.get('iq_invert') else '0'
+    # Patience gate (channel-acquisition phase C) — long-horizon persistence
+    # promotion of below-gate-floor carriers into the dechirp matched-filter.
+    env['LORA_PATIENCE'] = '1' if SETTINGS.get('patience_enabled', True) else '0'
     # Live SDR control: soapy_rx polls this file so gain changes apply WITHOUT a
     # pipeline restart.  Start fresh — drop any stale file so the -g in the command
     # wins on this run; later gain edits (POST /api/settings) rewrite it.
@@ -2624,7 +2730,28 @@ def api_settings():
                 _chan_changed = True
             except (TypeError, ValueError):
                 pass
-        _chan_keys = ('channelize_enabled', 'channelize_after_n', 'channelize_max_channels')
+        if 'channels_seed' in d and isinstance(d['channels_seed'], list):
+            # Validate + cap; malformed entries are dropped (same shape the
+            # UI posts: {center_mhz, bw_khz, sf, label}).
+            _seeds_in = []
+            for _s in d['channels_seed'][:SEED_CAP]:
+                try:
+                    _c = float(_s['center_mhz']); _b = float(_s['bw_khz']); _f = int(_s['sf'])
+                    if 100.0 <= _c <= 6000.0 and 7.8 <= _b <= 500.0 and 7 <= _f <= 12:
+                        _seeds_in.append({'center_mhz': _c, 'bw_khz': _b, 'sf': _f,
+                                          'label': str(_s.get('label') or '')[:40]})
+                except (KeyError, TypeError, ValueError):
+                    pass
+            SETTINGS['channels_seed'] = _seeds_in
+            _chan_changed = True
+        _pat_changed = False
+        if 'patience_enabled' in d:
+            _new_pat = bool(d['patience_enabled'])
+            if _new_pat != bool(SETTINGS.get('patience_enabled', True)):
+                SETTINGS['patience_enabled'] = _new_pat
+                _pat_changed = True   # launch env — needs a restart to apply
+        _chan_keys = ('channelize_enabled', 'channelize_after_n',
+                      'channelize_max_channels', 'channels_seed', 'patience_enabled')
         if any(k in d for k in ('autosave', 'waterfall', 'unknown', 'fingerprint',
                                 'protocols', 'wide_scan', 'sdr', 'radio', 'tune',
                                 'ldro_fallback', 'iq_invert', 'auto_gain',
@@ -2641,10 +2768,14 @@ def api_settings():
             _new_dir = _effective_capture_dir()
             if _cap_old_dir != _new_dir:
                 _sweep_capture_dir(_cap_old_dir)
-        # A channelize_* or capture-storage change alters the detector launch flags
-        # (--channels / --export-iq), so restart the running pipeline (background
-        # thread) to apply it.  No-op if not running.
-        if _chan_changed or _cap_changed:
+        # Channel-set changes (channelize_* toggles, seeds) apply LIVE via the
+        # ctl file — no restart, no dropped frames (phase B).  Capture-storage
+        # and patience changes alter LAUNCH state (--export-iq / env), so those
+        # still restart a running pipeline.
+        if _chan_changed and PIPELINE.get('running'):
+            _write_chan_ctl(CHAN.channel_tokens()
+                            if SETTINGS.get('channelize_enabled', True) else '')
+        if _cap_changed or _pat_changed:
             _restart_pipeline_bg()
         # Surface a bad capture path to the UI without failing the whole save.
         if _cap_error:
