@@ -6537,6 +6537,40 @@ def main():
     # margin.  Save file grows from ~1.4s to ~1.9s at 20Msps but decode succeeds.
     _MAX_PRE_HOP_S = 0.6
     _max_pre_hop_n = min(hop_n, int(_MAX_PRE_HOP_S * a.rate))
+    # ---- Short-sweep slice cache (UC audit E, bit-exact) ----
+    # At production hop (0.5 s = exactly 10 short-sweep steps) the low
+    # slices of each window are the SAME ABSOLUTE SAMPLES as the high
+    # slices of the previous window, so their Welch PSDs are byte-identical
+    # and recomputed for nothing.  Cache the PRISTINE (un-notched) welch
+    # output keyed by ABSOLUTE sample position: a hit ⟺ identical samples ⟺
+    # identical PSD, so notch+find_peaks run fresh on a COPY every window
+    # and the emitted peaks are bit-exact.  Keying by absolute position
+    # makes every reset/skip/carry-tail path a natural cache MISS (never a
+    # wrong hit), so no explicit invalidation is needed.  LORA_SLICE_CACHE=0
+    # disables; LORA_SLICE_CACHE_VERIFY=1 asserts each hit against a fresh
+    # welch.
+    _slice_cache = {}          # abs_start_sample -> (psd, psd_max|None)
+    _slice_cache_on = os.environ.get('LORA_SLICE_CACHE', '1') != '0'
+    _slice_cache_verify = os.environ.get('LORA_SLICE_CACHE_VERIFY') == '1'
+    _slice_cache_hits = 0
+    _slice_cache_miss = 0
+    # ---- pre_hop reference reuse (UC audit E, bit-exact) ----
+    # pre_hop is buf[hop_n-_max_pre_hop_n:hop_n] of the pre-slide window —
+    # at production overlap 0.5 those are the SAME ABSOLUTE SAMPLES already
+    # owned by an earlier iteration's _hop_own (kept alive in _slow_halves
+    # and fed as immutable refs to feed_tail — verified zero-copy).  Match
+    # by ABSOLUTE position and reuse a view of that array instead of a fresh
+    # 80 MB/window copy; ANY skip/carry-tail/reset fails the match and falls
+    # back to the copy, so it is correctness-automatic.  Safe because every
+    # pre_hop / _hop_own consumer is strictly read-only (recorder parts are
+    # concatenated, never mutated; feed_tail holds refs).  LORA_PREHOP_REF=0
+    # disables; LORA_PREHOP_VERIFY=1 asserts each reuse against a fresh copy.
+    from collections import deque as _deque_ph
+    _prehop_hist = _deque_ph(maxlen=4)   # (abs_start, hop_array) newest-last
+    _prehop_ref_on = os.environ.get('LORA_PREHOP_REF', '1') != '0'
+    _prehop_verify = os.environ.get('LORA_PREHOP_VERIFY') == '1'
+    _prehop_ref_hits = 0
+    _prehop_copies = 0
     tot_skip = 0
     _warned_slow = False   # keep-up monitor: warn once if the gate can't sustain rate
     t_start = time.time()
@@ -6853,6 +6887,8 @@ def main():
                 buf_pos = 0
                 buf = np.zeros(win_n, dtype=np.complex64)
                 pre_hop = None
+                _prehop_hist.clear()   # abs continuity broken by the rebuild
+                _slice_cache.clear()
                 _carry_tail = None
                 carry_n = 0
                 if recorder:
@@ -6888,7 +6924,30 @@ def main():
                 # Cap at 0.4s: enough lookback for SF11/125k preamble (0.26s)
                 # while keeping save files to ~1.4s instead of 1.9s, cutting
                 # decode queue wait roughly in half.
-                pre_hop = buf[hop_n - _max_pre_hop_n:hop_n].copy()
+                #
+                # The OLD (pre-slide) buf spans abs [tot_s-len(iq)-win_n,
+                # tot_s-len(iq)); pre_hop's abs range is [_ph0, _ph1).
+                _ph1 = tot_s - len(iq) - win_n + hop_n
+                _ph0 = _ph1 - _max_pre_hop_n
+                _ph_ref = None
+                if _prehop_ref_on:
+                    # Reuse an earlier _hop_own if one FULLY CONTAINS the
+                    # pre_hop abs range (identical samples by construction).
+                    for _has, _harr in _prehop_hist:
+                        if _has <= _ph0 and _has + len(_harr) >= _ph1:
+                            _ph_ref = _harr[_ph0 - _has:_ph1 - _has]
+                            break
+                if _ph_ref is not None:
+                    if _prehop_verify:
+                        _fresh = buf[hop_n - _max_pre_hop_n:hop_n]
+                        if not np.array_equal(_ph_ref, _fresh):
+                            print("[PREHOP-REF] MISMATCH — reference is NOT "
+                                  "bit-exact!", file=sys.stderr, flush=True)
+                    pre_hop = _ph_ref          # zero-copy view of owned array
+                    _prehop_ref_hits += 1
+                else:
+                    pre_hop = buf[hop_n - _max_pre_hop_n:hop_n].copy()
+                    _prehop_copies += 1
             buf[:sh] = buf[len(iq):]
             buf[sh:] = iq
         buf_pos += len(iq)
@@ -6975,12 +7034,46 @@ def main():
         for _si in range(_n_short_slices):
             _ss = _si * _short_step
             _seg = buf[_ss:_ss + _short_n]
-            if _maxhold:
-                _p_short, _p_short_max = welch_psd(_seg, nfft=4096, n_avg=_SHORT_N_AVG, also_max=True)
-                _notch_psd(_p_short)
+            # Absolute sample index of this slice's first sample (buf[0] is
+            # at tot_s - win_n).  The cache key — identical across windows
+            # for the same physical samples.
+            _abs_start = tot_s - win_n + _ss
+            _cs = _slice_cache.get(_abs_start) if _slice_cache_on else None
+            if _cs is None:
+                if _maxhold:
+                    _pw, _pw_max = welch_psd(_seg, nfft=4096,
+                                             n_avg=_SHORT_N_AVG, also_max=True)
+                else:
+                    _pw, _pw_max = welch_psd(_seg, nfft=4096,
+                                             n_avg=_SHORT_N_AVG), None
+                if _slice_cache_on:
+                    # Store PRISTINE (never notched); every use copies first.
+                    _slice_cache[_abs_start] = (_pw, _pw_max)
+                _cs = (_pw, _pw_max)
+                _slice_cache_miss += 1
             else:
-                _p_short, _p_short_max = welch_psd(_seg, nfft=4096, n_avg=_SHORT_N_AVG), None
-                _notch_psd(_p_short)
+                _slice_cache_hits += 1
+                if _slice_cache_verify:
+                    # Recompute fresh and assert the cache is bit-exact.
+                    if _maxhold:
+                        _vw, _vw_max = welch_psd(_seg, nfft=4096,
+                                                 n_avg=_SHORT_N_AVG,
+                                                 also_max=True)
+                    else:
+                        _vw, _vw_max = welch_psd(_seg, nfft=4096,
+                                                 n_avg=_SHORT_N_AVG), None
+                    _bad = (not np.array_equal(_vw, _cs[0])) or (
+                        (_cs[1] is None) != (_vw_max is None)) or (
+                        _vw_max is not None
+                        and not np.array_equal(_vw_max, _cs[1]))
+                    if _bad:
+                        print(f"[SLICE-CACHE] MISMATCH at abs={_abs_start} "
+                              f"— cache is NOT bit-exact!", file=sys.stderr,
+                              flush=True)
+            # Copy before notching so the cached array stays pristine.
+            _p_short = _cs[0].copy()
+            _p_short_max = _cs[1].copy() if _cs[1] is not None else None
+            _notch_psd(_p_short)
             if a.dc_notch > 0:
                 _p_short[max(0, _dc_c - _dc_bins):min(4096, _dc_c + _dc_bins + 1)] = np.median(_p_short)
             if _spur_notch_hz:
@@ -7016,6 +7109,15 @@ def main():
         for _sp in _short_peaks_all:
             if not any(abs(_sp[0] - _mp[0]) < _DEDUP_BINS for _mp in _gate_peaks):
                 _gate_peaks.append(_sp)
+        # Prune the slice cache to the current window's span: only the
+        # previous window's slices are ever reused (positions advance by one
+        # hop each window), so anything older than this window's oldest
+        # sample can never hit again.  Bounds the cache to <=_n_short_slices
+        # entries (~19) regardless of run length.
+        if _slice_cache_on and _slice_cache:
+            _cut = tot_s - win_n
+            for _k in [_k for _k in _slice_cache if _k < _cut]:
+                del _slice_cache[_k]
 
         # ---- Patience gate: accumulate per-bin exceedances ----
         # A beacon too weak for the energy gate still concentrates max-hold
@@ -7483,6 +7585,10 @@ def main():
                                          # which zeroed straddler decodes
                                          # on the first zero-copy attempt)
         _slow_halves.append(_hop_own)
+        # Record for pre_hop reuse: this hop covers abs [tot_s-hop_n, tot_s).
+        # It is an immutable owned array (same one _slow_halves/feed_tail
+        # hold), so a later window's pre_hop can view it instead of copying.
+        _prehop_hist.append((tot_s - hop_n, _hop_own))
         if recorder:
             _t_feed0 = time.time()
             recorder._dbg_tot_s = tot_s
@@ -7831,6 +7937,8 @@ def main():
                     buf_pos = 0
                     buf = np.zeros(win_n, dtype=np.complex64)
                     pre_hop = None  # stale after skip — reset for clean SC state
+                    _prehop_hist.clear()   # abs continuity broken by catchup
+                    _slice_cache.clear()
                     if recorder:
                         recorder.reset_prev()
 
@@ -7938,10 +8046,19 @@ def main():
                       f"slow={_prof['slow']/n*1000:.0f} "
                       f"feed={_prof['feed']/n*1000:.0f}"
                       + (f" catchup={_prof['catchup']/n*1000:.0f}"
-                         if _prof['catchup'] else ""),
+                         if _prof['catchup'] else "")
+                      + (f" slc={_slice_cache_hits}/"
+                         f"{_slice_cache_hits + _slice_cache_miss}"
+                         if _slice_cache_on else "")
+                      + (f" phref={_prehop_ref_hits}/"
+                         f"{_prehop_ref_hits + _prehop_copies}"
+                         if _prehop_ref_on and (_prehop_ref_hits
+                                                or _prehop_copies) else ""),
                       file=sys.stderr)
                 for k in _prof: _prof[k] = 0
                 _prof['n'] = 0
+                _slice_cache_hits = _slice_cache_miss = 0
+                _prehop_ref_hits = _prehop_copies = 0
 
     except KeyboardInterrupt:
         pass
