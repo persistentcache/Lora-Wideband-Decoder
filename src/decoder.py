@@ -4814,6 +4814,10 @@ def process_file(fpath, relay_after=None, relay_before=None,
     # also scales the rescue sub-call's budget (it passes _budget_override).
     if _BUDGET_S > 0:
         _BUDGET_S *= 2.0 ** ((sf - 7) * 0.5)
+    # Per-file deadline in process_time terms — threaded into _decode_attempt
+    # so its header-variant sweep respects the same budget the between-attempt
+    # checks already enforce (UC audit m).  None when the budget is unlimited.
+    _ddl = (_process_start + _BUDGET_S) if _BUDGET_S > 0 else None
 
     # Sample rate: PREFER an explicit token in the filename (e.g. "2000ksps"),
     # which the gate now writes.  The old size-based guess below is AMBIGUOUS —
@@ -5131,7 +5135,8 @@ def process_file(fpath, relay_after=None, relay_before=None,
             print("\n  === %s recenter by %.0f Hz ===" % (label, sh))
             iqx = recrop_centered(sh)
             r = _decode_attempt(iqx.copy(), sf, bw, N, ppm, fs, dec, name,
-                                Counter, skip_bins=skip_bins, sweep_budget=1.0)
+                                Counter, skip_bins=skip_bins, sweep_budget=1.0,
+                                deadline=_ddl)
             if r is not None and r[0] == 'OK':
                 return True
         return False
@@ -5158,7 +5163,7 @@ def process_file(fpath, relay_after=None, relay_before=None,
             print("\n  --- Retry #%d ---" % attempt)
         _d = {}
         result = _decode_attempt(iq1_work.copy(), sf, bw, N, ppm, fs, dec, name, Counter,
-                                 skip_bins=skip_bins, diag_out=_d)
+                                 skip_bins=skip_bins, diag_out=_d, deadline=_ddl)
         if (attempt == 0 and result is not None and result[0] == 'FAIL'
                 and bw <= 62500):
             # broadened 2026-07-05: ANY failed first attempt with a found
@@ -5191,7 +5196,7 @@ def process_file(fpath, relay_after=None, relay_before=None,
                                   name, Counter,
                                   skip_bins=list(skip_bins) + [result[3]],
                                   grid_sweep=True,
-                                  diag_out=_d2)
+                                  diag_out=_d2, deadline=_ddl)
             # ACCEPT only a CRC-VERIFIED retry (wrong fractional grids
             # 'decode' CRC-less garbage that parses: PL=10/64/180
             # headers all passed HDR_CHK on real captures)
@@ -5210,7 +5215,7 @@ def process_file(fpath, relay_after=None, relay_before=None,
                         iq1_work.copy(), sf, bw, N, ppm, fs, dec,
                         name, Counter,
                         skip_bins=list(skip_bins) + [result[3]],
-                        force_td=_td, diag_out=_d3)
+                        force_td=_td, diag_out=_d3, deadline=_ddl)
                     if (_r3 is not None and _r3[0] == 'OK'
                             and (_d3.get('crc_ok', False)
                                  or _d3.get('verified', False))):
@@ -5579,7 +5584,8 @@ def process_file(fpath, relay_after=None, relay_before=None,
                     print("\n  --- Pass2 Retry #%d ---" % attempt)
                 _d_p2 = {}
                 result = _decode_attempt(iq1_pass2.copy(), sf, bw, N, ppm, fs, dec, name, Counter,
-                                         skip_bins=p2_skip, diag_out=_d_p2)
+                                         skip_bins=p2_skip, diag_out=_d_p2,
+                                         deadline=_ddl)
                 if result is None:
                     break
                 status, mask_start, mask_len, p2_bin = result
@@ -5664,7 +5670,14 @@ def process_file(fpath, relay_after=None, relay_before=None,
 
 def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     grid_sweep=False, force_td=None,
-                    sweep_budget=2.0, diag_out=None):
+                    sweep_budget=2.0, diag_out=None, deadline=None):
+    # deadline (process_time seconds, or None): the header-variant sweep below
+    # is otherwise UNBOUNDED within one attempt — up to 128 grid_sweep offsets
+    # x 8 symbols of FFT — so a phantom preamble can blow the whole per-file
+    # budget before control returns to process_file's between-attempt check.
+    # We check it only BETWEEN td variants (fine granularity; the base td=0
+    # decode already ran before the loop), so a real frame's header always
+    # gets its base attempt (UC audit m).
     if skip_bins is None:
         skip_bins = []
     _LAST_EMIT_VERIFIED[0] = False
@@ -6977,7 +6990,21 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         _base_hdr_valid = False
         header_offsets = [force_td]
     if not _base_hdr_valid:
-        for td in header_offsets:
+        for _tdi, td in enumerate(header_offsets):
+            # Budget guard (UC audit m): bail the sweep if the per-file
+            # deadline has passed.  Checked per-variant (each ~8 small FFTs)
+            # so granularity stays fine; the base td=0 variant already
+            # completed above, so a real frame never loses its base attempt.
+            # At default budgets this NEVER fires on clean captures (they
+            # decode far inside budget) — it only caps phantom/collision
+            # captures that would otherwise starve later ladder stages.
+            if deadline is not None and time.process_time() > deadline:
+                if diag_out is not None:
+                    diag_out['hdr_sweep_bailed'] = True
+                print("  [BUDGET] header sweep bail (%d/%d variants) — "
+                      "deadline reached" % (_tdi, len(header_offsets)),
+                      flush=True)
+                break
             v = decode_header_variant(base_data_start + td)
             if v is None:
                 continue
