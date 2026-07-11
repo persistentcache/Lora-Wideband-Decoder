@@ -3839,7 +3839,7 @@ def _register_known_node(addr_int):
     else:
         _KNOWN_NODES.add(int(addr_int) & 0xFFFFFFFF)
 
-def _is_chase_acceptable_uni(tr):
+def _is_chase_acceptable_uni(tr, require_known=False):
     """Chase recovery gate for unicast DMs (encrypted, no key for verification).
     Accept iff recovered header is structurally a valid unicast frame AND its
     dst OR src is a previously-seen real node.  Strict broadcast (dst==FFFFFFFF)
@@ -3847,7 +3847,11 @@ def _is_chase_acceptable_uni(tr):
 
     BOOTSTRAP: when _KNOWN_NODES is empty (fresh deployment, no prior decodes),
     accept on STRUCTURAL grounds alone.  Subsequent decodes from the same nodes
-    then bootstrap the known-set and the strict gate engages."""
+    then bootstrap the known-set and the strict gate engages.
+
+    require_known=True disables the bootstrap arm: unicast is accepted ONLY
+    with a known-node endpoint.  Used by chase_decode (UC audit j), whose
+    bit-flip trials are correlated with the CRC and need the tighter gate."""
     if len(tr) < 16:
         return False
     # Broadcast — always accept (original behavior)
@@ -3875,7 +3879,7 @@ def _is_chase_acceptable_uni(tr):
         with _KNOWN_NODES_LOCK:
             snapshot = set(_KNOWN_NODES)
     if not snapshot:
-        return True   # bootstrap path
+        return not require_known   # bootstrap path (disabled for chase)
     return dst_int in snapshot or src_int in snapshot
 
 # Known-node set auto-populates from `from` field of any successfully-decoded
@@ -5135,6 +5139,7 @@ def process_file(fpath, relay_after=None, relay_before=None,
 
     _need_rescue = False   # set when a header decoded but its data never CRC'd
     _residual_clear = False  # set when the masked residual has NO preamble left
+    _sf_relabel_tried = False  # one-shot same-bw SF relabel (UC audit o)
     # Counter for consecutive attempts that produced NO valid LoRa header.  Real
     # packets of any protocol that pass the 4..237 byte sanity range reset this
     # counter; only sustained phantom-preamble cascades (gate fires on noise
@@ -5226,6 +5231,25 @@ def process_file(fpath, relay_after=None, relay_before=None,
         if status != 'OK' and _d.get('hdr_ok') and not _d.get('no_rescue'):
             _need_rescue = True   # confirmed packet whose data didn't decode here
         if status == 'WRONG_SF':
+            # SAME-BW SF RELABEL RETRY (UC audit o): the multi-SF
+            # Schmidl-Cox measured a dominant best_sf (carried in
+            # mask_start) — one same-bw retry costs NO extra bandwidth
+            # (fs=2*bw crop and dec=round(fs/bw) are unchanged; only
+            # N=2^sf and ppm=sf-2 change) and recovers frames whose
+            # FILENAME sf was mislabeled by a same-slope alias.  Old code
+            # printed best_sf and returned, yielding nothing.  One-shot
+            # (guarded) so a truly wrong capture still bails fast.
+            _best_sf = int(mask_start)
+            if (not _sf_relabel_tried and 7 <= _best_sf <= 12
+                    and _best_sf != sf):
+                _sf_relabel_tried = True
+                print(f"  SF-RELABEL: retrying at SF{_best_sf} "
+                      f"(same BW {bw/1000:.2f}k, filename said SF{sf})")
+                sf = _best_sf
+                N = 2 ** sf
+                ppm = sf - 2
+                _consec_no_header = 0
+                continue   # re-enter the ladder at the corrected SF
             return  # dominant signal is a different SF — give up immediately
         if status == 'OK':
             # Multi-packet recovery via SUCCESSIVE INTERFERENCE CANCELLATION.
@@ -6132,7 +6156,10 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                             and sf7_score < 0.5
                             and len(strong8) < 4):
                         print(f"  DIAG multi-sf: signal looks like SF{best_sf} (not SF{sf}) — aborting")
-                        return ('WRONG_SF', 0, 0, None)
+                        # Carry the MEASURED best_sf in the second field
+                        # (mask_start is meaningless for WRONG_SF) so the
+                        # caller can retry at the right label (UC audit o).
+                        return ('WRONG_SF', int(best_sf), 0, None)
                     elif best_sf != sf and best_score > 3.0 and sf7_score < 0.5:
                         print(f"  DIAG multi-sf: SF{best_sf} dominant but {len(strong8)} strong PMR symbols"
                               f" suggest signal is SF{sf} — preamble likely before capture window")
@@ -7571,8 +7598,19 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     # SF11/500k MeshCore beacons landing 1-2 low-margin nibbles
                     # off with the right values as second choice, and the old
                     # broadcast-only gate vetoing every fix.
+                    # Known-node UNICAST added to the chase gate (UC audit
+                    # j): a marginal DM one low-margin nibble off had NO
+                    # recovery path past primary CRC — the sweep's
+                    # direct-CRC accepts unicast via the same known-node
+                    # check, so the FP calculus here is nearly identical
+                    # (CRC-16 x structural x known-node membership).  The
+                    # bootstrap arm is DISABLED for chase (require_known):
+                    # flip trials are CRC-correlated, so an empty node set
+                    # must not open the unicast door.
                     if ok and (_is_plausible_mesh_header(tr)
-                               or _meshcore_frame_plausible(bytes(tr[:payload_len]))):
+                               or _meshcore_frame_plausible(bytes(tr[:payload_len]))
+                               or _is_chase_acceptable_uni(tr,
+                                                           require_known=True)):
                         flipped = [(sorted_soft[b][0], sorted_soft[b][1],
                                     sorted_soft[b][2], sorted_soft[b][3])
                                    for b in positions]
@@ -7726,15 +7764,46 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 if _first is None:
                     _first = (_pr, _pp, _ps, _pn, _dt)
             if not crc_ok and _first is not None:
-                # Neither aligned variant passed CRC outright — adopt the
-                # smaller-|dt| aligned decode (park removed) so chase and the
-                # sweep below work on a sane grid instead of coin flips.
-                raw_bytes, payload, pay_soft_info, decoded_nibs = _first[:4]
-                tau_frac += _first[4]
-                _park_delta, _ = _measure_payload_frac(tau_frac)
-                print("  FRAC PARK: no clean CRC — keeping aligned decode "
-                      "(tau %+.3f, residual %+.3f) for chase/sweep"
-                      % (_first[4], _park_delta))
+                # PURELY ADDITIVE NEWTON STEP (UC audit l): before adopting
+                # the aligned decode, try ONE extra decode at the aligned
+                # grid's re-measured residual — the mirror-overshoot cases
+                # (+0.412 -> -0.465) converge in one step.  Adopt ONLY on a
+                # clean CRC.  Everything else falls through to the exact
+                # baseline behavior (keep the smaller-|dt| aligned decode),
+                # so this can only turn a FAIL into a PASS — it never alters
+                # the grid the sweep/chase would otherwise have run on.
+                # (An earlier residual-magnitude adopt-guard was REVERTED:
+                # the sweep searches tau RELATIVE to the current grid, so a
+                # "worse-measuring" aligned grid can be exactly what lands
+                # the sweep on the winning tau — SF7/500k ctr4 regressed.)
+                _al = _first
+                _al_tau = tau_frac + _first[4]
+                _al_resid, _ = _measure_payload_frac(_al_tau)
+                if abs(_al_resid) >= 0.15:
+                    _nt = _al_tau + _al_resid
+                    _nr, _npp, _nps, _npn = soft_decode_payload(
+                        0, 0.0, frac_tau=_nt)
+                    if len(_nr) >= payload_len + 2:
+                        _nok, _nm = check_crc(_nr, payload_len)
+                        if _nok:
+                            raw_bytes, payload = _nr, _npp
+                            pay_soft_info, decoded_nibs = _nps, _npn
+                            crc_ok, crc_method, _clean_crc = True, _nm, True
+                            tau_frac = _nt
+                            if diag_out is not None:
+                                diag_out['crc_ok'] = True
+                            print("  CRC: %s OK (frac-park Newton step, "
+                                  "tau %+.3f)" % (_nm, _nt))
+                if not crc_ok:
+                    # BASELINE adopt: smaller-|dt| aligned decode (park
+                    # removed) so chase and the sweep below work on a sane
+                    # grid instead of coin flips.
+                    raw_bytes, payload, pay_soft_info, decoded_nibs = _al[:4]
+                    tau_frac = _al_tau
+                    _park_delta, _ = _measure_payload_frac(tau_frac)
+                    print("  FRAC PARK: no clean CRC — keeping aligned decode "
+                          "(tau %+.3f, residual %+.3f) for chase/sweep"
+                          % (_first[4], _park_delta))
 
     if _HARNESS_OUT:
         _margins = [float(s[3]) for s in pay_soft_info] if pay_soft_info else []
@@ -8219,7 +8288,13 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # demod's base goes first: on drift-tail captures every sweep
     # trial's worst8avg is ~0, so sweep-margin ordering carries no
     # signal.  Slow-BW long-symbol frames only.
-    if crc_present and (not crc_ok) and bw <= 62500 and sym_time_ms > 16.0:
+    # Gate on SYMBOL TIME alone (UC audit k): drift scales with symbol
+    # time, not bandwidth — the old `bw <= 62500` clause denied SF12/125k
+    # (32.8 ms symbols) and SF12/250k (16.4 ms) the same recovery while
+    # they pay the same per-symbol drift exposure.  Cost bounded: the
+    # stage only runs when primary+chase+sweep all failed AND the
+    # resid-curve span gate (>=0.12 bins) fires.
+    if crc_present and (not crc_ok) and sym_time_ms > 16.0:
         _retry_bases = [(0.0, 'primary', 0, 0.0, tau_frac, '')]
         if best_candidates:
             _retry_bases += sorted(best_candidates,
