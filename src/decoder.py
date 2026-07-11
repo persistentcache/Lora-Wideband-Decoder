@@ -7923,6 +7923,34 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             if diag_out is not None:
                 diag_out['no_rescue'] = True
 
+    # ---- Cross-attempt soft-combining accumulator (UC audit h) ----
+    # Every failed soft_decode_payload trial carries per-nibble
+    # (idx, best, second, margin) that was previously DISCARDED on CRC
+    # fail (record_candidate kept only a summary score).  The at-margin
+    # coin-flip class fails with 1-3 low-margin nibbles wrong in
+    # DIFFERENT positions per attempt (independent noise realizations
+    # per timing hypothesis — gt022: idx 9 flipped 4->2 / 0->1 / 0->8
+    # across attempts), so summing margin-weighted votes per nibble
+    # index across ALL attempts and decoding the argmax stream uses
+    # strictly more evidence than any single attempt.  Weighted by the
+    # attempt's median margin so a wrong-grid attempt (uniformly weak)
+    # cannot outvote good ones.  LORA_SOFT_COMBINE=0 disables.
+    _sc_on = (crc_present
+              and os.environ.get('LORA_SOFT_COMBINE', '1') != '0')
+    _sc_att = []       # (nibble tuple, soft list, attempt median margin)
+    _sc_len = len(decoded_nibs) if decoded_nibs else 0
+
+    def _sc_accumulate(nibs, soft):
+        if not (_sc_on and soft and nibs and len(nibs) == _sc_len):
+            return   # length mismatch = different grid; never mix
+        _aw = float(np.median([float(s[3]) for s in soft]))
+        if _aw <= 0.0:
+            return
+        _sc_att.append((tuple(int(v) for v in nibs), soft, _aw))
+
+    if not crc_ok:
+        _sc_accumulate(decoded_nibs, pay_soft_info)   # the failed primary
+
     # ---- Combined timing sweep with chase ----
     best_candidates = []
     if crc_present and not crc_ok and not _skip_sweep:
@@ -8015,6 +8043,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     payload = tr2[:payload_len]
                     return True
                 record_candidate(label, ds_off, slope, frac_tau, tr_raw, tr_soft)
+                _sc_accumulate(tr_nibs, tr_soft)   # soft-combine evidence
             return False
 
         # Two-dimensional timing search: integer ds_off (sample shift) AND
@@ -8065,6 +8094,123 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     print("    %s ds=%+d slope=%+.3f tau=%+.4f worst8avg=%.2f head=%s" % (
                         label, ds_off, slope, frac_tau, margin_score, hx))
 
+    # ---- CROSS-ATTEMPT SOFT COMBINING (UC audit h) ----
+    # Decode the margin-weighted argmax stream assembled from EVERY failed
+    # attempt so far (primary + sweep trials + curved-drift trials), then
+    # chase on the summed evidence.  Agreement gate: on the confident-wrong
+    # DUD class the attempts' streams diverge 24-37/74 nibbles (measured,
+    # gt_iq7 _022) and combining cannot help — require >=85% mean
+    # cross-attempt agreement so duds skip for free.  FP surface matches
+    # the existing sweep/chase: strict CRC-16 plus the same plausibility
+    # gates arbitrate.  Called after the sweep AND again after curved-drift
+    # (the at-margin class often runs SKIP-SWEEP -> only curved-drift
+    # trials generate attempt diversity for it).
+    _sc_tried_at = [0]
+
+    def _sc_try_combine():
+        nonlocal crc_ok, crc_method, _clean_crc, raw_bytes, payload
+        if not (crc_present and not crc_ok and _sc_on
+                and len(_sc_att) >= 3
+                and len(_sc_att) > _sc_tried_at[0]):
+            return
+        _sc_tried_at[0] = len(_sc_att)
+        # Quality filter FIRST: only attempts within 80% of the best
+        # attempt's median margin vote.  The sweep's junk-tau trials demod
+        # uniformly weak divergent streams; at 0.5x they still dominated
+        # the vote pool and buried the truth cluster (measured on the
+        # park-class bench: qf=0.5 -> combined stream 11-29 nibbles from
+        # truth, qf=0.8 -> 1-2 nibbles, i.e. within chase range).
+        _best_med = max(_a[2] for _a in _sc_att)
+        _kept = [_a for _a in _sc_att if _a[2] >= 0.8 * _best_med]
+        _n_att = len(_kept)
+        _sc_trace = os.environ.get('LORA_SC_TRACE', '')
+        if _sc_trace:
+            # Opt-in diagnostic dump (analog of LORA_DUMP_SYMS): every
+            # accumulated attempt's stream + weight, for offline analysis
+            # of what combining could/couldn't have recovered.
+            try:
+                import json as _json
+                with open(_sc_trace, 'a') as _tf:
+                    _tf.write(_json.dumps({
+                        'n_all': len(_sc_att), 'n_kept': _n_att,
+                        'att': [{'med': _a[2], 'nibs': list(_a[0])}
+                                for _a in _sc_att]}) + '\n')
+            except Exception:
+                pass
+        if _n_att < 3:
+            print("  SOFT-COMBINE: skipped (quality cluster %d/%d "
+                  "attempts < 3)" % (_n_att, len(_sc_att)))
+            return
+        # Margin-weighted votes from the kept cluster.  Vote from each
+        # attempt's full STREAM — soft_info does not carry an entry for
+        # every nibble index (measured: idx 0 absent), so soft-only votes
+        # leave holes; where soft has a margin use it, else weight the
+        # stream's value by the attempt median.
+        _sc_votes = {}   # nibble idx -> {value: summed weight}
+        for (_st, _sf2, _aw2) in _kept:
+            _mmap = {int(_e[0]): float(_e[3]) for _e in _sf2}
+            for _ix in range(min(_sc_len, len(_st))):
+                _d = _sc_votes.setdefault(_ix, {})
+                _mg = _mmap.get(_ix, _aw2)
+                _d[_st[_ix]] = _d.get(_st[_ix], 0.0) + _mg * _aw2
+        # WEIGHTED agreement gate = mean vote concentration.  Separates
+        # cleanly on the park bench: truth clusters measure 0.90-0.93,
+        # garbage invocations 0.40-0.53; the confident-wrong DUD class
+        # (streams 24-37/74 nibbles apart, gt_iq7 _022) lands far below.
+        _agree = []
+        for _i in range(_sc_len):
+            _d = _sc_votes.get(_i)
+            if not _d:
+                print("  SOFT-COMBINE: skipped (no votes at nibble %d)"
+                      % _i)
+                return
+            _tot = sum(_d.values())
+            _agree.append(max(_d.values()) / _tot if _tot > 0 else 0.0)
+        _agree_frac = float(np.mean(_agree)) if _agree else 0.0
+        if _agree_frac < 0.85:
+            print("  SOFT-COMBINE: skipped (weighted agreement %.0f%% < "
+                  "85%% over %d/%d attempts — divergent streams, dud class)"
+                  % (_agree_frac * 100.0, _n_att, len(_sc_att)))
+            return
+        _comb, _synth = [], []
+        for _i in range(_sc_len):
+            _d = _sc_votes.get(_i)
+            _rank = sorted(_d.items(), key=lambda kv: -kv[1])
+            _b, _w1 = _rank[0]
+            _s2, _w2 = _rank[1] if len(_rank) > 1 else ((_b ^ 0x1), 0.0)
+            _comb.append(int(_b))
+            # Synthetic soft info on the accumulator's own scale: the
+            # chase cap is a RATIO to the median of these margins, so
+            # only internal consistency matters.
+            _synth.append((_i, int(_b), int(_s2), float(_w1 - _w2)))
+        _tr = dewhiten(assemble(_comb))
+        if len(_tr) < payload_len + 2:
+            return
+        _ok, _method = check_crc(_tr, payload_len, strict=True)
+        if _ok and _is_chase_acceptable_uni(_tr):
+            print("  SOFT-COMBINE (%d attempts, agreement %.0f%%): "
+                  "CRC %s OK!" % (_n_att, _agree_frac * 100.0, _method))
+            crc_ok, crc_method = True, _method
+            # Direct CRC on the combined stream — no bit flipping
+            # involved, same convention as the sweep's direct-CRC accept.
+            _clean_crc = True
+            raw_bytes, payload = _tr, _tr[:payload_len]
+            return
+        _ok, _method, _tr2, _flipped = chase_decode(
+            _comb, _synth, max_flips=2, k=CHASE_K)
+        if _ok:
+            print("  SOFT-COMBINE (%d attempts, agreement %.0f%%) + "
+                  "chase(%d flips): CRC %s OK!"
+                  % (_n_att, _agree_frac * 100.0, len(_flipped), _method))
+            crc_ok, crc_method = True, _method
+            raw_bytes = _tr2
+            payload = _tr2[:payload_len]
+            return
+        print("  SOFT-COMBINE: no CRC (%d attempts, agreement %.0f%%)"
+              % (_n_att, _agree_frac * 100.0))
+
+    _sc_try_combine()
+
     # ---- CURVED-DRIFT RETRY (2026-07-06) ----
     # Nonlinear (thermal-settle) drift breaks the linear (slope, tau)
     # family: the payload demods CONFIDENTLY at consistently-wrong
@@ -8098,6 +8244,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                           max(_cv) - min(_cv)))
                 tr_raw, tr_pay, tr_soft, tr_nibs = soft_decode_payload(
                     _ds, _sl, frac_tau=_ft, resid_curve=_cv)
+                _sc_accumulate(tr_nibs, tr_soft)   # soft-combine evidence
                 if len(tr_raw) >= payload_len + 2:
                     ok, method = check_crc(tr_raw, payload_len,
                                            strict=True)
@@ -8137,6 +8284,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     tr_raw, tr_pay, tr_soft, tr_nibs = \
                         soft_decode_payload(0, 0.0, frac_tau=0.0,
                                             resid_curve=_cv)
+                    _sc_accumulate(tr_nibs, tr_soft)   # soft-combine evidence
                     if len(tr_raw) >= payload_len + 2:
                         ok, method = check_crc(tr_raw, payload_len,
                                                strict=True)
@@ -8160,6 +8308,11 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                                 payload = tr2[:payload_len]
             finally:
                 iq1 = _iq1_saved
+
+    # Second soft-combine window: the at-margin class often runs
+    # SKIP-SWEEP (confident demod), so its only attempt diversity comes
+    # from the curved-drift trials accumulated just above.
+    _sc_try_combine()
 
     # ---- Final result ----
     print("\n  === RESULT ===")
