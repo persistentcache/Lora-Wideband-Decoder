@@ -1391,7 +1391,31 @@ def hybrid_recenter(iq, fs, sf, bw):
     return (p['offset_hz'], p['pmr_db'], p['status'], p['time_sample'])
 
 
+# Per-peak dechirp memo (UC audit C, measured): the resolver evaluates the
+# SAME nb slice under the same (sf, bw, agg) up to several times per peak —
+# primary vote, positions loop, alias-chain re-checks — 657/2108 calls in the
+# busy bench were byte-identical (dechirp_peak_quality = 39.5 s of 102.4 s
+# total serial runtime).  The memo key hashes the actual slice CONTENT, so a
+# hit is byte-exact by construction; the dict lives in a thread-local set up
+# per peak (each pool worker / per-peak thread gets its own), so nothing
+# leaks across windows or peaks.  Hashing costs ~0.1-1 ms vs 10-40 ms per
+# avoided dechirp.
+_DPQ_MEMO = threading.local()
+
+
 def dechirp_peak_quality(iq, sf, bw, agg='best8'):
+    _memo = getattr(_DPQ_MEMO, 'd', None)
+    if _memo is None:
+        return _dechirp_peak_quality_core(iq, sf, bw, agg)
+    _mk = (sf, bw, agg, len(iq), hash(iq.tobytes()))
+    _hit = _memo.get(_mk)
+    if _hit is None:
+        _hit = _dechirp_peak_quality_core(iq, sf, bw, agg)
+        _memo[_mk] = _hit
+    return _hit
+
+
+def _dechirp_peak_quality_core(iq, sf, bw, agg='best8'):
     """Measure dechirp quality and carrier frequency offset.
 
     Returns (quality_dB, peak_bin) where:
@@ -2958,6 +2982,17 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 })
                 seen.add((sf, bw, _tb))
         return _ld
+
+    _process_one_peak_core = _process_one_peak
+
+    def _process_one_peak(_pk):
+        # Arm the per-peak dechirp memo for this peak's resolver work
+        # (thread-local: safe under both the serial and threaded paths).
+        _DPQ_MEMO.d = {}
+        try:
+            return _process_one_peak_core(_pk)
+        finally:
+            _DPQ_MEMO.d = None
 
     if (len(peaks) <= 1 or os.environ.get('LORA_DETECT_SERIAL')
             or (os.cpu_count() or 8) < 8):
@@ -6345,6 +6380,7 @@ def main():
     # 24-core box (24//4=6).  A box too weak to sustain the rate is caught at
     # runtime by the keep-up monitor (it warns + recommends a lower --rate)
     # rather than silently dropping samples.
+    _hybrid = False
     if a.detect_workers is not None and a.detect_workers < 0:
         # Use affinity-aware count (see comment near the decode worker block).
         try:
@@ -6360,28 +6396,66 @@ def main():
         # cores (quiet-window main-loop time dropped to ~0).  Hosts with
         # >=8 cores are unchanged (24-core validated value stays 6).
         _w = min(8, _ncpu_auto // 4)
+        if _w < 2 and _ncpu_auto >= 4:
+            # HYBRID DISPATCH (UC audit B, measured): both earlier verdicts
+            # were right for their regime — a QUIET band pays the pool's
+            # constant overhead for nothing (serial wins), but on a BUSY
+            # band a 2-worker pool on the SAME 4 cores sustains 8.2 Msps
+            # vs 3.8-4.4 serial (pipelining hides detect latency).  So on
+            # 4-7-core hosts: build the small pool, then route PER WINDOW
+            # in the main loop — inline while quiet, pool when candidate
+            # peaks pile up or the ring backs up.  LORA_HYBRID=0 restores
+            # pure serial; 2-3-core hosts stay serial (no room to win).
+            if str(os.environ.get('LORA_HYBRID', '1')).strip().lower() not in (
+                    '0', 'false', 'no', 'off'):
+                _w = 2
+                _hybrid = True
         a.detect_workers = _w if _w >= 2 else 0
         print(f"Detect workers: AUTO = "
               f"{a.detect_workers if a.detect_workers else 'serial'} "
-              f"(cpu_count={_ncpu_auto})", flush=True)
+              f"(cpu_count={_ncpu_auto}"
+              f"{', hybrid dispatch' if _hybrid else ''})", flush=True)
 
     _pool = None
     if a.detect_workers and a.detect_workers > 0:
         from detect_pool import DetectPool
         _win_n = int(a.rate * a.window)
-        _pool = DetectPool(
-            n_workers=a.detect_workers, n_slots=a.detect_workers + 8,
-            # +8 not +4: slot exhaustion made dispatch spin in
-            # _commit_oldest during busy sweep phases (detect phase
-            # spiking to 787 ms avg -> ring wraps every ~2 min)
-            win_n=_win_n,
-            params=dict(wb_fs=a.rate, wb_bw=a.bandwidth, center=a.center,
-                        sc_threshold=a.threshold, ethresh=a.energy_threshold,
-                        dc_notch=a.dc_notch, spur_notch=_spur_notch_hz or None,
-                        dechirp_chans=([(_c - a.center * 1e6, _s, _b)
-                                        for (_c, _b, _s) in _dechirp_src] or None)))
-        print(f"Detect pool: {a.detect_workers} worker processes "
-              f"({a.detect_workers + 8} slots)", flush=True)
+        # +8 not +4: slot exhaustion made dispatch spin in _commit_oldest
+        # during busy sweep phases (detect phase spiking to 787 ms avg ->
+        # ring wraps every ~2 min).  Hybrid small hosts get +4: quiet
+        # windows bypass the pool entirely there, so the deep slot cushion
+        # is unnecessary and shm is the scarce resource on a 4 GB Pi.
+        _n_slots = a.detect_workers + (4 if _hybrid else 8)
+        if _hybrid:
+            # RAM gate: the slots are real anonymous shm.  If they would
+            # eat >30% of MemAvailable, hybrid loses to OOM risk — fall
+            # back to serial (the previous small-host behaviour).
+            _shm_need = _n_slots * _win_n * 8
+            try:
+                with open('/proc/meminfo') as _mi:
+                    _avail_kb = next(int(l.split()[1]) for l in _mi
+                                     if l.startswith('MemAvailable:'))
+            except Exception:
+                _avail_kb = 0
+            if _avail_kb and _shm_need > _avail_kb * 1024 * 0.30:
+                print(f"Detect pool: hybrid disabled — {_n_slots} slots need "
+                      f"{_shm_need/1e9:.1f}GB shm vs "
+                      f"{_avail_kb/1e6:.1f}GB available (running serial)",
+                      flush=True)
+                _hybrid = False
+                a.detect_workers = 0
+        if a.detect_workers and a.detect_workers > 0:
+            _pool = DetectPool(
+                n_workers=a.detect_workers, n_slots=_n_slots,
+                win_n=_win_n,
+                params=dict(wb_fs=a.rate, wb_bw=a.bandwidth, center=a.center,
+                            sc_threshold=a.threshold, ethresh=a.energy_threshold,
+                            dc_notch=a.dc_notch, spur_notch=_spur_notch_hz or None,
+                            dechirp_chans=([(_c - a.center * 1e6, _s, _b)
+                                            for (_c, _b, _s) in _dechirp_src] or None)))
+            print(f"Detect pool: {a.detect_workers} worker processes "
+                  f"({_n_slots} slots{', hybrid' if _hybrid else ''})",
+                  flush=True)
 
     fp = open(a.file, 'rb') if a.file else sys.stdin.buffer
 
@@ -6422,6 +6496,24 @@ def main():
     _slow_fruitless = {} # bucket -> consecutive fruitless scans this streak
     _slow_exact = {}     # bucket -> freshest exact peak bin (for seeding)
     _slow_busy = [False] # background slow-scan in flight (drop-if-busy)
+    # Rate-bound for slow-scan LAUNCHES on low-core hosts (UC audit D,
+    # measured: 20 scans x 1.05 s in 39 busy windows = 21% of total runtime
+    # on a 4-core taskset).  On <8 cores enforce a minimum tick spacing
+    # between scans and skip launches while the ring is under pressure —
+    # deferred triggers stay in _slow_pending and refire while the
+    # persistent-peak streak lasts, so a real slow preamble (>=1 s, streak
+    # across many ticks) still gets scanned within its 4 s assembly window.
+    # >=8-core hosts are unchanged (0 = no bound).
+    try:
+        _ncpu_gate = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        _ncpu_gate = os.cpu_count() or 8
+    try:
+        _SLOW_MIN_TICKS = int(os.environ.get(
+            'LORA_SLOW_MIN_TICKS', '4' if _ncpu_gate < 8 else '0') or 0)
+    except ValueError:
+        _SLOW_MIN_TICKS = 0
+    _slow_last_fire = -10**9
     _slow_pending = {}   # bucket -> (exact_bin, expiry_tick): triggers that
                          # fired while a scan was in flight, deferred instead
                          # of dropped (the drop-if-busy race lost ~2/29 real
@@ -6649,6 +6741,14 @@ def main():
       _peak_cap = _PEAK_CAP_HI
       _cap_calm = 0
       _ring_n_total = max(1, int(a.rate * a.buf_seconds))
+      # Hybrid routing threshold + telemetry (UC audit B): windows with more
+      # candidate peaks than this go through the pool; fewer run inline.
+      try:
+          _HYB_PEAKS = max(0, int(os.environ.get('LORA_HYBRID_PEAKS', '2')))
+      except ValueError:
+          _HYB_PEAKS = 2
+      _hyb_inline = 0
+      _hyb_pooled = 0
 
       def _notch_psd(_pp):
           if a.dc_notch > 0:
@@ -7216,7 +7316,36 @@ def main():
         # occasionally be missed; all other SF/BW combinations fit entirely within
         # the 1s window (longest: SF12/BW125k = 262ms preamble).
         wc += 1; tw = time.time()
-        if _pool is not None:
+        # --- Hybrid per-window routing (UC audit B) ---
+        # Quiet window on a small host: skip the pool round-trip (slot
+        # memcpy + worker wakeup + lagged commit) and detect inline — with
+        # few peaks that costs ~the fixed sweep only.  Inline is ONLY taken
+        # once the in-flight queue is drained: pooled commits rebuild their
+        # packet tails from the TRAILING in-flight windows, so an inline
+        # window in the middle of that chain would hole the tail.  Steady
+        # state keeps depth == _LAG, so quiet windows drain ready commits
+        # (no-detection commits are cheap) until empty, then route inline;
+        # any window with real peak pressure or a filling ring goes back
+        # through the pool.
+        _route_inline = False
+        if _pool is not None and _hybrid:
+            if (len(_gate_peaks) <= _HYB_PEAKS
+                    and (not is_live
+                         or reader.available() / float(_ring_n_total) < 0.3)):
+                _ncd = 0
+                while (_inflight and _ncd < 6
+                       and _pool.ready(_inflight[0]['seq'])):
+                    _pd = _pool.peek(_inflight[0]['seq'])
+                    if _pd and len(_inflight) - 1 < _tail_windows_needed(_pd):
+                        break   # tail still needs trailing windows — stay pooled
+                    _commit_oldest()
+                    _ncd += 1
+                _route_inline = not _inflight
+            if _route_inline:
+                _hyb_inline += 1
+            else:
+                _hyb_pooled += 1
+        if _pool is not None and not _route_inline:
             # --- Multiprocess detect: dispatch this window, commit lagged ---
             # The producer never blocks on detection; workers run it in
             # parallel.  The capture's forward tail is reconstructed in
@@ -7472,7 +7601,22 @@ def main():
             print(f"[SLOW] tick={_slow_tick} halves={len(_slow_halves)} "
                   f"seeds={_slow_seeds} trig={_trig} "
                   f"pending={_slow_pending}", file=sys.stderr)
-        if _fire and len(_slow_halves) == 8 and not _slow_busy[0]:
+        # Low-core rate-bound (UC audit D): defer the launch when the last
+        # scan was < _SLOW_MIN_TICKS ago or the ring says the gate is behind.
+        # Deferrals keep _slow_pending intact so the trigger refires.
+        _slow_rate_ok = True
+        if _fire and _SLOW_MIN_TICKS and len(_slow_halves) == 8:
+            if _slow_tick - _slow_last_fire < _SLOW_MIN_TICKS:
+                _slow_rate_ok = False
+            elif (is_live
+                  and reader.available() / float(_ring_n_total) > 0.3):
+                _slow_rate_ok = False
+            if not _slow_rate_ok and os.environ.get('LORA_SLOW_DEBUG'):
+                print(f"[SLOW] rate-bound defer tick={_slow_tick} "
+                      f"(last={_slow_last_fire})", file=sys.stderr)
+        if (_fire and len(_slow_halves) == 8 and not _slow_busy[0]
+                and _slow_rate_ok):
+            _slow_last_fire = _slow_tick
             _slow_pending.clear()
             # parts refs only — the 640 MB concat happens IN THE THREAD
             # (it was 92 ms median on the loop, second stall driver)
@@ -7773,6 +7917,8 @@ def main():
                   f"save_q={save_q} dec_q={dec_q} active={active} "
                   f"pipe={dt * 1000:.0f}ms"
                   + (f" rss={_rss_mb:.0f}M" if _rss_mb else "")
+                  + (f" hyb={_hyb_inline}i/{_hyb_pooled}p"
+                     if _hybrid and _pool is not None else "")
                   + (f" drops={drops/1e6:.1f}M" if drops else "")
                   + (f" clip={_sat_max*100:.1f}%" if _sat_max > 0.005 else "")
                   + (f" gain={_agc.gain:.0f}" if _agc is not None and _agc.enabled
