@@ -6053,6 +6053,18 @@ class AutoGainGovernor:
     UP_WIN = 120
     COOL_WIN = 30
     CEIL_TTL_WIN = 1800          # ~30 min of 1 s windows
+    # SEVERE-clip fast backoff (item 9): a SINGLE window clipping this
+    # fraction of samples is unambiguous overload — back off immediately,
+    # bypassing the sustained-duty DOWN_WIN logic and the climb cooldown.
+    # The duty threshold (25% over 60 windows) was tuned for a continuous
+    # strong carrier; BURSTY close-node traffic clips 43-50% in individual
+    # windows but never reaches that duty, so the governor ratcheted
+    # 44->60 dB into ever-worse clipping (diagnosed live 2026-07-09).  A 44%
+    # window is not the tolerable sensitivity-clip the duty gate allows.
+    SEVERE_FRAC = 0.12
+    SEVERE_PACE = 2              # windows to wait between severe backoffs so
+                                 # the gain change applies + is re-measured
+                                 # before stepping again (no over-correction)
 
     def __init__(self, ctl_path, start_gain, gmin, gmax):
         self.ctl_path = ctl_path
@@ -6064,9 +6076,12 @@ class AutoGainGovernor:
         self.UP_WIN = int(os.environ.get('LORA_AGC_UP_WIN', self.UP_WIN))
         self.DOWN_WIN = int(os.environ.get('LORA_AGC_DOWN_WIN', self.DOWN_WIN))
         self.COOL_WIN = int(os.environ.get('LORA_AGC_COOL_WIN', self.COOL_WIN))
+        self.SEVERE_FRAC = float(os.environ.get('LORA_AGC_SEVERE_FRAC',
+                                                self.SEVERE_FRAC))
         self.enabled = True
         self.win = 0
         self.cool = 0
+        self.severe_cool = 0
         self.hist = collections.deque(maxlen=self.UP_WIN)
         self.ceiling = None
         self.ceil_expire = 0
@@ -6099,13 +6114,37 @@ class AutoGainGovernor:
         except OSError as e:
             print(f"  [AGC] ctl write failed: {e}", file=sys.stderr, flush=True)
 
-    def observe(self, clipped, busy):
+    def observe(self, clipped, busy, clip_frac=None):
         """Feed one 1-s window; may step the gain. busy = detections in the
-        previous window (blocks climbing, never blocks backing off)."""
+        previous window (blocks climbing, never blocks backing off).
+        clip_frac = fraction of samples clipped this window (for the severe
+        fast-backoff); None keeps the old boolean-only behaviour."""
         if not self.enabled:
             return
         self.win += 1
         self.hist.append(bool(clipped))
+        if self.severe_cool > 0:
+            self.severe_cool -= 1
+        # SEVERE-clip fast backoff: one unambiguously-overloaded window steps
+        # the gain down NOW, bypassing the duty logic AND the climb cooldown.
+        # Paced by SEVERE_PACE windows so the applied gain change is re-measured
+        # before the next step (no over-correction); the ceiling set here stops
+        # the climb logic from ratcheting straight back up.
+        if (clip_frac is not None and clip_frac >= self.SEVERE_FRAC
+                and self.severe_cool == 0
+                and self.gain - self.STEP >= self.gmin):
+            old = self.gain
+            self.gain -= self.STEP
+            self.ceiling = old
+            self.ceil_expire = self.win + self.CEIL_TTL_WIN
+            self.severe_cool = self.SEVERE_PACE
+            self.cool = self.COOL_WIN          # also block climbing for a bit
+            print(f"  [AGC] gain {old:.0f}->{self.gain:.0f} dB (SEVERE clip "
+                  f"{clip_frac*100:.0f}% in ONE window — fast backoff; "
+                  f"ceiling {self.ceiling:.0f})", file=sys.stderr, flush=True)
+            self._write()
+            self.hist.clear()
+            return
         if self.cool > 0:
             self.cool -= 1
             return
@@ -7405,7 +7444,8 @@ def main():
             # busy = the gate sees candidate peaks this window — a climb could
             # glitch an in-flight packet, so only climb on a truly idle band.
             # Backing off under sustained clip is never blocked by busy.
-            _agc.observe(_sat_frac > 0.005, busy=bool(_gate_peaks))
+            _agc.observe(_sat_frac > 0.005, busy=bool(_gate_peaks),
+                         clip_frac=_sat_frac)
 
         _prof['sat'] += time.time() - _t_step
         _t_step = time.time()
