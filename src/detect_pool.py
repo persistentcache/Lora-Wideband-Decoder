@@ -55,7 +55,12 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
         _dbg = 0
 
     while True:
-        task = task_q.get()
+        try:
+            task = task_q.get()
+        except KeyboardInterrupt:
+            # SIGINT at pipeline shutdown reaches the fork workers too —
+            # exit quietly instead of spraying a traceback per worker.
+            break
         if task is None:
             break
         slot, seq, n, psd, peaks, spur_db, task_center, task_chans = task
@@ -74,6 +79,8 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
                 kw['spur_db'] = spur_db
             _c = task_center if task_center is not None else center
             dets = L.detect_preamble(iq, wb_fs, wb_bw, _c, **kw)
+        except KeyboardInterrupt:
+            break   # shutdown SIGINT mid-detect — exit quietly
         except Exception as e:
             dets = []
             result_q.put((seq, dets, 'ERR:%s' % e))
@@ -156,10 +163,15 @@ class DetectPool:
         forever (UC audit b).  Losing one window beats losing the pipeline.
         """
         while seq not in self._results:
+            _all_alive = all(p.is_alive() for p in self._workers)
             try:
-                rseq, dets, err = self._result_q.get(timeout=10.0)
+                # Short wait once a worker is down: at SIGINT shutdown ALL
+                # workers die and the EOF drain would otherwise pay the full
+                # 10 s per still-in-flight window.
+                rseq, dets, err = self._result_q.get(
+                    timeout=10.0 if _all_alive else 0.5)
             except queue.Empty:
-                if all(p.is_alive() for p in self._workers):
+                if _all_alive:
                     continue   # slow window (big SF sweep) — keep waiting
                 import sys
                 print(f"[POOL] worker died; abandoning window {seq} "
