@@ -107,6 +107,13 @@ def load_settings():
                  # statistics; promotions force the dechirp matched-filter on
                  # the carrier (additive, bounded, auto-expiring).
                  'patience_enabled': True,
+                 # Auto-restart umbrella: on an UNEXPECTED detector exit or a
+                 # wedge (no telemetry for minutes) while the user intends the
+                 # pipeline running, the supervisor relaunches it through the
+                 # existing start/stop primitives with backoff + an attempt cap.
+                 # Default ON — this is the headless/24-7 resilience net; a
+                 # user pressing Stop always wins (intent is tracked).
+                 'auto_restart': True,
                  # Pipeline tuning — overrides lora.toml [detect] when set.  Defaults
                  # match the well-tuned values; users only edit these to chase weak
                  # signals, suppress false positives in noisy RF, or absorb bursts.
@@ -412,7 +419,21 @@ EDGES = defaultdict(lambda: {'count': 0, 'decoded': 0, 'encrypted': 0,
                              'last_ts': None})  # (from,to) -> stats
 SUBS = []                         # SSE subscriber queues
 SUBS_LOCK = threading.Lock()
-PIPELINE = {'proc': None, 'running': False, 'started_at': None, 'err': None}
+PIPELINE = {'proc': None, 'running': False, 'started_at': None, 'err': None,
+            # Supervisor state (auto-restart umbrella).  `want_running` is the
+            # USER INTENT and survives an unexpected exit — it is set on start
+            # and cleared FIRST in stop, so the watcher can tell a crash from a
+            # deliberate Stop.  The rest is the backoff governor.
+            'want_running': False, 'restart_attempts': 0,
+            'last_restart_at': 0.0, 'last_healthy_at': 0.0,
+            '_pending_restart': False}
+_SUPERVISOR_LOCK = threading.Lock()
+# Exponential-ish backoff by consecutive attempt, then a hard cap so a
+# genuinely broken config (bad SDR, wrong rate) can't restart-storm.
+_SUP_BACKOFF_S = [2, 5, 15, 30, 60]
+_SUP_MAX_ATTEMPTS = 5
+_SUP_NO_TELEMETRY_RESTART_S = 120.0   # a proc alive this long with NO [STAT]
+                                      # is wedged — recycle it (vs the 15 s warn)
 # Confirmation state (no-key zero-FP layer): a sender becomes trustworthy via
 # cross-frame evidence even when we can't decrypt or check a MIC.
 LW_DEVICES = {}                   # 'LW:<devaddr>' -> {fcnts:[..], count:n, confirmed:bool}
@@ -1980,6 +2001,10 @@ def _tail_health():
                         drops_m=_f_dr if _f_dr is not None else HEALTH['drops_m'])
                     changed = True
                     last_stat_at = now
+                    # Telemetry proves the detector loop is alive: stamp the
+                    # supervisor's healthy clock so a long good run earns a
+                    # fresh auto-restart budget (see _supervised_restart).
+                    PIPELINE['last_healthy_at'] = now
                     # A fresh STAT line means we got telemetry — clear any
                     # immediate "no telemetry" warning we may have raised.  We
                     # do NOT clear a CATCHUP warning here: a fresh STAT doesn't
@@ -2030,6 +2055,20 @@ def _tail_health():
                     if immediate_warn != new_w:
                         immediate_warn = new_w
                         changed = True
+                    # ESCALATION: past the warn, a proc alive but SILENT for
+                    # minutes is wedged (pool result() deadlock, save-chain
+                    # stall, iq-reader death — the detector hang classes).
+                    # Recycle it through the supervisor's backoff governor.
+                    # The restart resets started_at, so this fires at most once
+                    # per wedge before the timer re-arms on the fresh proc.
+                    if (seconds_since_stat > _SUP_NO_TELEMETRY_RESTART_S
+                            and PIPELINE.get('want_running')
+                            and SETTINGS.get('auto_restart', True)):
+                        print('[SUPERVISOR] no telemetry for %ds — recycling '
+                              'the wedged detector' % seconds_since_stat,
+                              file=sys.stderr, flush=True)
+                        _supervised_recycle('no telemetry %ds'
+                                            % int(seconds_since_stat))
             # Keep-up banner logic: never surface during warm-up; after that,
             # re-check on a 30 s cadence and clear if msps caught up.
             # Priority: immediate_warn (deterministic) > pending_warn (statistical
@@ -2409,12 +2448,85 @@ def start_pipeline():
     except Exception as e:
         PIPELINE['err'] = str(e)
         return {'ok': False, 'error': str(e)}
-    PIPELINE.update(proc=proc, running=True, started_at=time.time(), err=None)
+    PIPELINE.update(proc=proc, running=True, started_at=time.time(), err=None,
+                    want_running=True)   # intent ON — supervise from here
     _broadcast({'type': 'stats', 'data': _stats()})
     return {'ok': True}
 
 
+def _supervised_restart(reason):
+    """Relaunch the detector through start_pipeline() with backoff + attempt
+    cap.  Called from the crash watcher and the no-telemetry escalation; the
+    lock serialises those two threads.  Returns True on a launched restart,
+    False while still inside the backoff window or once the cap is hit."""
+    with _SUPERVISOR_LOCK:
+        if not (PIPELINE.get('want_running') and SETTINGS.get('auto_restart', True)):
+            return False
+        now = time.time()
+        # A pipeline that ran HEALTHY (emitting [STAT]) for a sustained stretch
+        # AFTER the last restart earns a fresh budget — a crash 10 min into a
+        # good run must not count against an earlier restart storm.  The signal
+        # is the gap between the last restart and the last healthy [STAT]: if
+        # the detector stayed healthy >60 s past its restart, it proved itself.
+        # (A restart-storm keeps last_healthy_at at/near last_restart_at, so the
+        # gap stays small and the attempt counter keeps climbing to the cap.)
+        _lh = PIPELINE.get('last_healthy_at', 0.0)
+        _lr = PIPELINE.get('last_restart_at', 0.0)
+        if _lh and _lh - _lr > 60.0:
+            PIPELINE['restart_attempts'] = 0
+        n = PIPELINE.get('restart_attempts', 0)
+        if n >= _SUP_MAX_ATTEMPTS:
+            _msg = ('Auto-restart gave up after %d attempts (%s). Check the '
+                    'SDR / config, then press Start.' % (n, reason))
+            if PIPELINE.get('err') != _msg:
+                PIPELINE['err'] = _msg
+                print('[SUPERVISOR] ' + _msg, file=sys.stderr, flush=True)
+                try:
+                    _broadcast({'type': 'stats', 'data': _stats()})
+                except Exception:
+                    pass
+            return False
+        backoff = _SUP_BACKOFF_S[min(n, len(_SUP_BACKOFF_S) - 1)]
+        if now - PIPELINE.get('last_restart_at', 0.0) < backoff:
+            return False   # still cooling down; the caller retries next tick
+        PIPELINE['restart_attempts'] = n + 1
+        PIPELINE['last_restart_at'] = now
+        print('[SUPERVISOR] restart #%d (%s) after %ds backoff'
+              % (n + 1, reason, backoff), file=sys.stderr, flush=True)
+        try:
+            r = start_pipeline()
+        except Exception as e:
+            PIPELINE['err'] = 'auto-restart failed: %s' % e
+            return False
+        return bool(r.get('ok'))
+
+
+def _supervised_recycle(reason):
+    """HANG path: the proc is alive but wedged (no telemetry).  start_pipeline
+    would no-op ('already running'), so kill the wedged process tree FIRST
+    (want_running stays True so it is still supervised), then restart."""
+    with _SUPERVISOR_LOCK:
+        if not (PIPELINE.get('want_running') and SETTINGS.get('auto_restart', True)):
+            return False
+        proc = PIPELINE.get('proc')
+        if proc and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                pass
+        _kill_stale_pipeline()
+        PIPELINE.update(proc=None, running=False)   # NB: want_running preserved
+    return _supervised_restart(reason)
+
+
 def stop_pipeline():
+    # Intent OFF, FIRST — before the kill — so the watcher's crash path (and
+    # any in-flight no-telemetry escalation) treats this deliberate teardown
+    # as a Stop, never a crash to auto-restart.
+    PIPELINE['want_running'] = False
+    PIPELINE['_pending_restart'] = False
+    PIPELINE['restart_attempts'] = 0
+    PIPELINE['err'] = None
     proc = PIPELINE.get('proc')
     if proc and proc.poll() is None:
         try:
@@ -2436,11 +2548,34 @@ def stop_pipeline():
 
 
 def _watch_pipeline():
+    # Body wrapped in try/except: this is the ONLY thread that flips 'running'
+    # off when the detector dies, so a stray _stats()/_broadcast exception must
+    # not kill it (the pre-supervisor code had no guard — a crash here left the
+    # GUI showing 'running' forever).
     while True:
-        proc = PIPELINE.get('proc')
-        if proc is not None and proc.poll() is not None:
-            PIPELINE.update(running=False, proc=None)
-            _broadcast({'type': 'stats', 'data': _stats()})
+        try:
+            proc = PIPELINE.get('proc')
+            if proc is not None and proc.poll() is not None:
+                # The detector process EXITED.  If the user still intends it
+                # running (want_running True — a deliberate Stop clears it
+                # first), this is an unexpected crash: mark it for the
+                # supervisor.  Otherwise it's a normal stop.
+                PIPELINE.update(running=False, proc=None)
+                _broadcast({'type': 'stats', 'data': _stats()})
+                if (PIPELINE.get('want_running')
+                        and SETTINGS.get('auto_restart', True)):
+                    PIPELINE['_pending_restart'] = True
+            # Drive a pending crash-restart every tick (proc is already None,
+            # so the block above won't re-fire) until the backoff window opens
+            # and start succeeds, or the attempt cap is hit and it gives up.
+            if PIPELINE.get('_pending_restart'):
+                if _supervised_restart('detector exit'):
+                    PIPELINE['_pending_restart'] = False
+                elif PIPELINE.get('restart_attempts', 0) >= _SUP_MAX_ATTEMPTS:
+                    PIPELINE['_pending_restart'] = False
+        except Exception as e:
+            print('[SUPERVISOR] watch loop error: %r' % e,
+                  file=sys.stderr, flush=True)
         time.sleep(1.0)
 
 
@@ -2690,6 +2825,8 @@ def api_settings():
             SETTINGS['iq_invert'] = bool(d['iq_invert'])
         if 'auto_gain' in d:
             SETTINGS['auto_gain'] = bool(d['auto_gain'])
+        if 'auto_restart' in d:
+            SETTINGS['auto_restart'] = bool(d['auto_restart'])
         if 'time_format' in d and str(d['time_format']) in ('12', '24'):
             SETTINGS['time_format'] = str(d['time_format'])
         if 'date_format' in d and str(d['date_format']) in _DATE_STRFTIME:
@@ -2755,6 +2892,7 @@ def api_settings():
         if any(k in d for k in ('autosave', 'waterfall', 'unknown', 'fingerprint',
                                 'protocols', 'wide_scan', 'sdr', 'radio', 'tune',
                                 'ldro_fallback', 'iq_invert', 'auto_gain',
+                                'auto_restart',
                                 'time_format', 'date_format',
                                 'capture_ram', 'capture_dir')
                + _chan_keys):
