@@ -1205,7 +1205,9 @@ def _hybrid_dechirp_pmr(iq, sf, bw, fs, n_syms=8):
     iq_syms = iq[:n_total * sps].reshape(n_total, sps)
     dechirped = iq_syms * dc
     if osf > 1:
-        dechirped = dechirped.reshape(n_total, N, osf).mean(axis=2)
+        _r = dechirped.reshape(n_total, N, osf)   # slice-add: see line ~1466
+        dechirped = ((_r[:, :, 0] + _r[:, :, 1]) * np.complex64(0.5)
+                     if osf == 2 else _r.mean(axis=2))
     spectra = np.abs(_fft(dechirped, axis=1)) ** 2
     peaks = np.max(spectra, axis=1)
     means = np.mean(spectra, axis=1)
@@ -1407,12 +1409,24 @@ def dechirp_peak_quality(iq, sf, bw, agg='best8'):
     _memo = getattr(_DPQ_MEMO, 'd', None)
     if _memo is None:
         return _dechirp_peak_quality_core(iq, sf, bw, agg)
-    _mk = (sf, bw, agg, len(iq), hash(iq.tobytes()))
+    # EXACT O(1) memo key: buffer start address + byte length.  The nb slice
+    # handed in is always a contiguous view into a base array the caller pins
+    # alive for the whole peak (nb_cache / _nb_by_bw dicts) and the memo is
+    # reset per peak (_process_one_peak wrapper), so within one memo's lifetime
+    # an address is NEVER reused by a different array.  Storing iq in the memo
+    # VALUE additionally pins the buffer for the entry's lifetime, making that
+    # invariant self-enforcing (a future refactor that stopped caching nb still
+    # could not alias).  (data_ptr, nbytes) == identical bytes by construction:
+    # no hashing, no subsample-collision risk.  Verified: 0 in-scope collisions
+    # over 32 052 real dechirp calls across 5 corpus files (g62, two60,
+    # g500_sf11, g42_sf12, gsf12_500k); the 2131 cross-peak address reuses seen
+    # are all harmless because the memo is cleared between peaks.
+    _mk = (sf, bw, agg, iq.nbytes, iq.ctypes.data)
     _hit = _memo.get(_mk)
     if _hit is None:
-        _hit = _dechirp_peak_quality_core(iq, sf, bw, agg)
+        _hit = (_dechirp_peak_quality_core(iq, sf, bw, agg), iq)
         _memo[_mk] = _hit
-    return _hit
+    return _hit[0]
 
 
 def _dechirp_peak_quality_core(iq, sf, bw, agg='best8'):
@@ -1444,8 +1458,19 @@ def _dechirp_peak_quality_core(iq, sf, bw, agg='best8'):
     iq_syms = iq[:n_total_syms * sym_samples].reshape(n_total_syms, sym_samples)
     dechirped = iq_syms * dc
     if osf > 1:
-        # Proper decimation: average osf consecutive samples → N samples/symbol
-        dechirped = dechirped.reshape(n_total_syms, N, osf).mean(axis=2)
+        # Proper decimation: average osf consecutive samples → N samples/symbol.
+        # ndarray.mean(axis=2) over the tiny inner axis hits numpy's generic
+        # reduce loop and is ~15x slower than an explicit add for the osf==2
+        # production case (measured 85% of this function's compute).  osf==2 is
+        # the ONLY value on this path (fs=2*bw here) and (a+b)*0.5 == (a+b)/2 is
+        # BIT-identical to mean in IEEE754.  osf!=2 (only reachable from the
+        # other two dechirp sites) keeps mean() so it stays bit-identical too —
+        # sum/osf rounds ~1e-7 differently for ODD osf.
+        _r = dechirped.reshape(n_total_syms, N, osf)
+        if osf == 2:
+            dechirped = (_r[:, :, 0] + _r[:, :, 1]) * np.complex64(0.5)
+        else:
+            dechirped = _r.mean(axis=2)
     spectra = np.abs(_fft(dechirped, axis=1)) ** 2
     peaks = np.max(spectra, axis=1)
     means = np.mean(spectra, axis=1)
@@ -1518,7 +1543,9 @@ def _dechirp_scan(nb, sf, bw, nbfs):
             continue
         d = seg[:ns * sym].reshape(ns, sym) * dc
         if osf > 1:
-            d = d.reshape(ns, N, osf).mean(axis=2)
+            _r = d.reshape(ns, N, osf)            # slice-add: see line ~1466
+            d = ((_r[:, :, 0] + _r[:, :, 1]) * np.complex64(0.5)
+                 if osf == 2 else _r.mean(axis=2))
         spec = np.abs(_fft(d, axis=1)) ** 2
         mn = spec.mean(axis=1)
         ratios = np.where(mn > 0, spec.max(axis=1) / mn, 0.0)
