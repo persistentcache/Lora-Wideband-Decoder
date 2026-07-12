@@ -3530,6 +3530,24 @@ class SignalRecorder:
             pass
 
         self._decoder = None
+        # RAM-PROPORTIONAL SPOOL (UC audit (s) re-exam 2026-07-12): the class
+        # default (600 MB) is the threshold above which a save job spills its
+        # wideband concat to a disk-backed memmap instead of holding it in RAM.
+        # With the save queue bounded at 8, up to 8 concurrent wideband jobs can
+        # sit in RAM — 8×600 MB ≈ 4.8 GB, an OOM on a small-RAM host.  Lower the
+        # threshold on such hosts so ~8 in-flight jobs stay under ~1/4 of system
+        # RAM (spilling sooner just trades RAM for disk I/O — never data loss).
+        # Big-RAM hosts keep the 600 MB default (min() only lowers, never
+        # raises).  Mostly a legacy-path guard: with LORA_NB_PENDING the pool
+        # commits queue KB-scale NB streams, not wideband arrays.
+        try:
+            with open('/proc/meminfo') as _mi:
+                _memtot_b = next(int(l.split()[1]) for l in _mi
+                                 if l.startswith('MemTotal')) * 1024
+            self._SPOOL_RAM_LIMIT = min(type(self)._SPOOL_RAM_LIMIT,
+                                        _memtot_b // 32)
+        except (OSError, StopIteration, ValueError):
+            pass
         # BOUNDED queue: each item carries a full wideband gate window (~300 MB
         # at 28 Msps).  An unbounded queue OOM-killed the process on a 60-msg
         # run when the save-worker fell behind (queue hit 129 → ~40 GB).  With
@@ -4870,6 +4888,38 @@ class BackgroundDecoder:
             _w_auto = max(2, _ncpu - 2)             # 8 cores → 6 workers
         else:
             _w_auto = max(2, min(16, _ncpu - 6))    # ≥12 cores → ncpu-6 (cap 16)
+        # RAM-CAP (UC audit (s) re-exam 2026-07-12): the count above is
+        # CPU-scaled with NO memory term, but decode workers are the DOMINANT
+        # RAM consumer — each ratchets to ~the recycle bound (LORA_DECODE_
+        # WORKER_RSS_MB, ~1.5-2 GB anon) and nothing else in the pipeline
+        # comes close.  On a small-RAM many-core host (e.g. 4 GB / 8 vCPU)
+        # the CPU scale picks 6 workers → ~12 GB → OOM.  Cap the AUTO count so
+        # peak worker RSS fits system RAM, leaving a reserve for the gate/ring/
+        # detect-pool + OS.  This is a pure no-loss trade: fewer workers = more
+        # decode LATENCY (captures live on /dev/shm and catch up during idle),
+        # never sample loss, and it also REDUCES gate starvation.  Big-RAM
+        # hosts are unaffected (the CPU cap dominates).  An explicit
+        # LORA_DECODE_WORKERS>0 always wins (operator knows the host).
+        if _env_nw_i <= 0:
+            try:
+                with open('/proc/meminfo') as _mi:
+                    _memtot_mb = next(int(l.split()[1]) for l in _mi
+                                      if l.startswith('MemTotal')) / 1024.0
+                _rss_lim = float(os.environ.get(
+                    'LORA_DECODE_WORKER_RSS_MB', '1500') or 1500)
+                # peak ≈ recycle bound + ratchet headroom above it
+                _per_worker_mb = max(512.0, _rss_lim) + 512.0
+                _reserve_mb = float(os.environ.get(
+                    'LORA_DECODE_RAM_RESERVE_MB', '2048'))
+                _w_ram = int(max(1, (_memtot_mb - _reserve_mb) / _per_worker_mb))
+                if _w_ram < _w_auto:
+                    print(f"[DECODER] RAM cap: {_memtot_mb:.0f}MB total, "
+                          f"~{_per_worker_mb:.0f}MB/worker → {_w_ram} decode "
+                          f"workers (cpu-scale wanted {_w_auto})",
+                          file=sys.stderr, flush=True)
+                    _w_auto = _w_ram
+            except (OSError, StopIteration, ValueError):
+                pass
         self._n_workers = (_env_nw_i if _env_nw_i > 0 else _w_auto)
         # ---- Two-tier decode on the SAME workers (no oversubscription) ----
         # Each manager serves the FAST queue first; only when it's empty does it
