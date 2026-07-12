@@ -3744,11 +3744,15 @@ class SignalRecorder:
                   f"base_span=[{sample_pos - sum(len(p) for p in parts)},"
                   f"{sample_pos})", flush=True)
         _gap_n = sum(len(g) for g in gap_parts) if gap_parts else 0
-        # tail_parts (pool commit): the tail is FULLY KNOWN now — the trailing
-        # windows are already in flight — so 'need' is exactly its length and
-        # nothing is deferred (UC audit q).
-        _need = (sum(len(t) for t in tail_parts) if tail_parts is not None
-                 else int(need_tail_n))
+        # tail_parts (pool commit) SEEDS the in-flight tail.  'need' is the FULL
+        # airtime (need_tail_n): if the seed covers it (short frame) the job
+        # finalizes now; if not (long slow-preset frame whose tail exceeds the
+        # in-flight window depth) it PENDS and feed_tail completes it from
+        # future loop hops (UC audit p — was silently truncated to the
+        # n_slots-hop ceiling).  Fallback to the seed length if no need given.
+        _need = (int(need_tail_n) if need_tail_n
+                 else (sum(len(t) for t in tail_parts)
+                       if tail_parts is not None else 0))
         job = {'base_parts': parts, 'dets': list(detections),
                'pre_hop_n': pre_hop_n, 'wb_n': len(wideband_buf) + _gap_n,
                'sample_pos': sample_pos, 'tail': [], 'got': 0,
@@ -3768,14 +3772,15 @@ class SignalRecorder:
                     del job['nb']
         if os.environ.get('LORA_SLOW_DEBUG'):
             print(f"[UPDEF-JOB] created dets={[(d['sf'], d['bw'], round(d['freq_hz']/1e6,4)) for d in job['dets']]} need={job['need']}", flush=True)
-        # POOL-MODE FULLY-KNOWN TAIL (UC audit q): feed it straight through and
-        # finalize NOW — no _pending, no broadcast feed_tail.  This routes the
-        # pool commit through the SAME NB cropper the serial live path uses, so
-        # the save queue holds KB-scale NB streams instead of the ~610 MB
-        # wideband array recorder.update() queued (the >=8-core / web
-        # detect_workers=-1 OOM driver).  NB output is byte-equivalent to the
-        # serial live captures; a cropper-degraded job falls back to the lazy
-        # PARTS save path (still no eager wideband concat).
+        # POOL-MODE SEED (UC audit q + p): feed the fully-known in-flight tail
+        # through the SAME NB cropper the serial live path uses — the save queue
+        # then holds KB-scale NB streams, not the ~610 MB wideband array
+        # recorder.update() queued (the >=8-core / web detect_workers=-1 OOM
+        # driver).  If the seed already covers the airtime, finalize now (short
+        # frames — low latency, no pend).  Otherwise the frame is LONGER than
+        # the in-flight window depth: PEND, and feed_tail completes it from
+        # future loop hops (the seed + future hops are contiguous — the
+        # in-flight forward-overlaps ARE the _hop_own's already emitted).
         if tail_parts is not None:
             if 'nb' in job:
                 for _h in tail_parts:
@@ -3790,8 +3795,10 @@ class SignalRecorder:
             else:
                 job['tail'] = list(tail_parts)
                 job['got'] = sum(len(t) for t in tail_parts)
-            self._finalize(job)
-            return []
+            if job['got'] >= job['need']:
+                self._finalize(job)     # seed covers the airtime — done
+                return []
+            # long frame — feed_tail finishes it (bounded by the 3-job cap)
         self._pending.append(job)
         if len(self._pending) > 3:
             if os.environ.get('LORA_SLOW_DEBUG'):
@@ -6782,6 +6789,7 @@ def main():
         if recorder:
             buf0 = _pool.slot_array(it['slot'])[:win_n]
             _tparts = []
+            _need_tail_n = 0
             if _inflight and dets0:
                 # Tail must cover the FULL packet AFTER the preamble.  A single
                 # next-window overlap (~0.5 s) is enough for short-SF packets,
@@ -6812,6 +6820,7 @@ def main():
                 # no deferral.
                 recorder.update_deferred(dets0, buf0, it['tot_s'],
                                          pre_hop=it['pre_hop'],
+                                         need_tail_n=_need_tail_n,
                                          tail_parts=_tparts)
             else:
                 # Legacy wideband path (LORA_NB_PENDING=0, or NB setup
@@ -7613,8 +7622,16 @@ def main():
                 # capture length no longer depends on pipeline speed.
                 _max_pkt_s = max(
                     (148.25 * (2 ** d['sf']) / d['bw']) for d in dets)
-                _max_tail_n = min(int(_max_pkt_s * a.rate), 3 * win_n,
-                                  _ring_n_total // 2)
+                # Cap = min(airtime, 24*win_n) (UC audit p).  Was
+                # min(airtime, 3*win_n, ring/2) — a stale blocking-read-era
+                # bound that truncated every frame past ~4.5 s (SF12/62.5k =
+                # 9.7 s, SF12/125k = 4.9 s) to a decoded header + cut payload.
+                # The deferred tail accumulates from LOOP HOPS (refs), not ring
+                # reads, so the ring/2 bound never applied; the slow-pass path
+                # already raised to 24*win_n for exactly this reason.  NB-mode
+                # crops each hop to KB as it arrives, so the longer pending job
+                # is tiny (and still bounded by the 3-job cap).
+                _max_tail_n = min(int(_max_pkt_s * a.rate), 24 * win_n)
                 if os.environ.get('LORA_NO_DEFER'):
                     tail_data, tail_skipped = reader.read(_max_tail_n)
                     if tail_data is not None:
@@ -7629,7 +7646,12 @@ def main():
                                              need_tail_n=_max_tail_n)
                     dets = []   # consumed: skip the immediate update below
             elif recorder and not is_live and dets:
-                # File mode: size the tail to the actual frame duration.
+                # File mode: size the tail to the actual frame duration.  Kept
+                # at 3*win_n — this is the OFFLINE blocking-read path whose
+                # _carry_tail continuity mechanism can't absorb a multi-second
+                # tail (verified: a 24*win_n read fragments the capture).  The
+                # deferred LIVE/POOL paths (the (p) targets, production) use
+                # feed_tail refs, not this read, and DO get the 24*win_n cap.
                 _max_pkt_s = max(
                     (148.25 * (2 ** d['sf']) / d['bw']) for d in dets)
                 _max_tail_n = min(int(_max_pkt_s * a.rate), 3 * win_n)
