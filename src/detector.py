@@ -3636,7 +3636,7 @@ class SignalRecorder:
 
     def update_deferred(self, detections, wideband_buf, sample_pos=0,
                         pre_hop=None, need_tail_n=0, owned_buf=False,
-                        gap_parts=None):
+                        gap_parts=None, tail_parts=None):
         """Register a save whose TAIL arrives later: instead of BLOCKING
         the main loop for an airtime-sized ring read (2.4 s per SF11/125k
         detection — measured as the dominant live-loop stall: CATCHUP
@@ -3744,10 +3744,15 @@ class SignalRecorder:
                   f"base_span=[{sample_pos - sum(len(p) for p in parts)},"
                   f"{sample_pos})", flush=True)
         _gap_n = sum(len(g) for g in gap_parts) if gap_parts else 0
+        # tail_parts (pool commit): the tail is FULLY KNOWN now — the trailing
+        # windows are already in flight — so 'need' is exactly its length and
+        # nothing is deferred (UC audit q).
+        _need = (sum(len(t) for t in tail_parts) if tail_parts is not None
+                 else int(need_tail_n))
         job = {'base_parts': parts, 'dets': list(detections),
                'pre_hop_n': pre_hop_n, 'wb_n': len(wideband_buf) + _gap_n,
                'sample_pos': sample_pos, 'tail': [], 'got': 0,
-               'need': int(need_tail_n)}
+               'need': _need}
         if self._nb_mode:
             _nb = self._nb_setup(job['dets'])
             if _nb is not None:
@@ -3763,6 +3768,30 @@ class SignalRecorder:
                     del job['nb']
         if os.environ.get('LORA_SLOW_DEBUG'):
             print(f"[UPDEF-JOB] created dets={[(d['sf'], d['bw'], round(d['freq_hz']/1e6,4)) for d in job['dets']]} need={job['need']}", flush=True)
+        # POOL-MODE FULLY-KNOWN TAIL (UC audit q): feed it straight through and
+        # finalize NOW — no _pending, no broadcast feed_tail.  This routes the
+        # pool commit through the SAME NB cropper the serial live path uses, so
+        # the save queue holds KB-scale NB streams instead of the ~610 MB
+        # wideband array recorder.update() queued (the >=8-core / web
+        # detect_workers=-1 OOM driver).  NB output is byte-equivalent to the
+        # serial live captures; a cropper-degraded job falls back to the lazy
+        # PARTS save path (still no eager wideband concat).
+        if tail_parts is not None:
+            if 'nb' in job:
+                for _h in tail_parts:
+                    try:
+                        self._crop_queue.put_nowait(('HOP', job, _h))
+                        job['got'] += len(_h)
+                    except queue.Full:
+                        # cropper full mid-tail: truncate here (same
+                        # degradation feed_tail takes) rather than stall the
+                        # realtime commit path.
+                        break
+            else:
+                job['tail'] = list(tail_parts)
+                job['got'] = sum(len(t) for t in tail_parts)
+            self._finalize(job)
+            return []
         self._pending.append(job)
         if len(self._pending) > 3:
             if os.environ.get('LORA_SLOW_DEBUG'):
@@ -6752,7 +6781,7 @@ def main():
                   f"pwr={d['peak_power_db']:.1f}dB{_bwq}", flush=True)
         if recorder:
             buf0 = _pool.slot_array(it['slot'])[:win_n]
-            tail0 = None
+            _tparts = []
             if _inflight and dets0:
                 # Tail must cover the FULL packet AFTER the preamble.  A single
                 # next-window overlap (~0.5 s) is enough for short-SF packets,
@@ -6760,14 +6789,13 @@ def main():
                 # packets are ~1.4 s and SF12/125 ~2.9 s, so a 2 s capture
                 # truncates the payload and the decoder yields only the header
                 # plus a handful of nibbles (LONG_MODERATE was 38/120 for this
-                # reason).  Concatenate the forward-overlap (hop_n:) of as many
+                # reason).  Gather the forward-overlap (hop_n:) of as many
                 # subsequent in-flight windows as needed to span max_pkt_s for
                 # the detected SF/BW.  Short-SF presets need only 1 window, so
-                # their behaviour is unchanged.
+                # their behaviour is unchanged.  Copies (slots get reused).
                 _a0 = max(dets0, key=lambda x: x.get('peak_power_db', 0.0))
                 _sym_t0 = (2 ** _a0['sf']) / _a0['bw']
                 _need_tail_n = int((16 + 4.25 + 8 + 120) * _sym_t0 * a.rate)
-                _tparts = []
                 _acc = 0
                 for _itn in _inflight:
                     _seg = _pool.slot_array(_itn['slot'])[:win_n][hop_n:]
@@ -6775,10 +6803,22 @@ def main():
                     _acc += len(_seg)
                     if _acc >= _need_tail_n:
                         break
-                if _tparts:
-                    tail0 = np.concatenate(_tparts)
-            recorder.update(dets0, buf0, it['tot_s'], tail=tail0,
-                            pre_hop=it['pre_hop'])
+            if recorder._nb_mode:
+                # NB-pending pool commit (UC audit q): crop base+tail straight
+                # to NB via the same cropper the serial live path uses — the
+                # save queue holds KB-scale NB, not the ~610 MB wideband array
+                # recorder.update() would queue.  The tail is fully known now
+                # (trailing windows in flight), so it is fed and finalized with
+                # no deferral.
+                recorder.update_deferred(dets0, buf0, it['tot_s'],
+                                         pre_hop=it['pre_hop'],
+                                         tail_parts=_tparts)
+            else:
+                # Legacy wideband path (LORA_NB_PENDING=0, or NB setup
+                # degenerate): eager concat, save worker FFT-crops.
+                tail0 = np.concatenate(_tparts) if _tparts else None
+                recorder.update(dets0, buf0, it['tot_s'], tail=tail0,
+                                pre_hop=it['pre_hop'])
         _pool.release_slot(it['slot'])
 
     try:
