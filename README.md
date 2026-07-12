@@ -48,6 +48,50 @@ is launched from the web UI based on `lora.toml`.
 
 Named profiles + live capability probing live in `src/sdr_profiles.py`.
 
+## System requirements
+
+The one number that drives everything is the **sample rate**, which for a
+complex SDR *is* the instantaneous bandwidth: 20 Msps = 20 MHz of spectrum
+watched at once. The pipeline scans the *entire* sampled band in real time,
+so **CPU and RAM both scale with the rate** - a wider view costs more of
+both. Choose the rate to fit the host; the program sizes itself to whatever
+it is given.
+
+**What a host can sustain live (measured, over-the-air):**
+
+| Host | Sustained rate / IBW | Notes |
+|---|---|---|
+| Desktop / laptop, many fast cores (dev host: 24-core x86, 64 GB) | **20-28 Msps / the full band** | validated default |
+| Raspberry Pi 4 (4× Cortex-A72, 8 GB) | **~5 Msps / ~5 MHz** | 20 Msps overruns it (~75 % of the air dropped) |
+
+Between those two the ceiling tracks **cores × per-core speed**. If a host
+cannot keep up it degrades gracefully - the gate skips ahead to stay
+real-time and decode is deferred - so you lose the dropped air but nothing
+crashes or leaks memory.
+
+**Minimums to run at all:**
+
+- **OS** - 64-bit Linux (uses `/proc`, CPU affinity, `fork`, POSIX shared
+  memory).
+- **Software** - Python 3 with numpy + scipy (pyfftw is used automatically
+  on ≤4-core hosts), plus an SDR capture tool (`hackrf_transfer`,
+  `bladeRF-cli`, SoapySDR, …).
+- **CPU** - any 64-bit multi-core, ARM or x86. More/faster cores → higher
+  sustainable rate (table above).
+- **RAM** - **~4 GB** at low rates; **8 GB for 20 Msps** (the ring buffer,
+  detect-pool shared memory and gate working set all grow with the rate);
+  **16 GB+** to run more decode workers in parallel for lower decode
+  latency. The decode-worker count auto-caps to fit whatever RAM is present,
+  so a small host is throttled, never OOM-killed.
+- **SDR** - a complex-sampling radio covering your target bandwidth (see
+  **Supported SDRs**), on **USB 3.0** for rates above ~8 Msps (20 Msps is
+  ≈ 40 MB/s off the device).
+
+**Rule of thumb:** a single LoRa channel needs only ~1 Msps, so *any* host
+can watch one known channel. The cost is the **coverage** - watching the
+whole band at once is what needs the CPU. Match the rate to the host: a Pi
+does a narrow slice, a desktop does the whole band.
+
 ## Numbers worth knowing
 
 **How weak can a signal be?** Measured with calibrated SNR ladders at
@@ -71,13 +115,11 @@ SNR** before letting go. Treat the table as slightly optimistic bounds
 the ladder battery was cross-validated against noise-injected off-air
 recordings and matched within one step).
 
-**Throughput reality check:** 28 Msps wideband keeps up in real time on
-a desktop-class multi-core CPU. Smaller in-band widths scale down
-gracefully - narrower capture, less CPU - so slower hosts can still run
-narrower slices of spectrum. Every release is regression-gated against
-a corpus of real off-air recordings (overload, clipping, DC spurs,
-two-node collisions, weak injections) plus live over-the-air legs
-against real Meshtastic and MeshCore nodes.
+**Throughput reality check:** see **System requirements** above for what
+each host class sustains in real time. Every release is regression-gated
+against a corpus of real off-air recordings (overload, clipping, DC spurs,
+two-node collisions, weak injections) plus live over-the-air legs against
+real Meshtastic and MeshCore nodes.
 
 ## Building from source
 
