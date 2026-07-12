@@ -4673,10 +4673,16 @@ class BackgroundDecoder:
     + numpy import costs.  The worker stays alive between decodes.
     """
 
-    def __init__(self, aes_key=None, no_key=False, verbose=False):
+    def __init__(self, aes_key=None, no_key=False, verbose=False,
+                 host_mem_ctx=None):
         self._verbose = verbose
         self._aes_key = aes_key
         self._no_key = no_key
+        # HOST/CONFIG memory context for the principled worker-RAM reserve.
+        # Keys: ring_bytes, detect_pool_bytes, win_n (see the RAM-cap block in
+        # the CPU/RAM auto-scale below).  Defaults to {} so the reserve
+        # degrades safely to just OS_slack when absent.
+        self._host_mem_ctx = host_mem_ctx or {}
         self._queue = queue.Queue()
         self._lock = threading.Lock()
         # Structured packet log (JSONL) the web UI tails.  Each decoded/encrypted
@@ -4936,13 +4942,37 @@ class BackgroundDecoder:
                     'LORA_DECODE_WORKER_RSS_MB', '1500') or 1500)
                 # peak ≈ recycle bound + ratchet headroom above it
                 _per_worker_mb = max(512.0, _rss_lim) + 512.0
-                _reserve_mb = float(os.environ.get(
-                    'LORA_DECODE_RAM_RESERVE_MB', '2048'))
+                # PRINCIPLED RESERVE (was a fixed 2048 MB rate-blind guess that
+                # was only right when the ring happened to be ~1 GB).  The
+                # reserve is EVERYTHING that is NOT a decode worker, derived
+                # from host+config values.  ring_bytes is LAZY (np.zeros) so it
+                # is invisible in current RSS at decoder-init and MUST be added
+                # explicitly.  An explicit LORA_DECODE_RAM_RESERVE_MB now
+                # OVERRIDES the derivation (was merely its default constant).
+                _env_res = os.environ.get('LORA_DECODE_RAM_RESERVE_MB')
+                if _env_res:                       # operator escape hatch wins
+                    _reserve_mb = float(_env_res)
+                else:
+                    _ctx = self._host_mem_ctx
+                    _win_n = float(_ctx.get('win_n', 0) or 0)          # rate*window
+                    _ring_b = float(_ctx.get('ring_bytes', 0) or 0)    # capped; 0 if file
+                    _dpool_b = float(_ctx.get('detect_pool_bytes', 0) or 0)  # 0 if serial
+                    # Gate working set: O(win_n) complex64 buffers (welch PSD,
+                    # win_n-FFT plan scratch, max-hold, convert-ahead, one save
+                    # window) — measured 7-9x win_n*8 at 10-20 Msps; 10x safe.
+                    _gate_mult = float(os.environ.get('LORA_GATE_WIN_MULT', '10'))
+                    _gate_b = _gate_mult * _win_n * 8.0
+                    # The ONE constant: numpy/scipy/FFTW-plan base (~80 MB
+                    # measured) + OS headroom + small save/crop margin.
+                    _os_slack_mb = float(os.environ.get('LORA_OS_SLACK_MB', '768'))
+                    _reserve_mb = ((_ring_b + _dpool_b + _gate_b) / (1024.0 * 1024.0)
+                                   + _os_slack_mb)
                 _w_ram = int(max(1, (_memtot_mb - _reserve_mb) / _per_worker_mb))
                 if _w_ram < _w_auto:
                     print(f"[DECODER] RAM cap: {_memtot_mb:.0f}MB total, "
-                          f"~{_per_worker_mb:.0f}MB/worker → {_w_ram} decode "
-                          f"workers (cpu-scale wanted {_w_auto})",
+                          f"reserve {_reserve_mb:.0f}MB, ~{_per_worker_mb:.0f}MB/"
+                          f"worker → {_w_ram} decode workers "
+                          f"(cpu-scale wanted {_w_auto})",
                           file=sys.stderr, flush=True)
                     _w_auto = _w_ram
             except (OSError, StopIteration, ValueError):
@@ -6790,8 +6820,30 @@ def main():
                     print("WARNING: Could not decode key. Using default.",
                           file=sys.stderr)
 
+        # Host/config memory context for the principled decode-worker RAM
+        # reserve (see BackgroundDecoder RAM-cap block).  All inputs are in
+        # scope: a.rate, a.buf_seconds, a.format, a.window, a.detect_workers
+        # (finalized above), is_live.
+        _bps_ring = 4 if a.format == 'sc16' else 2
+        _ring_bytes = 0
+        if is_live:                                   # file replay has no ring
+            _ring_bytes = int(a.rate * a.buf_seconds * _bps_ring)
+            try:                                      # mirror StreamBuffer 40% self-cap
+                with open('/proc/meminfo') as _mi:
+                    _avail_kb = next(int(l.split()[1]) for l in _mi
+                                     if l.startswith('MemAvailable'))
+                _ring_bytes = int(min(_ring_bytes, _avail_kb * 1024 * 0.40))
+            except (OSError, StopIteration, ValueError):
+                pass
+        _win_n_ctx = int(a.rate * a.window)
+        _dpool_bytes = 0
+        if a.detect_workers and a.detect_workers > 0:
+            _dpool_bytes = int((a.detect_workers + 8) * _win_n_ctx * 8)
         decoder = BackgroundDecoder(
-            aes_key=aes_key, no_key=no_key, verbose=a.decode_verbose)
+            aes_key=aes_key, no_key=no_key, verbose=a.decode_verbose,
+            host_mem_ctx=dict(ring_bytes=_ring_bytes,
+                              detect_pool_bytes=_dpool_bytes,
+                              win_n=_win_n_ctx))
         mode = "verbose" if a.decode_verbose else "compact"
         key_info = "NOKEY" if no_key else ("custom" if aes_key else "default")
         print(f"Decode: {mode} (key={key_info})", file=sys.stderr)
