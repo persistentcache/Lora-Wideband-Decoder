@@ -1409,6 +1409,18 @@ def dechirp_peak_quality(iq, sf, bw, agg='best8'):
     _memo = getattr(_DPQ_MEMO, 'd', None)
     if _memo is None:
         return _dechirp_peak_quality_core(iq, sf, bw, agg)
+    # GUARD: the pointer key below is exact ONLY for contiguous complex64
+    # buffers — nbytes is stride-blind and ctypes.data is the base address, so
+    # a strided view (nb[::2]) or a dtype-reinterpret view COLLIDES with a
+    # contiguous slice's key while holding different bytes (reproduced: stale
+    # 20.8dB/bin0 served for a strided view whose true result is 7.6dB/bin16).
+    # Route anything the key is not exact for to the unmemoized core (~100ns
+    # check; branch unreachable from all current callers — every call site
+    # passes fresh contiguous complex64 basic slices).  NOT covered: in-place
+    # mutation of a pinned buffer within one peak's memo lifetime — do not
+    # mutate nb arrays inside _process_one_peak.
+    if not (iq.flags.c_contiguous and iq.dtype == np.complex64):
+        return _dechirp_peak_quality_core(iq, sf, bw, agg)
     # EXACT O(1) memo key: buffer start address + byte length.  The nb slice
     # handed in is always a contiguous view into a base array the caller pins
     # alive for the whole peak (nb_cache / _nb_by_bw dicts) and the memo is
@@ -4934,12 +4946,25 @@ class BackgroundDecoder:
         # hosts are unaffected (the CPU cap dominates).  An explicit
         # LORA_DECODE_WORKERS>0 always wins (operator knows the host).
         if _env_nw_i <= 0:
+            # Each env knob parses with ITS OWN fallback so one typo'd value
+            # (e.g. LORA_OS_SLACK_MB=1g) degrades to that knob's default with a
+            # warning instead of silently disabling the ENTIRE RAM cap — which
+            # would resurrect the exact small-host OOM this block prevents.
+            def _envf(name, dflt):
+                _v = os.environ.get(name)
+                if not _v:
+                    return dflt
+                try:
+                    return float(_v)
+                except ValueError:
+                    print(f"[DECODER] ignoring malformed {name}={_v!r} "
+                          f"(using {dflt})", file=sys.stderr, flush=True)
+                    return dflt
             try:
                 with open('/proc/meminfo') as _mi:
                     _memtot_mb = next(int(l.split()[1]) for l in _mi
                                       if l.startswith('MemTotal')) / 1024.0
-                _rss_lim = float(os.environ.get(
-                    'LORA_DECODE_WORKER_RSS_MB', '1500') or 1500)
+                _rss_lim = _envf('LORA_DECODE_WORKER_RSS_MB', 1500.0)
                 # peak ≈ recycle bound + ratchet headroom above it
                 _per_worker_mb = max(512.0, _rss_lim) + 512.0
                 # PRINCIPLED RESERVE (was a fixed 2048 MB rate-blind guess that
@@ -4949,10 +4974,10 @@ class BackgroundDecoder:
                 # is invisible in current RSS at decoder-init and MUST be added
                 # explicitly.  An explicit LORA_DECODE_RAM_RESERVE_MB now
                 # OVERRIDES the derivation (was merely its default constant).
-                _env_res = os.environ.get('LORA_DECODE_RAM_RESERVE_MB')
-                if _env_res:                       # operator escape hatch wins
-                    _reserve_mb = float(_env_res)
-                else:
+                _reserve_mb = _envf('LORA_DECODE_RAM_RESERVE_MB', 0.0)
+                # unset / 0 / malformed -> derive.  (To force a worker COUNT
+                # use LORA_DECODE_WORKERS, which bypasses this block entirely.)
+                if _reserve_mb <= 0:
                     _ctx = self._host_mem_ctx
                     _win_n = float(_ctx.get('win_n', 0) or 0)          # rate*window
                     _ring_b = float(_ctx.get('ring_bytes', 0) or 0)    # capped; 0 if file
@@ -4960,11 +4985,11 @@ class BackgroundDecoder:
                     # Gate working set: O(win_n) complex64 buffers (welch PSD,
                     # win_n-FFT plan scratch, max-hold, convert-ahead, one save
                     # window) — measured 7-9x win_n*8 at 10-20 Msps; 10x safe.
-                    _gate_mult = float(os.environ.get('LORA_GATE_WIN_MULT', '10'))
+                    _gate_mult = _envf('LORA_GATE_WIN_MULT', 10.0)
                     _gate_b = _gate_mult * _win_n * 8.0
                     # The ONE constant: numpy/scipy/FFTW-plan base (~80 MB
                     # measured) + OS headroom + small save/crop margin.
-                    _os_slack_mb = float(os.environ.get('LORA_OS_SLACK_MB', '768'))
+                    _os_slack_mb = _envf('LORA_OS_SLACK_MB', 768.0)
                     _reserve_mb = ((_ring_b + _dpool_b + _gate_b) / (1024.0 * 1024.0)
                                    + _os_slack_mb)
                 _w_ram = int(max(1, (_memtot_mb - _reserve_mb) / _per_worker_mb))
@@ -4976,7 +5001,9 @@ class BackgroundDecoder:
                           file=sys.stderr, flush=True)
                     _w_auto = _w_ram
             except (OSError, StopIteration, ValueError):
-                pass
+                # /proc/meminfo unreadable/absent (non-Linux) — cap unavailable.
+                print("[DECODER] RAM cap unavailable (no /proc/meminfo) — "
+                      "using CPU scale only", file=sys.stderr, flush=True)
         self._n_workers = (_env_nw_i if _env_nw_i > 0 else _w_auto)
         # ---- Two-tier decode on the SAME workers (no oversubscription) ----
         # Each manager serves the FAST queue first; only when it's empty does it
