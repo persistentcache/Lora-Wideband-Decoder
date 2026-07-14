@@ -268,6 +268,34 @@ _IQ_INVERT = os.environ.get('LORA_IQ_INVERT') == '1'
 # allocation.  LORA_PREALLOC=0 restores the old always-fresh behavior.
 _PREALLOC = os.environ.get('LORA_PREALLOC', '1') != '0'
 
+# LAZY INT16 QUIET WINDOW (2026-07-14, measured low-core ceiling item 2):
+# on windows where the energy gate finds NO candidate peaks (true-quiet band
+# — the steady state the Pi-class hosts must sustain), the old pipeline
+# still converted every hop to complex64 and slid a full complex64 window
+# (~320 MB of memory traffic per hop at 20 Msps sc16) even though the only
+# consumers of a quiet window are a handful of Welch PSD segments (50 gate
+# + ~10 fresh short-sweep x 4096 samples), a 1/32-strided saturation probe,
+# and the per-hop owned copy (_hop_own).  Instead: keep the sliding window
+# as RAW int16/int8 (40 MB slide), convert ON DEMAND only the samples those
+# fixed-path consumers actually touch (int->float32 conversion is EXACT —
+# the scale is a power of two — so every lazily-converted segment is
+# bit-identical to a slice of a fully-converted window), and materialize
+# the full complex64 window ONCE (into a persistent prealloc buffer, item-1
+# pattern) the moment the final per-window peak list is non-empty (real
+# peaks, channelizer forced peaks, patience placeholders — they all land in
+# _gate_peaks before detect) or a detect-pool slot needs the window.
+# pre_hop / _hop_own / feed_tail / slow-scan assemblies stay complex64
+# (owned copies, deep pipeline dependency) — only the SLIDING WINDOW and
+# the hop/tail reads feeding it move to the raw domain.
+#   LORA_LAZY=0        kill switch: restores the previous always-complex64
+#                      pipeline byte-for-byte (all old code paths intact).
+#   LORA_LAZY_VERIFY=1 paranoia mode: maintains a shadow complex64 window
+#                      via the OLD pipeline's exact ops and asserts every
+#                      lazily-computed product (segments, strided probe,
+#                      Welch PSDs, materialization) bit-identical to it.
+_LAZY = os.environ.get('LORA_LAZY', '1') != '0'
+_LAZY_VERIFY = os.environ.get('LORA_LAZY_VERIFY') == '1'
+
 
 class IQReader:
     def __init__(self, fp, fmt='sc16'):
@@ -297,6 +325,14 @@ class IQReader:
         if _IQ_INVERT:
             f[1::2] *= -1.0
         return f.view(np.complex64)
+    def read_raw(self, n):
+        """Read n IQ samples as RAW interleaved int16/int8 pairs (2n elems,
+        UNCONVERTED — the lazy-window path, see _LAZY).  Returns None at
+        EOF.  Each call returns a fresh array (a zero-copy view of the just
+        -read bytes), so the result is owned by the caller."""
+        raw = self.fp.read(n * self.bps)
+        if len(raw) < n * self.bps: return None
+        return np.frombuffer(raw, dtype=np.int16 if self.sc16 else np.int8)
 
 
 class StreamBuffer:
@@ -385,6 +421,10 @@ class StreamBuffer:
         self._cvt_inline = None
         self._ahead_bufs = [None, None]
         self._ahead_idx = 0
+        # Reused raw-copy target for read_raw() (lazy-window path, _LAZY).
+        # Same ownership rule as the float buffers: an owned=False read_raw
+        # result is valid only until the caller's next read_raw().
+        self._raw_buf = None
 
         # Read in ~20 ms chunks.  Smaller chunks reduce pipe backpressure at
         # high sample rates while keeping per-call numpy conversion overhead low.
@@ -528,6 +568,71 @@ class StreamBuffer:
             if self._wp - pos > self._ring_n:
                 return None        # overwritten mid-convert — stale
         return out.view(np.complex64)
+
+    def _copy_span_raw(self, pos, n, out=None):
+        """Copy ring span [pos, pos+n) as RAW int16/int8 pairs WITHOUT the
+        lock — same lap-validation contract as _convert_span (returns None
+        if the writer overwrote the span mid-copy; caller must re-claim)."""
+        start = (pos * 2) % self._ring_elems
+        n_elem = n * 2
+        if out is None:
+            out = np.empty(n_elem, dtype=self._ring.dtype)
+        else:
+            out = out[:n_elem]
+        end = start + n_elem
+        if end <= self._ring_elems:
+            out[:] = self._ring[start:end]
+        else:
+            split = self._ring_elems - start
+            out[:split] = self._ring[start:self._ring_elems]
+            out[split:] = self._ring[:n_elem - split]
+        with self._lock:
+            if self._wp - pos > self._ring_n:
+                return None        # overwritten mid-copy — stale
+        return out
+
+    def read_raw(self, n, owned=False):
+        """Read n IQ samples as RAW interleaved int16/int8 pairs (2n elems,
+        UNCONVERTED — the lazy-window path, see _LAZY).
+
+        Returns (data, skipped) with the same skip/EOF semantics as read().
+        Ownership mirrors read(): owned=False may return a reused buffer
+        valid only until this reader's next read_raw(); owned=True callers
+        (tail reads retained as raw carry) get a private allocation.
+        Lazy mode never wants the convert-ahead machinery (there is nothing
+        to convert), so any pending prepare is cancelled."""
+        while True:
+            pos = None
+            with self._lock:
+                self._ahead = None
+                self._ahead_want = None
+                avail = self._wp - self._rp
+                if avail >= n:
+                    skipped = 0
+                    if avail > self._ring_n:
+                        lost = avail - self._ring_n
+                        self._rp += lost
+                        self._total_drops += lost
+                        skipped = lost
+                    pos = self._rp
+                elif self._eof:
+                    return None, 0
+            if pos is None:
+                time.sleep(0.005)
+                continue
+            # raw copy OUTSIDE the lock (same reasoning as read(): a long
+            # copy under the lock stalls the writer thread)
+            if owned or not _PREALLOC:
+                data = self._copy_span_raw(pos, n)
+            else:
+                if self._raw_buf is None or len(self._raw_buf) < n * 2:
+                    self._raw_buf = np.empty(n * 2, dtype=self._ring.dtype)
+                data = self._copy_span_raw(pos, n, out=self._raw_buf)
+            with self._lock:
+                if data is None or self._wp - pos > self._ring_n:
+                    continue          # lapped mid-copy: re-claim
+                self._rp = pos + n
+            return data, skipped
 
     @staticmethod
     def _grown(buf, n_elem):
@@ -682,8 +787,13 @@ def _hanning_c64(nfft):
     return w
 
 
-def welch_psd(iq, nfft=4096, n_avg=64, also_max=False):
-    n = len(iq)
+def _welch_psd_from(n, getseg, nfft=4096, n_avg=64, also_max=False):
+    """welch_psd core over an abstract segment source: `n` total samples,
+    `getseg(start, count)` returns complex64 samples [start, start+count).
+    Lets the lazy raw window (_LazyWindow, see _LAZY) feed segments that
+    are converted on demand — for an ndarray source (welch_psd below) the
+    getseg is a plain slice, so this refactor is bit-identical to the old
+    inline form (same segs array, same ops)."""
     step = max(nfft, n // n_avg)
     n_segs = max(1, min(n_avg, (n - nfft) // step + 1))
     if n_segs <= 0:
@@ -700,7 +810,7 @@ def welch_psd(iq, nfft=4096, n_avg=64, also_max=False):
             n_segs = i
             segs = segs[:n_segs]
             break
-        segs[i] = iq[s:s + nfft]
+        segs[i] = getseg(s, nfft)
     # SDR-agnostic DC/LO-leak removal: subtract the MEASURED stationary DC
     # component (the segments' mean — whatever this particular SDR's spike is,
     # no hardcoded magnitude or width) before windowing.  A constant is pure-DC,
@@ -730,6 +840,189 @@ def welch_psd(iq, nfft=4096, n_avg=64, also_max=False):
         pmax = pw.max(axis=0)
         return 10.0 * np.log10(psd + 1e-15), 10.0 * np.log10(pmax + 1e-15)
     return 10.0 * np.log10(psd + 1e-15)
+
+
+def welch_psd(iq, nfft=4096, n_avg=64, also_max=False):
+    return _welch_psd_from(len(iq), lambda s, m: iq[s:s + m],
+                           nfft=nfft, n_avg=n_avg, also_max=also_max)
+
+
+class _LazyWindow:
+    """RAW-domain sliding analysis window (low-core ceiling item 2, _LAZY).
+
+    Owns the main loop's sliding window as raw interleaved int16/int8 and
+    hands the per-window fixed path bit-exact complex64 on demand:
+
+      seg(start, n)     complex64 of window samples [start, start+n)
+                        (view of the materialization when present, else a
+                        fresh conversion of just those samples)
+      seg_owned(...)    same but ALWAYS a private allocation (retainers:
+                        pre_hop fallback, _hop_own)
+      strided(step)     complex64 equivalent of buf[::step] (sat probe)
+      welch(off, n, ..) welch_psd over window samples [off, off+n) built
+                        from lazily-converted segments (gate PSD + short
+                        sweep slices — only ~n_avg*nfft samples convert)
+      materialize()     the FULL complex64 window, converted once per
+                        window into a persistent prealloc buffer (item-1
+                        pattern).  REUSED across windows — any consumer
+                        retaining data across iterations must copy, exactly
+                        as with the old in-place-slid `buf`.
+
+    Bit-exactness: int->float32 conversion is exact (power-of-two scale,
+    same np.multiply + _IQ_INVERT ops as IQReader/_convert_span), so a
+    lazily-converted segment is bit-identical to the same slice of a fully
+    converted window.  LORA_LAZY_VERIFY=1 proves it at runtime: a shadow
+    complex64 window is maintained with the OLD pipeline's exact ops
+    (convert each fresh hop, slide in the complex domain) and every product
+    above is asserted np.array_equal against it."""
+
+    def __init__(self, win_n, sc16):
+        self.win_n = win_n
+        self._dtype = np.int16 if sc16 else np.int8
+        self.raw = np.zeros(win_n * 2, dtype=self._dtype)
+        self._scale = np.float32(1.0 / (2048.0 if sc16 else 128.0))
+        self._matf = None      # persistent float32 materialization target
+        self._c64 = None       # cached complex64 view for THIS window
+        self.verify_fails = 0
+        self._shadow = (np.zeros(win_n, dtype=np.complex64)
+                        if _LAZY_VERIFY else None)
+
+    def empty_raw(self):
+        return np.zeros(0, dtype=self._dtype)
+
+    def _convert(self, src, out=None):
+        """Raw interleaved ints -> complex64, bit-identical to the reader
+        conversions (fused power-of-two multiply + optional Q negate)."""
+        if out is None:
+            out = np.empty(len(src), dtype=np.float32)
+        else:
+            out = out[:len(src)]
+        np.multiply(src, self._scale, out=out, casting='unsafe')
+        if _IQ_INVERT:
+            out[1::2] *= -1.0
+        return out.view(np.complex64)
+
+    def convert_owned(self, raw):
+        """Standalone raw->complex64 (fresh allocation, caller owns) — for
+        tail reads that must become recorder-visible complex64."""
+        return self._convert(raw)
+
+    # ---- window mutation -------------------------------------------------
+    def slide(self, raw_fresh):
+        """Slide raw_fresh (interleaved elems, < window) into the window."""
+        n_el = len(raw_fresh)
+        w_el = len(self.raw)
+        if n_el >= w_el:
+            self.raw[:] = raw_fresh[-w_el:]
+        else:
+            self.raw[:w_el - n_el] = self.raw[n_el:]
+            self.raw[w_el - n_el:] = raw_fresh
+        self._c64 = None
+        if self._shadow is not None:
+            self._shadow_slide(raw_fresh)
+
+    def set_full(self, raw_iq):
+        """Full replacement (>= one window of fresh samples).  COPIES, so
+        reused reader buffers are safe to hand in."""
+        self.raw[:] = raw_iq[-len(self.raw):]
+        self._c64 = None
+        if self._shadow is not None:
+            self._shadow[:] = self._convert(self.raw)
+
+    def reset(self):
+        self.raw[:] = 0
+        self._c64 = None
+        if self._shadow is not None:
+            self._shadow[:] = 0
+
+    def _shadow_slide(self, raw_fresh):
+        # mirror of the OLD pipeline: convert the fresh hop, slide the
+        # complex64 window — the reference every lazy product must equal
+        k = len(raw_fresh) // 2
+        f = self._convert(raw_fresh)
+        if k >= self.win_n:
+            self._shadow[:] = f[-self.win_n:]
+        else:
+            self._shadow[:self.win_n - k] = self._shadow[k:]
+            self._shadow[self.win_n - k:] = f
+
+    def _vfail(self, tag):
+        self.verify_fails += 1
+        print(f"[LAZY-VERIFY] MISMATCH ({tag}) — lazy product is NOT "
+              f"bit-exact!", file=sys.stderr, flush=True)
+
+    # ---- lazy consumers ----------------------------------------------------
+    def seg(self, start, n):
+        """complex64 of window samples [start, start+n).  May be a VIEW of
+        the materialized window — transient use only (see seg_owned)."""
+        if self._c64 is not None:
+            out = self._c64[start:start + n]
+        else:
+            out = self._convert(self.raw[start * 2:(start + n) * 2])
+        if self._shadow is not None and not np.array_equal(
+                out, self._shadow[start:start + n]):
+            self._vfail(f'seg {start}+{n}')
+        return out
+
+    def seg_owned(self, start, n):
+        """Like seg() but always a private allocation (retainer-safe)."""
+        if self._c64 is not None:
+            out = self._c64[start:start + n].copy()
+        else:
+            out = self._convert(self.raw[start * 2:(start + n) * 2])
+        if self._shadow is not None and not np.array_equal(
+                out, self._shadow[start:start + n]):
+            self._vfail(f'seg_owned {start}+{n}')
+        return out
+
+    def strided(self, step):
+        """complex64 equivalent of buf[::step] (saturation probe)."""
+        if self._c64 is not None:
+            out = self._c64[::step]
+        else:
+            pairs = self.raw.reshape(self.win_n, 2)[::step]
+            f = np.empty(pairs.shape, dtype=np.float32)
+            np.multiply(pairs, self._scale, out=f, casting='unsafe')
+            if _IQ_INVERT:
+                f[:, 1] *= -1.0
+            out = f.reshape(-1).view(np.complex64)
+        if self._shadow is not None and not np.array_equal(
+                out, self._shadow[::step]):
+            self._vfail(f'strided {step}')
+        return out
+
+    def welch(self, off, n, nfft=4096, n_avg=64, also_max=False):
+        """welch_psd over window samples [off, off+n) — converts only the
+        n_avg segment starts the Welch actually reads (the quiet-window
+        enabler: 50x4096 samples instead of the whole window)."""
+        if self._c64 is not None:
+            res = welch_psd(self._c64[off:off + n], nfft=nfft,
+                            n_avg=n_avg, also_max=also_max)
+        else:
+            res = _welch_psd_from(n, lambda s, m: self.seg(off + s, m),
+                                  nfft=nfft, n_avg=n_avg, also_max=also_max)
+        if self._shadow is not None:
+            ref = welch_psd(self._shadow[off:off + n], nfft=nfft,
+                            n_avg=n_avg, also_max=also_max)
+            ok = (np.array_equal(res[0], ref[0])
+                  and np.array_equal(res[1], ref[1])) if also_max else \
+                np.array_equal(res, ref)
+            if not ok:
+                self._vfail(f'welch {off}+{n}')
+        return res
+
+    def materialize(self):
+        """The FULL complex64 window — converted at most once per window
+        into the persistent prealloc target (returns the cached view on
+        repeat calls within the same window)."""
+        if self._c64 is None:
+            if self._matf is None:
+                self._matf = np.empty(self.win_n * 2, dtype=np.float32)
+            self._c64 = self._convert(self.raw, out=self._matf)
+            if self._shadow is not None and not np.array_equal(
+                    self._c64, self._shadow):
+                self._vfail('materialize')
+        return self._c64
 
 
 def _emit_psd_frame(path, psd_db, out_bins=512, span_db=55.0):
@@ -6777,6 +7070,22 @@ def main():
     print(f"Listening...\n", file=sys.stderr)
 
     buf = np.zeros(win_n, dtype=np.complex64)
+    # ---- LAZY INT16 QUIET WINDOW (see _LAZY at module top) ----
+    # Enabled for serial detect and hybrid dispatch (the low-core hosts the
+    # quiet-window win targets).  Pooled NON-hybrid hosts keep the eager
+    # path: they dispatch EVERY window to a pool slot, so nothing is quiet,
+    # and the reader's convert-ahead overlap is worth more there.
+    # While _lz is active, `buf` is None on quiet windows and is bound to
+    # _lz.materialize() (a persistent reused buffer, same retention rules
+    # as the old in-place-slid window) whenever the peak list is non-empty.
+    _lz = None
+    if _LAZY and (_pool is None or _hybrid):
+        _lz = _LazyWindow(win_n, a.format == 'sc16')
+        buf = None
+        print(f"Lazy quiet window: ON (raw "
+              f"{'int16' if a.format == 'sc16' else 'int8'} slide, "
+              f"materialize on gate peaks"
+              f"{', VERIFY' if _LAZY_VERIFY else ''})", file=sys.stderr)
     pre_hop = None   # wideband data immediately before buf — for recording lookback
     from collections import deque as _deque
     _slow_halves = _deque(maxlen=8)   # last 8 hops = contiguous 4 s for the slow pass
@@ -7179,15 +7488,19 @@ def main():
         # here and read fewer fresh samples — keeps the audio timeline
         # contiguous and prevents 38ms-per-iter cumulative gap.
         carry_n = len(_carry_tail) if _carry_tail is not None else 0
+        if _lz is not None:
+            carry_n //= 2      # lazy carries are RAW interleaved I,Q elems
         fresh_n = max(0, hop_n - carry_n)
         if is_live:
             if fresh_n > 0:
-                result = reader.read(fresh_n, owned=_hop_owned)
+                result = (reader.read_raw(fresh_n) if _lz is not None
+                          else reader.read(fresh_n, owned=_hop_owned))
                 if result[0] is None:
                     break
                 iq_fresh, skipped = result
             else:
-                iq_fresh, skipped = np.zeros(0, dtype=np.complex64), 0
+                iq_fresh, skipped = (_lz.empty_raw() if _lz is not None
+                                     else np.zeros(0, dtype=np.complex64)), 0
 
             if skipped > 0:
                 # Temporal discontinuity — reset state
@@ -7210,7 +7523,11 @@ def main():
                           file=sys.stderr, flush=True)
                 # Reset the sliding window — fill entirely from scratch
                 buf_pos = 0
-                buf = np.zeros(win_n, dtype=np.complex64)
+                if _lz is not None:
+                    _lz.reset()
+                    buf = None
+                else:
+                    buf = np.zeros(win_n, dtype=np.complex64)
                 pre_hop = None
                 _prehop_hist.clear()   # abs continuity broken by the rebuild
                 _slice_cache.clear()
@@ -7220,11 +7537,13 @@ def main():
                     recorder.reset_prev()
         else:
             if fresh_n > 0:
-                iq_fresh = reader.read(fresh_n, owned=_hop_owned)
+                iq_fresh = (reader.read_raw(fresh_n) if _lz is not None
+                            else reader.read(fresh_n, owned=_hop_owned))
                 if iq_fresh is None:
                     break
             else:
-                iq_fresh = np.zeros(0, dtype=np.complex64)
+                iq_fresh = (_lz.empty_raw() if _lz is not None
+                            else np.zeros(0, dtype=np.complex64))
 
         if _carry_tail is not None and len(_carry_tail) > 0:
             iq = np.concatenate([_carry_tail, iq_fresh]) if len(iq_fresh) > 0 else _carry_tail
@@ -7232,16 +7551,23 @@ def main():
             iq = iq_fresh
         _carry_tail = None
 
-        tot_s += len(iq)
-        if len(iq) >= win_n:
+        # In lazy mode `iq` is RAW interleaved elems — 2 per IQ sample.
+        _n_iq = (len(iq) // 2) if _lz is not None else len(iq)
+        tot_s += _n_iq
+        if _n_iq >= win_n:
             pre_hop = None   # full replacement — no valid lookback
-            # RETAINS A VIEW of iq across iterations — safe because iq is
-            # always OWNED here: a concatenate result, an owned=True tail
-            # read (_carry_tail), or an owned=_hop_owned hop read (this
-            # branch needs len(iq_fresh) >= win_n, i.e. hop_n >= win_n).
-            buf = iq[-win_n:]
+            if _lz is not None:
+                # set_full COPIES, so the reader's reused raw buffer is safe
+                _lz.set_full(iq)
+                buf = None
+            else:
+                # RETAINS A VIEW of iq across iterations — safe because iq is
+                # always OWNED here: a concatenate result, an owned=True tail
+                # read (_carry_tail), or an owned=_hop_owned hop read (this
+                # branch needs len(iq_fresh) >= win_n, i.e. hop_n >= win_n).
+                buf = iq[-win_n:]
         else:
-            sh = win_n - len(iq)
+            sh = win_n - _n_iq
             # Save the data about to slide off: it immediately precedes the new
             # window and is contiguous with it.  Used as recording lookback so
             # the decoder always sees the full preamble even when it started
@@ -7256,7 +7582,7 @@ def main():
                 #
                 # The OLD (pre-slide) buf spans abs [tot_s-len(iq)-win_n,
                 # tot_s-len(iq)); pre_hop's abs range is [_ph0, _ph1).
-                _ph1 = tot_s - len(iq) - win_n + hop_n
+                _ph1 = tot_s - _n_iq - win_n + hop_n
                 _ph0 = _ph1 - _max_pre_hop_n
                 _ph_ref = None
                 if _prehop_ref_on:
@@ -7268,18 +7594,30 @@ def main():
                             break
                 if _ph_ref is not None:
                     if _prehop_verify:
-                        _fresh = buf[hop_n - _max_pre_hop_n:hop_n]
+                        _fresh = (buf[hop_n - _max_pre_hop_n:hop_n]
+                                  if _lz is None else
+                                  _lz.seg(hop_n - _max_pre_hop_n,
+                                          _max_pre_hop_n))
                         if not np.array_equal(_ph_ref, _fresh):
                             print("[PREHOP-REF] MISMATCH — reference is NOT "
                                   "bit-exact!", file=sys.stderr, flush=True)
                     pre_hop = _ph_ref          # zero-copy view of owned array
                     _prehop_ref_hits += 1
                 else:
-                    pre_hop = buf[hop_n - _max_pre_hop_n:hop_n].copy()
+                    # lazy: seg_owned converts JUST this pre-slide segment
+                    # (fresh private allocation — same retention as .copy())
+                    pre_hop = (buf[hop_n - _max_pre_hop_n:hop_n].copy()
+                               if _lz is None else
+                               _lz.seg_owned(hop_n - _max_pre_hop_n,
+                                             _max_pre_hop_n))
                     _prehop_copies += 1
-            buf[:sh] = buf[len(iq):]
-            buf[sh:] = iq
-        buf_pos += len(iq)
+            if _lz is not None:
+                _lz.slide(iq)      # 40 MB raw slide vs 320 MB c64 traffic
+                buf = None         # nothing may touch buf until materialized
+            else:
+                buf[:sh] = buf[len(iq):]
+                buf[sh:] = iq
+        buf_pos += _n_iq
         if buf_pos < win_n:
             continue
         _prof['read'] += time.time() - _t_step
@@ -7301,10 +7639,15 @@ def main():
         # so this change only HELPS short-preamble signals; long ones are
         # unaffected.
         if _maxhold:
-            _psd_gate, _psd_gmax = welch_psd(buf, nfft=4096, n_avg=50, also_max=True)
+            _psd_gate, _psd_gmax = (
+                _lz.welch(0, win_n, n_avg=50, also_max=True)
+                if _lz is not None else
+                welch_psd(buf, nfft=4096, n_avg=50, also_max=True))
             _notch_psd(_psd_gate)
         else:
-            _psd_gate, _psd_gmax = welch_psd(buf, nfft=4096, n_avg=50), None
+            _psd_gate, _psd_gmax = (
+                _lz.welch(0, win_n, n_avg=50) if _lz is not None
+                else welch_psd(buf, nfft=4096, n_avg=50)), None
             _notch_psd(_psd_gate)
         if a.dc_notch > 0:
             _fres = a.rate / 4096
@@ -7359,17 +7702,27 @@ def main():
         _short_n = int(_SHORT_WIN_S * a.rate)
         _short_step = max(1, int(_short_n * (1 - _SHORT_OVERLAP)))
         _short_peaks_all = []
-        _n_short_slices = max(0, (len(buf) - _short_n) // _short_step + 1)
+        _n_short_slices = max(0, ((win_n if _lz is not None else len(buf))
+                                  - _short_n) // _short_step + 1)
         for _si in range(_n_short_slices):
             _ss = _si * _short_step
-            _seg = buf[_ss:_ss + _short_n]
+            _seg = buf[_ss:_ss + _short_n] if _lz is None else None
             # Absolute sample index of this slice's first sample (buf[0] is
             # at tot_s - win_n).  The cache key — identical across windows
             # for the same physical samples.
             _abs_start = tot_s - win_n + _ss
             _cs = _slice_cache.get(_abs_start) if _slice_cache_on else None
             if _cs is None:
-                if _maxhold:
+                if _lz is not None:
+                    # lazy: only this slice's ~10 Welch segments convert
+                    if _maxhold:
+                        _pw, _pw_max = _lz.welch(_ss, _short_n,
+                                                 n_avg=_SHORT_N_AVG,
+                                                 also_max=True)
+                    else:
+                        _pw, _pw_max = _lz.welch(_ss, _short_n,
+                                                 n_avg=_SHORT_N_AVG), None
+                elif _maxhold:
                     _pw, _pw_max = welch_psd(_seg, nfft=4096,
                                              n_avg=_SHORT_N_AVG, also_max=True)
                 else:
@@ -7384,7 +7737,15 @@ def main():
                 _slice_cache_hits += 1
                 if _slice_cache_verify:
                     # Recompute fresh and assert the cache is bit-exact.
-                    if _maxhold:
+                    if _lz is not None:
+                        if _maxhold:
+                            _vw, _vw_max = _lz.welch(_ss, _short_n,
+                                                     n_avg=_SHORT_N_AVG,
+                                                     also_max=True)
+                        else:
+                            _vw, _vw_max = _lz.welch(_ss, _short_n,
+                                                     n_avg=_SHORT_N_AVG), None
+                    elif _maxhold:
                         _vw, _vw_max = welch_psd(_seg, nfft=4096,
                                                  n_avg=_SHORT_N_AVG,
                                                  also_max=True)
@@ -7702,7 +8063,9 @@ def main():
         # was ~250 ms per iteration — over a quarter of the hop budget.  We
         # subsample by 32× (give us ~875 k samples, plenty for a statistical
         # estimate) and use np.abs() on the subsample only.  Total < 8 ms.
-        _sub = buf[::32]
+        # lazy: strided() converts just the 1/32 subsample (bit-exact); it
+        # reuses the materialized window when one exists.
+        _sub = _lz.strided(32) if _lz is not None else buf[::32]
         _abs_sub = np.abs(_sub)
         _peak_amp = float(_abs_sub.max())
         _sat_frac = float(np.count_nonzero(_abs_sub > _clip_thresh)) / len(_abs_sub)
@@ -7786,6 +8149,12 @@ def main():
             while _pool.n_free() == 0:
                 _commit_oldest()
             _slot = _pool.acquire_slot()
+            if _lz is not None and buf is None:
+                # MATERIALIZATION TRIGGER (pool): every dispatched window
+                # needs the full c64 window in its slot — commits rebuild
+                # pending packet tails from TRAILING in-flight windows, so
+                # even a no-peak window's slot data can be read later.
+                buf = _lz.materialize()
             _pool.slot_array(_slot)[:len(buf)] = buf
             _pool.dispatch(_slot, _seq, len(buf), _psd_gate, _gate_peaks,
                            spur_db=_spur_db, center=_live_center_mhz,
@@ -7816,15 +8185,31 @@ def main():
             _prof['detect'] += dt
             _t_step = time.time()
         else:
-            dets = detect_preamble(buf, a.rate, a.bandwidth, _live_center_mhz,
-                                   sc_threshold=a.threshold,
-                                   ethresh=a.energy_threshold,
-                                   spur_db=_spur_db, dc_notch_mhz=a.dc_notch,
-                                   spur_notch_hz=_spur_notch_hz or None,
-                                   debug=a.debug,
-                                   cached_psd=_psd_gate,
-                                   cached_peaks=_gate_peaks,
-                                   dechirp_chans=(_win_chans or None))
+            if _lz is not None and not _gate_peaks:
+                # LAZY quiet window: with an empty cached-peaks list
+                # detect_preamble returns [] BEFORE it ever touches iq
+                # (`if not peaks: return []` precedes the FFT cache and the
+                # dechirp_chans use) — skip the call so the raw window never
+                # materializes.  The peak list here is FINAL: real 1s/max-
+                # hold peaks, short-sweep merges, channelizer forced peaks
+                # and patience placeholders were all appended above, so any
+                # of them firing lands in _gate_peaks and takes the else.
+                dets = []
+            else:
+                if _lz is not None and buf is None:
+                    # MATERIALIZATION TRIGGER (inline detect): peaks exist
+                    buf = _lz.materialize()
+                dets = detect_preamble(buf, a.rate, a.bandwidth,
+                                       _live_center_mhz,
+                                       sc_threshold=a.threshold,
+                                       ethresh=a.energy_threshold,
+                                       spur_db=_spur_db,
+                                       dc_notch_mhz=a.dc_notch,
+                                       spur_notch_hz=_spur_notch_hz or None,
+                                       debug=a.debug,
+                                       cached_psd=_psd_gate,
+                                       cached_peaks=_gate_peaks,
+                                       dechirp_chans=(_win_chans or None))
             dt = time.time() - tw; elapsed = time.time() - t_start
             _prof['detect'] += dt
             _t_step = time.time()
@@ -7876,12 +8261,22 @@ def main():
                 if os.environ.get('LORA_NO_DEFER'):
                     # owned: the tail is retained as _carry_tail across the
                     # next read (and can become `buf` via iq[-win_n:])
-                    tail_data, tail_skipped = reader.read(_max_tail_n,
-                                                          owned=True)
-                    if tail_data is not None:
-                        pre_tail = tail_data
-                        tot_s += len(pre_tail)
-                        _carry_tail = pre_tail
+                    if _lz is not None:
+                        # lazy: read the tail RAW (owned — retained as the
+                        # raw carry) and convert once for the recorder
+                        tail_data, tail_skipped = reader.read_raw(
+                            _max_tail_n, owned=True)
+                        if tail_data is not None:
+                            pre_tail = _lz.convert_owned(tail_data)
+                            tot_s += len(pre_tail)
+                            _carry_tail = tail_data
+                    else:
+                        tail_data, tail_skipped = reader.read(_max_tail_n,
+                                                              owned=True)
+                        if tail_data is not None:
+                            pre_tail = tail_data
+                            tot_s += len(pre_tail)
+                            _carry_tail = pre_tail
                     if tail_skipped:
                         tot_skip += tail_skipped
                 else:
@@ -7902,11 +8297,20 @@ def main():
                 if _max_tail_n > 0:
                     # owned: retained as _carry_tail across the next read
                     # (and can become `buf` via iq[-win_n:])
-                    tail_data = reader.read(_max_tail_n, owned=True)
-                    if tail_data is not None:
-                        pre_tail = tail_data
-                        tot_s += len(pre_tail)
-                        _carry_tail = pre_tail
+                    if _lz is not None:
+                        # lazy: RAW tail (owned by construction — a fresh
+                        # frombuffer view) + one conversion for the recorder
+                        tail_data = reader.read_raw(_max_tail_n)
+                        if tail_data is not None:
+                            pre_tail = _lz.convert_owned(tail_data)
+                            tot_s += len(pre_tail)
+                            _carry_tail = tail_data
+                    else:
+                        tail_data = reader.read(_max_tail_n, owned=True)
+                        if tail_data is not None:
+                            pre_tail = tail_data
+                            tot_s += len(pre_tail)
+                            _carry_tail = pre_tail
 
             _prof['tail'] += time.time() - _t_step
             _t_step = time.time()
@@ -7925,13 +8329,22 @@ def main():
         # from the last 6 hops), and only the triggering peaks are
         # processed (cached_peaks seeds — no long-buffer PSD). Idle cost
         # ~zero; ambient junk flickers and never accumulates the streak.
-        _hop_own = buf[-hop_n:].copy()   # ONE owned copy per hop, shared
+        _hop_own = (_lz.seg_owned(max(0, win_n - hop_n),
+                                  min(hop_n, win_n))
+                    if _lz is not None else
+                    buf[-hop_n:].copy())
+                                         # ONE owned copy per hop, shared
                                          # by the slow assembly AND every
                                          # pending tail (feed_tail holds
                                          # REFS — a view of the sliding
                                          # buf would mutate under them,
                                          # which zeroed straddler decodes
-                                         # on the first zero-copy attempt)
+                                         # on the first zero-copy attempt).
+                                         # Lazy: seg_owned is a private
+                                         # allocation with identical bits
+                                         # (conversion is exact), whether
+                                         # converted fresh (quiet) or
+                                         # copied from the materialization.
         _slow_halves.append(_hop_own)
         # Record for pre_hop reuse: this hop covers abs [tot_s-hop_n, tot_s).
         # It is an immutable owned array (same one _slow_halves/feed_tail
@@ -8283,7 +8696,11 @@ def main():
                         recorder.break_pending(
                             f"(catchup {skip_s:.2f}s)")
                     buf_pos = 0
-                    buf = np.zeros(win_n, dtype=np.complex64)
+                    if _lz is not None:
+                        _lz.reset()
+                        buf = None
+                    else:
+                        buf = np.zeros(win_n, dtype=np.complex64)
                     pre_hop = None  # stale after skip — reset for clean SC state
                     _prehop_hist.clear()   # abs continuity broken by catchup
                     _slice_cache.clear()
