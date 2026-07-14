@@ -254,21 +254,46 @@ PATIENCE_TRIALS_PER_WIN = 2
 # (normal IQ).  Mutually exclusive with normal traffic.  GUI: Config → Advanced.
 _IQ_INVERT = os.environ.get('LORA_IQ_INVERT') == '1'
 
+# PREALLOC CONVERSION BUFFERS (2026-07-13, measured low-core ceiling item 1):
+# the int->float32 hop conversion used to fresh-alloc ~80 MB per hop (file
+# mode: astype + separate /= = two passes; live: np.empty per _convert_span)
+# — the first-touch page faults alone cost ~23 ms/hop at 20 Msps.  Reusing
+# preallocated buffers (single fused np.multiply into them) measured
+# 23.4 -> 8.3 ms/hop file-mode.  OWNERSHIP RULE for reused buffers: a
+# buffer returned by IQReader.read()/StreamBuffer.read() with owned=False
+# is valid ONLY until the caller's next read() call on that reader; any
+# caller that retains the data past its next read (e.g. tail reads kept
+# as _carry_tail, or hop reads when hop_n >= win_n where buf becomes a
+# view of the returned array) MUST pass owned=True to get a fresh
+# allocation.  LORA_PREALLOC=0 restores the old always-fresh behavior.
+_PREALLOC = os.environ.get('LORA_PREALLOC', '1') != '0'
+
 
 class IQReader:
     def __init__(self, fp, fmt='sc16'):
         self.fp, self.sc16 = fp, (fmt == 'sc16')
         self.bps = 4 if self.sc16 else 2
-    def read(self, n):
+        self._scale = np.float32(1.0 / (2048.0 if self.sc16 else 128.0))
+        self._buf = None    # preallocated float32 target (see _PREALLOC note)
+    def read(self, n, owned=False):
         raw = self.fp.read(n * self.bps)
         if len(raw) < n * self.bps: return None
-        # Contiguous astype + zero-copy complex reinterpret — same conversion
-        # the live StreamBuffer path uses (bit-identical to the old strided
-        # (s[0::2]+1j*s[1::2]) form, measured 2.8x faster: 244->88 ms per
-        # 0.9 s hop at 20 Msps). Matters for file replay/regression runs.
+        # Fused scale straight into a reused buffer + zero-copy complex
+        # reinterpret — bit-identical to the old astype + /= two-pass form
+        # (scale is an exact power of two) but one pass and no 80 MB fresh
+        # alloc per hop (page faults dominated: measured 23.4 -> 8.3 ms per
+        # 0.5 s hop at 20 Msps). Matters for file replay/regression runs.
+        # owned=True callers retain the result past the next read() — give
+        # them a private allocation (see _PREALLOC ownership rule above).
         s = np.frombuffer(raw, dtype=np.int16 if self.sc16 else np.int8)
-        f = s.astype(np.float32)
-        f /= (2048.0 if self.sc16 else 128.0)
+        n_elem = n * 2
+        if owned or not _PREALLOC:
+            f = np.empty(n_elem, dtype=np.float32)
+        else:
+            if self._buf is None or len(self._buf) < n_elem:
+                self._buf = np.empty(n_elem, dtype=np.float32)
+            f = self._buf[:n_elem]
+        np.multiply(s, self._scale, out=f, casting='unsafe')
         if _IQ_INVERT:
             f[1::2] *= -1.0
         return f.view(np.complex64)
@@ -346,6 +371,20 @@ class StreamBuffer:
         self._ahead_want = None       # (pos, n) the thread is working on
         self._ahead_cv = threading.Condition(self._lock)
         self._ahead_thread = None
+        # Preallocated conversion targets (see _PREALLOC ownership rule at
+        # module top).  Three DISJOINT buffers: one for read()'s inline
+        # conversion, two alternating for the ahead worker.  Disjoint
+        # because a cancelled ahead prepare can still be mid-write when
+        # read() converts inline; two worker slots because the worker
+        # prepares hop k+1 while the consumer still holds hop k.  SAFETY
+        # ARGUMENT: every prepare is kicked from inside read(), i.e. after
+        # the previously returned buffer's lifetime ended (consumer contract:
+        # dead at its next read() call), and consecutive prepares alternate
+        # slots, so no conversion ever writes a buffer the consumer may
+        # still read.  owned=True reads bypass all of this (fresh alloc).
+        self._cvt_inline = None
+        self._ahead_bufs = [None, None]
+        self._ahead_idx = 0
 
         # Read in ~20 ms chunks.  Smaller chunks reduce pipe backpressure at
         # high sample rates while keeping per-call numpy conversion overhead low.
@@ -443,14 +482,19 @@ class StreamBuffer:
                 self._eof = True
                 break
 
-    def _convert_span(self, pos, n):
+    def _convert_span(self, pos, n, out=None):
         """Convert ring span [pos, pos+n) to complex64 WITHOUT the lock.
         Returns None if the writer lapped the span during conversion
         (caller must re-claim). Safe because the writer only ADVANCES
-        _wp; we validate no-overwrite after converting."""
+        _wp; we validate no-overwrite after converting.
+        `out`: optional preallocated float32 target (>= n*2 elems); when
+        None a fresh buffer is allocated (owned by the caller forever)."""
         start = (pos * 2) % self._ring_elems
         n_elem = n * 2
-        out = np.empty(n_elem, dtype=np.float32)
+        if out is None:
+            out = np.empty(n_elem, dtype=np.float32)
+        else:
+            out = out[:n_elem]
         end = start + n_elem
         if end <= self._ring_elems:
             segs = [(start, end, 0)]
@@ -485,6 +529,13 @@ class StreamBuffer:
                 return None        # overwritten mid-convert — stale
         return out.view(np.complex64)
 
+    @staticmethod
+    def _grown(buf, n_elem):
+        """Reuse `buf` if it fits n_elem float32 elems, else allocate."""
+        if buf is None or len(buf) < n_elem:
+            return np.empty(n_elem, dtype=np.float32)
+        return buf
+
     def _ahead_worker(self):
         while True:
             with self._lock:
@@ -502,7 +553,18 @@ class StreamBuffer:
             if not ready:
                 time.sleep(0.005)
                 continue
-            buf = self._convert_span(pos, n)
+            out = None
+            if _PREALLOC:
+                # Alternate the two worker slots per prepare: the slot of
+                # the LAST successful prepare may be the buffer the consumer
+                # is holding right now (returned via the fast path), so this
+                # prepare must target the other one (safety argument at the
+                # slot declarations in __init__).
+                self._ahead_idx = 1 - self._ahead_idx
+                self._ahead_bufs[self._ahead_idx] = self._grown(
+                    self._ahead_bufs[self._ahead_idx], n * 2)
+                out = self._ahead_bufs[self._ahead_idx]
+            buf = self._convert_span(pos, n, out=out)
             with self._lock:
                 if self._ahead_want == (pos, n):
                     self._ahead = (pos, n, buf)   # buf None if lapped
@@ -520,7 +582,7 @@ class StreamBuffer:
             self._ahead_thread.start()
         self._ahead_cv.notify_all()
 
-    def read(self, n):
+    def read(self, n, owned=False):
         """Read n IQ samples as complex64.
 
         Returns (data, skipped) where:
@@ -529,6 +591,11 @@ class StreamBuffer:
 
         Each call returns temporally contiguous data. If samples were lost,
         `skipped` > 0 indicates a temporal gap since the previous read.
+
+        OWNERSHIP (see _PREALLOC at module top): with owned=False the
+        returned array may be a reused preallocated buffer, valid only
+        until this reader's next read(); pass owned=True when the caller
+        retains the data past that (a private copy/allocation is returned).
         """
         # convert-ahead fast path: the prepared buffer matches our rp/n
         while True:
@@ -540,7 +607,10 @@ class StreamBuffer:
                         self._ahead = None
                         self._rp += n
                         self._kick_ahead(self._rp, n)
-                        return abuf, 0
+                        # prepared buffers live in the reused worker slots —
+                        # an owned read must hand out a private copy
+                        return (abuf.copy() if owned and _PREALLOC
+                                else abuf), 0
                     self._ahead = None    # stale (skip/size change)
                 if (self._ahead_want is not None
                         and self._ahead_want != (self._rp, n)):
@@ -562,7 +632,11 @@ class StreamBuffer:
             # inline conversion OUTSIDE the lock — holding it for the
             # whole ~150 ms stalled the WRITER thread (pipe backpressure
             # at exactly the moments the ring most needed draining)
-            data = self._convert_span(pos, n)
+            if owned or not _PREALLOC:
+                data = self._convert_span(pos, n)
+            else:
+                self._cvt_inline = self._grown(self._cvt_inline, n * 2)
+                data = self._convert_span(pos, n, out=self._cvt_inline)
             with self._lock:
                 if data is None or self._wp - pos > self._ring_n:
                     continue          # lapped mid-convert: re-claim
@@ -6681,6 +6755,13 @@ def main():
 
     win_n = int(a.rate * a.window)
     hop_n = int(win_n * (1.0 - a.overlap))
+    # Hop-read ownership (see _PREALLOC rule): at overlap > 0 (production)
+    # every hop read is fully consumed before the next read — the slide
+    # copies it into `buf` (or np.concatenate makes an owned array when a
+    # carry-tail exists) — so the reader may hand out its reused buffer.
+    # At overlap <= 0, hop_n >= win_n makes `buf = iq[-win_n:]` retain a
+    # VIEW of the returned array across iterations: reads must be owned.
+    _hop_owned = hop_n >= win_n
 
     print(f"=== LoRa Schmidl-Cox Detector ===", file=sys.stderr)
     print(f"Rate: {a.rate / 1e6:.1f}Msps  BW: {a.bandwidth / 1e6:.1f}MHz  "
@@ -7101,7 +7182,7 @@ def main():
         fresh_n = max(0, hop_n - carry_n)
         if is_live:
             if fresh_n > 0:
-                result = reader.read(fresh_n)
+                result = reader.read(fresh_n, owned=_hop_owned)
                 if result[0] is None:
                     break
                 iq_fresh, skipped = result
@@ -7139,7 +7220,7 @@ def main():
                     recorder.reset_prev()
         else:
             if fresh_n > 0:
-                iq_fresh = reader.read(fresh_n)
+                iq_fresh = reader.read(fresh_n, owned=_hop_owned)
                 if iq_fresh is None:
                     break
             else:
@@ -7154,6 +7235,10 @@ def main():
         tot_s += len(iq)
         if len(iq) >= win_n:
             pre_hop = None   # full replacement — no valid lookback
+            # RETAINS A VIEW of iq across iterations — safe because iq is
+            # always OWNED here: a concatenate result, an owned=True tail
+            # read (_carry_tail), or an owned=_hop_owned hop read (this
+            # branch needs len(iq_fresh) >= win_n, i.e. hop_n >= win_n).
             buf = iq[-win_n:]
         else:
             sh = win_n - len(iq)
@@ -7789,7 +7874,10 @@ def main():
                 # is tiny (and still bounded by the 3-job cap).
                 _max_tail_n = min(int(_max_pkt_s * a.rate), 24 * win_n)
                 if os.environ.get('LORA_NO_DEFER'):
-                    tail_data, tail_skipped = reader.read(_max_tail_n)
+                    # owned: the tail is retained as _carry_tail across the
+                    # next read (and can become `buf` via iq[-win_n:])
+                    tail_data, tail_skipped = reader.read(_max_tail_n,
+                                                          owned=True)
                     if tail_data is not None:
                         pre_tail = tail_data
                         tot_s += len(pre_tail)
@@ -7812,7 +7900,9 @@ def main():
                     (148.25 * (2 ** d['sf']) / d['bw']) for d in dets)
                 _max_tail_n = min(int(_max_pkt_s * a.rate), 3 * win_n)
                 if _max_tail_n > 0:
-                    tail_data = reader.read(_max_tail_n)
+                    # owned: retained as _carry_tail across the next read
+                    # (and can become `buf` via iq[-win_n:])
+                    tail_data = reader.read(_max_tail_n, owned=True)
                     if tail_data is not None:
                         pre_tail = tail_data
                         tot_s += len(pre_tail)
