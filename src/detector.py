@@ -246,6 +246,70 @@ PATIENCE_TRIALS = [(11, 125e3), (12, 125e3), (10, 125e3), (9, 125e3),
                    (10, 250e3), (12, 250e3), (9, 250e3), (8, 125e3)]
 PATIENCE_TRIALS_PER_WIN = 2
 
+# PRESCREEN — outcome-learned persistent-junk suppression (2026-07-14,
+# measured low-core ceiling item 3).  On a junk-heavy host (Pi at 20 Msps,
+# high gain) ambient spurs/images that survive the width floor fire the FULL
+# detect path nearly every window (chunk-FFT build + per-peak extract + SC),
+# holding detect= at 1100-2700 ms/window with det=0.  Measured separability
+# (junk20 + sdr_dcspur + two60): a cheap short-slice SC score does NOT
+# separate junk from real weak LoRa (junk SC p99 0.41 vs real floors at
+# 0.41-0.60) — but the FULL-PATH OUTCOME does, perfectly (0 detections in
+# ~3000 junk peaks).  So the prescreen learns junk from outcomes: a bin whose
+# gate peak fires at >=90% duty for MINUTES while the full path yields ZERO
+# detections anywhere near it is a spur, and its peaks are suppressed BEFORE
+# detect_preamble (an all-junk window then takes the lazy quiet path — no
+# window materialization, no 160 MB chunk FFT).  DEFAULT-PERMISSIVE, layered
+# unlearn/breakthrough guards (sensitivity is sacred — floors must not move):
+#   - detections (ANY path, incl. slow-pass/pooled) purge entries within
+#     ±15 bins immediately and veto learning within ±1 MHz for ~5 min —
+#     a real repeating beacon DETECTS, so it can never stay learned;
+#     beacon duty (airtime/period, <=65% even for 9 s slow frames) also
+#     sits under the 90% duty bar;
+#   - probe windows: every PRESCREEN_PROBE_EVERY-th window ALL suppressed
+#     peaks run the full path anyway (aligned, so 15/16 junk windows stay
+#     quiet); a probe detection unlearns instantly;
+#   - breakthrough: a peak markedly stronger (>= +margin dB) or much wider
+#     than the learned spur is processed, not suppressed — a real signal
+#     rising over a spur bin is seen the same window it appears;
+#   - fast unlearn: a junk bin that stops firing for PRESCREEN_GONE_WIN
+#     windows is dropped (no stale entries waiting to eat a future signal);
+#   - never learns: near recent detections, inside channelizer learned
+#     channels, or on patience-promoted carriers (their forced peaks are
+#     appended AFTER this hook and are never touched by it).
+# LORA_PRESCREEN=0 kill switch: restores current behavior verbatim.
+# LORA_PRESCREEN_VERIFY=1: learning + would-suppress bookkeeping run but
+# NOTHING is suppressed; every real detection is checked against recently
+# would-suppressed bins and any match increments the DEAFNESS counter
+# (printed in the end-of-run summary — must be 0 across the corpus).
+PRESCREEN_ON = os.environ.get('LORA_PRESCREEN', '1') != '0'
+PRESCREEN_VERIFY = os.environ.get('LORA_PRESCREEN_VERIFY') == '1'
+# decay horizon (windows) of the duty statistic; cold-start learn time is
+# ~1.6x this (seen must reach 80% of horizon), ~2.3x for a spur appearing
+# later — minutes at the production 0.5 s hop, so short captures and the
+# sensitivity battery never learn anything at all.
+def _psenv(name, dflt, cast, lo=None):
+    # Per-knob parse with fallback (pattern: RAM-cap _envf): a malformed or
+    # out-of-range value warns + uses the default instead of crashing the
+    # detector at import (int('x')) or later (PROBE=0 -> ZeroDivisionError).
+    _v = os.environ.get(name)
+    if not _v:
+        return dflt
+    try:
+        _x = cast(_v)
+        if lo is not None and _x < lo:
+            raise ValueError('below minimum %r' % lo)
+        return _x
+    except ValueError:
+        print('[GATE] ignoring malformed %s=%r (using %r)' % (name, _v, dflt),
+              file=sys.stderr, flush=True)
+        return dflt
+PRESCREEN_LEARN_WIN = _psenv('LORA_PRESCREEN_LEARN_WIN', 120, int, lo=2)
+PRESCREEN_DUTY = _psenv('LORA_PRESCREEN_DUTY', 0.90, float, lo=0.05)
+PRESCREEN_PROBE_EVERY = _psenv('LORA_PRESCREEN_PROBE', 16, int, lo=1)
+PRESCREEN_MARGIN_DB = _psenv('LORA_PRESCREEN_MARGIN_DB', 6.0, float)
+PRESCREEN_GONE_WIN = _psenv('LORA_PRESCREEN_GONE_WIN', 20, int, lo=1)
+PRESCREEN_CAP = 64        # max simultaneously-learned junk bins
+
 # IQ inversion: when set, conjugate the input stream (negate Q) so an IQ-inverted
 # transmitter — LoRaWAN downlink, satellite / tinyGS configs with Invert-IQ on —
 # decodes.  It must happen at the stream input, before detection: the detector's
@@ -6946,6 +7010,77 @@ def main():
                  int(PATIENCE_DUTY_MAX * 100), PATIENCE_CAP, PATIENCE_TTL_WIN),
               file=sys.stderr, flush=True)
 
+    # [PRESCREEN] outcome-learned persistent-junk state (see constants at
+    # top).  _jk_hits: per-bin decayed gate-peak hit counts (spread ±2 so
+    # window-to-window centroid jitter doesn't split a spur's duty across
+    # neighbours); _jk_seen: matching decayed window count (scalar — hits and
+    # seen share one recursion so a 100%-duty bin reads duty≈1 at any age,
+    # and the seen>=0.8*horizon gate is what enforces the minutes-long
+    # observation); _jk_elev/_jk_wid: EMA elevation (dB over window floor) /
+    # contour width per bin while unlearned — frozen into the entry at learn
+    # time as the breakthrough reference; _jk_junk: bin -> [elev_ref,
+    # width_ref, last_fire_wc]; _jk_det_bins: bin -> last wc a REAL detection
+    # published there (any path — the learn veto).
+    _jk_hits = np.zeros(4096, np.float32)
+    _jk_seen = 0.0
+    _jk_elev = np.zeros(4096, np.float32)
+    _jk_wid = np.zeros(4096, np.float32)
+    _jk_junk = {}
+    _jk_det_bins = {}
+    _jk_deaf = 0                 # VERIFY: prescreen-rejected peak turned into
+                                 # a full-path detection (must stay 0)
+    _jk_verify_recent = __import__('collections').deque()
+    _jk_sup_peaks = 0            # peaks suppressed (or would-be, in VERIFY)
+    _jk_sup_windows = 0          # windows fully quieted by suppression
+
+    def _jk_note_detection(_freq_hz):
+        """A REAL detection published at _freq_hz (any path: inline, pooled
+        commit, slow-pass): record the bin, zero accumulated junk-hits around
+        it and UNLEARN any junk entry near it — a detecting carrier is never
+        junk.  VERIFY mode: match the detection against recently
+        would-suppressed bins; any hit is a deafness event."""
+        nonlocal _jk_deaf
+        if not PRESCREEN_ON:
+            return
+        _b = 2048 + int(round((_freq_hz - _live_center_mhz * 1e6)
+                              / (a.rate / 4096.0)))
+        if not (0 <= _b < 4096):
+            return
+        _jk_det_bins[_b] = wc
+        _jk_hits[max(0, _b - 15):min(4096, _b + 16)] = 0.0
+        for _jb in [j for j in _jk_junk if abs(j - _b) <= 15]:
+            print('[PRESCREEN] unlearned %.4fMHz — real detection at the bin'
+                  % ((_live_center_mhz * 1e6
+                      + (_jb - 2048) * (a.rate / 4096.0)) / 1e6),
+                  file=sys.stderr, flush=True)
+            del _jk_junk[_jb]
+        if PRESCREEN_VERIFY:
+            while _jk_verify_recent and wc - _jk_verify_recent[0][0] > 40:
+                _jk_verify_recent.popleft()
+            # width-adaptive match: wide-BW gate centroids err up to ±bw/2
+            # (g500 lesson), so a fixed ±3-bin match would MISS real
+            # deafness on wide presets — the instrument must over-report,
+            # never under-report.
+            for _vwc, _vbins in _jk_verify_recent:
+                if any(abs(_b - _vb) <= max(3, _vhw + 2)
+                       for _vb, _vhw in _vbins):
+                    _jk_deaf += 1
+                    print('[PRESCREEN-DEAF] detection at %.4fMHz matches a '
+                          'bin the prescreen would have suppressed (wc %d) — '
+                          'deafness counter now %d'
+                          % (_freq_hz / 1e6, _vwc, _jk_deaf),
+                          file=sys.stderr, flush=True)
+                    break
+
+    if PRESCREEN_ON:
+        print('[GATE] prescreen (junk learner)%s: duty>=%d%% over ~%d-win '
+              'horizon, probe every %d, margin %+.1f dB, gone %d win, cap %d'
+              % (' [VERIFY — nothing suppressed]' if PRESCREEN_VERIFY else '',
+                 int(PRESCREEN_DUTY * 100), PRESCREEN_LEARN_WIN,
+                 PRESCREEN_PROBE_EVERY, PRESCREEN_MARGIN_DB,
+                 PRESCREEN_GONE_WIN, PRESCREEN_CAP),
+              file=sys.stderr, flush=True)
+
     # Build the multiprocess detect pool FIRST — before any reader/recorder/
     # decoder THREAD starts.  Forking a multithreaded process inherits the
     # other threads' held locks and the workers deadlock (the live gate hung
@@ -7325,6 +7460,7 @@ def main():
             if d.get('patience_trial'):
                 continue   # acquisition-internal: publish only on decode confirm
             _pat_note_detection(d['freq_hz'])
+            _jk_note_detection(d['freq_hz'])
             tot_d += 1
             _abst = it['tot_s'] / a.rate + d.get('preamble_t_s', 0.0)
             _bwq = (f" bwq={d['bw_quality_db']:.0f}dB abst={_abst:.2f}s"
@@ -7465,6 +7601,20 @@ def main():
                             _pat_hits[:] = 0.0
                             _pat_seen[:] = 0.0
                             _pat_promoted.clear()
+                            # [PRESCREEN] junk state is bin-indexed too: a
+                            # retune would remap every learned spur onto an
+                            # arbitrary NEW frequency and suppress real
+                            # signals there.  Hard reset (permissive: junk
+                            # re-earns over the full horizon, nothing is
+                            # ever suppressed at a wrong frequency).
+                            if PRESCREEN_ON:
+                                _jk_hits[:] = 0.0
+                                _jk_elev[:] = 0.0
+                                _jk_wid[:] = 0.0
+                                _jk_seen = 0.0
+                                _jk_junk.clear()
+                                _jk_det_bins.clear()
+                                _jk_verify_recent.clear()
                     # LIVE CHANNEL APPLY (channel-acquisition phase B): the web
                     # writes the channelizer's fed set here so a changed set
                     # (new learn, seed edit, enable toggle) takes effect WITHOUT
@@ -7857,6 +8007,128 @@ def main():
             _pat_hits += _exc_pat
             _pat_seen += _pat_obs
 
+        # ---- [PRESCREEN] outcome-learned persistent-junk suppression ----
+        # Sits AFTER patience accumulation (its masks see the untouched peak
+        # list) and BEFORE the throttle + channelizer/patience forced-peak
+        # appends (forced peaks are never suppressed; shedding junk here also
+        # stops junk from eating throttle cap slots that would otherwise
+        # push out weak REAL peaks).  If every peak in a window is learned
+        # junk, _gate_peaks empties and the window takes the lazy quiet path
+        # below — no materialization, no chunk-FFT, no per-peak work.
+        _jk_sup_this_win = False     # suppressed junk fired here (AGC busy)
+        if PRESCREEN_ON:
+            _jk_decay = 1.0 - 1.0 / PRESCREEN_LEARN_WIN
+            _jk_seen = _jk_seen * _jk_decay + 1.0
+            _jk_hits *= _jk_decay
+            _jk_floor = float(np.median(_psd_gate))
+            for _pk in _gate_peaks:
+                _jb0 = int(_pk[0])
+                if not (0 <= _jb0 < 4096):
+                    continue
+                _jk_hits[max(0, _jb0 - 2):min(4096, _jb0 + 3)] += 1.0
+                _je = float(_pk[2]) - _jk_floor
+                _jw = float(_pk[1])
+                if _jk_elev[_jb0] > 0.0:
+                    _jk_elev[_jb0] += 0.2 * (_je - _jk_elev[_jb0])
+                    _jk_wid[_jb0] += 0.2 * (_jw - _jk_wid[_jb0])
+                else:
+                    _jk_elev[_jb0] = _je
+                    _jk_wid[_jb0] = _jw
+            # fast unlearn: spur vanished (its bin stopped firing) — drop the
+            # entry so a future real signal there is never met by stale junk
+            for _jb0 in [j for j, r in _jk_junk.items()
+                         if wc - r[2] > PRESCREEN_GONE_WIN]:
+                print('[PRESCREEN] unlearned %.4fMHz — bin stopped firing'
+                      % ((_live_center_mhz * 1e6
+                          + (_jb0 - 2048) * (a.rate / 4096.0)) / 1e6),
+                      file=sys.stderr, flush=True)
+                del _jk_junk[_jb0]
+            # learn scan (cheap, every 8 windows): a bin at >=duty for the
+            # full horizon with no detection anywhere near it is a spur
+            if ((wc & 7) == 0 and len(_jk_junk) < PRESCREEN_CAP
+                    and _jk_seen >= 0.8 * PRESCREEN_LEARN_WIN):
+                for _db0 in [k for k, v in _jk_det_bins.items()
+                             if wc - v > 600]:
+                    del _jk_det_bins[_db0]
+                _jcand = np.where(_jk_hits >= PRESCREEN_DUTY * _jk_seen)[0]
+                _fres_jk = a.rate / 4096.0
+                _cen_jk = _live_center_mhz * 1e6
+                for _cb in _jcand[np.argsort(-_jk_hits[_jcand])]:
+                    if len(_jk_junk) >= PRESCREEN_CAP:
+                        break
+                    _cb = int(_cb)
+                    if any(abs(_cb - _jb0) <= 4 for _jb0 in _jk_junk):
+                        continue            # already-learned cluster
+                    if any(abs(_cb - _db0) <= 205 and wc - _dwc0 <= 600
+                           for _db0, _dwc0 in _jk_det_bins.items()):
+                        continue            # real traffic within ±1 MHz
+                    if any(abs((_cc0 - _cen_jk) / _fres_jk + 2048 - _cb)
+                           < max(3.0, _bw0 / _fres_jk) + 4
+                           for _cc0, _bw0, _sf0 in _dechirp_src):
+                        continue            # inside a channelizer channel
+                    if any(abs(_cb - _pb0) <= 12 for _pb0 in _pat_promoted):
+                        continue            # patience-promoted carrier
+                    _fe = float(_jk_elev[max(0, _cb - 2):
+                                         min(4096, _cb + 3)].max())
+                    _fw = float(_jk_wid[max(0, _cb - 2):
+                                        min(4096, _cb + 3)].max())
+                    _jk_junk[_cb] = [_fe, _fw, wc]
+                    print('[PRESCREEN] learned junk %.4fMHz (elev %.1f dB, '
+                          'w %.0f, duty %d%%, %d/%d slots) — suppressing; '
+                          'probe every %d win'
+                          % ((_cen_jk + (_cb - 2048) * _fres_jk) / 1e6, _fe,
+                             _fw,
+                             int(100 * _jk_hits[_cb] / max(_jk_seen, 1e-9)),
+                             len(_jk_junk), PRESCREEN_CAP,
+                             PRESCREEN_PROBE_EVERY),
+                          file=sys.stderr, flush=True)
+            # apply: suppress peaks on learned junk bins — except on probe
+            # windows (aligned so most junk windows go fully quiet) and for
+            # breakthrough peaks (stronger/wider than the learned spur)
+            if _jk_junk:
+                _jk_probe = (wc % PRESCREEN_PROBE_EVERY) == 0
+                _jk_kept = []
+                _jk_sup_bins = []
+                for _pk in _gate_peaks:
+                    _jb0 = int(_pk[0])
+                    _jrec = None
+                    for _jb1, _jr1 in _jk_junk.items():
+                        if abs(_jb0 - _jb1) <= 3:
+                            _jrec = _jr1
+                            break
+                    if _jrec is None:
+                        _jk_kept.append(_pk)
+                        continue
+                    _jrec[2] = wc            # junk bin still firing
+                    if _jk_probe:
+                        _jk_kept.append(_pk)     # scheduled full-path probe
+                        continue
+                    if (float(_pk[2]) - _jk_floor
+                            > _jrec[0] + PRESCREEN_MARGIN_DB):
+                        _jk_kept.append(_pk)     # breakthrough: stronger
+                        continue                 # than the learned spur
+                    if float(_pk[1]) > 2.0 * max(_jrec[1], 1.0) + 2.0:
+                        _jk_kept.append(_pk)     # much wider than the spur
+                        continue
+                    # (bin, half-width) — VERIFY's deafness match is
+                    # width-adaptive so wide-BW centroid error can't hide
+                    # a real suppression casualty
+                    _jk_sup_bins.append(
+                        (_jb0, int(round(float(_pk[1]) / 2.0)) + 1))
+                if _jk_sup_bins:
+                    _jk_sup_this_win = True
+                    _jk_sup_peaks += len(_jk_sup_bins)
+                    if PRESCREEN_VERIFY:
+                        # record only — nothing suppressed in VERIFY mode
+                        _jk_verify_recent.append((wc, tuple(_jk_sup_bins)))
+                        while (_jk_verify_recent
+                               and wc - _jk_verify_recent[0][0] > 40):
+                            _jk_verify_recent.popleft()
+                    else:
+                        _gate_peaks = _jk_kept
+                        if not _gate_peaks:
+                            _jk_sup_windows += 1
+
         # ---- Keep-up-driven peak throttle ----
         # The energy gate's job is bounding COMPUTE, not judging what's real —
         # SC + dechirp reject noise (measured: zero false positives even at
@@ -8097,7 +8369,11 @@ def main():
             # busy = the gate sees candidate peaks this window — a climb could
             # glitch an in-flight packet, so only climb on a truly idle band.
             # Backing off under sustained clip is never blocked by busy.
-            _agc.observe(_sat_frac > 0.005, busy=bool(_gate_peaks),
+            # busy: OR in prescreen-suppressed junk — suppression must not
+            # change what the AGC sees (a spur-only band previously blocked
+            # gain climbs; keep that behavior identical with prescreen on).
+            _agc.observe(_sat_frac > 0.005,
+                         busy=bool(_gate_peaks) or _jk_sup_this_win,
                          clip_frac=_sat_frac)
 
         _prof['sat'] += time.time() - _t_step
@@ -8227,6 +8503,7 @@ def main():
                 if d.get('patience_trial'):
                     continue   # acquisition-internal: publish only on decode confirm
                 _pat_note_detection(d['freq_hz'])
+                _jk_note_detection(d['freq_hz'])
                 tot_d += 1
                 bwq = f" bwq={d['bw_quality_db']:.0f}dB" if a.debug >= 1 else ""
                 print(f"[{elapsed:6.1f}s] DETECTED freq={d['freq_mhz']:.4f}MHz "
@@ -8609,6 +8886,7 @@ def main():
             if dets_slow:
                 for d in dets_slow:
                     _pat_note_detection(d['freq_hz'])
+                    _jk_note_detection(d['freq_hz'])
                     tot_d += 1
                     _abst = ((_reg_tot_s - len(_iq_long)) / a.rate
                              + d.get('preamble_t_s', 0.0))
@@ -8818,7 +9096,12 @@ def main():
                       + (f" phref={_prehop_ref_hits}/"
                          f"{_prehop_ref_hits + _prehop_copies}"
                          if _prehop_ref_on and (_prehop_ref_hits
-                                                or _prehop_copies) else ""),
+                                                or _prehop_copies) else "")
+                      + (f" jk={_jk_sup_peaks}sup/{len(_jk_junk)}bin"
+                         f"/{_jk_sup_windows}qw"
+                         + (f"/DEAF={_jk_deaf}" if PRESCREEN_VERIFY else "")
+                         if PRESCREEN_ON and (_jk_sup_peaks or _jk_junk)
+                         else ""),
                       file=sys.stderr)
                 for k in _prof: _prof[k] = 0
                 _prof['n'] = 0
@@ -8869,6 +9152,13 @@ def main():
           + _dec_summary
           + (f" skipped={tot_skip/1e6:.1f}M" if tot_skip else ""),
           file=sys.stderr)
+    if PRESCREEN_ON and (PRESCREEN_VERIFY or _jk_sup_peaks or _jk_junk):
+        print(f"[PRESCREEN] summary: {_jk_sup_peaks} peak(s) "
+              + ('would be ' if PRESCREEN_VERIFY else '')
+              + f"suppressed, {_jk_sup_windows} window(s) fully quieted, "
+              f"{len(_jk_junk)} junk bin(s) held at EOF"
+              + (f", DEAFNESS={_jk_deaf}" if PRESCREEN_VERIFY else ""),
+              file=sys.stderr, flush=True)
     if a.file: fp.close()
 
 
