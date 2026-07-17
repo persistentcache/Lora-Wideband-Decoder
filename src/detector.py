@@ -246,6 +246,42 @@ PATIENCE_TRIALS = [(11, 125e3), (12, 125e3), (10, 125e3), (9, 125e3),
                    (10, 250e3), (12, 250e3), (9, 250e3), (8, 125e3)]
 PATIENCE_TRIALS_PER_WIN = 2
 
+
+def patience_trial_family(sf, bw):
+    """Same-slope in-ladder rung family of a fired patience-trial rung.
+
+    A strong LoRa burst clears the despread bar under SAME-SLOPE aliases
+    (slope bw^2/2^sf; partners (sf±2, bw×2^±1)) by +10-18 dB — sometimes
+    BEATING the true combo (item 8a lesson 2) — so a fired trial's (sf,bw)
+    label names a FAMILY, not an identity.  Everything that must contain or
+    identify the TRUE signal (capture crop width, tail length, decode-job
+    labels) sizes for the whole family.  Bounded: the 12-rung ladder holds
+    families of at most 2 (e.g. {(10,62.5k),(12,125k)}); a rung with no
+    in-ladder partner returns just itself."""
+    _s0 = (float(bw) ** 2) / float(1 << int(sf))
+    _fam = [(s, b) for (s, b) in PATIENCE_TRIALS
+            if abs((b * b) / float(1 << s) - _s0) <= _s0 * 0.02]
+    return _fam or [(int(sf), float(bw))]
+
+
+def patience_cap_params(d):
+    """(crop_bw_hz, sym_time_s) a capture of detection `d` must be sized for.
+
+    Non-trial detections: their own label (byte-identical to the historic
+    per-label sizing).  patience_trial detections: the same-slope family
+    max — an alias-BW crop around a wider true signal contains no usable
+    preamble (measured: a 62.5k crop of a -6 dB SF12/125k carrier gave the
+    decoder NO PREAMBLE 5/5, so a promotion could never confirm and burned
+    the forced dechirp until TTL/futility), and an alias-sized tail budget
+    (half the true symbol time for the 2-step partner) truncates the true
+    payload → CRC fail even when the preamble survives."""
+    _sf, _bw = int(d['sf']), float(d['bw'])
+    if not d.get('patience_trial'):
+        return _bw, float(1 << _sf) / _bw
+    _fam = patience_trial_family(_sf, _bw)
+    return (max(b for _, b in _fam),
+            max(float(1 << s) / b for s, b in _fam))
+
 # PRESCREEN — outcome-learned persistent-junk suppression (2026-07-14,
 # measured low-core ceiling item 3).  On a junk-heavy host (Pi at 20 Msps,
 # high gain) ambient spurs/images that survive the width floor fire the FULL
@@ -309,6 +345,31 @@ PRESCREEN_PROBE_EVERY = _psenv('LORA_PRESCREEN_PROBE', 16, int, lo=1)
 PRESCREEN_MARGIN_DB = _psenv('LORA_PRESCREEN_MARGIN_DB', 6.0, float)
 PRESCREEN_GONE_WIN = _psenv('LORA_PRESCREEN_GONE_WIN', 20, int, lo=1)
 PRESCREEN_CAP = 64        # max simultaneously-learned junk bins
+
+# PATIENCE FUTILITY RETIRE (measured low-core ceiling item 4, 2026-07-16):
+# the HackRF fs/4 birdie (935.0000 MHz at -r 20M / -c 915 — a 1-bin spur
+# FLICKERING across windows) sails under every promotion veto (duty ~28% <
+# the 0.30 CW cap, isolated, clean observation) and then burns a forced
+# full-window dechirp EVERY window until TTL=1200 (~2.6 s/window on a Pi,
+# ~10 min per cycle) confirming NOTHING.  Physics: a promotion that
+# repeatedly HAS energy at its bin yet never yields a decode confirm is a
+# birdie/spur by definition — a real sub-gate carrier confirms via the
+# forced dechirp within its first energetic packet windows (the CHAN-DECHIRP
+# despread floor is ~-12 dB in-band, 14-16 dB below the gate).  So count
+# FUTILE trials: windows where the forced dechirp ran AND the promoted bin
+# showed a max-hold exceedance (the same signal patience accumulated hits
+# on).  Energy-ABSENT windows do not count — a 30 s-interval beacon, quiet
+# ~59 of every 60 windows, is never retired between packets.  After M futile
+# energy-present windows with ZERO confirmations: demote + a long
+# re-promotion cooldown on that bin, cleared instantly by any published
+# detection or decode confirm near it.  M=12 sizing: a beacon packet spans
+# 2-3 windows and the 12-rung (sf,bw) trial ladder sweeps in 6 windows
+# (2/window), so a real carrier meets its true combo within ~2 packets
+# (~4-6 energetic windows) — 12 keeps 2x headroom.
+# LORA_PATIENCE_FUTILE=0 kill switch: exact current (TTL-only) behavior.
+PATIENCE_FUTILE_M = _psenv('LORA_PATIENCE_FUTILE', 12, int, lo=0)
+PATIENCE_FUTILE_COOLDOWN = _psenv('LORA_PATIENCE_FUTILE_COOLDOWN',
+                                  3 * PATIENCE_HORIZON_WIN, int, lo=1)
 
 # IQ inversion: when set, conjugate the input stream (negate Q) so an IQ-inverted
 # transmitter — LoRaWAN downlink, satellite / tinyGS configs with Invert-IQ on —
@@ -2745,13 +2806,28 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         # the dechirp peak-to-noise — sensitive BELOW where Schmidl-Cox and the energy
         # gate go deaf.  Emits a detection the decoder then confirms (CRC rejects false
         # positives).  When it fires we skip SC for this peak (dechirp is more sensitive).
-        _dech = None
+        _dech_cands = []
         for _dc in (dechirp_chans or ()):
-            if abs(off_hz - _dc[0]) < _dc[2]:   # _dc = (offset_hz, sf, bw[, trial])
-                _dech = _dc
+            if abs(off_hz - _dc[0]) >= _dc[2]:  # _dc = (offset_hz, sf, bw[, trial])
+                continue
+            if not (len(_dc) > 3 and _dc[3]):
+                # Verified/learned channel: first within-bw match wins,
+                # exactly as before (channelizer channels sit at distinct
+                # offsets and precede the trial rungs in dechirp_chans).
+                _dech_cands = [_dc]
                 break
-        if _dech is not None:
-            _ldoff, _ldsf, _ldbw = _dech[0], _dech[1], _dech[2]
+            # TRIAL PARITY FIX (2026-07-16): _win_chans appends BOTH of this
+            # window's trial rungs at the SAME promoted-carrier offset, but
+            # the old first-match break only ever attempted the k=0 rung —
+            # and the rotation index (wc*TRIALS_PER_WIN + pi + k) steps by an
+            # EVEN stride per window, so a promotion's slot-index parity
+            # permanently locked it to 6 of the 12 rungs.  Measured: a -6 dB
+            # SF12/125k carrier fired ONLY its same-slope alias (10,62.5k)
+            # 5/5 and could never trial the true rung.  Collect ALL matching
+            # trial rungs and attempt each below; the per-window pairs
+            # (i, i+1) then cover the full ladder across the 6-window sweep.
+            _dech_cands.append(_dc)
+        if _dech_cands and (len(_dech_cands[0]) > 3 and _dech_cands[0][3]):
             # Patience TRIAL channel (4th field): the (sf, bw) is a rotating
             # HYPOTHESIS, not a learned identity — same-slope aliases clear
             # the 12 dB despread bar by +10-18 dB and can even beat the true
@@ -2762,7 +2838,6 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             # and never counted (soundness review: rotating labels turned one
             # strong carrier into N phantom detections and starved real
             # decodes on 10/14 corpus entries).
-            _ltrial = bool(len(_dech) > 3 and _dech[3])
             # A TRIAL may only process the patience PLACEHOLDER peak (floor-
             # level power at the promoted bin) — never a peak with real
             # elevation.  Otherwise a promotion near live traffic eats every
@@ -2773,9 +2848,11 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             # continuous 'seq' transmitter lost dets + a decode this way,
             # deterministically).  Real energy falls through to the normal
             # SC chain, which publishes, which retires the promotion.
-            if _ltrial and (pwr - _src_floor) >= 5.0:
-                _dech = None
-        if _dech is not None:
+            if (pwr - _src_floor) >= 5.0:
+                _dech_cands = []
+        for _dech in _dech_cands:
+            _ldoff, _ldsf, _ldbw = _dech[0], _dech[1], _dech[2]
+            _ltrial = bool(len(_dech) > 3 and _dech[3])
             try:
                 _nbq, _nbqfs = extract_narrowband_fft(iq_1m, _rate1m, 0.0, _ldbw)
                 _r = _dechirp_scan(_nbq, _ldsf, _ldbw, _nbqfs)
@@ -4396,7 +4473,10 @@ class SignalRecorder:
         """
         anchor = max(detections, key=lambda x: x.get('peak_power_db', 0.0))
         _exp_dec = int(os.environ.get('LORA_EXPORT_DEC', '2'))
-        export_bw = min(int(anchor['bw'] * _exp_dec / 2),
+        # patience_trial anchors size for the same-slope rung FAMILY (see
+        # patience_cap_params): an alias-BW crop cannot contain the true
+        # signal.  Non-trial anchors: identical to the old anchor['bw'].
+        export_bw = min(int(patience_cap_params(anchor)[0] * _exp_dec / 2),
                         int(self.wb_fs) // 2)
         D = int(round(self.wb_fs / float(export_bw * 2)))
         if D < 2:
@@ -4578,7 +4658,12 @@ class SignalRecorder:
                         self._img_carriers = [
                             c for c in self._img_carriers if c[2] > _cut]
 
-                sym_time = (2 ** sf) / bw
+                # Capture sizing: patience_trial anchors size for the same-
+                # slope rung FAMILY (crop width AND symbol time — the alias
+                # label's symbol time is half the true rung's for the 2-step
+                # partner, which would truncate the true payload).  Non-trial
+                # anchors get exactly the historic (bw, (2**sf)/bw).
+                _cap_bw, sym_time = patience_cap_params(anchor)
                 # Capture extent past the preamble = preamble (16) + SFD (4.25)
                 # + sync (8) + payload-symbol budget.  Originally 120 syms covered
                 # the absolute Meshtastic max (PL=237 / CR4/5 / LDRO) — but that
@@ -4611,7 +4696,7 @@ class SignalRecorder:
                 # ±1 MHz) keeps full ±BW recenter headroom; lower is faster but
                 # tighter.  Tunable via LORA_EXPORT_DEC for validation.
                 _exp_dec = int(os.environ.get('LORA_EXPORT_DEC', '2'))
-                export_bw = min(int(bw * _exp_dec / 2), self.wb_fs // 2)
+                export_bw = min(int(_cap_bw * _exp_dec / 2), self.wb_fs // 2)
 
                 # SOURCE OF TRUTH: the gate's detections list.  Each entry
                 # is a (Welch peak + multi-lag SC + dechirp) confirmed
@@ -5045,6 +5130,50 @@ class SignalRecorder:
                         # a SEPARATE bucket on SF7 (ttol=49 ms) — exactly
                         # the case a global 0.35 s ceiling would have merged.
                         _bkey = (_cand_freq, _abs_t_s, _ftol, _dt_win)
+                        # TRIAL LABEL LADDER (2026-07-16, defect-2 companion):
+                        # the decoder locks SF/BW from the capture FILENAME —
+                        # it can relabel SF at the same BW (WRONG_SF retry)
+                        # but can NEVER cross bandwidths, so an alias-labeled
+                        # trial capture is undecodable no matter how wide the
+                        # crop.  Submit the SAME (family-wide-cropped) bytes
+                        # once per same-slope family label via hardlinks (no
+                        # extra bytes on disk; each link has its own refcount/
+                        # unlink lifecycle and capacity reservation).  Links
+                        # are created BEFORE the primary submit so a fast
+                        # decode+unlink of the primary cannot race them.
+                        # Bounded: ladder families have at most 2 members, and
+                        # only acquisition-internal patience trials take this
+                        # path.  CRC still arbitrates identity; publish-on-
+                        # decode-confirm is unchanged.
+                        _fam_links = []
+                        if _lbl_blind:
+                            for _fsf, _fbw in patience_trial_family(
+                                    _src['sf'], _src['bw']):
+                                if (_fsf == _src['sf']
+                                        and abs(_fbw - _src['bw']) < 1.0):
+                                    continue          # primary label itself
+                                _sq2 = next(self._fname_seq)
+                                _fname2 = (
+                                    f"SF{_fsf}_{fmt_bw(_fbw)}"
+                                    f"_{d['freq_hz'] / 1e6:.4f}MHz"
+                                    f"_{int(round(nb_fs / 1000))}ksps"
+                                    f"_pwr{int(round(d.get('peak_power_db', 0.0)))}"
+                                    f"_{dt_str[:-3]}{_sq2 % 1000:03d}.cf32")
+                                _fpath2 = os.path.join(self.export_dir,
+                                                       _fname2)
+                                _admit2, _, _ = self._decoder._cap_try_reserve(
+                                    _fpath2, _fsize)
+                                if not _admit2:
+                                    continue
+                                try:
+                                    os.link(fpath, _fpath2)
+                                except OSError:
+                                    try:
+                                        nb.astype(np.complex64).tofile(_fpath2)
+                                    except Exception:
+                                        self._decoder._cap_release(_fpath2)
+                                        continue
+                                _fam_links.append((_fpath2, _fname2))
                         # Pass 1 — full-file primary with SIC: SC-scans the
                         # buffer, decodes the strongest preamble, subtracts
                         # its reconstructed signal, and re-searches the
@@ -5052,6 +5181,13 @@ class SignalRecorder:
                         # cancellation is clean (per-symbol amplitude OK).
                         self._decoder.submit(fpath, fname, bucket_key=_bkey,
                                              slow=bool(d.get('patience_trial')))
+                        # Family-label decode jobs (trial captures only) —
+                        # same bucket, slow tier: once any label in the
+                        # bucket decodes, the phase-2 bucket dedup skips the
+                        # rest, so the ladder costs nothing after a confirm.
+                        for _fp2, _fn2 in _fam_links:
+                            self._decoder.submit(_fp2, _fn2, bucket_key=_bkey,
+                                                 slow=True)
                         # Pass 2 — TIME-ISOLATED on this preamble.  Useful at
                         # FAST SF where the hop1 relay arrives ~50-200 ms
                         # after hop0 and they share a single capture file;
@@ -5170,6 +5306,12 @@ class BackgroundDecoder:
         self._decoded_total = 0
         self._decoded_keys = set()
         self._decoded_lock = threading.Lock()
+        # Carrier freqs (Hz) of decode-confirmed [PKT] records since the last
+        # drain — the patience gate's FUTILITY feedback (a promotion whose
+        # trial captures decode is real and must never be futility-retired).
+        # Capped: if nothing drains (patience off / futility off) it cannot
+        # grow.
+        self._confirmed_freqs = []
 
         # Phase-2 chase optimization: cross-worker bucket dedup + in-flight
         # tracking with dispatch deferral.
@@ -5844,6 +5986,16 @@ while True:
         with self._decoded_lock:
             return self._decoded_total, len(self._decoded_keys)
 
+    def drain_confirmed_freqs(self):
+        """Decode-confirmed carrier freqs (Hz) since the last call — the
+        patience gate's futility feedback.  Cheap (one lock, usually empty)."""
+        with self._decoded_lock:
+            if not self._confirmed_freqs:
+                return ()
+            _o = self._confirmed_freqs
+            self._confirmed_freqs = []
+        return _o
+
     def maybe_release_straggler(self):
         """Release ONE deferred straggler for a big-budget re-decode IF the
         decode system is idle right now — fast queue empty AND nothing decoding.
@@ -6155,6 +6307,14 @@ while True:
                                 self._decoded_total += 1
                                 if _uk is not None:
                                     self._decoded_keys.add((_r.get('proto'), _uk))
+                                try:
+                                    _cfm = float(_r.get('freq_mhz') or 0.0)
+                                except (TypeError, ValueError):
+                                    _cfm = 0.0
+                                if _cfm > 0.0:
+                                    self._confirmed_freqs.append(_cfm * 1e6)
+                                    if len(self._confirmed_freqs) > 64:
+                                        del self._confirmed_freqs[:-64]
                             if self._pkt_log_path:
                                 _r['ts'] = _now
                                 _out.append(_json.dumps(_r, separators=(',', ':')))
@@ -6983,6 +7143,13 @@ def main():
     _pat_det_bins = {}   # bin -> last wc a REAL detection published there (any path
                          # incl. slow-pass); patience must never pursue carriers
                          # that are being detected — mask + expire around them.
+    # Futility retire state (see PATIENCE_FUTILE_M constants): per-promotion
+    # energetic-window counts with zero decode confirms, the set of promotions
+    # a decode confirm has vouched for (futility-exempt until TTL), and the
+    # per-bin re-promotion cooldown gate written by a futility demote.
+    _pat_futile = {}      # promoted bin -> futile energy-present window count
+    _pat_confirmed = set()  # promoted bins with >=1 decode confirm
+    _pat_cooldown = {}    # bin -> wc when re-promotion is allowed again
     def _pat_note_detection(_freq_hz):
         """A REAL detection published at _freq_hz: zero accumulated hits and
         expire any promotion within ±1 MHz — patience only pursues carriers
@@ -7002,12 +7169,22 @@ def main():
                   'normally' % (_pat_promoted[_pb][1] / 1e6),
                   file=sys.stderr, flush=True)
             del _pat_promoted[_pb]
+            _pat_futile.pop(_pb, None)
+            _pat_confirmed.discard(_pb)
+        # A real detection also clears any futility cooldown nearby — the
+        # carrier is demonstrably real, so re-promotion must not be gated.
+        for _qb in [q for q in _pat_cooldown if abs(q - _b) <= 410]:
+            del _pat_cooldown[_qb]
 
     if PATIENCE_ON:
         print('[GATE] patience gate: margin %+.1f dB, promote at %.0f hits '
-              '(~%d-win horizon), duty<%d%%, cap %d, ttl %d win'
+              '(~%d-win horizon), duty<%d%%, cap %d, ttl %d win, '
+              'futile-retire %s'
               % (PATIENCE_MARGIN_DB, PATIENCE_MIN_HITS, PATIENCE_HORIZON_WIN,
-                 int(PATIENCE_DUTY_MAX * 100), PATIENCE_CAP, PATIENCE_TTL_WIN),
+                 int(PATIENCE_DUTY_MAX * 100), PATIENCE_CAP, PATIENCE_TTL_WIN,
+                 ('at %d energetic win (cooldown %d)'
+                  % (PATIENCE_FUTILE_M, PATIENCE_FUTILE_COOLDOWN))
+                 if PATIENCE_FUTILE_M > 0 else 'off'),
               file=sys.stderr, flush=True)
 
     # [PRESCREEN] outcome-learned persistent-junk state (see constants at
@@ -7441,7 +7618,10 @@ def main():
         if not dets:
             return 0
         _a0 = max(dets, key=lambda x: x.get('peak_power_db', 0.0))
-        _need = int((16 + 4.25 + 8 + 120) * ((2 ** _a0['sf']) / _a0['bw']) * a.rate)
+        # patience_trial dets size for the same-slope family's slowest
+        # symbol time (see patience_cap_params) — an alias-sized tail
+        # truncates the true payload.  Non-trial: identical to 2**sf/bw.
+        _need = int((16 + 4.25 + 8 + 120) * patience_cap_params(_a0)[1] * a.rate)
         return -(-_need // _tail_seg_n)   # ceil
 
     def _commit_oldest():
@@ -7601,6 +7781,9 @@ def main():
                             _pat_hits[:] = 0.0
                             _pat_seen[:] = 0.0
                             _pat_promoted.clear()
+                            _pat_futile.clear()
+                            _pat_confirmed.clear()
+                            _pat_cooldown.clear()
                             # [PRESCREEN] junk state is bin-indexed too: a
                             # retune would remap every learned spur onto an
                             # arbitrary NEW frequency and suppress real
@@ -8007,6 +8190,58 @@ def main():
             _pat_hits += _exc_pat
             _pat_seen += _pat_obs
 
+            # ---- FUTILITY RETIRE (see PATIENCE_FUTILE_M constants) ----
+            # A promotion whose bin repeatedly shows energy while its forced
+            # dechirp confirms NOTHING is a birdie/spur (the fs/4 flicker
+            # burned ~2.6 s/window for 10 min/TTL-cycle on a Pi).  Count
+            # energy-present windows only — beacon-gap windows never tick, so
+            # a sparse real beacon keeps full patience between packets.
+            if PATIENCE_FUTILE_M > 0:
+                # Decode confirms (trial captures decode on the slow tier and
+                # land asynchronously): vouch for nearby promotions forever
+                # (until TTL) and lift any nearby cooldown.
+                if decoder is not None:
+                    for _cfhz in decoder.drain_confirmed_freqs():
+                        _cfb = 2048 + int(round(
+                            (_cfhz - _live_center_mhz * 1e6)
+                            / (a.rate / 4096.0)))
+                        for _pb in [p for p in _pat_promoted
+                                    if abs(p - _cfb) <= 410]:
+                            if _pb not in _pat_confirmed:
+                                _pat_confirmed.add(_pb)
+                                _pat_futile.pop(_pb, None)
+                                print('[PATIENCE] confirmed %.4fMHz by '
+                                      'decode — futility exempt'
+                                      % (_pat_promoted[_pb][1] / 1e6),
+                                      file=sys.stderr, flush=True)
+                        for _qb in [q for q in _pat_cooldown
+                                    if abs(q - _cfb) <= 410]:
+                            del _pat_cooldown[_qb]
+                # Futile-trial count: raw max-hold exceedance at the promoted
+                # bin (±1 for centroid jitter) — the same statistic that
+                # earned the promotion, deliberately UNmasked (a nearby real
+                # detection retires the promotion via _pat_note_detection
+                # before masking could matter).
+                _thr_fut = _pat_med + PATIENCE_MARGIN_DB
+                for _pb in list(_pat_promoted):
+                    if _pb in _pat_confirmed:
+                        continue
+                    if float(_pp_pat[max(0, _pb - 1):_pb + 2].max()) <= _thr_fut:
+                        continue        # energy-absent window: does not count
+                    _pat_futile[_pb] = _pat_futile.get(_pb, 0) + 1
+                    if _pat_futile[_pb] < PATIENCE_FUTILE_M:
+                        continue
+                    print('[PATIENCE] futility-retired %.4fMHz — %d '
+                          'energetic windows, zero confirms; cooldown %d win'
+                          % (_pat_promoted[_pb][1] / 1e6, _pat_futile[_pb],
+                             PATIENCE_FUTILE_COOLDOWN),
+                          file=sys.stderr, flush=True)
+                    _pat_cooldown[_pb] = wc + PATIENCE_FUTILE_COOLDOWN
+                    _pat_hits[max(0, _pb - 4):_pb + 5] = 0.0
+                    _pat_seen[max(0, _pb - 4):_pb + 5] = 0.0
+                    del _pat_promoted[_pb]
+                    del _pat_futile[_pb]
+
         # ---- [PRESCREEN] outcome-learned persistent-junk suppression ----
         # Sits AFTER patience accumulation (its masks see the untouched peak
         # list) and BEFORE the throttle + channelizer/patience forced-peak
@@ -8213,6 +8448,10 @@ def main():
                       file=sys.stderr, flush=True)
                 _pat_hits[max(0, _pb - 4):_pb + 5] = 0.0
                 del _pat_promoted[_pb]
+                _pat_futile.pop(_pb, None)
+                _pat_confirmed.discard(_pb)
+            for _qb in [q for q, e in _pat_cooldown.items() if wc >= e]:
+                del _pat_cooldown[_qb]      # futility cooldown served
             if len(_pat_promoted) < PATIENCE_CAP:
                 _pcand = np.where(_pat_hits >= PATIENCE_MIN_HITS)[0]
                 for _cb in _pcand[np.argsort(-_pat_hits[_pcand])]:
@@ -8225,6 +8464,10 @@ def main():
                                                     # +11/-24 on two60)
                     if any(abs(_cb - _pb0) < 12 for _pb0 in _pat_promoted):
                         continue                    # already promoted (cluster)
+                    if any(abs(_cb - _qb0) <= 12 for _qb0 in _pat_cooldown):
+                        continue                    # futility cooldown: this
+                                                    # bin burned a full futile
+                                                    # cycle with zero confirms
                     if any(abs(_cb - _db0) <= 205 and wc - _dwc0 <= 600
                            for _db0, _dwc0 in _pat_det_bins.items()):
                         continue                    # being detected normally
@@ -8245,6 +8488,8 @@ def main():
                                     / max(_wv.sum(), 1e-9))
                     _phz = _cen_pat + (_cbin_f - 2048.0) * _fres_pat
                     _pat_promoted[_cb] = (wc + PATIENCE_TTL_WIN, _phz)
+                    _pat_futile.pop(_cb, None)      # fresh futility clock
+                    _pat_confirmed.discard(_cb)
                     print('[PATIENCE] promoted %.4fMHz (hits %.1f, duty %d%%, '
                           '%d/%d slots) — forcing dechirp until confirmed or TTL'
                           % (_phz / 1e6, float(_pat_hits[_cb]),
@@ -8524,7 +8769,7 @@ def main():
                 # processes anyway — identical samples, zero stall, and
                 # capture length no longer depends on pipeline speed.
                 _max_pkt_s = max(
-                    (148.25 * (2 ** d['sf']) / d['bw']) for d in dets)
+                    148.25 * patience_cap_params(d)[1] for d in dets)
                 # Cap = min(airtime, 24*win_n) (UC audit p).  Was
                 # min(airtime, 3*win_n, ring/2) — a stale blocking-read-era
                 # bound that truncated every frame past ~4.5 s (SF12/62.5k =
@@ -8569,7 +8814,7 @@ def main():
                 # deferred LIVE/POOL paths (the (p) targets, production) use
                 # feed_tail refs, not this read, and DO get the 24*win_n cap.
                 _max_pkt_s = max(
-                    (148.25 * (2 ** d['sf']) / d['bw']) for d in dets)
+                    148.25 * patience_cap_params(d)[1] for d in dets)
                 _max_tail_n = min(int(_max_pkt_s * a.rate), 3 * win_n)
                 if _max_tail_n > 0:
                     # owned: retained as _carry_tail across the next read
