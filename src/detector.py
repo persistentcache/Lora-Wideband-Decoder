@@ -7725,6 +7725,57 @@ def main():
       _peak_cap = _PEAK_CAP_HI
       _cap_calm = 0
       _ring_n_total = max(1, int(a.rate * a.buf_seconds))
+      # Proactive budget clamp state ([GATE-BUDGET] block in the loop; live
+      # only).  EWMAs (alpha 0.3) of the MEASURED per-peak detect cost and the
+      # fixed non-detect per-window overhead, both fed from the existing PROF
+      # counters — no new timing.  'margin' is the fraction of the hop budget
+      # the detect phase may spend; LORA_GATE_BUDGET=0 disables the clamp
+      # entirely (exact legacy behavior).  pp==0.0 means "no measurement yet"
+      # (cap stays at _PEAK_CAP_HI until the first busy window lands).
+      _bgt = {'pp': 0.0, 'ovh': 0.0, 'ovh_cum': 0.0,
+              'cap_last': _PEAK_CAP_HI,
+              'margin': _psenv('LORA_GATE_BUDGET', 0.85, float, lo=0.0)}
+      # Non-finite / absurd margins would crash the int() in the clamp
+      # (LORA_GATE_BUDGET=inf -> OverflowError mid-flight); _psenv's lo-check
+      # passes inf, so guard here.  Pure comparisons: NaN fails both sides,
+      # inf fails the upper bound — no math import needed at this scope.
+      if not (0.0 <= _bgt['margin'] <= 10.0):
+          print(f"[GATE] ignoring out-of-range LORA_GATE_BUDGET="
+                f"{_bgt['margin']} (using 0.85)", file=sys.stderr, flush=True)
+          _bgt['margin'] = 0.85
+      # Floor: shed-weakest-first keeps the strongest peaks (= the real
+      # traffic).  2 by default; 1 fits hosts whose per-peak cost x2 exceeds
+      # the hop even at floor (measured Pi: 2x171ms + 223ms ovh > 500ms hop
+      # -> a slow deficit still builds -> one CATCHUP skip per few min).
+      _BUDGET_CAP_FLOOR = int(_psenv('LORA_GATE_BUDGET_FLOOR', 2, int, lo=1))
+      _TRIAL_DEFER = os.environ.get('LORA_TRIAL_DEFER', '1') != '0'
+      _hop_budget_s = hop_n / float(a.rate)
+
+      def _budget_track(_dt, _npk):
+          # [GATE-BUDGET] EWMA maintenance, called right after the detect
+          # phase.  Per-peak cost: this window's detect-phase elapsed over the
+          # peaks it actually processed (pooled windows measure dispatch +
+          # backpressure commits — small while workers keep up, ≈ the true
+          # per-window worker cost once the pool saturates, which is exactly
+          # the deficit regime the clamp exists for).  Overhead: per-window
+          # delta of the cumulative PROF welch+gate/sweep+sat counters.
+          # 'read' is deliberately EXCLUDED: in live mode it is dominated by
+          # the reader's blocking wait-for-samples (≈ the whole hop on a host
+          # that keeps up — pacing, not compute; measured 444-486 ms live vs
+          # 9-10 ms file-mode for the same work), and including it pinned the
+          # cap at floor on healthy hosts.  Its true convert cost (~10 ms) is
+          # conservatively absorbed by the margin.  A negative delta means the
+          # [STAT] block just reset the counters — resync and skip that sample.
+          _cum = _prof['welch'] + _prof['notch'] + _prof['sat']
+          _d_ovh = _cum - _bgt['ovh_cum']
+          _bgt['ovh_cum'] = _cum
+          if _d_ovh >= 0.0:
+              _bgt['ovh'] = (_d_ovh if _bgt['ovh'] == 0.0
+                             else 0.3 * _d_ovh + 0.7 * _bgt['ovh'])
+          if _npk >= 1:
+              _pp = _dt / _npk
+              _bgt['pp'] = (_pp if _bgt['pp'] == 0.0
+                            else 0.3 * _pp + 0.7 * _bgt['pp'])
       # Hybrid routing threshold + telemetry (UC audit B): windows with more
       # candidate peaks than this go through the pool; fewer run inline.
       try:
@@ -8157,6 +8208,26 @@ def main():
         # -530 kHz and phantom-detected it under rotating trial labels).
         # Runs AFTER the full real-peak assembly (1s + max-hold + short-sweep
         # merge), BEFORE any forced/synthetic peaks are appended.
+        # ---- Backlog-gated trial deferral ([TRIAL-DEFER]) ----
+        # Forced dechirp trials (patience promotions + channelizer channels)
+        # are budget-EXEMPT by design — and measured on-Pi they are what
+        # busts realtime during dense traffic even with the [GATE-BUDGET]
+        # cap at floor (p90 detect 2450 ms at cap 2 with promotions active
+        # vs ~565 ms without → the remaining CATCHUP ring-skips).  Patience/
+        # channelizer forcing is a SENSITIVITY feature for a host that is
+        # keeping up; while a genuine backlog exists (>= one hop of unread
+        # samples, same test as the budget clamp) the forced trials pause —
+        # real gate peaks keep full service — and resume the moment the
+        # deficit clears.  Futility counting pauses too (no trial ran = no
+        # evidence).  LORA_TRIAL_DEFER=0 disables (legacy always-force).
+        _win_backlogged = (is_live and _TRIAL_DEFER
+                           and reader.available() >= hop_n)
+        if _win_backlogged != _bgt.get('defer_last', False):
+            print('[TRIAL-DEFER] backlog — forced trials paused'
+                  if _win_backlogged else
+                  '[TRIAL-DEFER] backlog cleared — forced trials resume',
+                  file=sys.stderr, flush=True)
+            _bgt['defer_last'] = _win_backlogged
         if PATIENCE_ON:
             _pp_pat = _psd_gmax if _psd_gmax is not None else _psd_gate
             _pat_decay = 1.0 - 1.0 / PATIENCE_HORIZON_WIN
@@ -8221,9 +8292,13 @@ def main():
                 # bin (±1 for centroid jitter) — the same statistic that
                 # earned the promotion, deliberately UNmasked (a nearby real
                 # detection retires the promotion via _pat_note_detection
-                # before masking could matter).
+                # before masking could matter).  Deferred windows (backlog —
+                # see _win_backlogged below) don't count: no trial ran, so
+                # the window is not evidence of futility.
                 _thr_fut = _pat_med + PATIENCE_MARGIN_DB
                 for _pb in list(_pat_promoted):
+                    if _win_backlogged:
+                        break
                     if _pb in _pat_confirmed:
                         continue
                     if float(_pp_pat[max(0, _pb - 1):_pb + 2].max()) <= _thr_fut:
@@ -8381,8 +8456,48 @@ def main():
         # shed.  _PEAK_CAP_HI also bounds the merged multi-pass peak list on
         # any host (the per-pass find_peaks cap of MAX_ENERGY_PEAKS never
         # bounded the merged 1s + max-hold + short-sweep total).
+        # ---- Proactive per-window compute budget ([GATE-BUDGET]) ----
+        # The ring>50% backstop below is REACTIVE: it only trips after tens of
+        # seconds of backlog have already accumulated, halves the cap, then
+        # relaxes (+1 per 8 calm windows) while the deficit rebuilds — measured
+        # on-Pi (4 Msps live) this oscillated through wholesale CATCHUP ring
+        # skips of ~35-41 s each that discarded real beacons unseen.  Clamp
+        # PROACTIVELY instead: from the EWMAs above, size the peak list so a
+        # window's EXPECTED detect cost fits inside the hop budget with margin
+        # — the deficit never accumulates in the first place.  Host-agnostic
+        # by construction: on a fast host the per-peak EWMA is tiny, the
+        # computed cap lands >= _PEAK_CAP_HI, and behavior is unchanged.
+        # Floor 2 (not _PEAK_CAP_LO): shed-weakest-first means the strongest
+        # peaks — the real traffic — are always processed.  The ring backstop
+        # is kept UNCHANGED underneath as a second line of defense; the
+        # effective cap is the min of both.  FILE mode (is_live False) never
+        # touches any of this.
+        _cap_budget = _PEAK_CAP_HI
+        _avail = reader.available() if is_live else 0
+        if (is_live and _bgt['margin'] > 0.0 and _bgt['pp'] > 0.0
+                and _avail >= hop_n):
+            # Engage only on GENUINE backlog (>= one hop of unread samples):
+            # a keeping-up host is structurally exempt — its reader never
+            # runs ahead — so the clamp cannot degrade healthy hosts (the
+            # verify pass measured a real decode lost to a false clamp when
+            # this condition was absent).  A deficit host banks a hop within
+            # ~0.5 s and engages ~40x sooner than the ring>50% backstop.
+            _bud_s = _hop_budget_s * _bgt['margin'] - _bgt['ovh']
+            _cap_new = min(_PEAK_CAP_HI,
+                           max(_BUDGET_CAP_FLOOR, int(_bud_s / _bgt['pp'])))
+            # Hysteresis: the int() truncation wobbles +-1 on noisy per-peak
+            # EWMAs (measured 34-41 cap transitions per 240 s leg without it);
+            # adopt only >=2 moves.  The ring backstop handles emergencies.
+            if abs(_cap_new - _bgt['cap_last']) >= 2:
+                print(f"[GATE-BUDGET] per-peak {_bgt['pp']*1000:.0f}ms "
+                      f"ovh {_bgt['ovh']*1000:.0f}ms "
+                      f"hop {_hop_budget_s*1000:.0f}ms — "
+                      f"budget cap -> {_cap_new}",
+                      file=sys.stderr, flush=True)
+                _bgt['cap_last'] = _cap_new
+            _cap_budget = _bgt['cap_last']
         if is_live:
-            _ring_frac = reader.available() / float(_ring_n_total)
+            _ring_frac = _avail / float(_ring_n_total)
             if _ring_frac > 0.5:
                 if _peak_cap > _PEAK_CAP_LO:
                     _peak_cap = max(_PEAK_CAP_LO, _peak_cap // 2)
@@ -8394,12 +8509,13 @@ def main():
                 if _cap_calm >= 8 and _peak_cap < _PEAK_CAP_HI:
                     _peak_cap += 1
                     _cap_calm = 0
-        if len(_gate_peaks) > _peak_cap:
+        _cap_eff = min(_peak_cap, _cap_budget)
+        if len(_gate_peaks) > _cap_eff:
             _gate_peaks.sort(key=lambda p: -p[2])
-            _n_shed = len(_gate_peaks) - _peak_cap
-            _gate_peaks = _gate_peaks[:_peak_cap]
+            _n_shed = len(_gate_peaks) - _cap_eff
+            _gate_peaks = _gate_peaks[:_cap_eff]
             print(f"[GATE-THROTTLE] shed {_n_shed} weakest candidate peak(s) "
-                  f"(cap {_peak_cap})", file=sys.stderr, flush=True)
+                  f"(cap {_cap_eff})", file=sys.stderr, flush=True)
 
         # Channelizer dechirp matched-filter: FORCE a candidate at each channelizer
         # channel every window — even with no energy peak — so the sensitive dechirp
@@ -8407,7 +8523,7 @@ def main():
         # weak/far signals that would despread fine), giving dedicated-narrowband-
         # receiver sensitivity.  No false-positive risk: dechirp + CRC reject empty
         # windows; cost bounded by the cap.  ADDITIVE — non-channel peaks untouched.
-        if _dechirp_src:
+        if _dechirp_src and not _win_backlogged:
             _fres_gate = a.rate / 4096.0
             _cen_hz = _live_center_mhz * 1e6
             for _cc, _bw_hz, _csf in _dechirp_src:
@@ -8498,7 +8614,7 @@ def main():
         # Forced peak per active promotion, every window (mirrors the
         # channelizer force above; 125 kHz width placeholder — the per-peak
         # pipeline measures the real width/preset itself).
-        if _pat_promoted:
+        if _pat_promoted and not _win_backlogged:
             _fres_pat = a.rate / 4096.0
             _cen_pat = _live_center_mhz * 1e6
             for _pb, (_pexp, _phz) in _pat_promoted.items():
@@ -8519,7 +8635,7 @@ def main():
         # carries it per-task so live channel changes reach the workers too).
         _win_chans = [(_c - _live_center_mhz * 1e6, _s, _b)
                       for (_c, _b, _s) in _dechirp_src]
-        if _pat_promoted:
+        if _pat_promoted and not _win_backlogged:
             _cen_pat = _live_center_mhz * 1e6
             for _pi, (_pb, (_pexp, _phz)) in enumerate(_pat_promoted.items()):
                 for _k in range(PATIENCE_TRIALS_PER_WIN):
@@ -8632,6 +8748,10 @@ def main():
         # occasionally be missed; all other SF/BW combinations fit entirely within
         # the 1s window (longest: SF12/BW125k = 262ms preamble).
         wc += 1; tw = time.time()
+        # [GATE-BUDGET] the list is FINAL here (cap, channelizer forced peaks
+        # and patience placeholders all applied above) — this is the count the
+        # detect phase actually pays for.
+        _n_pk_det = len(_gate_peaks)
         # --- Hybrid per-window routing (UC audit B) ---
         # Quiet window on a small host: skip the pool round-trip (slot
         # memcpy + worker wakeup + lagged commit) and detect inline — with
@@ -8704,6 +8824,8 @@ def main():
             elapsed = time.time() - t_start
             dt = time.time() - tw
             _prof['detect'] += dt
+            if is_live and _bgt['margin'] > 0.0:
+                _budget_track(dt, _n_pk_det)
             _t_step = time.time()
         else:
             if _lz is not None and not _gate_peaks:
@@ -8733,6 +8855,8 @@ def main():
                                        dechirp_chans=(_win_chans or None))
             dt = time.time() - tw; elapsed = time.time() - t_start
             _prof['detect'] += dt
+            if is_live and _bgt['margin'] > 0.0:
+                _budget_track(dt, _n_pk_det)
             _t_step = time.time()
 
             # Cross-window duplicate suppression is intentionally removed.
