@@ -180,6 +180,19 @@ DECHIRP_MIN_DB = 15.0
 # the energy gate give out.
 DECHIRP_MF_MIN_DB = 12.0
 
+# NOTE (2026-07-20, busy-wall lever 2 investigation): a "high-SNR resolver fast
+# path" was prototyped here — skip the dechirp candidate ladder when the best
+# matched-rate SC pair leads its same-lag/alias-chain siblings by a margin.  It
+# was REMOVED after measurement: matched-rate SC is a PRESENCE detector, not an
+# identity classifier (a strong chirp scores ~1.0 in EVERY sibling's matched
+# crop, across DIFFERENT slopes too), so on real signals the top siblings tie at
+# ~1.0 — the fast path fired 0/460 peak-lags on the busyslice bed and 88% of
+# peak-lags had best−2nd < 0.15.  Forcing it to fire matches busyslice by luck
+# but would mis-pick cross-slope/same-slope aliases (which pass the bwq confirm)
+# elsewhere.  The dechirp ladder is doing irreducible identity work.  See the
+# session note; the real per-peak lever is resolver crop reuse from the already-
+# computed _matched_nb (behaviour-conditional, needs its own floors gauntlet).
+
 # Forced-dechirp (channelizer) per-channel cooldown for the cross-batch capture dedup.
 # The forced dechirp re-fires every window a packet spans (and on its payload), so the
 # same packet would be captured/decoded many times.  Anchored to the channel carrier
@@ -2870,6 +2883,14 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         if len(iq_1m) < 32768 * 3:
             return _ld
 
+        # One forward-FFT cache for EVERY narrowband re-extraction of iq_1m
+        # below (trial rungs, resolver hypotheses, per-lag nb).  Created here —
+        # after the self-recenter above may have REPLACED iq_1m — because each
+        # cold ~1M-pt forward FFT costs ~93 ms on a Pi 4 and the trial-rung
+        # loop used to pay one per rung (the cache lived below the trial
+        # block, so N rungs = N identical FFTs — pure waste).
+        _ffc = []
+
         # === Channelizer dechirp matched-filter detection ===
         # If this peak is one of the channelizer's channels, despread it and detect on
         # the dechirp peak-to-noise — sensitive BELOW where Schmidl-Cox and the energy
@@ -2923,7 +2944,8 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             _ldoff, _ldsf, _ldbw = _dech[0], _dech[1], _dech[2]
             _ltrial = bool(len(_dech) > 3 and _dech[3])
             try:
-                _nbq, _nbqfs = extract_narrowband_fft(iq_1m, _rate1m, 0.0, _ldbw)
+                _nbq, _nbqfs = extract_narrowband_fft(iq_1m, _rate1m, 0.0,
+                                                      _ldbw, fft_cache=_ffc)
                 _r = _dechirp_scan(_nbq, _ldsf, _ldbw, _nbqfs)
                 if _r is not None and _r[0] >= DECHIRP_MF_MIN_DB:
                     _q, _ts, _pbin = _r
@@ -3202,7 +3224,6 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         seen = set()
         tried = set()      # exact (sf, bw, pos) dechirps already evaluated —
                            # different lags often resolve to the same candidate
-        _ffc = []   # one forward-FFT cache shared by all candidate extractions
         _nb_by_bw = {}     # bw -> (nb, fs): the narrowband extraction depends
                            # only on bw, so share it across the hit-lag loop
                            # (4 lags resolving to the same bw re-extracted the
