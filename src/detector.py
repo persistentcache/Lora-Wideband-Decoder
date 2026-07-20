@@ -86,8 +86,40 @@ if _FFT_LIB_CHOICE == 'pyfftw':
         pyfftw.config.NUM_THREADS = 1   # low-core: extra threads net-negative
         pyfftw.interfaces.cache.enable()
         pyfftw.interfaces.cache.set_keepalive_time(300.0)
-        from pyfftw.interfaces.scipy_fft import fft as _fft, ifft as _ifft
+        from pyfftw.interfaces.scipy_fft import (fft as _pyfftw_fft,
+                                                 ifft as _pyfftw_ifft)
         _FFT_WORKERS = 1
+        # MEASURE-quality plans (busy-wall profiling 2026-07-19): the default
+        # ESTIMATE plans execute 2.4x slower than MEASURE at the per-peak hot
+        # sizes (182 vs 74.5 ms @1M measured on-Pi), and the wisdom persist/
+        # reload below makes the one-time planning cost (~24 s/size) a
+        # first-run-only expense — every later process reuses the plan via
+        # wisdom.  LORA_FFTW_MEASURE=0 restores ESTIMATE.
+        # SIZE-CAPPED: MEASURE planning cost grows superlinearly — at the
+        # 16M+-point transforms a 20 Msps window produces, planning takes
+        # minutes per size and crawled a g32 replay to ~45 s/window.  The
+        # measured win came from the 262k-1M-pt per-peak sizes, so MEASURE
+        # only at or below the cap; ESTIMATE (old behavior) above it.
+        if os.environ.get('LORA_FFTW_MEASURE', '1') != '0':
+            try:
+                _MEASURE_MAX_N = int(os.environ.get('LORA_FFTW_MEASURE_MAX',
+                                                    '4194304'))
+            except ValueError:
+                _MEASURE_MAX_N = 4194304
+
+            def _fft(a, axis=-1, workers=None):
+                if a.shape[axis] <= _MEASURE_MAX_N:
+                    return _pyfftw_fft(a, axis=axis,
+                                       planner_effort='FFTW_MEASURE')
+                return _pyfftw_fft(a, axis=axis)
+
+            def _ifft(a, axis=-1, workers=None):
+                if a.shape[axis] <= _MEASURE_MAX_N:
+                    return _pyfftw_ifft(a, axis=axis,
+                                        planner_effort='FFTW_MEASURE')
+                return _pyfftw_ifft(a, axis=axis)
+        else:
+            _fft, _ifft = _pyfftw_fft, _pyfftw_ifft
 
         # Persist FFTW wisdom across runs.  Same file decoder.py uses so the
         # gate and decode workers share a single converging plan set.  Atomic
@@ -2269,10 +2301,47 @@ def _schmidl_cox_curve_multilag(iq_1m, lags, n_sym=8):
             out[L] = None
             continue
         n_full = n_wins * L
-        iq_a = iq_1m[:n_full].reshape(n_wins, L)
-        iq_b = iq_1m[L:L + n_full].reshape(n_wins, L)
-        # Correlation must still be per-lag (depends on shift L).
-        P = np.sum(iq_b * np.conj(iq_a), axis=1)
+        # Correlation must still be per-lag (depends on shift L) — but the
+        # old one-shot `np.sum(iq_b * np.conj(iq_a), axis=1)` materialized
+        # two full-signal complex64 temporaries per lag (~48 B/element of
+        # DRAM traffic; 400-500 MB/peak across the lag scan).  On a
+        # memory-bandwidth-bound host (Pi 4: ~4 GB/s, 1 MB shared L2) that
+        # alone was ~100-125 ms/peak — the busy-wall profile's #1 ARM-
+        # hostile stage.  Stream it through an L2-resident scratch instead
+        # (~16 B/element): conj+multiply in place over window-aligned
+        # chunks, reduce per window.  Per-call scratch keeps the >=8-core
+        # per-peak threadpool safe (np.empty, no zero-fill — cheap).
+        # Float accumulation order changes at the chunk seams; difference
+        # is float32-rounding-level, same class as the 5e-8 the multilag
+        # rewrite itself was validated at.
+        flat_a = iq_1m[:n_full]
+        flat_b = iq_1m[L:L + n_full]
+        P = np.empty(n_wins, dtype=np.complex64)
+        _CH = 65536
+        _scr = np.empty(min(_CH, max(L, 1)), dtype=np.complex64) \
+            if L > _CH else np.empty(min(_CH // L, n_wins) * L,
+                                     dtype=np.complex64)
+        if L <= _CH:
+            rows = max(1, _CH // L)
+            for w0 in range(0, n_wins, rows):
+                r = min(rows, n_wins - w0)
+                seg = r * L
+                off = w0 * L
+                t = _scr[:seg]
+                np.conjugate(flat_a[off:off + seg], out=t)
+                np.multiply(t, flat_b[off:off + seg], out=t)
+                P[w0:w0 + r] = t.reshape(r, L).sum(axis=1)
+        else:
+            for w in range(n_wins):
+                acc = 0.0 + 0.0j
+                base = w * L
+                for off in range(0, L, _CH):
+                    m = min(_CH, L - off)
+                    t = _scr[:m]
+                    np.conjugate(flat_a[base + off:base + off + m], out=t)
+                    np.multiply(t, flat_b[base + off:base + off + m], out=t)
+                    acc += complex(t.sum())
+                P[w] = acc
         # Energy from precomputed cumsum — O(1) lookups per window.
         a_starts = np.arange(n_wins, dtype=np.int64) * L
         b_starts = a_starts + L
