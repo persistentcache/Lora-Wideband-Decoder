@@ -5317,9 +5317,37 @@ class SignalRecorder:
                     # _crop_corr stays 0.0 → byte-identical legacy capture.
                     # Detection state (d/_src freq_hz, DETECTED lines, dedup
                     # keys, channel learning) is never touched.
+                    #
+                    # BURST-GATED (2026-07-21 follow-up): the meter is
+                    # restricted to THIS preamble's time window instead of
+                    # the slice's first 3 s.  A time-blind max-hold picks
+                    # the strongest bw-wide plateau anywhere in the slice —
+                    # in dense traffic that is often a NEIGHBOR packet at a
+                    # different carrier (stress-bed live leg: a truly-
+                    # centered SF9 capture was "corrected" -33.5 kHz onto a
+                    # neighbor's plateau and every decode then needed a
+                    # 53 kHz rescue recenter), or a merged union that
+                    # dilutes the midpoint (two SF11 captures measured
+                    # -15.5k/-29.6k full-slice vs -36.3k/-39.4k
+                    # burst-gated == the value every isolated SF11 capture
+                    # measures).  Window = preamble-8 .. preamble+40
+                    # symbols (label's own symbol time): covers preamble
+                    # (16) + SFD (4.25) + header (8) + margin for the
+                    # gate's preamble_t_s jitter (PASS-2 below trusts the
+                    # same position to ~8 syms), while shrinking the
+                    # collision cross-section ~10-20x vs 3 s.  Too-short
+                    # windows (alias-label trials, truncated streams) fall
+                    # below the meter's 4*2048-sample minimum → abstain,
+                    # exactly the fail-safe contract above.
                     _crop_corr = 0.0
                     if _CROP_CENTER_FIX and len(nb):
-                        _po = _nb_plateau_offset(nb, nb_fs, float(d['bw']))
+                        _d_sym_n = int(round((2 ** d['sf']) * nb_fs
+                                             / float(d['bw'])))
+                        _w0 = max(0, _preamble_sample - 8 * _d_sym_n)
+                        _w1 = min(len(nb),
+                                  _preamble_sample + 40 * _d_sym_n)
+                        _po = _nb_plateau_offset(nb[_w0:_w1], nb_fs,
+                                                 float(d['bw']))
                         if _po is not None and abs(_po) > 5000.0:
                             if _nb_job is None:
                                 # Direct path: re-extract at the corrected
