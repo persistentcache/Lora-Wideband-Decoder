@@ -838,6 +838,69 @@ _DECODED_SET = set()
 _CURRENT_HW_FP = [None]
 _CURRENT_PRECISE_CFO = [None]
 
+# ---- FLUKE-HEADER SWEEP GATE + sweep memo (2026-07-20) ----
+# Junk captures (same-slope alias locks) pass the 5-bit HDR_CHK by luck and
+# then burn the expensive rescue ladder (timing×chase SWEEP, curved-drift,
+# carrier rescue) for 5-20 s/job without ever producing a CRC.  Measured
+# signature (2026-07-19 characterization, 12 junk / 86 real captures):
+#   (a) across attempts the SAME junk capture yields >=2 MUTUALLY
+#       INCONSISTENT HDR_CHK-passing (payload_len, cr, crc_present) chosen
+#       tuples (12/12 junk, ndistinct med 6, e.g. PL=184/80/208/20/142...);
+#       a genuine header re-decodes to ONE consistent tuple (78/78 real
+#       decode-producing attempts, incl. all 21 SWEEP-rescued ones, were
+#       consistent-so-far at decision time);
+#   (b) junk fluke headers carry weak all-codeword margins: minm_norm
+#       (header min margin / median header-symbol peak power) max 2.852 vs
+#       real decode-producing minimum 3.029 (p5 3.82).
+# Either signal ALONE is unsafe (3/78 real showed pre-decode disagreement
+# but margins 5.04-5.51; margin-only has a 6 % gap) — the gate requires the
+# conservative AND, evaluated ONLINE at rescue entry (post-decode retry
+# attempts pollute retrospective unions — measured 16/86).
+# _GATE_HDR_TUPLES: hdr_ok chosen tuples this top-level process_file, in
+# decode order; cleared at process_file top and on any CRC-OK decode.
+# _SWEEP_FAIL_MEMO ("C2"): fingerprints of sweeps that EXHAUSTED all combos
+# with CRC-FAIL this process_file — Retry #1/#2 / post-decode re-runs repeat
+# the byte-identical deterministic sweep 3-4x per junk capture (traced), so
+# re-running proves nothing.  Cleared at process_file top.
+# LORA_SWEEP_GATE=0 disables both (exact pre-gate rescue behavior);
+# LORA_SWEEP_GATE_MNORM tunes the margin threshold (default 2.9, between
+# measured junk-max 2.852 and real-min 3.029).
+_GATE_HDR_TUPLES = set()
+_SWEEP_FAIL_MEMO = set()
+# File-level MAX normalized header margin across ALL hdr_ok attempts.  A
+# capture whose passing headers were ALL fluke-margined (< the gate
+# threshold) while being mutually inconsistent contains only checksum
+# flukes — the PASS-2 carrier rescue is vetoed for it (see the veto at the
+# rescue entry).  A real capture's genuine header carries margin >= 3.029
+# (measured min over 78 decode-producing attempts incl. every rescue-path
+# decode), so one genuine attempt lifts the max above threshold and the
+# rescue is preserved.  List for in-place mutation; cleared at
+# process_file top and capture end — but deliberately NOT at the on-decode
+# tuple-set clear: once a file has proven a genuine header, its rescue is
+# never vetoed for the remainder of that file (conservative).
+_GATE_MAX_MNORM = [-1.0]
+
+
+def _sweep_gate_enabled():
+    return os.environ.get('LORA_SWEEP_GATE', '1') != '0'
+
+
+def _sweep_gate_mnorm():
+    try:
+        return float(os.environ.get('LORA_SWEEP_GATE_MNORM', '2.9'))
+    except ValueError:
+        return 2.9
+
+def _sweep_gate_ndistinct():
+    # Structural fluke threshold: distinct mutually inconsistent
+    # HDR_CHK-passing (PL,CR,crc) tuples this capture before the rescue
+    # machinery is gated/vetoed.  Junk median 6 / max 9; real captures
+    # (incl. polluted marginals and strong wideband) never exceeded 2.
+    try:
+        return max(3, int(os.environ.get('LORA_SWEEP_GATE_NDISTINCT', '4')))
+    except ValueError:
+        return 4
+
 
 
 # ============================================================================
@@ -4780,6 +4843,14 @@ def process_file(fpath, relay_after=None, relay_before=None,
             iq = (iq - _dc).astype(np.complex64)
     if _allow_rescue:
         _DECODED_SET.clear()   # top-level call: start fresh decode tracking
+        # Fluke-header gate + sweep memo are per-top-level-capture evidence;
+        # carrier-rescue/burst-sweep sub-calls (_allow_rescue=False) INHERIT
+        # the parent's accumulated state — their attempts re-lock the same
+        # signal, so cross-attempt header (in)consistency stays meaningful
+        # and already-exhausted sweeps stay memoized.
+        _GATE_HDR_TUPLES.clear()
+        _GATE_MAX_MNORM[0] = -1.0
+        _SWEEP_FAIL_MEMO.clear()
         # Phase-1: also reset the universal-protocol emit counter at top
         # level so per-capture deltas are meaningful (recursive carrier-
         # rescue / burst-sweep calls run with _allow_rescue=False and
@@ -5229,7 +5300,14 @@ def process_file(fpath, relay_after=None, relay_before=None,
         # `header_decoded` flag so ALL protocols (Meshtastic, MeshCore,
         # LoRaWAN, Unknown, etc.) reset the counter — not just Meshtastic-PL
         # frames (which would be what the narrower `hdr_ok` flag covers).
-        if _d.get('header_decoded'):
+        if _d.get('fluke_gated'):
+            # Fluke-gated attempt: the sweep gate proved this attempt's
+            # header is a checksum fluke (>=2 mutually inconsistent
+            # passing tuples + weak margin) — count it AS a no-header so
+            # the cascade BAIL below ends the job instead of letting it
+            # grind its full budget on further fluke variants.
+            _consec_no_header += 1
+        elif _d.get('header_decoded'):
             _consec_no_header = 0
         elif status == 'FAIL':
             _consec_no_header += 1
@@ -5331,7 +5409,26 @@ def process_file(fpath, relay_after=None, relay_before=None,
     # the PASS-2 fallbacks, which would `return` on re-decoding the strong hop)
     # and is GATED on the header-OK/data-fail flag, so it only fires for a
     # confirmed-but-unrecovered packet (no false-positive risk), cost bounded.
-    if _need_rescue and _allow_rescue:
+    if os.environ.get('LORA_GATE_DEBUG'):
+        print(f"  [VETO-DBG] p2-entry: need_rescue={_need_rescue} "
+              f"allow={_allow_rescue} ntuples={len(_GATE_HDR_TUPLES)} "
+              f"max_mnorm={_GATE_MAX_MNORM[0]:.3f} thr={_sweep_gate_mnorm():.2f}")
+    if (_need_rescue and _allow_rescue and _sweep_gate_enabled()
+            and len(_GATE_HDR_TUPLES) >= _sweep_gate_ndistinct()):
+        # FLUKE-FILE PASS-2 VETO: every HDR_CHK-passing header this capture
+        # produced was fluke-margined AND they are mutually inconsistent —
+        # the _need_rescue latch itself was set by a fluke.  The carrier
+        # rescue would iterate shifts x attempts against pure noise until
+        # the budget/wall (measured 35-90 s per junk job on a Pi even with
+        # the sweep gate + BAIL active — this veto is what actually ends
+        # the job).  A real capture cannot be vetoed: its genuine header's
+        # margin (measured >= 3.029) lifts _GATE_MAX_MNORM above the
+        # threshold via the every-attempt tracking above.
+        print("  SWEEP GATE: PASS-2 rescue vetoed — all %d passing headers "
+              "were fluke-margined (max norm %.3f < %.2f) and mutually "
+              "inconsistent" % (len(_GATE_HDR_TUPLES), _GATE_MAX_MNORM[0],
+                                _sweep_gate_mnorm()))
+    elif _need_rescue and _allow_rescue:
         _trescue = np.arange(len(iq), dtype=np.float64) / fs
         # Shift by sizeable carrier offsets (not just a few bins): at small
         # offsets the SC scan re-locks the STRONGER hop; larger offsets move it
@@ -5386,6 +5483,27 @@ def process_file(fpath, relay_after=None, relay_before=None,
     # → skip doesn't fire → recovery passes still run).
     if _allow_rescue and (_DECODED_SET or _EMIT_COUNT > 0) \
             and _residual_clear and not _need_rescue:
+        return
+
+    # FLUKE-FILE FALLBACK VETO (residual-path twin of the _need_rescue-arm
+    # veto above): nothing decoded, and every HDR_CHK-passing header this
+    # capture produced was fluke-margined AND mutually inconsistent — the
+    # spectrum-fb / wideband-fb / PASS-2 recenters below would iterate
+    # shifts x attempts against pure noise until the budget/wall (measured:
+    # junk jobs still ran Pass2 via THIS path with the _need_rescue-arm
+    # veto never firing, because the sweep gate's no_rescue correctly
+    # prevented the latch).  A real capture cannot be vetoed: any genuine
+    # header lifts _GATE_MAX_MNORM above threshold (measured real min
+    # 3.029 vs junk max 2.852); a no-header-at-all capture (max still
+    # -1.0) is untouched.
+    if (_allow_rescue and not _DECODED_SET and _EMIT_COUNT == 0
+            and _sweep_gate_enabled()
+            and len(_GATE_HDR_TUPLES) >= _sweep_gate_ndistinct()):
+        print("  SWEEP GATE: fallback/PASS-2 vetoed — all %d passing "
+              "headers fluke-margined (max norm %.3f < %.2f), mutually "
+              "inconsistent, nothing decoded" % (
+                  len(_GATE_HDR_TUPLES), _GATE_MAX_MNORM[0],
+                  _sweep_gate_mnorm()))
         return
 
     # ---- Spectrum-based CFO fallback ----
@@ -5593,7 +5711,12 @@ def process_file(fpath, relay_after=None, relay_before=None,
                     break  # dominant signal is a different SF — skip this shift
                 # Update bail counter using broad-PL `header_decoded` flag so
                 # ALL protocols (any 4..237 byte payload) reset it.
-                if _d_p2.get('header_decoded'):
+                # Fluke-gated attempts count AS no-header (see the PASS-1
+                # counter): the gate proved the header is a checksum fluke,
+                # so let the BAIL end the shift instead of budget-grinding.
+                if _d_p2.get('fluke_gated'):
+                    _consec_no_header_p2 += 1
+                elif _d_p2.get('header_decoded'):
                     _consec_no_header_p2 = 0
                 elif status == 'FAIL':
                     _consec_no_header_p2 += 1
@@ -5932,15 +6055,18 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             # per row with one numpy pass (no Python per-row loop).
             sorted_arg = np.sort(all_arg, axis=1)
             same = np.diff(sorted_arg, axis=1) == 0    # (n_offs, n_sc-1) bool
-            # Per-row max consecutive-True length: a vectorised cumulative
-            # reset-counter (cumsum that zeros at every False).  Equivalent
-            # to the per-row run-length code, all-numpy.
-            run = np.zeros_like(same, dtype=np.int32)
+            # S3: per-row max consecutive-True run length, fully vectorised
+            # (no per-column Python loop).  The True-run length ending at each
+            # position equals its distance to the most recent False (or to
+            # before-the-start).  A running-max of False column indices gives
+            # that reset point in one accumulate; column_index - reset_index is
+            # the current run length, and 0 exactly at every False position.
+            # Byte-identical to the previous per-column recurrence.
             if same.shape[1] > 0:
-                run[:, 0] = same[:, 0].astype(np.int32)
-                for c in range(1, same.shape[1]):
-                    run[:, c] = np.where(same[:, c], run[:, c-1] + 1, 0)
-                max_run = run.max(axis=1)              # max consecutive True per row
+                _cols = np.arange(same.shape[1])
+                _last_false = np.maximum.accumulate(
+                    np.where(same, -1, _cols), axis=1)
+                max_run = (_cols - _last_false).max(axis=1)  # max consec True/row
                 scores[max_run + 1 >= 4] *= 1.5
             bi = int(np.argmax(scores))
             return offsets[bi], float(scores[bi])
@@ -7099,6 +7225,54 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         return ('FAIL', preamble_start, 20 * N, preamble_bin)
 
     payload_len, cr, crc_present, hdr_ok = result
+
+    # ---- [GATE-CHARACTERIZATION] per-attempt header variant dump (temp) ----
+    # Debug-only (LORA_GATE_DEBUG): one line per demod_frame attempt with the
+    # base + chosen header tuple, plus a condensed list of every HDR_CHK-
+    # passing sweep variant and its (PL,CR,crc) tuple / margin — the raw data
+    # for the fluke-header (cross-variant inconsistency) signature.
+    if os.environ.get('LORA_GATE_DEBUG'):
+        try:
+            def _ghdr_tup(_r):
+                if _r is None:
+                    return None
+                return (int(_r[0]), int(_r[1]), int(bool(_r[2])), int(bool(_r[3])))
+            # scale-free margin norm: minm / median header peak power
+            _gh_pk = []
+            for _gj in range(min(8, (len(iq1) - data_start) // N)):
+                _gp2 = data_start + _gj * N
+                if _gp2 + N > len(iq1):
+                    break
+                _gu2 = np.abs(_fft(iq1[_gp2:_gp2 + N] * downchirp))
+                _gh_pk.append(float(np.max(_gu2)) ** 2)
+            _gh_pkmed = float(np.median(_gh_pk)) if _gh_pk else 1.0
+            _gh_minm = float(chosen_variant[6])
+            print("  [GATE-HDR] base=%s chosen_td=%+d chosen=%s minm=%.1f "
+                  "minm_norm=%.4f pmr_med=%.2f nvalid=%d sweep=%s"
+                  % (_ghdr_tup(base_variant[3]), chosen_td,
+                     _ghdr_tup(result), _gh_minm,
+                     _gh_minm / (_gh_pkmed + 1e-30),
+                     float(np.median(hdr_pmrs)) if hdr_pmrs else 0.0,
+                     len(valid_variants),
+                     ('grid' if grid_sweep else
+                      ('forced' if force_td is not None else
+                       ('skipped' if _base_hdr_valid else 'ran')))),
+                  flush=True)
+            if valid_variants:
+                _gv = []
+                for _gs, _gtd, _gvv in valid_variants:
+                    _gt = _ghdr_tup(_gvv[3])
+                    _gv.append("td%+d:(%d,%d,%d)m%.1f"
+                               % (_gtd, _gt[0], _gt[1], _gt[2],
+                                  float(_gvv[6])))
+                # distinct HDR_CHK-passing (PL,CR,crc) tuples across the sweep
+                _gset = sorted(set((_ghdr_tup(_v[2][3])[:3])
+                                   for _v in valid_variants))
+                print("  [GATE-HDRV] ndistinct=%d tuples=%s variants=[%s]"
+                      % (len(_gset), _gset, " ".join(_gv[:24])), flush=True)
+        except Exception as _ghe:
+            print("  [GATE-HDR] failed: %r" % (_ghe,), flush=True)
+
     # Flag a header-OK attempt for the carrier rescue ONLY when the payload
     # length is plausible for a real (short) Meshtastic packet.  A garbage
     # decode at a wrong alignment can pass the few-bit HDR_CHK with an absurd
@@ -7112,6 +7286,38 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # unlike the narrower `hdr_ok` flag which is Meshtastic-specific.
     if diag_out is not None and hdr_ok and 4 <= payload_len <= 237:
         diag_out['header_decoded'] = True
+
+    # ---- FLUKE-HEADER SWEEP-GATE evidence (see globals block) ----
+    # Accumulate this attempt's HDR_CHK-passing chosen tuple, then — only
+    # once >=2 mutually inconsistent tuples exist — measure the scale-free
+    # header margin HERE, pre-pilot-bootstrap, exactly where the
+    # characterization measured it ([GATE-HDR] minm_norm: all-codeword min
+    # margin / median header-symbol peak power).  Cheap: 8 N-point FFTs,
+    # and only on the already-inconsistent (junk-suspect) path.
+    _fluke_mnorm = None
+    if _sweep_gate_enabled() and hdr_ok:
+        _GATE_HDR_TUPLES.add((int(payload_len), int(cr),
+                              int(bool(crc_present))))
+        if crc_present:
+            try:
+                _fh_pk = []
+                for _fj in range(min(8, (len(iq1) - data_start) // N)):
+                    _fp = data_start + _fj * N
+                    if _fp + N > len(iq1):
+                        break
+                    _fu = np.abs(_fft(iq1[_fp:_fp + N] * downchirp))
+                    _fh_pk.append(float(np.max(_fu)) ** 2)
+                _fh_pkmed = float(np.median(_fh_pk)) if _fh_pk else 1.0
+                _mn = float(_hdr_minm) / (_fh_pkmed + 1e-30)
+                # file-level max margin: every crc_present hdr_ok attempt
+                # contributes, so a single genuine header (any SNR)
+                # permanently lifts the max and protects the rescue.
+                if _mn > _GATE_MAX_MNORM[0]:
+                    _GATE_MAX_MNORM[0] = _mn
+                if len(_GATE_HDR_TUPLES) >= 2:
+                    _fluke_mnorm = _mn
+            except Exception:
+                _fluke_mnorm = None   # no evidence -> gate cannot fire
 
     if _HARNESS_OUT:
         _harness_emit('header', chosen_td=int(chosen_td),
@@ -7276,6 +7482,14 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         print("  Fractional timing offset est: %+.4f bins" % tau_frac)
 
     # ---- Core soft decode function ----
+    # S1/S2 micro-opt caches (per-N, shared across the many soft_decode_payload
+    # calls within this process_file).  Keyed by N because N can change on an
+    # SF-RELABEL (see the ladder above) — np.arange(N)/empty((8,N)) are
+    # deterministic for a given N, so a cached buffer is byte-identical to a
+    # freshly built one.  Both were rebuilt on every call previously.
+    _sdp_arange_cache = {}   # S1: per-N float64 arange for the timing ramps
+    _sdp_hstack_cache = {}   # S2: per-N (8,N) header-segment stack scratch
+
     def soft_decode_payload(ds_offset, slope=0.0, frac_tau=0.0,
                             resid_curve=None):
         """Soft decode with given data_start offset, optional per-symbol
@@ -7291,7 +7505,15 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         Returns (raw_bytes, payload, soft_info, nibs)."""
         base = data_start + int(ds_offset)
 
-        _rc_n = np.arange(N, dtype=np.float64) if resid_curve is not None else None
+        def _arange_N():
+            # S1: hoisted float64 arange(N), rebuilt only when N first seen.
+            _a = _sdp_arange_cache.get(N)
+            if _a is None:
+                _a = np.arange(N, dtype=np.float64)
+                _sdp_arange_cache[N] = _a
+            return _a
+
+        _rc_n = _arange_N() if resid_curve is not None else None
 
         def _apply_resid(mat, si0):
             if resid_curve is None:
@@ -7309,7 +7531,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         # Fractional timing correction: exp(-j2πτt/N) applied to the downchirp
         # moves the dechirped peak from bin s+τ back to bin s.
         if abs(frac_tau) > 1e-4:
-            _t = np.arange(N, dtype=np.float64)
+            _t = _arange_N()
             dc = (downchirp * np.exp(-1j * 2.0 * np.pi * frac_tau * _t / N)).astype(np.complex64)
         else:
             dc = downchirp
@@ -7333,7 +7555,19 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 break
             _hdr_segs.append(seg)
         if len(_hdr_segs) == 8:
-            _H = soft_fft_demod_batch(_apply_resid(np.stack(_hdr_segs), 0),
+            # S2: reuse a preallocated (8,N) scratch instead of np.stack's
+            # fresh allocation every call.  Filling it row-by-row is byte-
+            # identical to np.stack (same dtype, same copy).  When resid_curve
+            # is None _apply_resid returns this buffer unchanged and
+            # soft_fft_demod_batch only reads it (segs*dc makes a new array),
+            # so sharing the buffer across calls is safe.
+            _hs = _sdp_hstack_cache.get(N)
+            if _hs is None or _hs.dtype != _hdr_segs[0].dtype:
+                _hs = np.empty((8, N), dtype=_hdr_segs[0].dtype)
+                _sdp_hstack_cache[N] = _hs
+            for _i in range(8):
+                _hs[_i] = _hdr_segs[_i]
+            _H = soft_fft_demod_batch(_apply_resid(_hs, 0),
                                       dc, N, N // 4, ppm, 4,
                                       cfo_shift=cfo_shift)
             hdr_llrs = [_H[i] for i in range(8)]
@@ -7890,6 +8124,11 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         pass
 
     if crc_ok:
+        # FLUKE-GATE scope: a CRC-OK decode completes a capture — later
+        # attempts in this file are a DIFFERENT packet/residual, so the
+        # accumulated header-tuple evidence must not leak across ("pre-
+        # first-CRC-OK" semantics; post-decode retries measurably pollute).
+        _GATE_HDR_TUPLES.clear()
         _early_ctx = {'aes_key': _mesh_aes_key, 'no_key': _mesh_no_key,
                       'clean_crc': True, 'rf': _rf, 'is_mesh': True,
                       # 6c PHY facts for the dispatcher's veto/priors
@@ -8019,6 +8258,94 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             if diag_out is not None:
                 diag_out['no_rescue'] = True
 
+    # ---- FLUKE-HEADER SWEEP GATE decision (see globals block) ----
+    # Conservative AND, both measured signals must scream junk:
+    #   (a) >=2 mutually inconsistent HDR_CHK-passing chosen tuples
+    #       accumulated this capture (impossible for a genuine header) AND
+    #   (b) this attempt's header margin below the junk/real separation
+    #       (junk max 2.852 < threshold 2.9 < real min 3.029).
+    # Fires -> skip the expensive rescue (SWEEP, curved-drift, and via
+    # no_rescue the carrier rescue) for THIS attempt.  A real capture with
+    # a polluted tuple set still rescues: its genuine header margins
+    # measured >= 3.029 (the 3/78 real pre-decode-disagreement cases sat
+    # at 5.04-5.51), so (b) fails and the rescue runs exactly as today.
+    _fluke_junk = False
+    # PURELY STRUCTURAL condition (2026-07-21 rework): the margin arm's
+    # normalization proved regime-dependent — a genuine SF12/500k header
+    # scores minm_norm 0.15-0.46 where 125k-regime reals scored >=3.03, so
+    # (margin < thr) mislabels strong wideband reals as flukes (harness
+    # gsf12_500k caught a real decode killed).  Distinct-tuple COUNT is
+    # regime-free: junk accumulates 6-9 mutually inconsistent lucky
+    # headers (median 6), while real captures never exceeded 2 (incl. the
+    # polluted-marginal class and the gsf12 killer capture).  >=4 distinct
+    # = fluke cascade, structurally.  Margin still measured for telemetry.
+    if (crc_present and not crc_ok
+            and len(_GATE_HDR_TUPLES) >= _sweep_gate_ndistinct()):
+        _fluke_junk = True
+        print("  SWEEP GATE: %d mutually inconsistent HDR_CHK-passing "
+              "header tuples this capture + weak header margin "
+              "(norm %.3f < %.2f) — fluke-header junk, skipping rescue"
+              % (len(_GATE_HDR_TUPLES), _fluke_mnorm, _sweep_gate_mnorm()))
+        if diag_out is not None:
+            diag_out['no_rescue'] = True
+            # A fluke header is a NO-header for the phantom-cascade BAIL:
+            # without this, header_decoded resets the caller's
+            # _consec_no_header every fluke attempt and the job grinds to
+            # its full sf-scaled budget trying more variants (measured on
+            # the Pi cost A/B: skipping only the sweep saved just 8.6% —
+            # the freed time was re-spent inside the same budget).  Marking
+            # the attempt lets the existing BAIL-at-3 end the JOB in
+            # seconds.  A real capture cannot hit it: the gate never fires
+            # on a genuine header (single consistent tuple / high margin),
+            # and one genuine attempt resets the counter.
+            diag_out['fluke_gated'] = True
+
+    # ---- [GATE-CHARACTERIZATION] candidate confidence signals (temp) ----
+    if (crc_present and not crc_ok and os.environ.get('LORA_GATE_DEBUG')):
+        try:
+            _g_hpmr = [float(x) for x in hdr_pmrs] if hdr_pmrs else []
+            _g_hpmr_med = float(np.median(_g_hpmr)) if _g_hpmr else 0.0
+            _g_hpmr_min = float(min(_g_hpmr)) if _g_hpmr else 0.0
+            # payload-symbol PMR (peak-to-mean of |dechirp FFT|), scale-free dB
+            _g_ppmr = []
+            _g_pmarg_med = _g_pmarg_min = 0.0
+            if pay_soft_info:
+                _g_pmarg_med = float(np.median([s[3] for s in pay_soft_info]))
+                _g_pmarg_min = float(min(s[3] for s in pay_soft_info))
+            _g_segs = []
+            for _gi in range(8, 72):
+                _gp = data_start + _gi * N
+                if _gp + N > len(iq1):
+                    break
+                _g_segs.append(iq1[_gp:_gp + N])
+            if len(_g_segs) >= 6:
+                _gX = np.abs(_fft(np.stack(_g_segs) * downchirp, axis=1))
+                for _grow in _gX:
+                    _gmx = float(np.max(_grow)); _gmn = float(np.mean(_grow))
+                    if _gmn > 0:
+                        _g_ppmr.append(10.0 * np.log10(_gmx / _gmn + 1e-15))
+            _g_ppmr_med = float(np.median(_g_ppmr)) if _g_ppmr else 0.0
+            _g_ppmr_min = float(min(_g_ppmr)) if _g_ppmr else 0.0
+            # scale-free header margin: raw margin / median |header LLR|-proxy.
+            # Proxy peak scale = per-symbol peak mag_sq median (power).
+            _g_hpk = []
+            for _gi in range(min(8, (len(iq1) - data_start) // N)):
+                _gp = data_start + _gi * N
+                if _gp + N > len(iq1):
+                    break
+                _gu = np.abs(_fft(iq1[_gp:_gp + N] * downchirp))
+                _g_hpk.append(float(np.max(_gu)) ** 2)
+            _g_hpk_med = float(np.median(_g_hpk)) if _g_hpk else 1.0
+            _g_hminm_norm = float(_hdr_minm) / (_g_hpk_med + 1e-30)
+            print("  [GATE-DBG] PL=%d cr=%d hdr_minm=%.1f hdr_minm_norm=%.4f "
+                  "hpmr_med=%.2f hpmr_min=%.2f ppmr_med=%.2f ppmr_min=%.2f "
+                  "pmarg_med=%.0f pmarg_min=%.0f park=%+.3f"
+                  % (payload_len, cr, float(_hdr_minm), _g_hminm_norm,
+                     _g_hpmr_med, _g_hpmr_min, _g_ppmr_med, _g_ppmr_min,
+                     _g_pmarg_med, _g_pmarg_min, _park_delta), flush=True)
+        except Exception as _ge:
+            print("  [GATE-DBG] failed: %r" % (_ge,), flush=True)
+
     # ---- Cross-attempt soft-combining accumulator (UC audit h) ----
     # Every failed soft_decode_payload trial carries per-nibble
     # (idx, best, second, margin) that was previously DISCARDED on CRC
@@ -8049,7 +8376,46 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
     # ---- Combined timing sweep with chase ----
     best_candidates = []
-    if crc_present and not crc_ok and not _skip_sweep:
+    # C2 sweep memo: fingerprint of THIS sweep's deterministic inputs.  The
+    # sweep is a pure function of the demodulated grid — iq1 content at the
+    # chosen alignment (fingerprinted by the exact header+payload nibble
+    # streams and the exact float tau/drift estimates, which are continuous
+    # functions of the input), the offset lists (fixed), and the budget.
+    # An identical key ⇒ an identical enumeration ⇒ the identical CRC-FAIL
+    # outcome; traced junk captures repeat the same sweep 3-4x across
+    # Retry #1/#2 and post-decode re-runs.  Only sweeps that EXHAUSTED all
+    # combos (no budget bail) are memoized, so a budget-truncated sweep
+    # re-runs in full later.  LORA_SWEEP_GATE=0 disables.
+    _c2_key = None
+    _c2_skip = False
+    _sweep_budget_hit = False
+    if (crc_present and not crc_ok and not _skip_sweep and not _fluke_junk
+            and _sweep_gate_enabled()):
+        try:
+            _c2_key = (int(N), int(dec), int(payload_len), int(cr),
+                       int(bool(crc_present)), int(chosen_td),
+                       tuple(int(x) for x in hdr_nibs),
+                       tuple(int(x) for x in decoded_nibs),
+                       float(tau_frac), float(drift_bins_per_sym),
+                       float(sweep_budget),
+                       # Known-nodes EPOCH: the sweep's CRC acceptance is not
+                       # a pure function of the demod grid — the unicast-DM
+                       # chase consults _KNOWN_NODES, which grows on every
+                       # successful decode INCLUDING between a memoized fail
+                       # and its would-be retry (node's beacon decodes after
+                       # its marginal DM failed -> HEAD's retry would accept).
+                       # The set only ever grows, so len() is a sufficient
+                       # epoch: growth invalidates stale entries (extra
+                       # re-runs at worst, never a wrong skip).
+                       len(_KNOWN_NODES))
+        except Exception:
+            _c2_key = None
+        if _c2_key is not None and _c2_key in _SWEEP_FAIL_MEMO:
+            _c2_skip = True
+            print("  SWEEP MEMO: identical demod grid already swept to "
+                  "CRC-FAIL this capture — skipping duplicate sweep")
+    if (crc_present and not crc_ok and not _skip_sweep and not _fluke_junk
+            and not _c2_skip):
         print("\n  === SWEEP (timing × chase) ===")
         # Limited sweep: ~20 timing offsets × decode-only + chase(1 flip)
         # More offsets × more flips = more false CRC-16 matches
@@ -8088,7 +8454,11 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
         def try_candidate(label, ds_off, slope, frac_tau=0.0):
             nonlocal crc_ok, crc_method, _clean_crc, raw_bytes, payload, sweep_count
-            if crc_ok or time.process_time() - sweep_start > SWEEP_BUDGET:
+            nonlocal _sweep_budget_hit
+            if crc_ok:
+                return True
+            if time.process_time() - sweep_start > SWEEP_BUDGET:
+                _sweep_budget_hit = True   # truncated — NOT memoizable
                 return True
             tr_raw, tr_pay, tr_soft, tr_nibs = soft_decode_payload(ds_off, slope, frac_tau=frac_tau)
             sweep_count += 1
@@ -8189,6 +8559,10 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 for margin_score, label, ds_off, slope, frac_tau, hx in best_candidates[:5]:
                     print("    %s ds=%+d slope=%+.3f tau=%+.4f worst8avg=%.2f head=%s" % (
                         label, ds_off, slope, frac_tau, margin_score, hx))
+        # C2: this exact sweep exhausted every combo without a CRC — a
+        # byte-identical re-run (same key) is proven futile; memoize.
+        if _c2_key is not None and not crc_ok and not _sweep_budget_hit:
+            _SWEEP_FAIL_MEMO.add(_c2_key)
 
     # ---- CROSS-ATTEMPT SOFT COMBINING (UC audit h) ----
     # Decode the margin-weighted argmax stream assembled from EVERY failed
@@ -8321,7 +8695,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # they pay the same per-symbol drift exposure.  Cost bounded: the
     # stage only runs when primary+chase+sweep all failed AND the
     # resid-curve span gate (>=0.12 bins) fires.
-    if crc_present and (not crc_ok) and sym_time_ms > 16.0:
+    if crc_present and (not crc_ok) and (not _fluke_junk) and sym_time_ms > 16.0:
         _retry_bases = [(0.0, 'primary', 0, 0.0, tau_frac, '')]
         if best_candidates:
             _retry_bases += sorted(best_candidates,
@@ -8417,6 +8791,9 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     _sc_try_combine()
 
     # ---- Final result ----
+    if crc_ok:
+        _GATE_HDR_TUPLES.clear()   # fluke-gate scope: capture completed
+        _GATE_MAX_MNORM[0] = -1.0
     print("\n  === RESULT ===")
     payload = raw_bytes[:payload_len]
     print("  Payload (%d bytes): %s" % (payload_len, ''.join('%02x' % b for b in payload)))
