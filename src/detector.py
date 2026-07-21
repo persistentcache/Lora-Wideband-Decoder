@@ -465,6 +465,20 @@ _PREALLOC = os.environ.get('LORA_PREALLOC', '1') != '0'
 #                      Welch PSDs, materialization) bit-identical to it.
 _LAZY = os.environ.get('LORA_LAZY', '1') != '0'
 _LAZY_VERIFY = os.environ.get('LORA_LAZY_VERIFY') == '1'
+# CROP-CENTER FIX (2026-07-21): exported captures were mis-centered
+# +6..45 kHz because a burst-correlated CW spur (measured at carrier
+# +57 kHz) hijacks the Welch-argmax carrier centroid in detect_preamble.
+# Fix lives ENTIRELY in the recorder save path: after the narrowband
+# slice exists, measure the packet's max-hold plateau ON THE SLICE
+# (_nb_plateau_offset — the investigation's ±150 Hz-validated meter) and,
+# if it says the crop is >5 kHz off DC, recenter the exported bytes and
+# add the correction to the FILENAME frequency only.  The det dicts'
+# freq_hz, DETECTED lines, dedup keys and channel learning are
+# byte-identical by construction (nothing detection-side reads the
+# correction).  Estimator abstains (None) whenever no bw-wide plateau
+# qualifies → original center kept, fail-safe.
+# LORA_CROP_CENTER_FIX=0 → exact legacy bytes + filenames.
+_CROP_CENTER_FIX = os.environ.get('LORA_CROP_CENTER_FIX', '1') != '0'
 
 
 class IQReader:
@@ -1621,6 +1635,57 @@ def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
     result *= (n_out / N)
 
     return result, float(target_fs)
+
+
+def _nb_plateau_offset(iq, fs, bw):
+    """CROP-CENTER FIX: max-hold plateau mis-centering meter.
+
+    Verbatim port of the investigation's validated ground-truth estimator
+    (scratch plateau_validated.py, ±150 Hz on the gatecap SF11 set).
+    A LoRa chirp sweeps the full bw every symbol, so under MAX-HOLD every
+    in-band bin reaches ~full chirp power → a flat, bw-wide plateau that a
+    narrow burst-CW spur (1-3 bins, constant envelope, gains nothing from
+    max-hold) cannot displace — unlike the Welch-average argmax centroid it
+    hijacks in detect_preamble.  Floor is a LOW percentile (p20), NOT the
+    median: at fs = 2*bw the plateau itself spans ~half the bins.
+
+    Returns the plateau edge-midpoint offset from DC (Hz) — i.e. how far
+    off-center the crop is — or None to ABSTAIN (slice too short, or no
+    contiguous floor+6dB run of width 0.6-1.4x bw).  Callers MUST treat
+    None as "keep the original center" (fail-safe contract: a correction
+    is only ever applied on a positive, bw-wide plateau identification).
+    """
+    n = 2048
+    if len(iq) < 4 * n:
+        return None
+    mh = None
+    w = np.hanning(n)
+    for i in range(0, min(len(iq), int(fs * 3.0)) - n, n // 2):
+        S = np.abs(np.fft.fftshift(np.fft.fft(iq[i:i + n] * w))) ** 2
+        mh = S if mh is None else np.maximum(mh, S)
+    if mh is None:
+        return None
+    frq = np.fft.fftshift(np.fft.fftfreq(n, 1.0 / fs))
+    floor = np.percentile(mh, 20)
+    thr = floor * 3.981  # floor + 6 dB
+    abv = mh > thr
+    d = np.diff(abv.astype(np.int8))
+    st = np.where(d == 1)[0] + 1
+    en = np.where(d == -1)[0]
+    if abv[0]:
+        st = np.r_[0, st]
+    if abv[-1]:
+        en = np.r_[en, len(abv) - 1]
+    best, be = None, -1.0
+    for s, e in zip(st, en):
+        wd = (e - s + 1) * (fs / n)
+        if 0.6 * bw <= wd <= 1.4 * bw:
+            es = float(mh[s:e + 1].sum())
+            if es > be:
+                be, best = es, (s, e)
+    if best is None:
+        return None
+    return 0.5 * (frq[best[0]] + frq[best[1]])
 
 
 
@@ -5241,6 +5306,50 @@ class SignalRecorder:
                         nb, nb_fs = extract_narrowband_fft(
                             extended, self.wb_fs, off, export_bw,
                             fft_cache=_ext_fft_cache)
+
+                    # ---- CROP-CENTER FIX (2026-07-21) ----
+                    # Measure the packet's max-hold plateau ON the NB slice
+                    # just built; if the crop center is >5 kHz off the
+                    # plateau midpoint, recenter the EXPORTED bytes and add
+                    # the correction to the FILENAME freq below.  Fail-safe
+                    # contract: _nb_plateau_offset returns None (abstain)
+                    # unless it positively identifies a bw-wide plateau, and
+                    # _crop_corr stays 0.0 → byte-identical legacy capture.
+                    # Detection state (d/_src freq_hz, DETECTED lines, dedup
+                    # keys, channel learning) is never touched.
+                    _crop_corr = 0.0
+                    if _CROP_CENTER_FIX and len(nb):
+                        _po = _nb_plateau_offset(nb, nb_fs, float(d['bw']))
+                        if _po is not None and abs(_po) > 5000.0:
+                            if _nb_job is None:
+                                # Direct path: re-extract at the corrected
+                                # center — the cached forward FFT makes this
+                                # one cheap extra inverse.
+                                _nb2, _fs2 = extract_narrowband_fft(
+                                    extended, self.wb_fs, off + _po,
+                                    export_bw, fft_cache=_ext_fft_cache)
+                                if len(_nb2):
+                                    nb, nb_fs = _nb2, _fs2
+                                    _crop_corr = float(_po)
+                            else:
+                                # Lazy path: the cropper's wideband parts are
+                                # gone (streams only), so recenter the NB
+                                # stream itself with a heterodyne mix —
+                                # equivalent to a re-extract at off+corr
+                                # except in the empty brick-wall band edges
+                                # (the packet spans ±bw/2+corr, well inside
+                                # the ±bw slice).  Detection unchanged.
+                                _ph = np.arange(len(nb), dtype=np.float64)
+                                nb = (nb * np.exp(
+                                    (-2j * np.pi * _po / nb_fs) * _ph)
+                                      ).astype(np.complex64)
+                                _crop_corr = float(_po)
+                            if self.debug >= 1 and _crop_corr != 0.0:
+                                print(f"         [CROP-CENTER] "
+                                      f"{d['freq_hz'] / 1e6:.4f}MHz "
+                                      f"corr={_crop_corr / 1e3:+.1f}kHz "
+                                      f"({'mix' if _nb_job is not None else 'reextract'})",
+                                      flush=True)
                     _preamble_sym = _preamble_sample // sym_n if sym_n > 0 else 0
                     _relay_after_syms     = _preamble_sym + 149
                     _original_before_syms = max(0, _preamble_sym - 8)
@@ -5268,9 +5377,13 @@ class SignalRecorder:
                     # never share a filename (same-ms finalizes of same-
                     # carrier packets used to, and the 4 parallel save
                     # workers then corrupted the file racing tofile).
+                    # CROP-CENTER FIX: the filename freq is the decoder's
+                    # starting-CFO truth for the file's DC — it must name the
+                    # (possibly corrected) actual crop center.  _crop_corr is
+                    # 0.0 on abstain/kill-switch → byte-identical legacy name.
                     _sq = next(self._fname_seq)
                     fname = (f"SF{d['sf']}_{fmt_bw(d['bw'])}"
-                             f"_{d['freq_hz'] / 1e6:.4f}MHz"
+                             f"_{(d['freq_hz'] + _crop_corr) / 1e6:.4f}MHz"
                              f"_{int(round(nb_fs / 1000))}ksps"
                              f"_pwr{int(round(d.get('peak_power_db', 0.0)))}"
                              f"_{dt_str[:-3]}{_sq % 1000:03d}.cf32")
@@ -5349,7 +5462,7 @@ class SignalRecorder:
                                 _sq2 = next(self._fname_seq)
                                 _fname2 = (
                                     f"SF{_fsf}_{fmt_bw(_fbw)}"
-                                    f"_{d['freq_hz'] / 1e6:.4f}MHz"
+                                    f"_{(d['freq_hz'] + _crop_corr) / 1e6:.4f}MHz"
                                     f"_{int(round(nb_fs / 1000))}ksps"
                                     f"_pwr{int(round(d.get('peak_power_db', 0.0)))}"
                                     f"_{dt_str[:-3]}{_sq2 % 1000:03d}.cf32")
