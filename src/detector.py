@@ -4122,6 +4122,15 @@ class _StreamDecimator:
         return self.feed(np.zeros(self.H, np.complex64))
 
 
+def _slope(sf, bw):
+    """Chirp slope family key: bw^2 / 2^sf (rounded to kHz-scale).  Every
+    (sf, bw) that shares this value produces the same physical up-chirp rate,
+    so a down-alias (e.g. SF7/62.5k) collapses onto its real same-slope parent
+    (SF9/125k).  Used by the recorder's cross-batch dedup to keep an alias from
+    claiming its own keep-2 slots."""
+    return round(bw * bw / (2.0 ** sf) / 1e3)
+
+
 class SignalRecorder:
     """One file per detection, saved in a background thread.
 
@@ -4264,6 +4273,31 @@ class SignalRecorder:
         # single-pass decode); the gate's per-preamble carrier estimate provides
         # that.
         self._dedup_keep = int(os.environ.get('LORA_DEDUP_KEEP', '2'))
+        # Option A — slope-family-aware cross-batch dedup.  Collapse a same-slope
+        # alias (SF7/62.5k = down-alias of real SF9/125k) onto its real parent
+        # cluster so it does NOT get its own keep-2 slots + decode jobs; when a
+        # cluster is full, a higher-quality (bw_quality_db) member evicts the
+        # weakest slot so the true parent always wins over the 3-6 dB-weaker
+        # alias.  LORA_SLOPE_DEDUP=0 → exact per-(sf,bw) HEAD behaviour.
+        self._slope_dedup = os.environ.get('LORA_SLOPE_DEDUP', '1') != '0'
+        # Option B — load-aware keep-1.  When the decode backlog (dec_q =
+        # decoder.pending()) is above threshold, drop effective keep 2→1 so a
+        # real beacon's 2nd fallback capture is not queued while the single slow
+        # worker is saturated.  LORA_KEEP1_UNDER_LOAD=0 → legacy always-keep-2.
+        self._keep1_under_load = os.environ.get('LORA_KEEP1_UNDER_LOAD', '1') != '0'
+        self._keep1_load_thresh = int(
+            os.environ.get('LORA_KEEP1_LOAD_THRESH', '6'))
+        # Record-time same-slope alias gate margin (dB).  A same-slope member
+        # whose raw dechirp quality is more than this below a different-label
+        # sibling already in its cluster is the down-alias and is not recorded.
+        # 2.5 dB sits safely inside the measured 3-6 dB alias-vs-parent gap
+        # while never gating a genuinely-strongest member.  0 disables the gate
+        # (keeps only the registry eviction).
+        try:
+            self._slope_margin_db = float(
+                os.environ.get('LORA_SLOPE_MARGIN_DB', '2.5'))
+        except ValueError:
+            self._slope_margin_db = 2.5
         # Strong-carrier registry for GLOBAL IQ-image rejection.  detect_preamble
         # rejects images only when the stronger real signal is co-detected in
         # the SAME 1 s window; with 50 % window overlap an image is often saved
@@ -5005,6 +5039,7 @@ class SignalRecorder:
                     if p.get('forced_dechirp'):
                         _dt_win = DECHIRP_DEDUP_WIN_S
                     _match = 0
+                    _skip = False
                     with self._saved_abs_t_lock:
                         # PER-LABEL keep-N (2026-07-08): the cluster key now
                         # includes (sf, bw).  Same-label re-detections of one
@@ -5033,24 +5068,93 @@ class SignalRecorder:
                         # WEAKEST det from the batch power-sort — UC audit a):
                         # the registry must match/register under the label
                         # the save actually carries.
+                        # Option A extends the cluster key: besides exact
+                        # (sf, bw), a same-SLOPE member collapses onto the
+                        # cluster too (bw^2/2^sf identical) — so a down-alias
+                        # (SF7/62.5k of a real SF9/125k, SF9/62.5k of SF11/125k)
+                        # no longer opens its own keep-2 slots and its own
+                        # never-CRCing decode jobs.  The registry tuple now
+                        # carries bw_quality_db as a 5th field for the quality-
+                        # ranked eviction below.  LORA_SLOPE_DEDUP=0 → exact
+                        # per-(sf,bw) HEAD behaviour.
                         _lbl_blind = bool(_src.get('patience_trial'))
-                        for _sf_hz, _st, _ssf, _sbw in self._saved_abs_t:
+                        _cand_slope = _slope(_src['sf'], _src['bw'])
+                        _cand_q = float(_src.get('bw_quality_db', 0.0))
+                        # Option B: effective keep collapses 2→1 under decode
+                        # backlog so a real beacon's 2nd fallback capture is not
+                        # queued while the single slow worker is saturated.
+                        _eff_keep = self._dedup_keep
+                        if (self._keep1_under_load and self._dedup_keep > 1
+                                and self._decoder is not None
+                                and self._decoder.pending()
+                                    > self._keep1_load_thresh):
+                            _eff_keep = 1
+                        _cluster_idx = []
+                        _best_diff_q = -1e30   # best q of a same-slope,
+                        #   DIFFERENT-(sf,bw) member already in this cluster
+                        for _i, _e in enumerate(self._saved_abs_t):
+                            _sf_hz, _st, _ssf, _sbw = _e[0], _e[1], _e[2], _e[3]
                             if (abs(_cand_freq - _sf_hz) < _ftol
                                     and abs(_abs_t_s - _st) < _dt_win
                                     and (_lbl_blind
                                          or (_ssf == _src['sf']
-                                             and _sbw == _src['bw']))):
+                                             and _sbw == _src['bw'])
+                                         or (self._slope_dedup
+                                             and _slope(_ssf, _sbw)
+                                                 == _cand_slope))):
                                 _match += 1
-                        if _match < self._dedup_keep:
+                                _cluster_idx.append(_i)
+                                if (self._slope_dedup
+                                        and (_ssf != _src['sf']
+                                             or _sbw != _src['bw'])):
+                                    _best_diff_q = max(_best_diff_q, _e[4])
+                        # RECORD-TIME same-slope alias gate (the eviction below
+                        # only rewrites the registry — it cannot un-create a
+                        # decode job for an alias that already filled a free
+                        # keep-N slot or beat the weakest one).  A same-slope
+                        # member whose raw dechirp quality is MARGIN dB below a
+                        # different-label sibling already in the cluster is the
+                        # 3-6 dB-weaker down-alias (SF7/62.5k of a real
+                        # SF9/125k) — skip RECORDING it entirely so it never
+                        # becomes a decode job, regardless of slot availability.
+                        # A genuinely-strongest same-slope member is never
+                        # gated (it clears the margin), preserving a real weak
+                        # SF7/62.5k that has no stronger sibling.
+                        if (self._slope_dedup
+                                and _best_diff_q - _cand_q > self._slope_margin_db):
+                            _skip = True
+                        elif _match < _eff_keep:
                             self._saved_abs_t.append(
                                 (_cand_freq, _abs_t_s,
-                                 _src['sf'], _src['bw']))
+                                 _src['sf'], _src['bw'], _cand_q))
                             if len(self._saved_abs_t) > 4000:
                                 _cut = _abs_t_s - 10.0
                                 self._saved_abs_t = [
                                     e for e in self._saved_abs_t
                                     if e[1] > _cut]
-                    if _match >= self._dedup_keep:
+                        elif self._slope_dedup and _cluster_idx:
+                            # Cluster full: quality-ranked eviction.  If this
+                            # det's bw_quality_db beats the weakest slot's, evict
+                            # + replace that slot so the true higher-q member
+                            # always wins; the 3-6 dB-weaker alias never
+                            # displaces the real parent.  Registry stays bounded
+                            # (replace, not add) — at most a few evictions until
+                            # the highest-q member holds the slot.  REGRESSION
+                            # GUARD: the SF12/62.5k-vs-SF10/31.25k GT pair is
+                            # same-slope (~954); keeping the higher-raw-q member
+                            # preserves the required decode of both texts.
+                            _weak_i = min(
+                                _cluster_idx,
+                                key=lambda _j: self._saved_abs_t[_j][4])
+                            if _cand_q > self._saved_abs_t[_weak_i][4]:
+                                self._saved_abs_t[_weak_i] = (
+                                    _cand_freq, _abs_t_s,
+                                    _src['sf'], _src['bw'], _cand_q)
+                            else:
+                                _skip = True
+                        else:
+                            _skip = True
+                    if _skip:
                         if self.debug >= 1:
                             print(f"         [RFDEDUP] skip "
                                   f"{_cand_freq / 1e6:.4f}MHz t={_abs_t_s:.2f}s",
