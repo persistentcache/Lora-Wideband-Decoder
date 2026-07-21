@@ -5197,17 +5197,43 @@ def process_file(fpath, relay_after=None, relay_before=None,
         Doing it as soon as a large off-centre preamble is seen avoids
         burning the whole PASS-1 retry budget first (run_4 Test4 hop0:
         ~10 s → ~2 s).  Returns True iff a packet decoded."""
-        for sh in ([cfo_hz, cfo_hz - bw] if cfo_hz > bw / 2 else
-                   [cfo_hz, cfo_hz + bw] if cfo_hz < -bw / 2 else [cfo_hz]):
+        # WRAP-FIRST rung order (2026-07-21, alias-ladder measurement): the
+        # coarse preamble bin is unwrapped, so a centered capture with a
+        # small NEGATIVE cfo surfaces as a large positive alias.  Across
+        # every measured live leg, ALL 11 productive early rungs were the
+        # SMALL wrapped interpretation and the raw large shift rescued
+        # nothing in ~40 tries — while a raw-first hdr_ok grind at the
+        # wrong alias starved the true rung past the watchdog on a real
+        # packet.  Same rung SET (both still run on failure), same CRC
+        # acceptance — order only.  LORA_ALIAS_WRAP_FIRST=0 -> raw-first.
+        _wrap_first = os.environ.get('LORA_ALIAS_WRAP_FIRST', '1') != '0'
+        if cfo_hz > bw / 2:
+            _rungs = [cfo_hz - bw, cfo_hz] if _wrap_first else [cfo_hz, cfo_hz - bw]
+        elif cfo_hz < -bw / 2:
+            _rungs = [cfo_hz + bw, cfo_hz] if _wrap_first else [cfo_hz, cfo_hz + bw]
+        else:
+            _rungs = [cfo_hz]
+        for sh in _rungs:
             if abs(sh) < 5 * bw / N:
                 continue
             if _BUDGET_S > 0 and (time.process_time() - _process_start) > _BUDGET_S:
                 return False
+            # Per-rung budget slice: the remaining CPU budget is split
+            # across the remaining rungs so one wrong-alias hdr_ok grind
+            # cannot consume the whole job (measured: 3x 102s watchdog
+            # kills inside a first-rung grind while the true sibling rung
+            # never ran).  The last rung gets everything left.
+            if _BUDGET_S > 0 and len(_rungs) > 1 and sh is _rungs[0]:
+                _rung_left = _BUDGET_S - (time.process_time() - _process_start)
+                _rung_cap = _process_start + _BUDGET_S - _rung_left / 2.0
+            else:
+                _rung_cap = None
             print("\n  === %s recenter by %.0f Hz ===" % (label, sh))
             iqx = recrop_centered(sh)
             r = _decode_attempt(iqx.copy(), sf, bw, N, ppm, fs, dec, name,
                                 Counter, skip_bins=skip_bins, sweep_budget=1.0,
-                                deadline=_ddl)
+                                deadline=(_ddl if _rung_cap is None else
+                                          (min(_ddl, _rung_cap) if _ddl else _rung_cap)))
             if r is not None and r[0] == 'OK':
                 return True
         return False
