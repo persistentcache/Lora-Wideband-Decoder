@@ -5660,6 +5660,25 @@ class BackgroundDecoder:
         # pre-SF-scaling — SF12 gets ~8.5 s vs the ~57 s a full 10 s budget
         # scales to).  Bailed decodes are requeued to the slow tier.
         self._stress_budget = float(os.environ.get('LORA_STRESS_BUDGET_S', '1.5'))
+        # Decode-queue depth that triggers fail-fast budgets for FRESH jobs
+        # (see the worker loop): deep queue = fresh packets take the fast
+        # path, marginals defer to the idle slow tier.  0 disables.
+        try:
+            self._pressure_n = int(os.environ.get('LORA_DECODE_PRESSURE_N', '8'))
+        except ValueError:
+            self._pressure_n = 8
+        # Pressure-path budget (flat CPU seconds across SF, like the stress
+        # path).  A 4.0 s variant ("let clean SF11 pass first try") was
+        # A/B-tested and LOST to 1.5 s (med latency 108/114 vs 78/109 s,
+        # uniq tied): the requeue-slow path recovers bounced cleans promptly
+        # and the tighter budget keeps the single worker freer.  1.5 =
+        # identical to the proven v2 behavior (-20% med latency, +2.5
+        # decodes vs no pressure trigger).
+        try:
+            self._pressure_budget = float(
+                os.environ.get('LORA_DECODE_PRESSURE_BUDGET_S', '1.5'))
+        except ValueError:
+            self._pressure_budget = 1.5
         # Respect cgroup/taskset CPU affinity — `os.cpu_count()` returns the
         # SYSTEM count (e.g. 24) even when the process is pinned to 4 cores via
         # taskset / cgroup; on those hosts that would auto-scale to 16 decode
@@ -6289,7 +6308,23 @@ while True:
             # the next idle gap, so marginal packets are DEFERRED under
             # load, never lost.  Idle behavior is byte-identical.
             _stress_shrunk = False
-            if job_budget is None and self._gate_stress.is_set():
+            # DECODE-PRESSURE fail-fast (latency lever, 2026-07-21): the
+            # gate-stress trigger below covers RING pressure only — when the
+            # gate keeps up but the DECODE queue runs deep, queued jobs still
+            # got the full idle-recovery budget, so 88-102 s marginal grinds
+            # held the single low-core worker while fresh beacons waited
+            # (measured live real-beacon queue latency: med ~100 s).  A deep
+            # decode queue now triggers the same battle-tested fail-fast +
+            # REQUEUE-SLOW path: fresh packets decode in seconds, marginal
+            # stragglers are DEFERRED to idle gaps (big-budget slow tier),
+            # never lost.  LORA_DECODE_PRESSURE_N jobs (0 disables).
+            _dec_pressure = False
+            if job_budget is None and self._pressure_n > 0:
+                _dec_pressure = self.pending() > self._pressure_n
+            _press_only = False
+            if job_budget is None and (self._gate_stress.is_set()
+                                       or _dec_pressure):
+                _press_only = _dec_pressure and not self._gate_stress.is_set()
                 # Flat CPU budget: process_file multiplies any budget by
                 # 2^((sf-7)/2) (SF12 ≈ 5.7x — right for idle recovery, wrong
                 # for fail-fast).  Pre-divide by the same factor so the
@@ -6298,7 +6333,9 @@ while True:
                 import re as _re_sf
                 _m_sf = _re_sf.search(r'SF(\d+)_', fname)
                 _sf_j = int(_m_sf.group(1)) if _m_sf else 7
-                job_budget = self._stress_budget / (2.0 ** ((_sf_j - 7) * 0.5))
+                _flat = (self._pressure_budget if _press_only
+                         else self._stress_budget)
+                job_budget = _flat / (2.0 ** ((_sf_j - 7) * 0.5))
                 _stress_shrunk = True
             if self._decoder_script is None:
                 self._queue.task_done()
