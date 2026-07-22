@@ -7724,6 +7724,14 @@ def main():
     is_live = (a.file is None)
     if is_live:
         reader = StreamBuffer(fp, a.format, a.rate, buf_seconds=a.buf_seconds)
+        # Ring TRUTH write-back: StreamBuffer's low-RAM guard may have scaled
+        # the ring below the requested seconds.  Every downstream sizing
+        # decision (banner, decode-RAM reserve, CATCHUP trigger, backlog
+        # fractions) must derive from the ring that actually EXISTS — sized
+        # from the requested seconds, the 80% CATCHUP trigger waits on
+        # capacity that isn't there and the ring silently overwrites unread
+        # samples before it ever fires.
+        a.buf_seconds = reader._ring_n / float(a.rate)
         buf_mb = int(a.rate * a.buf_seconds * (4 if a.format == 'sc16' else 2) / 1e6)
         print(f"Stream: ring buffer {a.buf_seconds:.1f}s ({buf_mb} MB) — "
               f"pipe never blocks", file=sys.stderr)
@@ -8127,13 +8135,18 @@ def main():
       _TRIAL_DEFER = os.environ.get('LORA_TRIAL_DEFER', '1') != '0'
       _hop_budget_s = hop_n / float(a.rate)
 
-      def _budget_track(_dt, _npk):
+      def _budget_track(_dt, _npk, _wts=0.0, _wpk=0):
           # [GATE-BUDGET] EWMA maintenance, called right after the detect
-          # phase.  Per-peak cost: this window's detect-phase elapsed over the
-          # peaks it actually processed (pooled windows measure dispatch +
-          # backpressure commits — small while workers keep up, ≈ the true
-          # per-window worker cost once the pool saturates, which is exactly
-          # the deficit regime the clamp exists for).  Overhead: per-window
+          # phase.  Per-peak cost comes from WORKER-TRUTH samples on the
+          # pooled path (_wts seconds over _wpk peaks, timed inside the
+          # workers and drained via take_busy_stats): the dispatch-side wall
+          # time there is slot memcpy + queue put — milliseconds while the
+          # workers keep up — and feeding it as "per-peak cost" under-reported
+          # the true 500k peak cost (~950 ms on a Pi) ~100x, so the cap
+          # admitted 12-21 peaks/window for 30-50 s until the pool saturated
+          # and the ring CATCHUP-skipped (the 500k forensics, 2026-07-21).
+          # The _dt/_npk sample is kept for the paths where dispatch time IS
+          # the true cost (inline/serial detect).  Overhead: per-window
           # delta of the cumulative PROF welch+gate/sweep+sat counters.
           # 'read' is deliberately EXCLUDED: in live mode it is dominated by
           # the reader's blocking wait-for-samples (≈ the whole hop on a host
@@ -8148,6 +8161,10 @@ def main():
           if _d_ovh >= 0.0:
               _bgt['ovh'] = (_d_ovh if _bgt['ovh'] == 0.0
                              else 0.3 * _d_ovh + 0.7 * _bgt['ovh'])
+          if _wpk >= 1:
+              _pp = _wts / _wpk
+              _bgt['pp'] = (_pp if _bgt['pp'] == 0.0
+                            else 0.3 * _pp + 0.7 * _bgt['pp'])
           if _npk >= 1:
               _pp = _dt / _npk
               _bgt['pp'] = (_pp if _bgt['pp'] == 0.0
@@ -8858,7 +8875,15 @@ def main():
             # verify pass measured a real decode lost to a false clamp when
             # this condition was absent).  A deficit host banks a hop within
             # ~0.5 s and engages ~40x sooner than the ring>50% backstop.
-            _bud_s = _hop_budget_s * _bgt['margin'] - _bgt['ovh']
+            # Worker-lane capacity: pooled detect runs on n_workers cores in
+            # parallel, so the sustainable per-hop detect budget is
+            # n_workers x hop (serial/inline keeps the single-lane budget).
+            # Subtracting the parent-side ovh from the worker lane is
+            # dimensionally conservative (they are different cores) — it
+            # only ever shrinks the cap.
+            _lanes = (a.detect_workers if (_pool is not None
+                                           and a.detect_workers) else 1)
+            _bud_s = _lanes * _hop_budget_s * _bgt['margin'] - _bgt['ovh']
             _cap_new = min(_PEAK_CAP_HI,
                            max(_BUDGET_CAP_FLOOR, int(_bud_s / _bgt['pp'])))
             # Hysteresis: the int() truncation wobbles +-1 on noisy per-peak
@@ -8867,11 +8892,47 @@ def main():
             if abs(_cap_new - _bgt['cap_last']) >= 2:
                 print(f"[GATE-BUDGET] per-peak {_bgt['pp']*1000:.0f}ms "
                       f"ovh {_bgt['ovh']*1000:.0f}ms "
-                      f"hop {_hop_budget_s*1000:.0f}ms — "
+                      f"hop {_hop_budget_s*1000:.0f}ms x{_lanes} — "
                       f"budget cap -> {_cap_new}",
                       file=sys.stderr, flush=True)
                 _bgt['cap_last'] = _cap_new
             _cap_budget = _bgt['cap_last']
+            # Ring-headroom admission bound (no hysteresis — must react
+            # immediately): never queue more worker-lane work than fits in
+            # the time left before the 80% CATCHUP trigger.  Backlog = peaks
+            # dispatched but not yet returned, priced at the measured
+            # per-peak cost; half the remaining headroom is admission
+            # budget, half absorbs estimation error.  Converts any cost
+            # mis-prediction into a few shed peaks instead of a wholesale
+            # 35-50 s ring skip.
+            if _pool is not None:
+                _head_s = max(0.0, (0.8 * _ring_n_total - _avail)
+                              / float(a.rate))
+                _pend_pk = sum(_w.get('npk', 0) for _w in _inflight
+                               if not _pool.ready(_w['seq']))
+                _cap_ring = int((_lanes * _head_s * 0.5) / _bgt['pp']
+                                - _pend_pk)
+                _cap_budget = min(_cap_budget,
+                                  max(_BUDGET_CAP_FLOOR, _cap_ring))
+        elif (is_live and _bgt['margin'] > 0.0 and _bgt['pp'] == 0.0
+                and _pool is not None and _avail >= hop_n):
+            # Cold start under backlog with NO cost measurement yet:
+            # admitting _PEAK_CAP_HI unknown-cost peaks here queued 25-100 s
+            # of worker time before the first worker-truth sample could land
+            # (the restart-into-flood catastrophe).  Measure-then-commit:
+            # admit two peaks per worker lane to obtain the sample, then the
+            # honest cap takes over (~1-2 windows).  KNOWN BOUNDED TRADE
+            # (3-lens verify, 2026-07-21): a HEALTHY host restarting behind a
+            # producer-banked queue (e.g. web settings-save while soapy_rx
+            # keeps its 512 MB queue) also lands here for those 1-2 windows
+            # and sheds all but the strongest 2*lanes candidates — a rare
+            # one-shot weakest-peak loss per restart, accepted vs risking a
+            # 35-50 s wholesale ring skip; co-started runs (<0.5 hop banked)
+            # never enter.  2*lanes keeps worst-case unknown work ~4 s
+            # (2 windows x 2 peaks/lane x ~1 s worst measured per-peak).
+            _cap_budget = max(_BUDGET_CAP_FLOOR,
+                              2 * (a.detect_workers if a.detect_workers
+                                   else 1))
         if is_live:
             _ring_frac = _avail / float(_ring_n_total)
             if _ring_frac > 0.5:
@@ -9176,7 +9237,7 @@ def main():
             _pool.dispatch(_slot, _seq, len(buf), _psd_gate, _gate_peaks,
                            spur_db=_spur_db, center=_live_center_mhz,
                            dechirp_chans=(_win_chans or None))
-            _inflight.append({'seq': _seq, 'slot': _slot,
+            _inflight.append({'seq': _seq, 'slot': _slot, 'npk': _n_pk_det,
                               'pre_hop': pre_hop, 'tot_s': tot_s})
             _seq += 1
             # Tail-aware commit: once depth exceeds the base lag, commit the
@@ -9201,7 +9262,11 @@ def main():
             dt = time.time() - tw
             _prof['detect'] += dt
             if is_live and _bgt['margin'] > 0.0:
-                _budget_track(dt, _n_pk_det)
+                # npk=0: the dispatch-side dt is NOT a per-peak cost sample
+                # on the pooled path — worker-truth arrives via
+                # take_busy_stats (see _budget_track).
+                _wts, _wpk = _pool.take_busy_stats()
+                _budget_track(dt, 0, _wts, _wpk)
             _t_step = time.time()
         else:
             if _lz is not None and not _gate_peaks:
@@ -9232,7 +9297,12 @@ def main():
             dt = time.time() - tw; elapsed = time.time() - t_start
             _prof['detect'] += dt
             if is_live and _bgt['margin'] > 0.0:
-                _budget_track(dt, _n_pk_det)
+                # Inline/serial: dt IS the true detect cost.  Worker samples
+                # from earlier pooled windows may still be pending in the
+                # pool accumulators (hybrid routing) — fold those too.
+                _wts, _wpk = (_pool.take_busy_stats() if _pool is not None
+                              else (0.0, 0))
+                _budget_track(dt, _n_pk_det, _wts, _wpk)
             _t_step = time.time()
 
             # Cross-window duplicate suppression is intentionally removed.
