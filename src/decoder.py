@@ -5240,8 +5240,6 @@ def process_file(fpath, relay_after=None, relay_before=None,
 
 
     _need_rescue = False   # set when a header decoded but its data never CRC'd
-    _rescue_spans = []     # sample spans of the hdr_ok/no-CRC latches
-    _emitted_spans = []    # sample spans of packets actually emitted
     _residual_clear = False  # set when the masked residual has NO preamble left
     _sf_relabel_tried = False  # one-shot same-bw SF relabel (UC audit o)
     # Counter for consecutive attempts that produced NO valid LoRa header.  Real
@@ -5341,17 +5339,6 @@ def process_file(fpath, relay_after=None, relay_before=None,
             _consec_no_header += 1
         if status != 'OK' and _d.get('hdr_ok') and not _d.get('no_rescue'):
             _need_rescue = True   # confirmed packet whose data didn't decode here
-            # Record WHERE the unrecovered header sat (sample span), so the
-            # rescue entries below can tell a genuinely-unrecovered packet
-            # from a fluke header that sat ON a packet we LATER emitted
-            # (post-first-decode continuation waste: junk-latched rescue
-            # re-decoded an already-emitted packet up to 6x, ~40 s/job in
-            # 9/189 measured jobs).
-            if _d.get('mask_start') is not None and _d.get('mask_len'):
-                _rescue_spans.append((int(_d['mask_start']),
-                                      int(_d['mask_start']) + int(_d['mask_len'])))
-            else:
-                _rescue_spans.append(None)   # unknown span -> never skippable
         if status == 'WRONG_SF':
             # SAME-BW SF RELABEL RETRY (UC audit o): the multi-SF
             # Schmidl-Cox measured a dominant best_sf (carried in
@@ -5386,7 +5373,6 @@ def process_file(fpath, relay_after=None, relay_before=None,
             if mask_len > 0:
                 mask_end = min(len(iq1_work), mask_start + mask_len)
                 iq1_work[mask_start:mask_end] = 0.0
-                _emitted_spans.append((int(mask_start), int(mask_end)))
                 continue
             return  # no mask info — stop here
         if preamble_bin is not None:
@@ -5453,23 +5439,6 @@ def process_file(fpath, relay_after=None, relay_before=None,
         print(f"  [VETO-DBG] p2-entry: need_rescue={_need_rescue} "
               f"allow={_allow_rescue} ntuples={len(_GATE_HDR_TUPLES)} "
               f"max_mnorm={_GATE_MAX_MNORM[0]:.3f} thr={_sweep_gate_mnorm():.2f}")
-    # POST-FIRST-DECODE OVERLAP RELEASE: if EVERY latched no-CRC header
-    # span overlaps a packet we subsequently EMITTED, the "unrecovered
-    # packet" was that packet all along (a wrong-alias/fluke header on it)
-    # — the rescue would only re-decode it into the dedup.  Only fires
-    # when something emitted AND every span is known and covered; any
-    # unknown or uncovered span keeps the rescue.  LORA_RESCUE_OVERLAP=0
-    # disables.
-    if (_need_rescue and _emitted_spans and _rescue_spans
-            and os.environ.get('LORA_RESCUE_OVERLAP', '1') != '0'
-            and all(sp is not None
-                    and any(sp[0] < e1 and sp[1] > e0
-                            for (e0, e1) in _emitted_spans)
-                    for sp in _rescue_spans)):
-        print("  RESCUE-OVERLAP: all %d unrecovered-header spans lie on "
-              "already-emitted packets — skipping rescue/PASS-2 re-decode"
-              % len(_rescue_spans))
-        _need_rescue = False
     if (_need_rescue and _allow_rescue and _sweep_gate_enabled()
             and len(_GATE_HDR_TUPLES) >= _sweep_gate_ndistinct()):
         # FLUKE-FILE PASS-2 VETO: every HDR_CHK-passing header this capture
