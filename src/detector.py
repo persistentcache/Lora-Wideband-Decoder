@@ -8115,11 +8115,15 @@ def main():
           print(f"[GATE] ignoring out-of-range LORA_GATE_BUDGET="
                 f"{_bgt['margin']} (using 0.85)", file=sys.stderr, flush=True)
           _bgt['margin'] = 0.85
-      # Floor: shed-weakest-first keeps the strongest peaks (= the real
-      # traffic).  2 by default; 1 fits hosts whose per-peak cost x2 exceeds
-      # the hop even at floor (measured Pi: 2x171ms + 223ms ovh > 500ms hop
-      # -> a slow deficit still builds -> one CATCHUP skip per few min).
-      _BUDGET_CAP_FLOOR = int(_psenv('LORA_GATE_BUDGET_FLOOR', 2, int, lo=1))
+      # Floor = 1: the peak count is DERIVED from measured per-peak cost vs
+      # the hop budget (the formula below) — a fixed floor above 1 OVERRIDES
+      # that derivation and, when even 2 peaks exceed the hop (measured:
+      # 2x171ms+223ms > 500ms at 125k on a Pi; ~2x950ms at 500k), forces a
+      # deficit that ends in a 35 s CATCHUP ring-skip losing EVERYTHING —
+      # strictly worse than processing the one strongest peak.  Hosts whose
+      # budget fits more peaks derive more automatically; fast hosts never
+      # clamp at all.  Ship-optimized for every host/bandwidth, no tuning.
+      _BUDGET_CAP_FLOOR = int(_psenv('LORA_GATE_BUDGET_FLOOR', 1, int, lo=1))
       _TRIAL_DEFER = os.environ.get('LORA_TRIAL_DEFER', '1') != '0'
       _hop_budget_s = hop_n / float(a.rate)
 
