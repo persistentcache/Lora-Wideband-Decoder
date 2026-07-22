@@ -5955,6 +5955,20 @@ class BackgroundDecoder:
         # LATENCY instead of packet LOSS.
         self._pressure = 0.0
         self._defer_state = False
+        # Slow-tier concurrency accounting.  Both release paths used to gate
+        # on "_active_count == 0" (nothing decoding AT ALL) to keep at most
+        # one heavy re-decode off a burst.  On any host whose worker pool is
+        # kept busy by the fast tier — i.e. every low-core host under load —
+        # that condition is essentially never true, so the slow queue NEVER
+        # drained in-run and pressure-deferred packets were LOST at shutdown
+        # instead of merely delayed (measured 2026-07-22: 192 jobs stranded
+        # across 14 live presets, queue depth to 42, decode 30-58%).  The
+        # intent was "one slow re-decode at a time", which is exactly what
+        # this counter expresses — without coupling it to unrelated fast-tier
+        # work.  Released jobs are tracked by path so the count survives the
+        # requeue/relay paths.
+        self._slow_inflight = 0
+        self._slow_released_job = None
         self._slow_budget = float(os.environ.get('LORA_SLOW_BUDGET_S', '45'))
         # Slow mop-up runs ONLY when capture is not active.  A big-budget
         # re-decode running DURING live capture holds workers and starves the
@@ -6274,13 +6288,7 @@ while True:
             return
         if self._slow_queue.qsize() == 0 or not self._queue.empty():
             return
-        with self._lock:
-            if self._active_count >= 1:
-                return
-        try:
-            self._queue.put(self._slow_queue.get_nowait())
-        except queue.Empty:
-            pass
+        self._release_one_slow()
 
     def submit(self, fpath, fname, relay_after_syms=None, relay_before_syms=None,
                bucket_key=None, slow=False):
@@ -6365,13 +6373,65 @@ while True:
             return
         if not self._queue.empty():
             return
+        self._release_one_slow()
+
+    def _release_one_slow(self):
+        """Move ONE slow-tier job into the fast queue, at most one in flight.
+
+        Callers have already established that no fast-tier work is waiting.
+        The released job is consumed by the SAME fixed worker pool, so this
+        adds no processes and cannot oversubscribe the gate; if every worker
+        is busy it simply waits its turn in the fast queue instead of rotting
+        in the slow one.
+
+        Realtime guard: gate on LIVE ring occupancy, not on the _defer_state
+        latch.  The latch exists to route NEW jobs to the slow tier and holds
+        for a 20 s min-dwell; gating releases on it would re-starve the queue
+        on exactly the busy hosts this fix targets.  Live pressure is the
+        honest "is there room for heavy work right now" signal, and the
+        _gate_stress throttle still pauses a running re-decode if the reader
+        starts dropping.  File mode leaves _pressure at 0.0 → unchanged."""
+        if self._pressure > 0.20:
+            return
         with self._lock:
-            if self._active_count != 0:
+            if self._slow_inflight >= 1:
                 return
         try:
-            self._queue.put(self._slow_queue.get_nowait())
+            _job = self._slow_queue.get_nowait()
         except queue.Empty:
-            pass
+            return
+        with self._lock:
+            self._slow_inflight += 1
+            self._slow_released_job = _job
+        self._queue.put(_job)
+
+    def _slow_take(self, job):
+        """Claim the slow-tier reservation iff `job` IS the released slow job.
+
+        Identity-based, NOT path-keyed: several submissions legitimately share
+        one fpath (the PASS-2 time-isolated variant, relay probes, and the
+        [BUDGET] requeue), so matching on path let a FAST-tier job retire the
+        slow reservation while the slow job was still running — permitting a
+        second heavy re-decode against the live gate."""
+        with self._lock:
+            if (self._slow_released_job is not None
+                    and job is self._slow_released_job):
+                self._slow_released_job = None
+                return True
+        return False
+
+    def _slow_retire(self):
+        """Release the in-flight slow reservation.
+
+        MUST run on EVERY exit path of the dispatch-loop iteration that
+        claimed it.  The early `continue`s (no decoder script, SKIP-BUCKET,
+        SKIP-INFLIGHT-ADMIT, worker-start failure) are not corner cases —
+        SKIP-BUCKET is the *designed* outcome for patience-trial families
+        submitted under one bucket key — and leaking there pins
+        _slow_inflight at 1, which turns both release paths into permanent
+        no-ops and re-starves the slow queue unconditionally."""
+        with self._lock:
+            self._slow_inflight = max(0, self._slow_inflight - 1)
 
     def drain_slow_into_fast(self):
         """Move the slow mop-up queue into the fast queue so the blocking
@@ -6436,6 +6496,9 @@ while True:
             if self._gate_stress.is_set():
                 time.sleep(self._stress_pause_s)
             fpath, fname, relay_after_syms, relay_before_syms, job_budget = job
+            # Claim the slow-tier reservation ONCE, here, by job identity; every
+            # exit path below must retire it (see _slow_retire).
+            _slow_rel = self._slow_take(job)
             # Load-aware decode budget: when the gate is under pressure (ring
             # filling or dropping — same signal as the pause above), a
             # fast-tier decode runs with a FAIL-FAST budget instead of the
@@ -6479,6 +6542,8 @@ while True:
                 job_budget = _flat / (2.0 ** ((_sf_j - 7) * 0.5))
                 _stress_shrunk = True
             if self._decoder_script is None:
+                if _slow_rel:
+                    self._slow_retire()
                 self._queue.task_done()
                 continue
 
@@ -6494,6 +6559,8 @@ while True:
             if self._bucket_already_decoded(fpath):
                 self._rawlog('SKIP-BUCKET', os.path.basename(fpath))
                 self._ref_dec_and_maybe_unlink(fpath)
+                if _slow_rel:
+                    self._slow_retire()
                 self._queue.task_done()
                 if self._verbose:
                     print(f"         [BUCKET-DEDUP] skip {os.path.basename(fpath)} "
@@ -6523,6 +6590,8 @@ while True:
                         # Sibling admitted while we waited — skip cleanly.
                         self._rawlog('SKIP-INFLIGHT-ADMIT', os.path.basename(fpath))
                         self._ref_dec_and_maybe_unlink(fpath)
+                        if _slow_rel:
+                            self._slow_retire()
                         self._queue.task_done()
                         if self._verbose:
                             print(f"         [BUCKET-DEDUP] skip {os.path.basename(fpath)} "
@@ -6545,6 +6614,8 @@ while True:
             if worker is None or worker.poll() is not None:
                 worker = self._start_worker()
                 if worker is None:
+                    if _slow_rel:
+                        self._slow_retire()
                     self._queue.task_done()
                     continue
 
@@ -6790,6 +6861,8 @@ while True:
                         pass
                 with self._lock:
                     self._active_count -= 1
+                if _slow_rel:
+                    self._slow_retire()
                 self._queue.task_done()
                 # Phase-2: clear the in-flight bucket entry so waiting
                 # sibling workers can proceed (either they'll see the bucket
