@@ -22,7 +22,6 @@ Usage:
 """
 import os
 import queue
-import time
 import numpy as np
 import multiprocessing as mp
 from multiprocessing import shared_memory
@@ -66,12 +65,6 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
             break
         slot, seq, n, psd, peaks, spur_db, task_center, task_chans = task
         iq = views[slot][:n]
-        # Worker-truth timing: the parent's budget clamp needs the REAL
-        # per-peak detect cost, and only the worker can measure it — the
-        # dispatch-side wall time is just slot memcpy + queue put while
-        # workers keep up (~100x under the true 500k peak cost).
-        _t0 = time.monotonic()
-        _npk = len(peaks) if peaks else 0
         try:
             kw = dict(sc_threshold=sc_thr, ethresh=ethr,
                       dc_notch_mhz=dc_notch, spur_notch_hz=spur_notch,
@@ -90,10 +83,9 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
             break   # shutdown SIGINT mid-detect — exit quietly
         except Exception as e:
             dets = []
-            result_q.put((seq, dets, 'ERR:%s' % e,
-                          time.monotonic() - _t0, _npk))
+            result_q.put((seq, dets, 'ERR:%s' % e))
             continue
-        result_q.put((seq, dets, None, time.monotonic() - _t0, _npk))
+        result_q.put((seq, dets, None))
 
     for s in shms:
         s.close()
@@ -130,12 +122,6 @@ class DetectPool:
             p.start()
             self._workers.append(p)
         self._results = {}   # seq -> dets, filled as results arrive
-        # Worker-truth detect timing, accumulated from returned results and
-        # drained by the parent's budget clamp via take_busy_stats().  Only
-        # busy windows (>=1 peak) count: quiet windows early-return in
-        # detect_preamble and would dilute the per-peak cost estimate.
-        self._busy_t = 0.0
-        self._busy_pk = 0
 
     def acquire_slot(self):
         # Single-threaded caller (the gate producer), so no lock needed.
@@ -158,7 +144,7 @@ class DetectPool:
         self._task_q.put((slot, seq, n, psd, peaks, spur_db, center,
                           dechirp_chans))
 
-    def _absorb(self, rseq, dets, err, det_s=0.0, npk=0):
+    def _absorb(self, rseq, dets, err):
         if err is not None:
             # Worker-side detect exceptions used to vanish silently (the
             # third tuple field was read and dropped): a systematic failure
@@ -166,18 +152,7 @@ class DetectPool:
             import sys
             print(f"[POOL] worker error on window {rseq}: {err}",
                   file=sys.stderr, flush=True)
-        if npk >= 1 and det_s > 0.0:
-            self._busy_t += det_s
-            self._busy_pk += npk
         self._results[rseq] = dets
-
-    def take_busy_stats(self):
-        """Return and reset (worker detect seconds, peak count) accumulated
-        from busy-window results since the last call."""
-        t, pk = self._busy_t, self._busy_pk
-        self._busy_t = 0.0
-        self._busy_pk = 0
-        return t, pk
 
     def result(self, seq):
         """Block until window `seq`'s detection is available; return dets.
@@ -193,7 +168,7 @@ class DetectPool:
                 # Short wait once a worker is down: at SIGINT shutdown ALL
                 # workers die and the EOF drain would otherwise pay the full
                 # 10 s per still-in-flight window.
-                rseq, dets, err, _ds, _npk = self._result_q.get(
+                rseq, dets, err = self._result_q.get(
                     timeout=10.0 if _all_alive else 0.5)
             except queue.Empty:
                 if _all_alive:
@@ -203,7 +178,7 @@ class DetectPool:
                       f"(no detections)", file=sys.stderr, flush=True)
                 self._results[seq] = []
                 break
-            self._absorb(rseq, dets, err, _ds, _npk)
+            self._absorb(rseq, dets, err)
         return self._results.pop(seq)
 
     def ready(self, seq):
@@ -212,8 +187,8 @@ class DetectPool:
         realtime read on a not-yet-finished detection."""
         try:
             while True:
-                rseq, dets, err, _ds, _npk = self._result_q.get_nowait()
-                self._absorb(rseq, dets, err, _ds, _npk)
+                rseq, dets, err = self._result_q.get_nowait()
+                self._absorb(rseq, dets, err)
         except queue.Empty:
             pass
         return seq in self._results
