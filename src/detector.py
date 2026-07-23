@@ -7932,8 +7932,15 @@ def main():
     # wrong hit), so no explicit invalidation is needed.  LORA_SLICE_CACHE=0
     # disables; LORA_SLICE_CACHE_VERIFY=1 asserts each hit against a fresh
     # welch.
-    _slice_cache = {}          # abs_start_sample -> (psd, psd_max|None)
+    _slice_cache = {}          # abs_start_sample -> [psd, psd_max|None, notch_sig, peaks]
     _slice_cache_on = os.environ.get('LORA_SLICE_CACHE', '1') != '0'
+    # Reuse the post-processed per-slice PEAK list (not just the pristine PSD) on
+    # a cache hit whose notch signature is unchanged — skips the copy + notch +
+    # find_peaks that otherwise ran on every cached slice every window (the
+    # sweep's dominant cost).  Deterministic: the peak list is a pure function of
+    # the pristine PSD (already verify-checked) + the notch signature.  Kill-
+    # switch; disable to prove detection-equivalence vs recompute-every-window.
+    _slice_peak_cache_on = os.environ.get('LORA_SLICE_PEAK_CACHE', '1') != '0'
     _slice_cache_verify = os.environ.get('LORA_SLICE_CACHE_VERIFY') == '1'
     _slice_cache_hits = 0
     _slice_cache_miss = 0
@@ -8560,6 +8567,14 @@ def main():
         _short_peaks_all = []
         _n_short_slices = max(0, ((win_n if _lz is not None else len(buf))
                                   - _short_n) // _short_step + 1)
+        # Signature of every input to the per-slice notch + find_peaks: a cached
+        # slice's peak list is reusable only while ALL of these are unchanged.
+        # EXACT center (no rounding — _notch_psd and emitted freqs use it) so two
+        # distinct centers can never share a key; live retune / spur-notch / dc-
+        # notch / threshold / maxhold changes each force a peak-cache recompute
+        # (the pristine PSD cache is retained; only the peak memo invalidates).
+        _notch_sig = (_live_center_mhz, a.dc_notch, a.energy_threshold,
+                      bool(_maxhold), tuple(_spur_notch_hz) if _spur_notch_hz else ())
         for _si in range(_n_short_slices):
             _ss = _si * _short_step
             _seg = buf[_ss:_ss + _short_n] if _lz is None else None
@@ -8584,10 +8599,12 @@ def main():
                 else:
                     _pw, _pw_max = welch_psd(_seg, nfft=4096,
                                              n_avg=_SHORT_N_AVG), None
+                # Mutable [pristine_psd, pristine_psd_max, peak_notch_sig, peaks]
+                # — PSD stays pristine (every use copies first); the last two
+                # slots memoize the post-processed peak list per notch signature.
+                _cs = [_pw, _pw_max, None, None]
                 if _slice_cache_on:
-                    # Store PRISTINE (never notched); every use copies first.
-                    _slice_cache[_abs_start] = (_pw, _pw_max)
-                _cs = (_pw, _pw_max)
+                    _slice_cache[_abs_start] = _cs
                 _slice_cache_miss += 1
             else:
                 _slice_cache_hits += 1
@@ -8616,7 +8633,17 @@ def main():
                         print(f"[SLICE-CACHE] MISMATCH at abs={_abs_start} "
                               f"— cache is NOT bit-exact!", file=sys.stderr,
                               flush=True)
+            # Peak-result reuse: on a slice whose pristine PSD is cached AND
+            # whose notch signature matches the memoized one, the emitted peak
+            # list is identical — reuse it and skip copy + notch + find_peaks.
+            if (_slice_peak_cache_on and _cs[2] == _notch_sig
+                    and _cs[3] is not None and not _slice_cache_verify):
+                _short_peaks_all.extend(_cs[3])
+                continue
+            _peak_reuse_ref = (_cs[3] if (_cs[2] == _notch_sig
+                                          and _cs[3] is not None) else None)
             # Copy before notching so the cached array stays pristine.
+            _slice_peaks = []
             _p_short = _cs[0].copy()
             _p_short_max = _cs[1].copy() if _cs[1] is not None else None
             _notch_psd(_p_short)
@@ -8638,14 +8665,26 @@ def main():
             # so the short-window contribution is only needed for ≥250 k.
             for _bin, _w, _db, *_pkrest in find_peaks(_p_short, thresh_db=a.energy_threshold, fres_hz=a.rate / 4096.0):
                 if _w >= 30:
-                    _short_peaks_all.append((_bin, _w, _db,
-                                             _pkrest[0] if _pkrest else None))
+                    _slice_peaks.append((_bin, _w, _db,
+                                         _pkrest[0] if _pkrest else None))
             if _p_short_max is not None:
                 _notch_psd(_p_short_max)
                 for _bin, _w, _db, *_pkrest in find_peaks(_p_short_max, thresh_db=a.energy_threshold, fres_hz=a.rate / 4096.0):
                     if _w >= 30:
-                        _short_peaks_all.append((_bin, _w, _db,
-                                                 _pkrest[0] if _pkrest else None))
+                        _slice_peaks.append((_bin, _w, _db,
+                                             _pkrest[0] if _pkrest else None))
+            if _slice_cache_verify and _peak_reuse_ref is not None:
+                # The reuse shortcut WOULD have returned _peak_reuse_ref; assert
+                # the freshly recomputed peaks match it (invalidation test:
+                # LORA_SLICE_CACHE_VERIFY=1 while changing center/threshold/notch).
+                if tuple(_slice_peaks) != _peak_reuse_ref:
+                    print(f"[SLICE-PEAK-CACHE] MISMATCH at abs={_abs_start} "
+                          f"— peak reuse would NOT be exact!", file=sys.stderr,
+                          flush=True)
+            if _slice_cache_on:              # memoize for the next window's reuse
+                _cs[2] = _notch_sig
+                _cs[3] = tuple(_slice_peaks)  # immutable — never aliased/mutated
+            _short_peaks_all.extend(_slice_peaks)
         # Dedup by bin proximity (±15 bins ≈ ±100kHz) — narrower than 30 bins
         # so adjacent-channel hop0/hop1 pairs (commonly ±175 kHz apart) are
         # not collapsed into a single candidate. Sort by power desc so the
