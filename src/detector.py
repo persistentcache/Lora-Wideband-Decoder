@@ -22,6 +22,30 @@ Usage:
 """
 
 import sys, os
+# ---- Bound glibc malloc arenas BEFORE anything allocates (OOM fix, codex
+# review 2026-07-23) ----
+# glibc spawns extra malloc arenas under allocation contention (up to ~8×CPU),
+# each retaining fragmented free regions after numpy arrays are freed.  With the
+# detector's many threads (gate, crop, save, decode-mgr, iq-reader, 2 cvt) doing
+# heavy alloc churn, that fragmentation crept RSS up ~200 MB/min at 20 Msps with
+# EVERY logical queue bounded and empty — the residual OOM after the joint memory
+# plan.  MALLOC_ARENA_MAX=2 flattened it (measured: 20 Msps + decode went from
+# OOM-at-13s to a stable MemAvailable plateau).  glibc reads this only at process
+# start, so os.environ alone is too late for THIS process — re-exec once (the
+# env-presence guard prevents a loop and honours an operator override).  Must
+# precede numpy import, threads, arg parsing, and any stdin read; execve keeps
+# the pid/pgid and the inherited stdin/stdout pipe fds intact.
+if (__name__ == '__main__' and sys.platform.startswith('linux')
+        and 'MALLOC_ARENA_MAX' not in os.environ
+        and 'glibc.malloc.arena_max=' not in os.environ.get('GLIBC_TUNABLES', '')):
+    os.environ['MALLOC_ARENA_MAX'] = '2'
+    _oa = getattr(sys, 'orig_argv', None)
+    os.execve(sys.executable,
+              [sys.executable, *(_oa[1:] if _oa else sys.argv)], os.environ)
+if __name__ == '__main__':
+    sys.stderr.write("[MALLOC] arena_max=%s (2=bounded via re-exec; unset=off)\n"
+                     % os.environ.get('MALLOC_ARENA_MAX', 'UNSET'))
+    sys.stderr.flush()
 # Pin BLAS/FFT pools to ONE thread — MUST precede the numpy import.
 # Two reasons:
 # 1. DEADLOCK (found live 2026-07-09, py-spy): scipy-OpenBLAS registers a
@@ -481,6 +505,500 @@ _LAZY_VERIFY = os.environ.get('LORA_LAZY_VERIFY') == '1'
 _CROP_CENTER_FIX = os.environ.get('LORA_CROP_CENTER_FIX', '1') != '0'
 
 
+# ============================================================================
+# Instrumentation (VALIDATION-ONLY, additive — no behavior change).  Emits
+# structured RUN_EVENT lines to stderr for the paced-replay validation harness
+# (RF-time + monotonic clocks so pre-input-EOF decodes can be separated from
+# post-input-EOF drain).  run_id comes from the runner via LORA_RUN_ID so it
+# matches the runner-generated manifest; detector does NOT call git.
+# ============================================================================
+_RUN_ID = os.environ.get('LORA_RUN_ID') or ('pid%d-%d' % (os.getpid(),
+                                                          time.monotonic_ns()))
+_RUN_EVENT_LOCK = threading.Lock()
+
+def _run_event(event, **kw):
+    # Caller may pass mono_ns to log the EXACT stored timestamp (so the field
+    # matches the value saved on the object, not a second clock read).
+    if 'mono_ns' not in kw:
+        kw['mono_ns'] = time.monotonic_ns()
+    rec = {'run_event': event, 'run_id': _RUN_ID, **kw}
+    # NO silent swallow: for a VALIDATION build a lost event (esp. input_eof)
+    # would make an invalid run look scoreable.  One os.write() is atomic for
+    # a <PIPE_BUF line, so events from different threads never interleave; a
+    # write failure propagates and fails the run loudly rather than silently.
+    line = json.dumps(rec, separators=(',', ':'), default=str) + '\n'
+    with _RUN_EVENT_LOCK:
+        os.write(2, line.encode('utf-8', 'replace'))
+
+
+# ============================================================================
+# Candidate-lifecycle audit (VALIDATION-ONLY, gated OFF by default).  Emits ONE
+# batched cand_audit RUN_EVENT per non-empty gate window so raw-detection,
+# admission, and preamble-detection recall can be scored SEPARATELY offline
+# against the frozen occurrence oracle.  Energy candidates are Welch-PSD peaks
+# (freq bin + width + power); SF/BW are NOT known until detect_preamble, so
+# actual SF/BW/conf are attached only to 'detected' results (forced/patience
+# candidates carry a HYPOTHESIS sf/bw, kept distinct).  When _CAND_AUDIT is
+# False every hook is a single boolean skip — near-zero hot-path cost.
+# ============================================================================
+_CAND_AUDIT = os.environ.get('LORA_CAND_AUDIT', '0') == '1'
+_CAND_AUDIT_SCHEMA = 3
+
+# Per-peak cost-breakdown profiler (channelizer feasibility, 2026-07-23): times
+# the three per-peak categories a channelizer would/wouldn't amortize — EXTRACT
+# (narrowband crop+IFFT, amortizable) vs SC (schmidl-cox, per-signal) vs DECHIRP
+# (per-signal).  Gated by LORA_PP_PROF (near-zero cost off).  Run --detect-workers 0
+# so it accumulates in main and prints at the Done line.
+_PP_PROF_ON = os.environ.get('LORA_PP_PROF', '0') == '1'
+_PP_PROF = {'extract': 0.0, 'sc': 0.0, 'dechirp': 0.0,
+            'n_extract': 0, 'n_sc': 0, 'n_dechirp': 0}
+_EXT_CALLS = [0]         # exact-duplicate extraction meter (bit-identical memo potential)
+_EXT_KEYS = set()        # distinct (F, center_bin, n_out) keys seen
+
+
+def _pp_time(_cat, _ncat):
+    def _deco(_fn):
+        if not _PP_PROF_ON:
+            return _fn
+
+        def _wrap(*a, **k):
+            import time as _t
+            _t0 = _t.perf_counter()
+            try:
+                return _fn(*a, **k)
+            finally:
+                _PP_PROF[_cat] += _t.perf_counter() - _t0
+                _PP_PROF[_ncat] += 1
+        return _wrap
+    return _deco
+
+# PSD diagnostic (validation-only, gated OFF).  Dumps pre-rejection gate inputs
+# for windows containing target rf-times (hop-0 controls + hop-1 packets).
+# Ring-gate ablation (TEST-ONLY, default OFF, codex-agreed first causal probe):
+# when set, the slow scan's ring-pressure deferral (is_live && ring>0.3) is NOT
+# enforced.  Busy + rate gates are UNCHANGED so the intervention is isolated.
+# The ring-pressure condition is still COMPUTED and logged (would_have) so the
+# ablation's effect on coherent coverage is attributable.
+_SLOW_NO_RING_DEFER = os.environ.get('LORA_SLOW_NO_RING_DEFER', '0') == '1'
+# PROF/measurement kill-switch: hard-DISABLE slow-scan EXECUTION (never launches
+# the bg scan), so its CPU/memory is fully removed for isolation runs. Distinct
+# from drop-if-busy (which still fires when idle). Default off.
+_NO_SLOW = os.environ.get('LORA_NO_SLOW', '0') == '1'
+# Per-peak coverage-based candidate COALESCING (throughput, 2026-07-23): the
+# overlapping mean/max-hold/short-sweep gate passes emit several energy peaks for
+# ONE physical signal; the per-peak SF/BW resolution then runs redundantly on
+# each (the measured detect-worker bottleneck at 20 Msps).  Process peaks
+# strongest-first and skip any whose carrier already sits inside a CONFIRMED
+# detection's freq±bw/2 — LOSSLESS (an adjacent channel outside the detected
+# bandwidth is never covered, so it is still processed; the post-loop
+# one-signal-one-detection dedup stays the final arbiter).  Kill-switch.
+# DEFAULT OFF — measured LOSSY 2026-07-23: freq/BW coverage cannot distinguish a
+# redundant over-split candidate from a DISTINCT same-band packet at a different
+# TIME (a broadcast on the beacon's channel was suppressed and LOST), and the
+# time isn't knowable until the per-peak work runs.  Freq-only pre-skip is
+# inherently lossy; kept off pending a truly-lossless design.
+_COALESCE = os.environ.get('LORA_COALESCE', '0') != '0'
+_PSD_DIAG = os.environ.get('LORA_PSD_DIAG', '0') == '1'
+def _parse_psd_diag_times(s):
+    out = []
+    for tok in (s or '').replace(' ', '').split(','):
+        if tok:
+            try:
+                out.append(float(tok))
+            except ValueError:
+                pass
+    return out
+_psd_diag_times = _parse_psd_diag_times(os.environ.get('LORA_PSD_DIAG_TIMES', ''))
+try:
+    _psd_diag_freq_hz = float(os.environ.get('LORA_PSD_DIAG_FREQ_MHZ', '914.54')) * 1e6
+except ValueError:
+    _psd_diag_freq_hz = 914.54e6
+try:
+    _psd_diag_halfbins = max(4, int(os.environ.get('LORA_PSD_DIAG_HALFBINS', '160')))
+except ValueError:
+    _psd_diag_halfbins = 160
+
+
+class _IdAlloc:
+    """Central, thread-safe, per-run id allocator (Phase-1 lineage).  ONE lock,
+    separate monotonic counters per id type (candidate/detection/work/scan).
+    'producer' is a SEPARATE field on each event, never an id prefix (codex Q1).
+    Pool workers and the slow background thread run concurrently, so every id
+    is allocated through this lock — no worker-local counters."""
+    __slots__ = ('_lock', '_c')
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._c = {'candidate': 0, 'detection': 0, 'work': 0, 'scan': 0}
+
+    def next(self, kind):
+        with self._lock:
+            self._c[kind] += 1
+            return self._c[kind]
+
+
+class _WorkLedger:
+    """Thread-safe submitted-vs-terminal work reconciliation.  A work item is
+    'submitted' once (work_id); requeue/re-tier does NOT re-submit (same logical
+    work) and is NOT terminal.  A submitted work item must terminate EXACTLY
+    ONCE via note_terminal; a duplicate terminal or a terminal for an
+    un-submitted work_id is an INVARIANT FAILURE (dup_terminal / unknown_terminal
+    -> audit_valid=false).  Outstanding = submitted - terminated at clean drain."""
+    __slots__ = ('_lock', '_sub', '_done', 'outcomes', 'dup_terminal',
+                 'unknown_terminal')
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sub = set()          # work_ids submitted
+        self._done = {}            # work_id -> terminal outcome
+        self.outcomes = {}
+        self.dup_terminal = 0
+        self.unknown_terminal = 0
+
+    def note_submit(self, wid):
+        with self._lock:
+            self._sub.add(wid)
+
+    def note_terminal(self, wid, outcome):
+        """Returns True if this is the FIRST terminal for wid (emit the event);
+        False on a duplicate (already terminalized) -> caller suppresses."""
+        with self._lock:
+            if wid in self._done:
+                self.dup_terminal += 1
+                return False
+            if wid not in self._sub:
+                self.unknown_terminal += 1
+            self._done[wid] = outcome
+            self.outcomes[outcome] = self.outcomes.get(outcome, 0) + 1
+            return True
+
+    def snapshot(self):
+        with self._lock:
+            outstanding = sorted(self._sub - set(self._done))
+            return (len(self._sub), len(self._done), dict(self.outcomes),
+                    self.dup_terminal, self.unknown_terminal, outstanding)
+
+
+# Module-level singletons (only live when audit is on).
+_LID = _IdAlloc() if _CAND_AUDIT else None
+_WLED = _WorkLedger() if _CAND_AUDIT else None
+
+class _CandWin:
+    """One gate window's candidate lifecycle.  Created at window begin, populated
+    during that window's candidate handling, ATTACHED to the _inflight item, and
+    emitted at _commit_oldest when the (async, lagged) pool result for its seq
+    returns — or emitted inline (pool_seq=None) when detection is synchronous.
+    Strong refs to every tracked peak tuple are held until emit so Python cannot
+    reuse an id() and corrupt attribution.  Reconciliation is by ordinal + exact
+    bin signature, never float freq."""
+    __slots__ = ('mgr', 'awid', 'pool_seq', 'tot_s', 'cen_hz', 'fres',
+                 'center_bin', 'rate', 'dispatch_mono',
+                 'raw', 'forced', 'patience', 'drops', 'admitted', '_ord_by_id')
+
+    def __init__(self, mgr, awid, tot_s, cen_hz):
+        self.mgr = mgr; self.awid = awid; self.pool_seq = None
+        self.tot_s = int(tot_s); self.cen_hz = float(cen_hz)
+        self.fres = mgr.fres; self.center_bin = mgr.center_bin; self.rate = mgr.rate
+        self.dispatch_mono = None
+        self.raw = []            # (ord, peakobj, bin, width, pwr)  STRONG REF
+        self.forced = []         # (ord, peakobj, bin, width, pwr, hyp_sf, hyp_bw)
+        self.patience = []       # (ord, peakobj, bin, width, pwr, hyp_sf, hyp_bw)
+        self.drops = {}          # id(peak) -> reason
+        self.admitted = []       # STRONG REFS to final dispatched peaks
+        self._ord_by_id = {}     # id(peak) -> ordinal
+
+    def _bin_hz(self, b):
+        return self.cen_hz + (b - self.center_bin) * self.fres
+
+    def snapshot_raw(self, peaks):
+        for p in peaks:
+            o = len(self.raw)
+            self._ord_by_id[id(p)] = o
+            self.raw.append((o, p, int(p[0]), int(p[1]), float(p[2])))
+
+    def add(self, peak, tier, hyp_sf=None, hyp_bw=None):
+        o = -(len(self.forced) + len(self.patience)) - 1
+        self._ord_by_id[id(peak)] = o
+        row = (o, peak, int(peak[0]), int(peak[1]), float(peak[2]), hyp_sf, hyp_bw)
+        (self.forced if tier == 'forced' else self.patience).append(row)
+
+    def drop(self, peaks, reason):
+        for p in peaks:
+            self.drops[id(p)] = reason
+
+    def set_admitted(self, final_peaks, dispatch_mono, pool_seq=None):
+        self.admitted = list(final_peaks)       # strong refs
+        self.dispatch_mono = dispatch_mono
+        self.pool_seq = pool_seq
+
+    def emit(self, dets, buf_len, status, commit_mono):
+        adm_ids = set(id(p) for p in self.admitted)
+        # invariant canaries
+        inv = {'dropped_unknown': 0, 'untracked_final': 0,
+               'drop_admit_conflict': 0, 'drop_unknown_cand': 0, 'duplicate_id': 0}
+        seen = set()
+        for coll in (self.raw, self.forced, self.patience):
+            for row in coll:
+                pid = id(row[1])
+                if pid in seen:
+                    inv['duplicate_id'] += 1
+                seen.add(pid)
+        for pid in self.drops:
+            if pid not in seen:
+                inv['drop_unknown_cand'] += 1
+            if pid in adm_ids:
+                inv['drop_admit_conflict'] += 1
+        for p in self.admitted:
+            if id(p) not in self._ord_by_id:
+                inv['untracked_final'] += 1
+
+        def _disp(peakobj):
+            pid = id(peakobj)
+            if pid in self.drops:
+                return self.drops[pid]
+            if pid in adm_ids:
+                return 'admitted'
+            inv['dropped_unknown'] += 1
+            return 'dropped_unknown'
+        from collections import Counter as _C
+        drop_reasons = dict(_C(self.drops.values()))
+
+        # --- Phase-1 lineage: producer + window_id + per-candidate side-table id.
+        # window_id == awid (assigned at new_window, BEFORE inline/pool choice).
+        # producer is a SEPARATE field, derived from whether a pool_seq was set.
+        producer = 'main_inline' if self.pool_seq is None else 'main_pool'
+        window_id = self.awid
+        # Assign a monotonic side-table candidate_id to each window candidate
+        # WITHOUT modifying the (pickled, id()-tracked) peak tuple (codex g3).
+        _cand_id = {}                    # ordinal -> candidate_id
+        _bin_candids = {}                # bin -> [candidate_id, ...] (for annotation)
+        for _coll in (self.raw, self.forced, self.patience):
+            for _row in _coll:
+                _o, _b0 = _row[0], _row[2]
+                _cid = _LID.next('candidate') if _LID is not None else None
+                _cand_id[_o] = _cid
+                _bin_candids.setdefault(_b0, []).append(_cid)
+
+        det_rows = []
+        _link_counts = {}
+        for d in (dets or ()):
+            try:
+                _b = int(round((float(d.get('freq_hz', 0.0)) - self.cen_hz)
+                               / self.fres)) + self.center_bin
+            except Exception:
+                _b = None
+            _off = d.get('preamble_t_s')
+            # detection_id is assigned UNCONDITIONALLY (candidate-independent,
+            # codex g1): every returned detection is emitted regardless of
+            # whether candidate reconciliation resolves.
+            _did = _LID.next('detection') if _LID is not None else None
+            # HEURISTIC candidate ANNOTATION by bin signature (±8 bins) — a
+            # DIAGNOSTIC HINT, NOT a causal parent (codex A).  Never gates
+            # emission.  Dedupe by candidate_id; record nearest bin delta + the
+            # match count so the first run establishes the delta distribution.
+            _match_ids, _near_delta = set(), None
+            if _b is not None:
+                for _bb, _ids in _bin_candids.items():
+                    if abs(_bb - _b) <= 8:
+                        _match_ids.update(_ids)
+                        if _near_delta is None or abs(_bb - _b) < abs(_near_delta):
+                            _near_delta = _bb - _b
+            _nmatch = len(_match_ids)
+            if _nmatch == 1:
+                _link, _hint = 'heuristic_unique_8bin', next(iter(_match_ids))
+            elif _nmatch > 1:
+                _link, _hint = 'heuristic_ambiguous', None
+            else:
+                _link, _hint = 'unresolved', None
+            _link_counts[_link] = _link_counts.get(_link, 0) + 1
+            # stamp lineage onto the SHARED detection dict so it flows to the
+            # recorder/submit (emit runs BEFORE recorder — placement-audit B).
+            # candidate_hint_id is a HINT; parent_candidate_id stays null in
+            # Phase-1 (exact linkage is Phase-2).
+            if isinstance(d, dict):
+                d['_lin_detection_id'] = _did
+                d['_lin_producer'] = producer
+                d['_lin_window_id'] = window_id
+                d['_lin_candidate_hint_id'] = _hint
+                d['_lin_candidate_bin_delta'] = _near_delta
+                d['_lin_candidate_matches_within_8bins'] = _nmatch
+                d['_lin_candidate_link_status'] = _link
+            det_rows.append({'freq_hz': d.get('freq_hz'), 'bin': _b,
+                             'sf': d.get('sf'), 'bw': d.get('bw'),
+                             'detect_conf': d.get('detect_conf'),
+                             'preamble_offset_s': _off,
+                             'event_rf_s': (None if _off is None
+                                            else self.tot_s / self.rate + float(_off)),
+                             'patience_trial': bool(d.get('patience_trial')),
+                             'forced_dechirp': bool(d.get('forced_dechirp')),
+                             'detection_id': _did, 'producer': producer,
+                             'window_id': window_id,
+                             'candidate_hint_id': _hint,
+                             'candidate_bin_delta': _near_delta,
+                             'candidate_matches_within_8bins': _nmatch,
+                             'candidate_link_status': _link})
+        n_inv = sum(inv.values())
+        _run_event('cand_audit',
+                   audit_window_id=self.awid, window_id=window_id, producer=producer,
+                   pool_seq=self.pool_seq, status=status,
+                   window_start_sample=self.tot_s,
+                   window_end_sample=self.tot_s + int(buf_len),
+                   rf_start_s=self.tot_s / self.rate,
+                   rf_end_s=(self.tot_s + int(buf_len)) / self.rate,
+                   fres_hz=self.fres, center_hz=self.cen_hz, center_bin=self.center_bin,
+                   dispatch_mono_ns=self.dispatch_mono, commit_mono_ns=commit_mono,
+                   n_raw=len(self.raw), n_forced=len(self.forced),
+                   n_patience=len(self.patience), n_admitted=len(self.admitted),
+                   n_detected=len(det_rows), invariant_failures=n_inv, invariants=inv,
+                   candidate_link_counts=_link_counts,
+                   raw=[{'ord': o, 'bin': b, 'width': w, 'pwr': pw,
+                         'freq_hz': self._bin_hz(b), 'disposition': _disp(pk),
+                         'candidate_id': _cand_id.get(o)}
+                        for (o, pk, b, w, pw) in self.raw],
+                   forced=[{'ord': o, 'bin': b, 'width': w, 'pwr': pw,
+                            'freq_hz': self._bin_hz(b), 'hyp_sf': hs, 'hyp_bw': hb,
+                            'disposition': _disp(pk), 'candidate_id': _cand_id.get(o)}
+                           for (o, pk, b, w, pw, hs, hb) in self.forced],
+                   patience=[{'ord': o, 'bin': b, 'width': w, 'pwr': pw,
+                              'freq_hz': self._bin_hz(b), 'hyp_sf': hs, 'hyp_bw': hb,
+                              'disposition': _disp(pk), 'candidate_id': _cand_id.get(o)}
+                             for (o, pk, b, w, pw, hs, hb) in self.patience],
+                   drop_reasons=drop_reasons, detections=det_rows)
+        self.mgr.note_emit(status, len(self.raw) + len(self.forced) + len(self.patience),
+                           len(self.raw) == 0 and not self.forced and not self.patience,
+                           n_inv, bool(self.pool_seq is None), len(det_rows), _link_counts)
+
+
+class _CandAuditMgr:
+    """Config + cumulative bookkeeping across all windows; creates per-window
+    _CandWin objects and emits the final drained summary."""
+    __slots__ = ('rate', 'fres', 'center_bin', '_awid', 'windows_begun',
+                 'windows_emitted', 'candidates', 'empty_windows', 'inv_failures',
+                 'inline_windows', 'pool_windows', 'status_counts', 'skips',
+                 'detections', 'link_counts', 'slow_suppressed', 'slow_started',
+                 'slow_consumed', 'slow_failed', 'slow_discarded', 'slow_hits',
+                 'slow_nohit', 'slow_max_ring_frac')
+
+    def __init__(self, rate, nfft_gate):
+        self.rate = rate; self.fres = rate / nfft_gate; self.center_bin = nfft_gate // 2
+        self._awid = 0; self.windows_begun = 0; self.windows_emitted = 0
+        self.candidates = 0; self.empty_windows = 0; self.inv_failures = 0
+        self.inline_windows = 0; self.pool_windows = 0
+        self.status_counts = {}; self.skips = []
+        self.detections = 0
+        self.link_counts = {}
+        # slow-scan lifecycle rollups (per-attempt events are separate)
+        self.slow_suppressed = {'busy': 0, 'rate': 0, 'ring': 0, 'would_ring': 0}
+        self.slow_started = 0; self.slow_consumed = 0; self.slow_failed = 0
+        self.slow_discarded = 0; self.slow_hits = 0; self.slow_nohit = 0
+        # max ring fraction observed at a fire-eligible slow-scan decision — shows
+        # how close the ring got to the 0.3 defer threshold even when it didn't
+        # cross (codex: "did not reproduce" evidence needs the near-miss margin).
+        self.slow_max_ring_frac = 0.0
+
+    def new_window(self, tot_s, cen_hz):
+        self._awid += 1; self.windows_begun += 1
+        return _CandWin(self, self._awid, tot_s, cen_hz)
+
+    def note_emit(self, status, n_cand, is_empty, n_inv, is_inline,
+                  n_det=0, link_counts=None):
+        self.windows_emitted += 1; self.candidates += n_cand
+        if is_empty:
+            self.empty_windows += 1
+        self.inv_failures += n_inv
+        self.status_counts[status] = self.status_counts.get(status, 0) + 1
+        if is_inline:
+            self.inline_windows += 1
+        else:
+            self.pool_windows += 1
+        self.detections += n_det
+        if link_counts:
+            for k, v in link_counts.items():
+                self.link_counts[k] = self.link_counts.get(k, 0) + v
+
+    def note_skip(self, start_sample, end_sample):
+        self.skips.append([int(start_sample), int(end_sample)])
+
+    def note_slow_suppressed(self, busy, rate, ring, would_ring=False):
+        if busy: self.slow_suppressed['busy'] += 1
+        if rate: self.slow_suppressed['rate'] += 1
+        if ring: self.slow_suppressed['ring'] += 1
+        if would_ring: self.slow_suppressed['would_ring'] += 1
+
+    def note_slow_started(self):
+        self.slow_started += 1
+
+    def note_slow_failed(self):
+        self.slow_failed += 1
+
+    def note_slow_discarded(self, n):
+        self.slow_discarded += int(n)
+
+    def note_slow_result(self, n_hits):
+        self.slow_consumed += 1
+        if n_hits:
+            self.slow_hits += 1
+        else:
+            self.slow_nohit += 1
+
+    def summary(self, outstanding):
+        # WINDOW-level rollup only (emitted at loop end, BEFORE the decoder
+        # drain).  Work reconciliation is NOT here — it must wait for the drain
+        # (see lineage_summary(), emitted post-drain), else in-flight work would
+        # falsely read as outstanding.  windows_valid is window-scoped.
+        windows_valid = (self.windows_begun == self.windows_emitted
+                         and outstanding == 0 and self.inv_failures == 0)
+        _run_event('cand_audit_summary', schema=_CAND_AUDIT_SCHEMA,
+                   windows_begun=self.windows_begun, windows_emitted=self.windows_emitted,
+                   outstanding_windows=outstanding, candidates=self.candidates,
+                   detections=self.detections, empty_windows=self.empty_windows,
+                   invariant_failures=self.inv_failures,
+                   inline_windows=self.inline_windows, pool_windows=self.pool_windows,
+                   status_counts=self.status_counts, skip_ranges=self.skips,
+                   skip_samples=sum(b - a for a, b in self.skips),
+                   candidate_link_counts=self.link_counts,
+                   slow_suppressed=self.slow_suppressed, slow_started=self.slow_started,
+                   slow_consumed=self.slow_consumed, slow_hits=self.slow_hits,
+                   slow_nohit=self.slow_nohit, windows_valid=windows_valid,
+                   slow_max_ring_frac=round(self.slow_max_ring_frac, 4))
+
+    def lineage_summary(self, outstanding_windows):
+        """Authoritative post-drain reconciliation (codex req 1 + ordering).
+        Emitted AFTER the decoder queues/requeues/slow-results have drained, so
+        outstanding work is real, not in-flight.  audit_valid gates on window
+        validity AND exactly-once work termination AND no slow started/consumed
+        mismatch."""
+        w_sub = w_term = 0
+        w_out = {}
+        dup_t = unk_t = 0
+        outstanding_work = []
+        if _WLED is not None:
+            (w_sub, w_term, w_out, dup_t, unk_t,
+             outstanding_work) = _WLED.snapshot()
+        windows_valid = (self.windows_begun == self.windows_emitted
+                         and outstanding_windows == 0 and self.inv_failures == 0)
+        # every STARTED slow scan must be accounted: consumed, failed, or
+        # DISCARDED at shutdown (residual results audit-off would also discard).
+        slow_consistent = (self.slow_started
+                           == self.slow_consumed + self.slow_failed + self.slow_discarded)
+        detection_lineage_valid = bool(
+            windows_valid and not outstanding_work and dup_t == 0 and unk_t == 0
+            and slow_consistent)
+        _run_event('lineage_summary', schema=_CAND_AUDIT_SCHEMA,
+                   windows_valid=windows_valid,
+                   work_submitted=w_sub, work_terminal=w_term,
+                   work_outstanding=len(outstanding_work),
+                   outstanding_work_ids=outstanding_work[:64],
+                   work_outcomes=w_out, dup_terminal=dup_t, unknown_terminal=unk_t,
+                   slow_started=self.slow_started, slow_consumed=self.slow_consumed,
+                   slow_failed=self.slow_failed, slow_discarded=self.slow_discarded,
+                   slow_hits=self.slow_hits,
+                   slow_nohit=self.slow_nohit, slow_consistent=slow_consistent,
+                   candidate_lineage_complete=False,
+                   detection_lineage_valid=detection_lineage_valid,
+                   audit_valid=detection_lineage_valid)
+
+
 class IQReader:
     def __init__(self, fp, fmt='sc16'):
         self.fp, self.sc16 = fp, (fmt == 'sc16')
@@ -580,7 +1098,20 @@ class StreamBuffer:
         self._rp = 0          # read position (absolute, in IQ samples)
         self._lock = threading.Lock()
         self._eof = False
+        # Instrumentation (validation-only): monotonic-ns marks of the stream
+        # timebase, same clock the decode-emit records use, so a packet is
+        # pre-input-EOF iff result_processed_mono_ns <= input_eof_mono_ns.
+        # first_chunk_read_complete = when the first blocking chunk read
+        # returned; input_eof = clean source EOF.  A reader ERROR is NOT eof:
+        # it leaves input_eof None and emits input_terminated → run invalid.
+        self._first_chunk_read_complete_mono_ns = None
+        self._input_eof_mono_ns = None
+        self._reader_error = None   # set to repr(exc) on a reader-thread failure
         self._total_drops = 0
+        # Ingress accounting (validation-only): total BYTES pulled from the
+        # source, counted BEFORE any truncation/partial-read handling so every
+        # discarded byte stays observable (source_summary invariant, codex).
+        self._bytes_read_total = 0
         # CONVERT-AHEAD (2026-07-05): live reads are 100% uniform hop-sized
         # since the deferred-tail work, so a dedicated thread converts the
         # NEXT hop while the main loop processes the current one — read()
@@ -673,9 +1204,36 @@ class StreamBuffer:
         while not self._eof:
             try:
                 raw = self._fp.read(self._chunk_bytes)
-                if not raw or len(raw) < self.bps:
+                if not raw:
+                    # Empty read = CLEAN EOF.
+                    if self._input_eof_mono_ns is None:
+                        _t_ns = time.monotonic_ns()
+                        self._input_eof_mono_ns = _t_ns
+                        _run_event('input_eof', mono_ns=_t_ns, reason='clean_eof')
                     self._eof = True
                     break
+                # Count every byte read BEFORE truncation/partial handling so a
+                # sub-sample remainder can never be silently unobserved.  Under
+                # the SAME lock as source_snapshot() so the post-loop snapshot is
+                # truly atomic even if the reader thread is not yet joined.
+                with self._lock:
+                    self._bytes_read_total += len(raw)
+                if len(raw) < self.bps:
+                    # A nonempty read shorter than ONE complex sample is
+                    # MALFORMED/truncated input, NOT a clean EOF.  Record it as
+                    # a reader error (→ main() exits nonzero) and emit
+                    # input_terminated so the run is scored invalid.
+                    self._reader_error = ('partial_sample got=%d < bps=%d'
+                                          % (len(raw), self.bps))
+                    _run_event('input_terminated', reason='partial_sample',
+                               got=len(raw), bps=self.bps)
+                    self._eof = True
+                    break
+                if self._first_chunk_read_complete_mono_ns is None:
+                    _t_ns = time.monotonic_ns()
+                    self._first_chunk_read_complete_mono_ns = _t_ns
+                    _run_event('first_chunk_read_complete', mono_ns=_t_ns,
+                               chunk_bytes=self._chunk_bytes)
                 n_samp = len(raw) // self.bps
 
                 if self.sc16:
@@ -703,6 +1261,13 @@ class StreamBuffer:
                 # exits and the outage is at least visible upstream.
                 print(f"[READER] reader thread failed: {_re!r} — "
                       f"treating as EOF", file=sys.stderr, flush=True)
+                # A reader ERROR is NOT a clean EOF.  Leave _input_eof_mono_ns
+                # None (so no valid pre/post-EOF split exists), record the error
+                # so main() can EXIT NONZERO, and emit a distinct terminal event
+                # that INVALIDATES the run for scoring.
+                self._reader_error = repr(_re)
+                _run_event('input_terminated', reason='reader_error',
+                           error=repr(_re))
                 self._eof = True
                 break
 
@@ -953,6 +1518,26 @@ class StreamBuffer:
         with self._lock:
             return self._total_drops
 
+    def source_snapshot(self):
+        """Atomic (locked) ingress snapshot for the post-loop source_summary.
+        Returns _wp/_rp/drops/bytes together so residual and partial-byte
+        accounting are coherent (no reliance on the production-only
+        tot_s == _rp equivalence).  samples_dequeued + residual == ingress."""
+        with self._lock:
+            wp, rp, drops, bread = (self._wp, self._rp, self._total_drops,
+                                    self._bytes_read_total)
+        return {
+            'bytes_per_iq_sample': self.bps,
+            'bytes_read_total': bread,
+            'samples_ingested': wp,
+            'samples_dequeued': rp,
+            'residual_samples': wp - rp,
+            'ring_dropped_samples': drops,
+            'partial_bytes_discarded': bread - wp * self.bps,
+            'reader_error': self._reader_error,
+            'saw_clean_eof': self._input_eof_mono_ns is not None,
+        }
+
 
 # ---- Energy detection ----
 
@@ -1067,6 +1652,8 @@ class _LazyWindow:
         self._scale = np.float32(1.0 / (2048.0 if sc16 else 128.0))
         self._matf = None      # persistent float32 materialization target
         self._c64 = None       # cached complex64 view for THIS window
+        self._conv_samples = 0  # PROF: cumulative complex samples converted
+        self._mat_count = 0     # PROF: cumulative materialize() calls
         self.verify_fails = 0
         self._shadow = (np.zeros(win_n, dtype=np.complex64)
                         if _LAZY_VERIFY else None)
@@ -1077,6 +1664,7 @@ class _LazyWindow:
     def _convert(self, src, out=None):
         """Raw interleaved ints -> complex64, bit-identical to the reader
         conversions (fused power-of-two multiply + optional Q negate)."""
+        self._conv_samples += len(src) // 2   # PROF: complex samples converted
         if out is None:
             out = np.empty(len(src), dtype=np.float32)
         else:
@@ -1200,6 +1788,7 @@ class _LazyWindow:
         into the persistent prealloc target (returns the cached view on
         repeat calls within the same window)."""
         if self._c64 is None:
+            self._mat_count += 1        # PROF: full-window materialization
             if self._matf is None:
                 self._matf = np.empty(self.win_n * 2, dtype=np.float32)
             self._c64 = self._convert(self.raw, out=self._matf)
@@ -1377,6 +1966,7 @@ def _emit_run_peaks(psd_db, start, end, min_bins, wide_run_bins, min_sep_bins, p
 
 # ---- Narrowband extraction ----
 
+@_pp_time('extract','n_extract')
 def extract_nb_fft_multi_bw(iq, wb_fs, offset_hz, target_bws, chunk=65536,
                             fft_cache=None):
     """
@@ -1540,6 +2130,7 @@ def extract_narrowband_stateful(iq, wb_fs, offset_hz, target_bw,
 
 
 
+@_pp_time('extract','n_extract')
 def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
     """FFT-based narrowband extraction — clean brick-wall filter, no aliasing.
 
@@ -1594,6 +2185,9 @@ def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
     # Find the center bin corresponding to offset_hz
     freq_per_bin = wb_fs / N
     center_bin = N // 2 + int(round(offset_hz / freq_per_bin))
+    if _PP_PROF_ON:   # exact-duplicate extraction redundancy meter (memo potential)
+        _EXT_CALLS[0] += 1
+        _EXT_KEYS.add((id(F), center_bin, n_out))
 
     # Crop n_out bins centered on the signal
     half = n_out // 2
@@ -2007,6 +2601,7 @@ def hybrid_recenter(iq, fs, sf, bw):
 _DPQ_MEMO = threading.local()
 
 
+@_pp_time('dechirp','n_dechirp')
 def dechirp_peak_quality(iq, sf, bw, agg='best8'):
     _memo = getattr(_DPQ_MEMO, 'd', None)
     if _memo is None:
@@ -2130,6 +2725,7 @@ def _dechirp_peak_quality_core(iq, sf, bw, agg='best8'):
     return 10.0 * np.log10(best_avg + 1e-15), peak_bin
 
 
+@_pp_time('dechirp','n_dechirp')
 def _dechirp_scan(nb, sf, bw, nbfs):
     """Dechirp matched-filter preamble detection for a single channel.
 
@@ -2340,6 +2936,7 @@ if os.environ.get('LORA_SCAN_FULL'):
 _ALL_LAGS_1M = sorted(_SC_LAGS_1M.keys())
 
 
+@_pp_time('sc','n_sc')
 def _schmidl_cox_curve_multilag(iq_1m, lags, n_sym=8):
     """Compute SC curves for many lags on the same signal in one pass.
 
@@ -2460,6 +3057,7 @@ def _schmidl_cox_curve(iq_1m, lag, n_sym=8):
     return np.convolve(s, np.ones(n_sym) / n_sym, mode='valid')
 
 
+@_pp_time('sc','n_sc')
 def schmidl_cox_score(iq_1m, lag, n_sym=8, _curve=None):
     """Schmidl-Cox score for one lag: argmax of the SC sliding-mean curve.
     Returns (score, preamble_sample_idx) where score ∈ [0, 1].
@@ -2471,6 +3069,7 @@ def schmidl_cox_score(iq_1m, lag, n_sym=8, _curve=None):
     return float(mean_s[best_idx]), best_idx * lag
 
 
+@_pp_time('sc','n_sc')
 def schmidl_cox_peaks(iq_1m, lag, n_sym=8, thr=0.5, max_peaks=6, min_sep_win=16,
                       _curve=None):
     """Like schmidl_cox_score, but returns ALL time-separated preamble plateaus
@@ -3704,8 +4303,26 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         # hosts (UC audit, measured A/B on a 4-core taskset: the thread pool
         # is pure GIL contention there — serial 91.3s/3.29GB vs threaded
         # 111.4s/4.04GB, identical detections).
-        for _pk in peaks:
-            dets.extend(_process_one_peak(_pk))
+        if _COALESCE and len(peaks) > 1:
+            # Coverage-based coalescing (see _COALESCE at module top): strongest
+            # first; skip a peak already covered by a confirmed detection's band.
+            _cov = []   # (carrier_hz, bw) of confirmed detections this window
+            _n_skipped = 0
+            for _pk in sorted(peaks, key=lambda p: -p[2]):
+                _pkhz = center_hz + (_pk[0] - nfft_c / 2) * fres
+                if any(abs(_pkhz - _c) <= _b * 0.5 for (_c, _b) in _cov):
+                    _n_skipped += 1
+                    continue
+                _r = _process_one_peak(_pk)
+                dets.extend(_r)
+                for _d in _r:
+                    _cov.append((_d['freq_hz'], _d['bw']))
+            if _n_skipped and debug >= 1:
+                print(f"  [COALESCE] skipped {_n_skipped}/{len(peaks)} "
+                      f"redundant per-peak jobs (same-signal)", file=sys.stderr)
+        else:
+            for _pk in peaks:
+                dets.extend(_process_one_peak(_pk))
     else:
         from concurrent.futures import ThreadPoolExecutor
         # Cap workers at the PHYSICAL core count: on a 4-core host the old
@@ -4251,6 +4868,7 @@ class SignalRecorder:
         # Big-RAM hosts keep the 600 MB default (min() only lowers, never
         # raises).  Mostly a legacy-path guard: with LORA_NB_PENDING the pool
         # commits queue KB-scale NB streams, not wideband arrays.
+        _memtot_b = 8 << 30      # fallback if /proc/meminfo unreadable
         try:
             with open('/proc/meminfo') as _mi:
                 _memtot_b = next(int(l.split()[1]) for l in _mi
@@ -4259,6 +4877,7 @@ class SignalRecorder:
                                         _memtot_b // 32)
         except (OSError, StopIteration, ValueError):
             pass
+        self._memtot_b = _memtot_b
         # BOUNDED queue: each item carries a full wideband gate window (~300 MB
         # at 28 Msps).  An unbounded queue OOM-killed the process on a 60-msg
         # run when the save-worker fell behind (queue hit 129 → ~40 GB).  With
@@ -4278,10 +4897,31 @@ class SignalRecorder:
         # unbounded wideband memory.
         self._nb_mode = False
         self._crop_queue = None
+        # HOST-DERIVED crop-queue bound (codex OOM review 2026-07-23): a BASE
+        # item can hold a ~wb_fs*8-byte wideband window copy (160 MB @20 Msps);
+        # the old fixed maxsize=48 = a 7.7 GB ceiling that OOMs a small-RAM host
+        # once the single crop worker starves under detect-worker CPU contention
+        # (the 20 Msps Pi's second OOM sink).  Budget a modest RAM slice AFTER
+        # the ring+pool+OS reserve, in BYTES, and derive the entry count from the
+        # worst-case item size — big-RAM hosts still get up to 48, the Pi ~6.
+        # Env override is a kill-switch only (never the primary tuning knob).
+        _win_bytes = max(1, int(self.wb_fs * 8))         # ~1 s wideband, complex64
+        _crop_budget_b = self._memtot_b // 12            # ~0.66 GB / 8 GB host
+        _cq_max = max(2, min(48, _crop_budget_b // _win_bytes))
+        try:
+            _cq_max = max(1, int(os.environ.get('LORA_CROP_QUEUE_MAX', _cq_max)))
+        except ValueError:
+            pass
+        self._crop_overflow_drops = 0        # telemetry: hard-dropped jobs at queue-full
+        self._crop_overflow_last_warn = 0.0
         if os.environ.get('LORA_NB_PENDING', '1') != '0':
             try:
                 from scipy.signal import firwin, upfirdn  # noqa: F401
-                self._crop_queue = queue.Queue(maxsize=48)
+                self._crop_queue = queue.Queue(maxsize=_cq_max)
+                print(f"[RING] decode crop queue: maxsize={_cq_max} "
+                      f"(~{_cq_max * _win_bytes / 1e9:.1f} GB ceiling; "
+                      f"host-derived from {self._memtot_b/1e9:.0f} GB RAM, "
+                      f"{_win_bytes/1e6:.0f} MB/window)", file=sys.stderr)
                 t = threading.Thread(target=self._crop_worker,
                                      daemon=True, name='recorder-crop')
                 t.start()
@@ -4387,6 +5027,17 @@ class SignalRecorder:
 
     def set_decoder(self, decoder):
         self._decoder = decoder
+
+    def _crop_overflow_warn(self):
+        """Rate-limited overload notice when decode crop jobs are hard-dropped
+        because the crop worker can't keep up (host too slow at this rate)."""
+        _now = time.time()
+        if _now - self._crop_overflow_last_warn >= 5.0:
+            self._crop_overflow_last_warn = _now
+            print(f"[OVERLOAD] decode crop queue full — "
+                  f"{self._crop_overflow_drops} job(s) hard-dropped so far "
+                  f"(detection continues; some decodes lost at this rate)",
+                  file=sys.stderr, flush=True)
 
     def update_deferred(self, detections, wideband_buf, sample_pos=0,
                         pre_hop=None, need_tail_n=0, owned_buf=False,
@@ -4521,9 +5172,19 @@ class SignalRecorder:
                     self._crop_queue.put_nowait(('BASE', job, parts))
                     job['base_parts'] = []
                 except queue.Full:
-                    # cropper drowning — degrade this job to the legacy
-                    # wideband path rather than block the loop
-                    del job['nb']
+                    # Cropper drowning (overload).  HARD-DROP this job — do NOT
+                    # fall back to the legacy WIDEBAND-retaining path (the old
+                    # `del job['nb']` let job['tail']=wideband land in _pending +
+                    # the save queue, so the queue-full path GREW retained memory
+                    # instead of shrinking it — the 20 Msps Pi's decode OOM sink,
+                    # codex review).  The queue-full path must monotonically
+                    # reduce memory: drop the job, free its base copy, count it.
+                    # Losing this detection's DECODE is the correct behaviour at
+                    # ~4x decode overload; detection + other jobs are unaffected.
+                    self._crop_overflow_drops += 1
+                    parts = None            # release the ~160 MB base copy now
+                    self._crop_overflow_warn()
+                    return []
         if os.environ.get('LORA_SLOW_DEBUG'):
             print(f"[UPDEF-JOB] created dets={[(d['sf'], d['bw'], round(d['freq_hz']/1e6,4)) for d in job['dets']]} need={job['need']}", flush=True)
         # POOL-MODE SEED (UC audit q + p): feed the fully-known in-flight tail
@@ -5515,14 +6176,15 @@ class SignalRecorder:
                         # residual.  Catches multi-packet files when SIC
                         # cancellation is clean (per-symbol amplitude OK).
                         self._decoder.submit(fpath, fname, bucket_key=_bkey,
-                                             slow=bool(d.get('patience_trial')))
+                                             slow=bool(d.get('patience_trial')),
+                                             lineage=d)
                         # Family-label decode jobs (trial captures only) —
                         # same bucket, slow tier: once any label in the
                         # bucket decodes, the phase-2 bucket dedup skips the
                         # rest, so the ladder costs nothing after a confirm.
                         for _fp2, _fn2 in _fam_links:
                             self._decoder.submit(_fp2, _fn2, bucket_key=_bkey,
-                                                 slow=True)
+                                                 slow=True, lineage=d)
                         # Pass 2 — TIME-ISOLATED on this preamble.  Useful at
                         # FAST SF where the hop1 relay arrives ~50-200 ms
                         # after hop0 and they share a single capture file;
@@ -5545,7 +6207,8 @@ class SignalRecorder:
                                 relay_after_syms=_iso_after,
                                 relay_before_syms=_iso_before,
                                 bucket_key=_bkey,
-                                slow=bool(d.get('patience_trial')))
+                                slow=bool(d.get('patience_trial')),
+                                lineage=d)
             except Exception as e:
                 print(f"[RECORDER] save error: {e}", file=sys.stderr, flush=True)
             finally:
@@ -5969,6 +6632,13 @@ class BackgroundDecoder:
         # requeue/relay paths.
         self._slow_inflight = 0
         self._slow_released_job = None
+        # Instrumentation (validation-only): per-job identity counter so a
+        # packet record can be tied back to the job that produced it (and thus
+        # whether that job was deferred to the slow tier).  Its OWN lock — never
+        # self._lock — so it cannot introduce a lock-ordering deadlock with the
+        # scheduler lock that submit() paths may already hold.
+        self._job_id_ctr = 0
+        self._job_id_lock = threading.Lock()
         self._slow_budget = float(os.environ.get('LORA_SLOW_BUDGET_S', '45'))
         # Slow mop-up runs ONLY when capture is not active.  A big-budget
         # re-decode running DURING live capture holds workers and starves the
@@ -6291,13 +6961,16 @@ while True:
         self._release_one_slow()
 
     def submit(self, fpath, fname, relay_after_syms=None, relay_before_syms=None,
-               bucket_key=None, slow=False):
+               bucket_key=None, slow=False, lineage=None):
         """Queue a capture file for background decoding.
 
         relay_after_syms:  blank first N BW-rate symbols → find hop AFTER primary.
         relay_before_syms: blank from symbol N onward   → find hop BEFORE primary.
         bucket_key:        (cand_freq_hz, abs_t_s) for Phase-2 cross-worker
                            bucket dedup; None disables the dedup for this job.
+        lineage:           the source detection dict (Phase-1 audit lineage);
+                           carries _lin_* fields stamped at detect emit / slow
+                           consume.  None when audit is off.
         """
         if not self._decoder_script:
             return
@@ -6334,7 +7007,81 @@ while True:
         _slow_tier = slow or self._defer_state
         self._rawlog('SUBMIT', f"{fname} relay={relay_after_syms},{relay_before_syms} "
                                f"tier={'slow' if _slow_tier else 'fast'}")
-        (self._slow_queue if _slow_tier else self._queue).put((fpath, fname, relay_after_syms, relay_before_syms, None))
+        # Instrumentation (validation-only): job-local metadata carried WITH the
+        # job tuple (6th element) — NOT looked up later in the prunable
+        # _fname_bucket.  capture_anchor_rf_s = the crop's candidate-preamble RF
+        # time (bucket_key[1]); it anchors the capture, not a specific packet
+        # (one crop can emit several [PKT]s), so it is labelled honestly and no
+        # per-packet rf_event_s is derived (the decoder exposes no within-crop
+        # offset).  The tuple's index 0 (fpath) and object identity are
+        # unchanged, so the slow-tier reservation (_slow_take/_slow_job) is
+        # unaffected.
+        with self._job_id_lock:
+            self._job_id_ctr += 1
+            _jid = self._job_id_ctr
+        # initial_slow is IMMUTABLE (the tier at submission); ever_deferred and
+        # requeue_count accumulate — so a realtime job later requeued reads
+        # initial_slow=False, ever_deferred=True.  float() the anchor so a numpy
+        # scalar can't break json.dumps downstream.
+        # Preserve ALL FOUR bucket values (freq, rf_s, freq_tol, time_tol) so the
+        # offline scorer can associate repeated same-payload occurrences using
+        # the detector's OWN recorded time tolerance (never exact float equality
+        # on rf_s).  float() each so a numpy scalar can't break json.dumps.
+        def _bf(_i):
+            if (bucket_key is not None and len(bucket_key) > _i
+                    and bucket_key[_i] is not None):
+                return float(bucket_key[_i])
+            return None
+        _meta = {'job_id': _jid,
+                 'submit_mono_ns': time.monotonic_ns(),
+                 'capture_anchor_freq_hz': _bf(0),
+                 'capture_anchor_rf_s': _bf(1),
+                 'capture_anchor_freq_tol_hz': _bf(2),
+                 'capture_anchor_time_tol_s': _bf(3),
+                 'initial_slow': bool(_slow_tier),
+                 'ever_deferred': bool(_slow_tier),
+                 'requeue_count': 0}
+        # Phase-1 lineage: allocate a LOGICAL work_id (reused on requeue) and
+        # carry producer / window|scan / detector-side detection fields (kept
+        # SEPARATE from the decoder-reported bw/sf/freq).  Emit a work_submitted
+        # lifecycle event + ledger note so starved/failed work is observable.
+        if _LID is not None:
+            _lin = lineage if isinstance(lineage, dict) else {}
+            _wid = _LID.next('work')
+            _meta['work_id'] = _wid
+            _meta['queue_attempt_seq'] = 0
+            _meta['producer'] = _lin.get('_lin_producer')
+            _meta['parent_detection_id'] = _lin.get('_lin_detection_id')
+            # exact candidate linkage is Phase-2; Phase-1 carries only a HINT.
+            _meta['parent_candidate_id'] = None
+            _meta['candidate_hint_id'] = _lin.get('_lin_candidate_hint_id')
+            _meta['candidate_bin_delta'] = _lin.get('_lin_candidate_bin_delta')
+            _meta['window_id'] = _lin.get('_lin_window_id')
+            _meta['scan_id'] = _lin.get('_lin_scan_id')
+            _meta['candidate_link_status'] = _lin.get('_lin_candidate_link_status')
+            # detector-side values (NEVER overwritten by decoder output)
+            _meta['detector_freq_hz'] = (float(_lin['freq_hz'])
+                                         if _lin.get('freq_hz') is not None else _bf(0))
+            _meta['detector_sf'] = _lin.get('sf')
+            _meta['detector_bw_hz'] = (float(_lin['bw'])
+                                       if _lin.get('bw') is not None else None)
+            _meta['detector_preamble_rf_s'] = _bf(1)
+            if _WLED is not None:
+                _WLED.note_submit(_wid)
+            _run_event('work_submitted', run_id=_RUN_ID, work_id=_wid,
+                       queue_attempt_seq=0, job_id=_jid, producer=_meta['producer'],
+                       window_id=_meta['window_id'], scan_id=_meta['scan_id'],
+                       parent_detection_id=_meta['parent_detection_id'],
+                       parent_candidate_id=_meta['parent_candidate_id'],
+                       queue_tier=('slow' if _slow_tier else 'fast'),
+                       detector_sf=_meta['detector_sf'],
+                       detector_bw_hz=_meta['detector_bw_hz'],
+                       detector_freq_hz=_meta['detector_freq_hz'])
+        if _slow_tier:
+            _run_event('slow_enqueued', job_id=_jid, reason='initial_slow',
+                       requeue_count=0)
+        (self._slow_queue if _slow_tier else self._queue).put(
+            (fpath, fname, relay_after_syms, relay_before_syms, None, _meta))
 
     def pending(self):
         with self._lock:
@@ -6433,6 +7180,71 @@ while True:
         with self._lock:
             self._slow_inflight = max(0, self._slow_inflight - 1)
 
+    def _slow_dispose(self, meta, slow_rel, outcome, executed, result_mono_ns,
+                      parsed_records=None, logged_records=None):
+        """Instrumentation (validation-only): the SINGLE exit-path disposition
+        for a dispatched job.  Centralizes reservation retirement + the
+        release/completion events so NO early-exit path can retire silently or
+        recreate the coverage gap (jobs 57/61 in ref-pass1 hit an early exit
+        whose bare _slow_retire() left slow_reserved without a matching
+        slow_reservation_released).  Called at normal completion AND all four
+        early exits.  `slow_rel` gates the release exactly as before; the
+        completion event fires for any ever-deferred/initial-slow job with a
+        terminal outcome (a real disposition time, never null)."""
+        if slow_rel:
+            self._slow_retire()
+            _run_event('slow_reservation_released', job_id=meta.get('job_id'),
+                       requeue_count=meta.get('requeue_count'))
+        if meta.get('ever_deferred') or meta.get('initial_slow'):
+            _kw = dict(job_id=meta.get('job_id'), outcome=outcome,
+                       executed=executed, terminal=True,
+                       requeue_count=meta.get('requeue_count'),
+                       result_processed_mono_ns=result_mono_ns)
+            if parsed_records is not None:
+                _kw['parsed_records'] = parsed_records
+            _run_event('slow_completed', **_kw)
+        # Phase-1 work-lifecycle TERMINAL (centralized, exactly-once).  A job
+        # that requeued THIS attempt is not terminal here (it terminalizes on its
+        # later completion attempt).  Outcome taxonomy maps the dispatch _oc /
+        # early-exit reason to a work outcome; 'completed_decode' is keyed on the
+        # PARSED record count (parsed_records), never a substring.
+        _wid = meta.get('work_id')
+        if _WLED is not None and _wid is not None and not meta.get('_work_requeued'):
+            _WORK_OUTCOME = {
+                'packet': 'completed_decode', 'no_packet': 'completed_no_decode',
+                'parse_error': 'failed_parse', 'subprocess_error': 'failed_worker',
+                'manager_error': 'failed_worker', 'timeout': 'failed_timeout',
+                'worker_start_failed': 'failed_worker',
+                'skipped_bucket': 'cancelled_bucket_dedup',
+                'skipped_inflight': 'cancelled_inflight',
+                'no_decoder': 'cancelled_no_decoder'}
+            # keyed on records LOGGED to the canonical sink (codex C1).  A
+            # 'packet' (parsed>0) that logged ZERO records = telemetry lost
+            # (failed_record_log), NOT completed_no_decode.
+            if outcome == 'packet':
+                if logged_records and logged_records > 0:
+                    _wo = 'completed_decode'
+                elif parsed_records and parsed_records > 0:
+                    _wo = 'failed_record_log'
+                else:
+                    _wo = 'completed_no_decode'
+            else:
+                _wo = _WORK_OUTCOME.get(outcome, 'failed_' + str(outcome))
+            if _WLED.note_terminal(_wid, _wo):
+                _run_event('work_' + _wo, run_id=_RUN_ID, work_id=_wid,
+                           queue_attempt_seq=meta.get('queue_attempt_seq'),
+                           job_id=meta.get('job_id'), producer=meta.get('producer'),
+                           parsed_records=parsed_records, logged_records=logged_records)
+
+    def _slow_state_snapshot(self):
+        """Instrumentation (validation-only): scheduler-lock-consistent snapshot
+        of the deferred-tier state for the drain_end acceptance invariant."""
+        with self._lock:
+            return {'slow_inflight': self._slow_inflight,
+                    'slow_reservation_present': self._slow_released_job is not None,
+                    'slow_queue_size': self._slow_queue.qsize(),
+                    'fast_queue_size': self._queue.qsize()}
+
     def drain_slow_into_fast(self):
         """Move the slow mop-up queue into the fast queue so the blocking
         workers re-decode the budget-bound stragglers (with their big per-job
@@ -6495,10 +7307,24 @@ while True:
             # flag and decoders resume full speed.
             if self._gate_stress.is_set():
                 time.sleep(self._stress_pause_s)
-            fpath, fname, relay_after_syms, relay_before_syms, job_budget = job
+            fpath, fname, relay_after_syms, relay_before_syms, job_budget, _meta = job
+            if _meta is None:
+                _meta = {}
+            # ATTEMPT-LOCAL requeue flag (codex): reset FALSE at every attempt
+            # entry so a stale True from a prior attempt can never suppress this
+            # attempt's terminalization (a requeue->early-exit/exception would
+            # otherwise leave the work outstanding).  Set True only in the
+            # requeue block below when THIS attempt actually requeues.
+            _meta['_work_requeued'] = False
+            # Named for what it is: when the manager DEQUEUED the item (not
+            # necessarily when decode execution starts).
+            _manager_dequeue_mono_ns = time.monotonic_ns()   # instrumentation
             # Claim the slow-tier reservation ONCE, here, by job identity; every
             # exit path below must retire it (see _slow_retire).
             _slow_rel = self._slow_take(job)
+            if _slow_rel:
+                _run_event('slow_reserved', job_id=_meta.get('job_id'),
+                           requeue_count=_meta.get('requeue_count'))
             # Load-aware decode budget: when the gate is under pressure (ring
             # filling or dropping — same signal as the pause above), a
             # fast-tier decode runs with a FAIL-FAST budget instead of the
@@ -6542,8 +7368,9 @@ while True:
                 job_budget = _flat / (2.0 ** ((_sf_j - 7) * 0.5))
                 _stress_shrunk = True
             if self._decoder_script is None:
-                if _slow_rel:
-                    self._slow_retire()
+                self._slow_dispose(_meta, _slow_rel, 'no_decoder',
+                                   executed=False,
+                                   result_mono_ns=time.monotonic_ns())
                 self._queue.task_done()
                 continue
 
@@ -6559,8 +7386,9 @@ while True:
             if self._bucket_already_decoded(fpath):
                 self._rawlog('SKIP-BUCKET', os.path.basename(fpath))
                 self._ref_dec_and_maybe_unlink(fpath)
-                if _slow_rel:
-                    self._slow_retire()
+                self._slow_dispose(_meta, _slow_rel, 'skipped_bucket',
+                                   executed=False,
+                                   result_mono_ns=time.monotonic_ns())
                 self._queue.task_done()
                 if self._verbose:
                     print(f"         [BUCKET-DEDUP] skip {os.path.basename(fpath)} "
@@ -6590,8 +7418,9 @@ while True:
                         # Sibling admitted while we waited — skip cleanly.
                         self._rawlog('SKIP-INFLIGHT-ADMIT', os.path.basename(fpath))
                         self._ref_dec_and_maybe_unlink(fpath)
-                        if _slow_rel:
-                            self._slow_retire()
+                        self._slow_dispose(_meta, _slow_rel, 'skipped_inflight',
+                                           executed=False,
+                                           result_mono_ns=time.monotonic_ns())
                         self._queue.task_done()
                         if self._verbose:
                             print(f"         [BUCKET-DEDUP] skip {os.path.basename(fpath)} "
@@ -6614,8 +7443,9 @@ while True:
             if worker is None or worker.poll() is not None:
                 worker = self._start_worker()
                 if worker is None:
-                    if _slow_rel:
-                        self._slow_retire()
+                    self._slow_dispose(_meta, _slow_rel, 'worker_start_failed',
+                                       executed=False,
+                                       result_mono_ns=time.monotonic_ns())
                     self._queue.task_done()
                     continue
 
@@ -6623,6 +7453,17 @@ while True:
                 self._active_count += 1
 
             t_start = time.time()
+            # Instrumentation (validation-only): initialize ALL diagnostic state
+            # BEFORE the job try-block so the finally's slow_completed can never
+            # reference an undefined variable (which would mask the real
+            # exception).  Each is overwritten on the normal path below.
+            output = ''
+            _result_processed_mono_ns = None
+            timed_out = False
+            worker_died = False
+            _pkt_parsed_count = 0
+            _pkt_logged_count = 0    # records actually written (codex C1)
+            _job_exc = None
             try:
                 # Send file path, search mode, and per-job budget to worker.
                 # Format: "<fpath>\t<mode>\t<budget>\n"
@@ -6722,6 +7563,11 @@ while True:
                     worker = None
 
                 output = '\n'.join(output_lines)
+                # Instrumentation (validation-only): ONE timestamp for when the
+                # manager finished processing this job's result — defined for
+                # EVERY job (packet, no-packet, error) so slow_completed below
+                # can reference it regardless of outcome.
+                _result_processed_mono_ns = time.monotonic_ns()
                 elapsed = time.time() - t_start
                 self._rawlog('JOB', f"{fname} mode={relay_field or '-'} "
                                     f"budget={job_budget} elapsed={elapsed:.1f}s "
@@ -6740,6 +7586,7 @@ while True:
                                 _r = _json.loads(_ln[6:])
                             except Exception:
                                 continue
+                            _pkt_parsed_count += 1   # instrumentation (parsed OK)
                             # Authoritative decode count (data-path truth, not the
                             # noisy compact stdout).  Distinct-packet key prefers a
                             # stable identity: Meshtastic PacketID+hop, else the raw
@@ -6760,12 +7607,60 @@ while True:
                                         del self._confirmed_freqs[:-64]
                             if self._pkt_log_path:
                                 _r['ts'] = _now
+                                # Instrumentation (validation-only): timing +
+                                # provenance so pre/post-input-EOF can be
+                                # separated offline and a deferred job proven to
+                                # complete during input.  capture_anchor_rf_s is
+                                # the crop's candidate-preamble RF time (NOT a
+                                # per-packet event time); rf_event_s is null
+                                # because the decoder exposes no within-crop
+                                # offset — labelled honestly via rf_time_basis.
+                                _r['run_id'] = _RUN_ID
+                                _r['result_processed_mono_ns'] = _result_processed_mono_ns
+                                _r['job_submit_mono_ns'] = _meta.get('submit_mono_ns')
+                                _r['manager_dequeue_mono_ns'] = _manager_dequeue_mono_ns
+                                _r['decode_job_id'] = _meta.get('job_id')
+                                _r['initial_slow'] = _meta.get('initial_slow')
+                                _r['ever_deferred'] = _meta.get('ever_deferred')
+                                _r['requeue_count'] = _meta.get('requeue_count')
+                                # Phase-1 lineage (audit on): work_id + producer +
+                                # detector-side fields, kept SEPARATE from the
+                                # decoder-reported bw/sf/freq already in _r.
+                                if _meta.get('work_id') is not None:
+                                    _r['work_id'] = _meta.get('work_id')
+                                    _r['queue_attempt_seq'] = _meta.get('queue_attempt_seq')
+                                    _r['producer'] = _meta.get('producer')
+                                    _r['parent_detection_id'] = _meta.get('parent_detection_id')
+                                    _r['parent_candidate_id'] = _meta.get('parent_candidate_id')
+                                    _r['candidate_hint_id'] = _meta.get('candidate_hint_id')
+                                    _r['candidate_bin_delta'] = _meta.get('candidate_bin_delta')
+                                    _r['window_id'] = _meta.get('window_id')
+                                    _r['scan_id'] = _meta.get('scan_id')
+                                    _r['candidate_link_status'] = _meta.get('candidate_link_status')
+                                    _r['detector_freq_hz'] = _meta.get('detector_freq_hz')
+                                    _r['detector_sf'] = _meta.get('detector_sf')
+                                    _r['detector_bw_hz'] = _meta.get('detector_bw_hz')
+                                    _r['detector_preamble_rf_s'] = _meta.get('detector_preamble_rf_s')
+                                _r['decode_capture_fname'] = fname
+                                _anchor = _meta.get('capture_anchor_rf_s')
+                                _r['capture_anchor_freq_hz'] = _meta.get('capture_anchor_freq_hz')
+                                _r['capture_anchor_rf_s'] = _anchor
+                                _r['capture_anchor_freq_tol_hz'] = _meta.get('capture_anchor_freq_tol_hz')
+                                _r['capture_anchor_time_tol_s'] = _meta.get('capture_anchor_time_tol_s')
+                                _r['rf_time_basis'] = (
+                                    'detector_candidate_preamble'
+                                    if _anchor is not None else None)
+                                _r['rf_event_s'] = None
                                 _out.append(_json.dumps(_r, separators=(',', ':')))
                     if _out and self._pkt_log_path:
                         try:
                             with self._pkt_log_lock:
                                 with open(self._pkt_log_path, 'a') as _pf:
                                     _pf.write('\n'.join(_out) + '\n')
+                            # count only AFTER a successful write (codex C1):
+                            # 'completed_decode' means a record was LOGGED, not
+                            # merely parsed.
+                            _pkt_logged_count += len(_out)
                         except Exception:
                             pass
 
@@ -6777,14 +7672,42 @@ while True:
                 # _packet_dedup suppresses anything already emitted → no
                 # double-count.  Only PRIMARY (not relay/iso) jobs, only from
                 # the fast tier (is_slow guards against infinite re-queue).
-                if ((job_budget is None or _stress_shrunk) and output
-                        and '[BUDGET]' in output
-                        and relay_after_syms is None
-                        and relay_before_syms is None):
+                _will_requeue = ((job_budget is None or _stress_shrunk) and output
+                                 and '[BUDGET]' in output
+                                 and relay_after_syms is None
+                                 and relay_before_syms is None)
+                if _will_requeue:
                     self._ref_inc(fpath)
                     self._rawlog('REQUEUE-SLOW', fname)
+                    # Carry the job-local meta forward.  initial_slow is
+                    # IMMUTABLE (this was a fast-tier job that BAILED); mark
+                    # ever_deferred and bump requeue_count.  Same job_id so the
+                    # eventual deferred completion is traceable to the original.
+                    _rq_meta = dict(_meta)
+                    _rq_meta['ever_deferred'] = True
+                    _rq_meta['requeue_count'] = _rq_meta.get('requeue_count', 0) + 1
+                    # This attempt requeued -> mark it so the completion dispose
+                    # below does NOT terminalize (the re-tiered job terminalizes
+                    # on its later completion attempt).  Flag lives on THIS
+                    # attempt's meta only (the forwarded _rq_meta copy is reset
+                    # False at its own attempt entry).
+                    _meta['_work_requeued'] = True
+                    # Phase-1 lineage: same LOGICAL work_id, incremented attempt.
+                    if _rq_meta.get('work_id') is not None:
+                        _rq_meta['queue_attempt_seq'] = _rq_meta.get('queue_attempt_seq', 0) + 1
+                        _run_event('work_retiered', run_id=_RUN_ID,
+                                   work_id=_rq_meta['work_id'],
+                                   queue_attempt_seq=_rq_meta['queue_attempt_seq'],
+                                   job_id=_rq_meta.get('job_id'), reason='budget_requeue')
+                    _run_event('slow_enqueued', job_id=_rq_meta.get('job_id'),
+                               reason='budget_requeue',
+                               requeue_count=_rq_meta['requeue_count'])
                     self._slow_queue.put((fpath, fname, None, None,
-                                          self._slow_budget))
+                                          self._slow_budget, _rq_meta))
+                # (Work-lifecycle terminal accounting is centralized in
+                # _slow_dispose; the attempt-local _work_requeued flag was reset
+                # False at attempt entry and set True above iff this attempt
+                # requeued.)
 
                 if self._verbose:
                     if output and output.strip():
@@ -6819,6 +7742,7 @@ while True:
                         sys.stdout.flush()
 
             except Exception as e:
+                _job_exc = repr(e)   # instrumentation: real failure, not no_packet
                 self._rawlog('JOB-ERROR', f"{fname} exc={e!r}")
                 sys.stdout.write(
                     f"         [DECODE ERROR] {fname}: {e}\n")
@@ -6861,8 +7785,33 @@ while True:
                         pass
                 with self._lock:
                     self._active_count -= 1
-                if _slow_rel:
-                    self._slow_retire()
+                # Instrumentation (validation-only): NORMAL completion goes
+                # through the SAME _slow_dispose helper as the four early exits
+                # (centralized so no path can retire without logging).  Outcome
+                # is a specific taxonomy (not everything-is-no_packet), and
+                # 'packet' is keyed on the PARSED record count, not a substring.
+                if _job_exc is not None:
+                    _oc = 'manager_error'      # exception in the manager
+                elif worker_died:
+                    _oc = 'subprocess_error'   # worker EOF mid-job
+                elif timed_out:
+                    _oc = 'timeout'            # wall-deadline overrun
+                elif _pkt_parsed_count > 0:
+                    _oc = 'packet'             # >=1 parsed [PKT] record
+                elif '[PKT]' in output:
+                    _oc = 'parse_error'        # [PKT] present, none parsed
+                else:
+                    _oc = 'no_packet'          # clean run, produced nothing
+                # work outcome is keyed on records actually LOGGED to the
+                # canonical sink (codex C1) — NO parsed fallback.  When no
+                # pkt-log sink is configured, _pkt_logged_count stays 0 and a
+                # parsed-but-unlogged 'packet' becomes failed_record_log
+                # (telemetry lost) rather than completed_no_decode.
+                self._slow_dispose(_meta, _slow_rel, _oc, executed=True,
+                                   result_mono_ns=(_result_processed_mono_ns
+                                                   or time.monotonic_ns()),
+                                   parsed_records=_pkt_parsed_count,
+                                   logged_records=_pkt_logged_count)
                 self._queue.task_done()
                 # Phase-2: clear the in-flight bucket entry so waiting
                 # sibling workers can proceed (either they'll see the bucket
@@ -7750,6 +8699,7 @@ def main():
               f"{', hybrid dispatch' if _hybrid else ''})", flush=True)
 
     _pool = None
+    _orig_detect_workers = a.detect_workers   # request, before serial-fallback
     if a.detect_workers and a.detect_workers > 0:
         from detect_pool import DetectPool
         _win_n = int(a.rate * a.window)
@@ -7758,7 +8708,20 @@ def main():
         # ring wraps every ~2 min).  Hybrid small hosts get +4: quiet
         # windows bypass the pool entirely there, so the deep slot cushion
         # is unnecessary and shm is the scarce resource on a 4 GB Pi.
-        _n_slots = a.detect_workers + (4 if _hybrid else 8)
+        # RAM co-sizing (codex OOM review 2026-07-23): each slot is a real
+        # win_n*8-byte shm array (160 MB @20 Msps).  On a small-RAM host the
+        # deep +8 cushion (10 slots = 1.6 GB) is memory the joint plan can't
+        # spare — under permanent overload measured slot concurrency stays ~6-7
+        # anyway, so cap the cushion to +4 (=6 slots, recovers ~640 MB for the
+        # ring / headroom) when RAM is tight.  Big-RAM hosts keep +8.
+        try:
+            with open('/proc/meminfo') as _mi0:
+                _memtot_slots = next(int(l.split()[1]) for l in _mi0
+                                     if l.startswith('MemTotal:')) * 1024
+        except Exception:
+            _memtot_slots = 16 << 30
+        _slot_extra = 4 if (_hybrid or _memtot_slots < int(12e9)) else 8
+        _n_slots = a.detect_workers + _slot_extra
         if _hybrid:
             # RAM gate: the slots are real anonymous shm.  If they would
             # eat >30% of MemAvailable, hybrid loses to OOM risk — fall
@@ -7789,6 +8752,65 @@ def main():
             print(f"Detect pool: {a.detect_workers} worker processes "
                   f"({_n_slots} slots{', hybrid' if _hybrid else ''})",
                   flush=True)
+
+    # ---- UNIFIED STARTUP MEMORY PLAN (codex OOM review 2026-07-23) ----
+    # Ring + detect-pool slots + per-process private baselines + crop/decode
+    # transients + OS headroom are ONE budget.  The old sizers were INDEPENDENT:
+    # the ring took "40% of MemAvailable" (StreamBuffer.__init__) while the pool
+    # separately reserved its slots — so on an 8 GB Pi at 20 Msps they summed
+    # PAST RAM (ring 3.6 + slots 1.6 + 3 python baselines + decode ~2 + OS) and
+    # OOM'd even with every queue bounded (measured: --no-decode plateaus ~5.4GB,
+    # --decode OOMs).  Size the RING from what's LEFT after everything that
+    # coexists, so the aggregate working set fits with margin.  Live path only
+    # (file mode uses IQReader, no ring).  Big-RAM hosts are unaffected — the
+    # plan only ever LOWERS buf_seconds (the requested value stays the ceiling).
+    if a.file is None:
+        _ring_bps = 4 if a.format == 'sc16' else 2      # ring stores RAW int16/int8
+        _slot_bytes = (_n_slots * _win_n * 8) if (_pool is not None) else 0
+        try:
+            with open('/proc/meminfo') as _mi:
+                _avail_b = next(int(l.split()[1]) for l in _mi
+                                if l.startswith('MemAvailable:')) * 1024
+        except Exception:
+            _avail_b = 8 << 30
+        _will_decode = ((a.decode if a.decode is not None
+                         else (a.export_iq is not None)) and not a.no_decode)
+        # Reserves calibrated to MEASURED Pi peaks (2026-07-23): at 20 Msps the
+        # MAIN process private heap alone reached ~2.5 GB with decode on (numpy/
+        # scipy/pyFFTW + gate arrays + the crop/save/decode pipeline), on top of
+        # ring + shm slots.  Each figure carries margin over the observed value
+        # so the aggregate leaves ~1 GB of MemAvailable headroom, not zero.
+        _os_reserve = int(1.5e9)                        # OS + page cache (~1 GB obs + margin)
+        _main_working = int(3.0e9 if _will_decode       # main heap: ~2.5 GB obs + 0.5 margin
+                            else 1.5e9)                 # (no-decode main is far lighter)
+        _worker_b = (a.detect_workers or 0) * int(0.5e9)  # per detect-worker private + margin
+        # Explicit spike headroom NEVER given to the ring: the steady-state
+        # reserves above under-predict transient peaks (decode crop copies +
+        # pyFFTW scratch).  Hold ~1.2 GB back so the MemAvailable lower envelope
+        # stays ~1 GB+ (codex margin guidance — a full-budget ring dipped to
+        # ~370 MB, too thin; MALLOC_ARENA_MAX=2 now caps the fragmentation creep).
+        _spike_margin = int(1.2e9)
+        _ring_budget_b = max(0, _avail_b - _os_reserve - _slot_bytes
+                             - _main_working - _worker_b - _spike_margin)
+        _plan_bufs = _ring_budget_b / float(a.rate * _ring_bps)
+        # Feasibility target: a ring shorter than ~8 s can't bridge slow-preset
+        # overload bursts.  If the SAFE budget can't afford it, that's a signal
+        # the host is over-configured for this rate — warn, but NEVER allocate
+        # past the safety budget (floor 3 s just avoids a degenerate ring).
+        if _plan_bufs < 8.0:
+            print(f"[MEMPLAN] ring budget only {_plan_bufs:.1f}s (<8s target) on "
+                  f"{_avail_b/1e9:.1f}GB after slots {_slot_bytes/1e9:.1f}GB + main "
+                  f"{_main_working/1e9:.1f}GB + workers {_worker_b/1e9:.1f}GB + OS "
+                  f"1.5GB — host tight for {a.rate/1e6:.0f} Msps this config",
+                  file=sys.stderr)
+        _plan_bufs = max(3.0, _plan_bufs)
+        if _plan_bufs < a.buf_seconds:
+            print(f"[MEMPLAN] ring {a.buf_seconds:.0f}s -> {_plan_bufs:.1f}s "
+                  f"(joint budget: {_avail_b/1e9:.1f}GB avail - OS 1.5 - slots "
+                  f"{_slot_bytes/1e9:.1f} - main {_main_working/1e9:.1f} - workers "
+                  f"{_worker_b/1e9:.1f} = {_ring_budget_b/1e9:.1f}GB ring)",
+                  file=sys.stderr)
+            a.buf_seconds = _plan_bufs
 
     fp = open(a.file, 'rb') if a.file else sys.stdin.buffer
 
@@ -7876,7 +8898,16 @@ def main():
                          # SF12 frames per leg whose trigger ticks all landed
                          # in another bucket's busy shadow — typically their
                          # own IQ-image's scan)
-    _slow_results = queue.Queue()   # (dets_slow, _iq_long, reg_tot_s, trig)
+    # maxsize=1 backstop: single-flight (below) keeps _slow_busy TRUE until a
+    # result is drained AND processed, so at most one result is ever pending —
+    # but the bound guarantees the ~640 MB _iql assemblies can never pile up
+    # unboundedly (the dominant 20 Msps OOM driver: the old unbounded queue +
+    # busy-cleared-at-scan-complete let a new scan launch while the prior 640 MB
+    # result sat undrained, growing RSS ~200 MB/s).  A hit-less scan drops _iql
+    # entirely (puts None), so only scans that actually detect retain the array.
+    _slow_results = queue.Queue(maxsize=1)   # (dets_slow, _iq_long|None, reg_tot_s, trig, scan_id)
+    _slow_iql_dropped = [0]          # telemetry: hit-less scans whose 640MB _iql was freed
+    _slow_max_qdepth = [0]           # telemetry: peak _slow_results depth observed
     # Tail samples consumed last iter (for save).  Prepended to this iter's iq
     # so the audio timeline stays continuous — without this, every save creates
     # a `tail_n` audio gap between adjacent Welch windows and packets that land
@@ -7884,6 +8915,14 @@ def main():
     _carry_tail = None
     buf_pos = tot_s = tot_d = wc = 0
     _sat_max = 0.0   # worst ADC-clip fraction since the last [STAT] (surfaced as a warning)
+    # Saturation subsample: target a FIXED ~256k-sample statistical population
+    # regardless of rate (host/rate-agnostic — the old hardcoded 32x scanned
+    # ~625k strided samples across the whole 160MB window every hop; under the
+    # detect-worker memory-bus contention that cache-hostile gather measured
+    # ~67ms, far above its ~16ms idle cost).  256k gives a clip-fraction
+    # standard error <0.01% — negligible vs the 0.5% engage threshold — while
+    # touching ~2.4x fewer cache lines.  Floor of 32 keeps low-rate behaviour.
+    _sat_stride = max(32, win_n // 262144)
     # Worst-case preamble duration across all Meshtastic presets:
     #   SF12/62.5k = 16×4096/62500 = 1.049s  →  not capturable within hop anyway
     #   SF12/125k  = 16×4096/125000 = 0.524s  ← needs most lookback in-window
@@ -7905,8 +8944,13 @@ def main():
     # wrong hit), so no explicit invalidation is needed.  LORA_SLICE_CACHE=0
     # disables; LORA_SLICE_CACHE_VERIFY=1 asserts each hit against a fresh
     # welch.
-    _slice_cache = {}          # abs_start_sample -> (psd, psd_max|None)
+    _slice_cache = {}          # abs_start_sample -> [psd, psd_max|None, notch_sig, peaks]
     _slice_cache_on = os.environ.get('LORA_SLICE_CACHE', '1') != '0'
+    # Reuse the post-processed per-slice PEAK list too (not just the PSD) on a
+    # cache hit with unchanged notch signature — skips copy+notch+find_peaks,
+    # the sweep's dominant cost.  A/B kill-switch (default on); disable to prove
+    # detection-equivalence vs the recompute-every-window path.
+    _slice_peak_cache_on = os.environ.get('LORA_SLICE_PEAK_CACHE', '1') != '0'
     _slice_cache_verify = os.environ.get('LORA_SLICE_CACHE_VERIFY') == '1'
     _slice_cache_hits = 0
     _slice_cache_miss = 0
@@ -8025,6 +9069,30 @@ def main():
     if recorder and decoder:
         recorder.set_decoder(decoder)
 
+    # Instrumentation (validation-only): one RUNMETA line with the RESOLVED
+    # EFFECTIVE runtime values (post-derivation, not argv) under the shared
+    # run_id — reconciles the runner manifest with what the detector actually
+    # ran.  Emitted here (after pool/reader/decoder exist) so effective decode
+    # workers and the real ring size are known.
+    try:
+        _eff_ring_n = getattr(reader, '_ring_n', None)
+    except Exception:
+        _eff_ring_n = None
+    # effective detect workers = ACTUAL live pool process count (not the argparse
+    # request, which may differ after the serial-fallback derivation).
+    try:
+        _eff_detw = len(_pool._workers) if _pool is not None else 0
+    except Exception:
+        _eff_detw = (0 if _pool is None else None)
+    _run_event('runmeta', wb_fs=a.rate, fmt=a.format, is_live=is_live,
+               requested_detect_workers=_orig_detect_workers,
+               effective_detect_workers=_eff_detw,
+               effective_decode_workers=(decoder._n_workers
+                                         if decoder is not None else 0),
+               ring_n=_eff_ring_n, buf_seconds=a.buf_seconds,
+               overlap=a.overlap, t_start_wall=t_start,
+               slow_no_ring_defer=_SLOW_NO_RING_DEFER)
+
     # Multiprocess detection pipeline state (the pool itself was built earlier,
     # before threads started, so its fork is safe).  With --detect-workers N>0
     # each gate window is fanned out to N single-threaded detect processes
@@ -8033,6 +9101,9 @@ def main():
     # "tail" is reconstructed from the next in-flight window (windows overlap
     # 50%), so no post-detect ring read is needed.
     _inflight = __import__('collections').deque()
+    # Candidate-lifecycle audit (validation-only, gated off).  4096-pt gate FFT.
+    _cand_mgr = _CandAuditMgr(a.rate, 4096) if _CAND_AUDIT else None
+    _caw = None   # current window's audit object (None when audit off / not yet built)
     _seq = 0
     # Commit lag = how many windows stay in flight before the oldest is committed
     # (printed + saved + decoded).  At hop≈0.5 s this lag IS the airtime→result
@@ -8076,6 +9147,10 @@ def main():
         it = _inflight.popleft()
         _t_res0 = time.time()
         dets0 = _pool.result(it['seq'])
+        _caw_c = it.get('cand_audit')
+        if _caw_c is not None:
+            _caw_c.emit(dets0, it.get('buf_len', win_n), 'completed',
+                        time.monotonic_ns())
         _res_wait = time.time() - _t_res0
         if _res_wait > 0.2 and os.environ.get('LORA_SLOW_DEBUG'):
             print(f"[COMMIT-WAIT] {_res_wait:.2f}s on seq {it['seq']}",
@@ -8140,7 +9215,13 @@ def main():
     try:
       _prof = {'read': 0.0, 'slide': 0.0, 'welch': 0.0, 'notch': 0.0,
                'sat': 0.0, 'detect': 0.0, 'tail': 0.0, 'recorder': 0.0,
-               'slow': 0.0, 'feed': 0.0, 'catchup': 0.0, 'n': 0}
+               'slow': 0.0, 'feed': 0.0, 'catchup': 0.0, 'n': 0,
+               'rd_io': 0.0, 'rd_slide': 0.0,   # split of 'read': IO/convert vs window copy
+               'sweep': 0.0, 'sweep_welch': 0.0, 'sweep_post': 0.0}  # split of 'notch'
+      # PROF: parallel per-stage THREAD-CPU time (wall >> cpu => blocking, not
+      # compute) — same keys as _prof, stamped at the same boundaries.
+      _proft = {k: 0.0 for k in _prof}
+      _tt_step = time.thread_time()
       _t_iter_start = time.time()
       # Waterfall: opt-in via LORA_PSD_FILE (web sets a tmpfs path).  Throttled,
       # reuses _psd_gate below → no extra FFT.  A sibling '<file>.off' marker (set
@@ -8242,6 +9323,7 @@ def main():
                   _pp[max(0, _sb - _nb):min(4096, _sb + _nb + 1)] = np.median(_pp)
       while True:
         _t_step = time.time()
+        _tt_step = time.thread_time()
         dets = []   # per-iteration default: the detect-pool path commits its
                     # detections asynchronously and never binds `dets` in this
                     # scope — the slow-pass block below reads it either way
@@ -8322,8 +9404,10 @@ def main():
         fresh_n = max(0, hop_n - carry_n)
         if is_live:
             if fresh_n > 0:
+                _t_io0 = time.time()
                 result = (reader.read_raw(fresh_n) if _lz is not None
                           else reader.read(fresh_n, owned=_hop_owned))
+                _prof['rd_io'] += time.time() - _t_io0
                 if result[0] is None:
                     break
                 iq_fresh, skipped = result
@@ -8440,17 +9524,21 @@ def main():
                                _lz.seg_owned(hop_n - _max_pre_hop_n,
                                              _max_pre_hop_n))
                     _prehop_copies += 1
+            _t_sl0 = time.time()
             if _lz is not None:
                 _lz.slide(iq)      # 40 MB raw slide vs 320 MB c64 traffic
                 buf = None         # nothing may touch buf until materialized
             else:
                 buf[:sh] = buf[len(iq):]
                 buf[sh:] = iq
+            _prof['rd_slide'] += time.time() - _t_sl0
         buf_pos += _n_iq
         if buf_pos < win_n:
             continue
         _prof['read'] += time.time() - _t_step
+        _proft['read'] += time.thread_time() - _tt_step
         _t_step = time.time()
+        _tt_step = time.thread_time()
 
         # ---- Quick energy scan to decide if tail pre-read needed ----
         # compute PSD once here; pass it to detect_preamble to avoid recomputation.
@@ -8490,7 +9578,9 @@ def main():
                 _nb = max(1, int(round(_hw / _fres2)))
                 _psd_gate[max(0, _sb - _nb):min(4096, _sb + _nb + 1)] = np.median(_psd_gate)
         _prof['welch'] += time.time() - _t_step
+        _proft['welch'] += time.thread_time() - _tt_step
         _t_step = time.time()
+        _tt_step = time.thread_time()
         if _psd_file and (time.time() - _psd_last) >= (1.0 / _psd_fps):
             _psd_last = time.time()
             if not (_psd_off and os.path.exists(_psd_off)):
@@ -8506,6 +9596,10 @@ def main():
         # bin CW/LO/clipping spikes; at higher rates it backs off (20 Msps -> 3 bins,
         # 61 Msps -> no-op) so a narrow channel spanning few bins is never at risk.
         _min_w = min(4, max(1, int(round(0.5 * 31250.0 / (a.rate / 4096.0)))))
+        # Candidate audit: begin THIS window (every processed window gets exactly
+        # one audit object, emitted later at commit/inline/drain).
+        _caw = (_cand_mgr.new_window(tot_s, _live_center_mhz * 1e6)
+                if _cand_mgr is not None else None)
         _gate_peaks = [_p for _p in find_peaks(_psd_gate, thresh_db=a.energy_threshold, fres_hz=a.rate / 4096.0)
                        if _p[1] >= _min_w]
         if _psd_gmax is not None:
@@ -8513,6 +9607,138 @@ def main():
             for _mh in find_peaks(_psd_gmax, thresh_db=a.energy_threshold, fres_hz=a.rate / 4096.0):
                 if _mh[1] >= _min_w and not any(abs(_mh[0] - _g[0]) < 15 for _g in _gate_peaks):
                     _gate_peaks.append(_mh)
+
+        # ------------------------------------------------------------------
+        # PSD DIAGNOSTIC (validation-only, gated OFF; additive — no behavior
+        # change).  For windows whose RF interval contains a target time
+        # (LORA_PSD_DIAG_TIMES, comma rf-seconds — the hop-0 controls AND the
+        # hop-1 packets), dump the pre-rejection gate inputs around the carrier
+        # band so the n_raw=0 question (true sub-threshold energy vs a peak
+        # prominence/width/merge rejection) can be answered offline.  Emits mean
+        # _psd_gate + max-hold _psd_gmax stats, the RAW find_peaks output in-band
+        # (BEFORE the _min_w / merge filters -> shows the first-failed predicate),
+        # baseline floor, threshold, and window RMS/clip.
+        if _PSD_DIAG and _psd_diag_times:
+            _nfft = len(_psd_gate)
+            _win_len = win_n if _lz is not None else len(buf)
+            _rf0 = tot_s / a.rate
+            _rf1 = (tot_s + _win_len) / a.rate
+            _hit = [_tt for _tt in _psd_diag_times if _rf0 <= _tt < _rf1]
+            if _hit:
+                import math as _m
+                _fres = a.rate / _nfft
+                _ctr = _nfft // 2                       # center bin from len(psd), not 2048
+                _cbin = int(round((_psd_diag_freq_hz - _live_center_mhz * 1e6)
+                                  / _fres)) + _ctr
+                _blo, _bhi = max(0, _cbin - _psd_diag_halfbins), min(_nfft, _cbin + _psd_diag_halfbins)
+
+                def _jnum(x):                            # JSON-safe: NaN/Inf -> None
+                    try:
+                        xf = float(x)
+                        return xf if _m.isfinite(xf) else None
+                    except Exception:
+                        return None
+
+                def _arr(a2):
+                    # FULL precision (codex): rounding to 2dp could move a bin
+                    # across nf+6 / nf+4 under the strict '>' predicate.  6dp is
+                    # far below any dB granularity that matters yet keeps volume small.
+                    return [None if not _m.isfinite(float(v)) else round(float(v), 6)
+                            for v in a2]
+
+                _nf = float(np.median(_psd_gate))        # THE find_peaks baseline
+                _mean_band = _psd_gate[_blo:_bhi]
+                _bmax = float(np.max(_mean_band)) if len(_mean_band) else None
+                _barg = (int(np.argmax(_mean_band)) + _blo) if len(_mean_band) else None
+                _cval = float(_psd_gate[_cbin]) if 0 <= _cbin < _nfft else None
+                _gmax_band = None
+                if _psd_gmax is not None:
+                    _gb = _psd_gmax[_blo:_bhi]
+                    _gmax_band = {'max_db': _jnum(np.max(_gb)) if len(_gb) else None,
+                                  'argbin': (int(np.argmax(_gb)) + _blo) if len(_gb) else None,
+                                  'baseline_db': _jnum(np.median(_psd_gmax)),
+                                  'band_db': _arr(_gb)}
+                # RAW find_peaks in-band, BEFORE _min_w / merge (first-failed):
+                _raw_mean_pk = [[int(p[0]), int(p[1]), _jnum(p[2])]
+                                for p in find_peaks(_psd_gate, thresh_db=a.energy_threshold,
+                                                    fres_hz=_fres) if _blo <= p[0] < _bhi]
+                _raw_max_pk = ([[int(p[0]), int(p[1]), _jnum(p[2])]
+                                for p in find_peaks(_psd_gmax, thresh_db=a.energy_threshold,
+                                                    fres_hz=_fres) if _blo <= p[0] < _bhi]
+                               if _psd_gmax is not None else [])
+                _adm_pk = [[int(g[0]), int(g[1]), _jnum(g[2])]
+                           for g in _gate_peaks if _blo <= g[0] < _bhi]
+                # notch state intersecting the band
+                _dc_halfbins = int(round((a.dc_notch or 0.0) * 1e6 / _fres))
+                _spur_ranges = []
+                for (_sf_hz, _sh_hz) in (_spur_notch_hz or []):
+                    _sb = int(round((_sf_hz - _live_center_mhz * 1e6) / _fres)) + _ctr
+                    _shw = int(round((_sh_hz or 0.0) / _fres))
+                    if _sb + _shw >= _blo and _sb - _shw < _bhi:
+                        _spur_ranges.append([_sb - _shw, _sb + _shw])
+                _carrier_notched = (abs(_cbin - _ctr) <= _dc_halfbins
+                                    or any(lo <= _cbin < hi for lo, hi in _spur_ranges))
+                _rms = None; _clipf = None
+                try:
+                    _bb = buf[:win_n] if _lz is None else None
+                    if _bb is not None and len(_bb):
+                        _rms = _jnum(np.sqrt(np.mean(_bb.real.astype(np.float64) ** 2
+                                                     + _bb.imag.astype(np.float64) ** 2)))
+                        _clipf = _jnum(np.mean((np.abs(_bb.real) > 0.98)
+                                               | (np.abs(_bb.imag) > 0.98)))
+                except Exception:
+                    pass
+                _step = max(_nfft, _win_len // 50)
+                _n_segs = max(1, min(50, (_win_len - _nfft) // _step + 1))
+                _run_event('psd_diag',
+                           window_id=(_caw.awid if _caw is not None else None),
+                           rf_start_s=_rf0, rf_end_s=_rf1,
+                           sample_start=int(tot_s), sample_end=int(tot_s + _win_len),
+                           target_times=_hit,
+                           target_offsets_s=[round(_tt - _rf0, 4) for _tt in _hit],
+                           carrier_freq_hz=_psd_diag_freq_hz, carrier_bin=_cbin,
+                           center_bin=_ctr, band_start_bin=_blo, band_end_bin=_bhi,
+                           fres_hz=_fres, nfft=_nfft, welch_n_avg=50,
+                           welch_step_samples=_step, welch_n_segs=_n_segs,
+                           welch_also_max=bool(_maxhold),
+                           # find_peaks production predicates (offline reconstructs
+                           # the first-failed predicate from the band arrays + these)
+                           energy_threshold_db=a.energy_threshold, min_bins=3,
+                           base_contour_db=4.0, base_min_bins=4,
+                           wide_run_bins=(int(round(700e3 / _fres))),
+                           min_width_bins=_min_w,
+                           gate_baseline_db=_nf,
+                           mean_psd_band_max_db=_jnum(_bmax),
+                           mean_psd_band_argbin=_barg,
+                           carrier_value_db=_jnum(_cval),
+                           band_max_minus_baseline_db=(_jnum(_bmax - _nf)
+                                                       if _bmax is not None else None),
+                           carrier_value_minus_baseline_db=(_jnum(_cval - _nf)
+                                                            if _cval is not None else None),
+                           mean_psd_band_db=_arr(_mean_band),
+                           maxhold_band=_gmax_band,
+                           raw_meanpsd_peaks_inband=_raw_mean_pk,
+                           raw_maxhold_peaks_inband=_raw_max_pk,
+                           admitted_gate_peaks_inband=_adm_pk,
+                           dc_notch_halfbins=_dc_halfbins,
+                           spur_notch_band_ranges=_spur_ranges,
+                           carrier_notched=bool(_carrier_notched),
+                           # search-range facts: the energy gate's find_peaks runs
+                           # over the FULL _psd_gate (no bandwidth-edge restriction;
+                           # a.bandwidth only bounds per-peak extraction), so the
+                           # active search range is [0, nfft) minus notches.
+                           search_bin_range=[0, _nfft],
+                           carrier_in_search_range=bool(0 <= _cbin < _nfft
+                                                        and not _carrier_notched),
+                           band_bins_excluded_from_search=(
+                               ([[max(_blo, _ctr - _dc_halfbins),
+                                  min(_bhi, _ctr + _dc_halfbins)]]
+                                if abs(_cbin - _ctr) <= _dc_halfbins
+                                or (_ctr - _dc_halfbins < _bhi
+                                    and _ctr + _dc_halfbins > _blo) else [])
+                               + _spur_ranges),
+                           window_rms=_rms, clip_fraction=_clipf,
+                           maxhold_on=bool(_maxhold))
 
 
         # ---- Multi-resolution Welch: short-window sweep ----
@@ -8525,6 +9751,7 @@ def main():
         # dominate the 1s pass, so the short pass only adds peaks for short
         # bursts that the 1s pass missed.  Cost: ~20 Welches with n_avg=10
         # at nfft=4096 ≈ 10ms per main-loop iteration.
+        _t_sweep0 = time.time()
         _SHORT_WIN_S = 0.100
         _SHORT_OVERLAP = 0.5
         _SHORT_N_AVG = 10
@@ -8533,6 +9760,20 @@ def main():
         _short_peaks_all = []
         _n_short_slices = max(0, ((win_n if _lz is not None else len(buf))
                                   - _short_n) // _short_step + 1)
+        # Post-processing (notch + find_peaks) on a slice's PRISTINE cached PSD
+        # is deterministic given the notch parameters + energy threshold — so
+        # for a cache-HIT slice whose notch signature is unchanged, the emitted
+        # peak list is bit-identical and can be reused, skipping the per-slice
+        # copy+notch+2×find_peaks (measured ~165ms/iter, the sweep's dominant
+        # cost — the Welch itself is already 50%-overlap cached).  The signature
+        # invalidates the peak cache (NOT the PSD cache) on any live retune /
+        # spur-notch / dc-notch / threshold change.  The window-specific dedup
+        # against _gate_peaks stays per-window, so behaviour is unchanged.
+        # EXACT center (no rounding — _notch_psd and emitted absolute freqs
+        # consume the unrounded value, so two distinct centers must not share a
+        # key).  _maxhold is startup-fixed but included for free safety.
+        _notch_sig = (_live_center_mhz, a.dc_notch, a.energy_threshold,
+                      bool(_maxhold), tuple(_spur_notch_hz) if _spur_notch_hz else ())
         for _si in range(_n_short_slices):
             _ss = _si * _short_step
             _seg = buf[_ss:_ss + _short_n] if _lz is None else None
@@ -8541,6 +9782,7 @@ def main():
             # for the same physical samples.
             _abs_start = tot_s - win_n + _ss
             _cs = _slice_cache.get(_abs_start) if _slice_cache_on else None
+            _t_sw0 = time.time()
             if _cs is None:
                 if _lz is not None:
                     # lazy: only this slice's ~10 Welch segments convert
@@ -8557,10 +9799,12 @@ def main():
                 else:
                     _pw, _pw_max = welch_psd(_seg, nfft=4096,
                                              n_avg=_SHORT_N_AVG), None
+                # Mutable [pristine_psd, pristine_psd_max, peak_notch_sig, peaks]
+                # — PSD stays pristine (every use copies first); the last two
+                # slots memoize the post-processed peak list per notch signature.
+                _cs = [_pw, _pw_max, None, None]
                 if _slice_cache_on:
-                    # Store PRISTINE (never notched); every use copies first.
-                    _slice_cache[_abs_start] = (_pw, _pw_max)
-                _cs = (_pw, _pw_max)
+                    _slice_cache[_abs_start] = _cs
                 _slice_cache_miss += 1
             else:
                 _slice_cache_hits += 1
@@ -8589,7 +9833,20 @@ def main():
                         print(f"[SLICE-CACHE] MISMATCH at abs={_abs_start} "
                               f"— cache is NOT bit-exact!", file=sys.stderr,
                               flush=True)
+            _prof['sweep_welch'] += time.time() - _t_sw0
+            _t_sp0 = time.time()
+            # Peak-result reuse: on a slice whose pristine PSD is cached AND
+            # whose notch signature matches the memoized one, the post-processed
+            # peak list is bit-identical — reuse it and skip copy+notch+peaks.
+            if (_slice_peak_cache_on and _cs[2] == _notch_sig
+                    and _cs[3] is not None and not _slice_cache_verify):
+                _short_peaks_all.extend(_cs[3])
+                _prof['sweep_post'] += time.time() - _t_sp0
+                continue
+            _peak_reuse_ref = (_cs[3] if (_cs[2] == _notch_sig
+                                          and _cs[3] is not None) else None)
             # Copy before notching so the cached array stays pristine.
+            _slice_peaks = []
             _p_short = _cs[0].copy()
             _p_short_max = _cs[1].copy() if _cs[1] is not None else None
             _notch_psd(_p_short)
@@ -8611,14 +9868,28 @@ def main():
             # so the short-window contribution is only needed for ≥250 k.
             for _bin, _w, _db, *_pkrest in find_peaks(_p_short, thresh_db=a.energy_threshold, fres_hz=a.rate / 4096.0):
                 if _w >= 30:
-                    _short_peaks_all.append((_bin, _w, _db,
-                                             _pkrest[0] if _pkrest else None))
+                    _slice_peaks.append((_bin, _w, _db,
+                                         _pkrest[0] if _pkrest else None))
             if _p_short_max is not None:
                 _notch_psd(_p_short_max)
                 for _bin, _w, _db, *_pkrest in find_peaks(_p_short_max, thresh_db=a.energy_threshold, fres_hz=a.rate / 4096.0):
                     if _w >= 30:
-                        _short_peaks_all.append((_bin, _w, _db,
-                                                 _pkrest[0] if _pkrest else None))
+                        _slice_peaks.append((_bin, _w, _db,
+                                             _pkrest[0] if _pkrest else None))
+            if _slice_cache_verify and _peak_reuse_ref is not None:
+                # The reuse shortcut WOULD have returned _peak_reuse_ref; assert
+                # the freshly recomputed peaks match it bit-for-bit (invalidation
+                # test: exercise with LORA_SLICE_CACHE_VERIFY=1 while changing
+                # center / threshold / dc-notch / spur list live).
+                if tuple(_slice_peaks) != _peak_reuse_ref:
+                    print(f"[SLICE-PEAK-CACHE] MISMATCH at abs={_abs_start} "
+                          f"— peak reuse would NOT be exact!", file=sys.stderr,
+                          flush=True)
+            if _slice_cache_on:              # memoize for the next window's reuse
+                _cs[2] = _notch_sig
+                _cs[3] = tuple(_slice_peaks)  # immutable — never aliased/mutated
+            _short_peaks_all.extend(_slice_peaks)
+            _prof['sweep_post'] += time.time() - _t_sp0
         # Dedup by bin proximity (±15 bins ≈ ±100kHz) — narrower than 30 bins
         # so adjacent-channel hop0/hop1 pairs (commonly ±175 kHz apart) are
         # not collapsed into a single candidate. Sort by power desc so the
@@ -8628,6 +9899,7 @@ def main():
         for _sp in _short_peaks_all:
             if not any(abs(_sp[0] - _mp[0]) < _DEDUP_BINS for _mp in _gate_peaks):
                 _gate_peaks.append(_sp)
+        _prof['sweep'] += time.time() - _t_sweep0
         # Prune the slice cache to the current window's span: only the
         # previous window's slices are ever reused (positions advance by one
         # hop each window), so anything older than this window's oldest
@@ -8770,6 +10042,10 @@ def main():
         # push out weak REAL peaks).  If every peak in a window is learned
         # junk, _gate_peaks empties and the window takes the lazy quiet path
         # below — no materialization, no chunk-FFT, no per-peak work.
+        # Candidate audit: snapshot the ENERGY candidates at their fullest —
+        # AFTER the short-peak merge, BEFORE junk-suppression / shed / dedup.
+        if _caw is not None:
+            _caw.snapshot_raw(_gate_peaks)
         _jk_sup_this_win = False     # suppressed junk fired here (AGC busy)
         if PRESCREEN_ON:
             _jk_decay = 1.0 - 1.0 / PRESCREEN_LEARN_WIN
@@ -8880,6 +10156,10 @@ def main():
                                and wc - _jk_verify_recent[0][0] > 40):
                             _jk_verify_recent.popleft()
                     else:
+                        if _caw is not None:
+                            _kept_ids = {id(_x) for _x in _jk_kept}
+                            _caw.drop([_p for _p in _gate_peaks
+                                       if id(_p) not in _kept_ids], 'junk_suppressed')
                         _gate_peaks = _jk_kept
                         if not _gate_peaks:
                             _jk_sup_windows += 1
@@ -8957,6 +10237,11 @@ def main():
         _cap_eff = min(_peak_cap, _cap_budget)
         if len(_gate_peaks) > _cap_eff:
             _gate_peaks.sort(key=lambda p: -p[2])
+            if _caw is not None:
+                # binding source recorded, no arbitrary tie-break
+                _bind = ('both' if _peak_cap == _cap_budget
+                         else 'peak_cap' if _cap_eff == _peak_cap else 'budget')
+                _caw.drop(_gate_peaks[_cap_eff:], 'shed_' + _bind)
             _n_shed = len(_gate_peaks) - _cap_eff
             _gate_peaks = _gate_peaks[:_cap_eff]
             print(f"[GATE-THROTTLE] shed {_n_shed} weakest candidate peak(s) "
@@ -8978,6 +10263,8 @@ def main():
                     # carry the channel's REAL PSD value (not a placeholder) so the
                     # spur-reject / power ordering downstream treat it correctly
                     _gate_peaks.append((_cbin, _wbins, float(_psd_gate[_cbin]), float(np.median(_psd_gate))))   # forced; dechirp decides
+                    if _caw is not None:
+                        _caw.add(_gate_peaks[-1], 'forced', hyp_sf=_csf, hyp_bw=_bw_hz)
             # Fix #3 (per-channel compute): a strong signal's sidelobes each fall within
             # ±bw of a channel and would EACH fire the expensive forced dechirp + decode.
             # Keep only the peak NEAREST each channel centre (the carrier); drop the
@@ -8990,6 +10277,8 @@ def main():
                 if len(_in) > 1:
                     _keep = min(_in, key=lambda _pk: abs(_pk[0] - _cbin))
                     _drop = {id(_pk) for _pk in _in if _pk is not _keep}
+                    if _caw is not None:
+                        _caw.drop([_pk for _pk in _in if _pk is not _keep], 'dedup_sidelobe')
                     _gate_peaks = [_pk for _pk in _gate_peaks if id(_pk) not in _drop]
 
         # ---- Patience gate: promote + force ----
@@ -9070,6 +10359,10 @@ def main():
                                         max(3, int(round(125e3 / _fres_pat))),
                                         float(_psd_gate[_cbin]),
                                         float(np.median(_psd_gate))))
+                    if _caw is not None:
+                        # patience hypothesis (sf,bw) is set downstream by the
+                        # rotating trial list, not here → None at candidate stage
+                        _caw.add(_gate_peaks[-1], 'patience')
 
         # Per-window dechirp channel list: the channelizer's fed set PLUS a
         # rotating (sf, bw) trial pair per patience promotion.  This is what
@@ -9108,7 +10401,9 @@ def main():
             decoder.set_pressure(_press)
             decoder.maybe_release_pressure()
         _prof['notch'] += time.time() - _t_step
+        _proft['notch'] += time.thread_time() - _tt_step
         _t_step = time.time()
+        _tt_step = time.thread_time()
 
         # NB: the tail read is deferred to AFTER detect_preamble so we never
         # silently consume IQ samples we won't use.  The old code read up to
@@ -9139,14 +10434,34 @@ def main():
         # Saturation check: just need to know if a meaningful fraction of
         # samples is clipping.  Computing np.percentile on 28 M complex samples
         # was ~250 ms per iteration — over a quarter of the hop budget.  We
-        # subsample by 32× (give us ~875 k samples, plenty for a statistical
-        # estimate) and use np.abs() on the subsample only.  Total < 8 ms.
-        # lazy: strided() converts just the 1/32 subsample (bit-exact); it
-        # reuses the materialized window when one exists.
-        _sub = _lz.strided(32) if _lz is not None else buf[::32]
-        _abs_sub = np.abs(_sub)
-        _peak_amp = float(_abs_sub.max())
-        _sat_frac = float(np.count_nonzero(_abs_sub > _clip_thresh)) / len(_abs_sub)
+        # subsample (rate-derived _sat_stride, ~256k samples — see init) and
+        # test in the SQUARED-magnitude domain (re²+im²) so we skip the per-
+        # sample sqrt that np.abs() does; the clip threshold is squared to
+        # match.  Peak amplitude (debug/AGC display only) is the sqrt of the
+        # max, one scalar op.  lazy: strided() converts just the subsample.
+        _sub = _lz.strided(_sat_stride) if _lz is not None else buf[::_sat_stride]
+        _sr = _sub.real
+        _si = _sub.imag
+        _mag2_sub = _sr * _sr + _si * _si
+        _clip2 = _clip_thresh * _clip_thresh
+        _peak_amp = float(np.sqrt(_mag2_sub.max())) if len(_mag2_sub) else 0.0
+        _sat_frac = float(np.count_nonzero(_mag2_sub > _clip2)) / max(1, len(_mag2_sub))
+        # Boundary refinement (codex review): the coarse stride trades precision
+        # for speed and a deterministic stride can ALIAS with periodic clipping.
+        # Whenever the coarse estimate shows ANY hint of clipping (>0.1%, well
+        # below the 0.5% engage threshold and far above the ~0.01% noise floor),
+        # re-measure with the dense stride-32 grid so the engage DECISION uses
+        # the accurate fraction.  No clipping (the overwhelmingly common case) →
+        # coarse ~0 → skip → full speed; only genuinely-clipping windows pay the
+        # dense recompute.
+        if _sat_stride > 32 and _sat_frac > 0.001:
+            _sub2 = _lz.strided(32) if _lz is not None else buf[::32]
+            _m2r = _sub2.real
+            _m2i = _sub2.imag
+            _mag2_d = _m2r * _m2r + _m2i * _m2i
+            _sat_frac = float(np.count_nonzero(_mag2_d > _clip2)) / max(1, len(_mag2_d))
+            if len(_mag2_d):
+                _peak_amp = float(np.sqrt(_mag2_d.max()))
         if _sat_frac > _sat_max:
             _sat_max = _sat_frac
         _spur_db  = a.spur_reject
@@ -9183,7 +10498,9 @@ def main():
                          clip_frac=_sat_frac)
 
         _prof['sat'] += time.time() - _t_step
+        _proft['sat'] += time.thread_time() - _tt_step
         _t_step = time.time()
+        _tt_step = time.thread_time()
         # ---- Detect ----
         # SC buffer = buf only (no pre_hop concat).  Using buf (1s / 28M samples)
         # with a shared FFT cache (chunk=65536) costs ~228ms one-time + ~8ms/peak,
@@ -9245,8 +10562,11 @@ def main():
             _pool.dispatch(_slot, _seq, len(buf), _psd_gate, _gate_peaks,
                            spur_db=_spur_db, center=_live_center_mhz,
                            dechirp_chans=(_win_chans or None))
+            if _caw is not None:
+                _caw.set_admitted(_gate_peaks, time.monotonic_ns(), pool_seq=_seq)
             _inflight.append({'seq': _seq, 'slot': _slot,
-                              'pre_hop': pre_hop, 'tot_s': tot_s})
+                              'pre_hop': pre_hop, 'tot_s': tot_s,
+                              'cand_audit': _caw, 'buf_len': len(buf)})
             _seq += 1
             # Tail-aware commit: once depth exceeds the base lag, commit the
             # oldest ONLY when its detection is ready AND enough trailing windows
@@ -9303,6 +10623,13 @@ def main():
             if is_live and _bgt['margin'] > 0.0:
                 _budget_track(dt, _n_pk_det)
             _t_step = time.time()
+            # Candidate audit (INLINE/serial path): synchronous — emit now with
+            # this window's dets (pool_seq stays None).  Covers the lazy quiet
+            # window too (empty _gate_peaks → dets=[] → n_raw=0 record).
+            if _caw is not None:
+                _caw.set_admitted(_gate_peaks, time.monotonic_ns())
+                _caw.emit(dets, len(buf) if buf is not None else win_n,
+                          'inline', time.monotonic_ns())
 
             # Cross-window duplicate suppression is intentionally removed.
             # Any frequency-bucket dedup at this stage cannot distinguish the
@@ -9562,18 +10889,36 @@ def main():
         # Low-core rate-bound (UC audit D): defer the launch when the last
         # scan was < _SLOW_MIN_TICKS ago or the ring says the gate is behind.
         # Deferrals keep _slow_pending intact so the trigger refires.
+        _ring_frac = (reader.available() / float(_ring_n_total)) if is_live else 0.0
+        _ring_pressure = bool(is_live and _ring_frac > 0.3)
+        if (_cand_mgr is not None and _fire and len(_slow_halves) == 8
+                and _ring_frac > _cand_mgr.slow_max_ring_frac):
+            _cand_mgr.slow_max_ring_frac = _ring_frac
         _slow_rate_ok = True
         if _fire and _SLOW_MIN_TICKS and len(_slow_halves) == 8:
             if _slow_tick - _slow_last_fire < _SLOW_MIN_TICKS:
                 _slow_rate_ok = False
-            elif (is_live
-                  and reader.available() / float(_ring_n_total) > 0.3):
+            elif _ring_pressure and not _SLOW_NO_RING_DEFER:
+                # ABLATION: when _SLOW_NO_RING_DEFER, ring pressure does NOT
+                # defer the scan (busy/rate gates untouched).
                 _slow_rate_ok = False
             if not _slow_rate_ok and os.environ.get('LORA_SLOW_DEBUG'):
                 print(f"[SLOW] rate-bound defer tick={_slow_tick} "
                       f"(last={_slow_last_fire})", file=sys.stderr)
+        # Slow-scan SUPPRESSION accounting.  actual _sup_ring counts only an
+        # ACTUAL ring-caused deferral (false under the ablation); would_ring
+        # counts whenever ring pressure was present (regardless of ablation) so
+        # the ablation's coverage effect is attributable.
+        if (_cand_mgr is not None and _fire and len(_slow_halves) == 8
+                and (not (not _slow_busy[0] and _slow_rate_ok) or _ring_pressure)):
+            _sup_busy = bool(_slow_busy[0])
+            _sup_rate = bool(_SLOW_MIN_TICKS
+                             and _slow_tick - _slow_last_fire < _SLOW_MIN_TICKS)
+            _sup_ring = bool(_ring_pressure and not _SLOW_NO_RING_DEFER)
+            _cand_mgr.note_slow_suppressed(_sup_busy, _sup_rate, _sup_ring,
+                                           would_ring=_ring_pressure)
         if (_fire and len(_slow_halves) == 8 and not _slow_busy[0]
-                and _slow_rate_ok):
+                and _slow_rate_ok and not _NO_SLOW):
             _slow_last_fire = _slow_tick
             _slow_pending.clear()
             # parts refs only — the 640 MB concat happens IN THE THREAD
@@ -9583,9 +10928,25 @@ def main():
             _seedpk_bg = [(float(_b), 13, 20.0, None) for _b in _trig_bg]
             _regpos_bg = tot_s
             _slow_busy[0] = True
+            # Phase-1 slow-scan lifecycle: allocate scan_id, record STARTED
+            # BEFORE launch (so a stuck scan is visible), with the ABSOLUTE
+            # sample interval + ring positions for offline coverage derivation.
+            _scan_id = _LID.next('scan') if _LID is not None else None
+            if _scan_id is not None:
+                if _cand_mgr is not None:
+                    _cand_mgr.note_slow_started()
+                _scan_len = sum(len(_h) for _h in _halves_bg)
+                _run_event('slow_scan_started', run_id=_RUN_ID, scan_id=_scan_id,
+                           seeds=len(_trig_bg), producer='slow_scan',
+                           scan_end_sample=int(tot_s),
+                           scan_start_sample=int(tot_s) - int(_scan_len),
+                           rf_end_s=tot_s / a.rate,
+                           rf_start_s=(tot_s - _scan_len) / a.rate,
+                           ring_available=(reader.available() if is_live else None),
+                           ring_total=_ring_n_total)
 
             def _slow_scan_bg(_hv=_halves_bg, _spk=_seedpk_bg,
-                              _tg=_trig_bg, _rp=_regpos_bg):
+                              _tg=_trig_bg, _rp=_regpos_bg, _sid=_scan_id):
                 # BACKGROUND slow scan (0.5-0.6 s of FFT work): ran on the
                 # main loop before and, stacked with p90 read+dispatch,
                 # pushed iterations past the 500 ms hop budget -> ring
@@ -9614,12 +10975,32 @@ def main():
                         print(f"[SLOW-SCAN] {time.time() - _t0:.2f}s "
                               f"seeds={len(_tg)} hits={len(_ds or [])} (bg)",
                               file=sys.stderr, flush=True)
-                    _slow_results.put((_ds or [], _iql, _rp, _tg))
+                    if _sid is not None:
+                        _run_event('slow_scan_completed', run_id=_RUN_ID,
+                                   scan_id=_sid, duration_s=time.time() - _t0,
+                                   hits=len(_ds or []), producer='slow_scan')
+                    # Attack the payload itself (codex): a hit-less scan (the
+                    # common case) has no consumer use for _iql — the consumer
+                    # only touches _iq_long inside `if dets_slow:` — so drop the
+                    # ~640 MB immediately instead of parking it in the queue.
+                    if _ds:
+                        _slow_results.put((_ds, _iql, _rp, _tg, _sid))
+                    else:
+                        _slow_results.put(([], None, _rp, _tg, _sid))
+                        _iql = None
+                        _slow_iql_dropped[0] += 1
+                    # NOTE: _slow_busy stays TRUE here — single-flight now spans
+                    # produce→drain→process (cleared in the consumer), so a new
+                    # 640 MB scan cannot launch while this result is unconsumed.
                 except Exception as _se:
                     print(f"[SLOW-SCAN] bg scan failed: {_se!r}",
                           file=sys.stderr, flush=True)
-                finally:
-                    _slow_busy[0] = False
+                    if _sid is not None:
+                        if _cand_mgr is not None:
+                            _cand_mgr.note_slow_failed()
+                        _run_event('slow_scan_failed', run_id=_RUN_ID,
+                                   scan_id=_sid, error=repr(_se), producer='slow_scan')
+                    _slow_busy[0] = False   # failed → no result to drain; re-arm
 
             if is_live:
                 threading.Thread(target=_slow_scan_bg, daemon=True).start()
@@ -9635,8 +11016,33 @@ def main():
                 _slow_pending[int(_b) // 8] = (_b, _slow_tick + 4)
 
         # consume finished background scans (bookkeeping on main thread)
+        _slow_max_qdepth[0] = max(_slow_max_qdepth[0], _slow_results.qsize())
         while not _slow_results.empty():
-            dets_slow, _iq_long, _reg_tot_s, _trig_done = _slow_results.get()
+            dets_slow, _iq_long, _reg_tot_s, _trig_done, _scan_done = _slow_results.get()
+            # Phase-1 lineage: the slow scan owns NO _CandWin — stamp producer +
+            # scan_id + a fresh detection_id onto each slow detection so its
+            # decode record self-identifies (candidate_id is null: no
+            # materialized energy candidate).  Detection logging is
+            # candidate-independent (every dets_slow entry gets an id).
+            if _cand_mgr is not None:
+                _cand_mgr.note_slow_result(len(dets_slow))
+                _n_consumed = 0
+                for _d in dets_slow:
+                    if isinstance(_d, dict):
+                        _d['_lin_detection_id'] = (_LID.next('detection')
+                                                   if _LID is not None else None)
+                        _d['_lin_producer'] = 'slow_scan'
+                        _d['_lin_scan_id'] = _scan_done
+                        _d['_lin_window_id'] = None
+                        _d['_lin_candidate_hint_id'] = None
+                        _d['_lin_candidate_bin_delta'] = None
+                        _d['_lin_candidate_matches_within_8bins'] = 0
+                        _d['_lin_candidate_link_status'] = 'not_applicable'
+                        _n_consumed += 1
+                # hits-produced (slow_scan_completed) vs detections consumed here
+                # must reconcile offline; emit the consumed count keyed by scan.
+                _run_event('slow_scan_consumed', run_id=_RUN_ID,
+                           scan_id=_scan_done, n_consumed=_n_consumed)
             _hit_bins = set()
             _hit_cool = {}       # hit bin -> post-hit cooldown (ticks)
             for d in dets_slow:
@@ -9758,8 +11164,31 @@ def main():
                                              need_tail_n=_slow_tail_n,
                                              owned_buf=True,
                                              gap_parts=_gap_parts)
+            # Single-flight release: this result is fully drained AND processed
+            # (its _iq_long is now cropped/owned by the recorder), so re-arm the
+            # slow scan.  Cleared here — NOT at scan completion — so a new 640 MB
+            # scan cannot start while a prior result is still pending/processing.
+            _iq_long = None            # drop our local ref to the ~640 MB array
+            _slow_busy[0] = False
         _prof['slow'] += time.time() - _t_slowblk0
         _t_step = time.time()
+
+        if os.environ.get('LORA_MEMDBG') and (wc % 4) == 0:
+            try:
+                with open('/proc/self/status') as _st:
+                    _rss = next(int(l.split()[1]) for l in _st
+                                if l.startswith('VmRSS')) // 1024
+            except Exception:
+                _rss = -1
+            _cq = recorder._crop_queue.qsize() if (recorder and getattr(recorder, '_crop_queue', None)) else -1
+            _sq = recorder._save_queue.qsize() if recorder else -1
+            _pd = len(recorder._pending) if recorder else -1
+            _cod = getattr(recorder, '_crop_overflow_drops', -1) if recorder else -1
+            _dq = decoder.pending() if decoder else -1
+            print(f"[MEMDBG] rss={_rss}MB inflight={len(_inflight)} "
+                  f"crop_q={_cq} save_q={_sq} pending={_pd} crop_drop={_cod} "
+                  f"decoder_pending={_dq} ring_avail={reader.available() if is_live else 0}",
+                  file=sys.stderr, flush=True)
 
         # ---- Skip-ahead ONLY if the ring buffer is near wrap ----
         # The old "skip when >2 windows behind" threshold was discarding
@@ -9779,6 +11208,11 @@ def main():
             if avail > int(0.8 * _ring_n):
                 skipped_ahead = reader.skip_to_latest(win_n)
                 if skipped_ahead > 0:
+                    if _cand_mgr is not None:
+                        # half-open skipped RF sample range [start, end): these
+                        # samples are never processed → the scorer counts oracle
+                        # occurrences here as input-coverage losses (primary).
+                        _cand_mgr.note_skip(tot_s, tot_s + skipped_ahead)
                     tot_skip += skipped_ahead
                     skip_s = skipped_ahead / a.rate
                     print(f"[{elapsed:6.1f}s] CATCHUP skip {skipped_ahead/1e6:.1f}M "
@@ -9932,6 +11366,33 @@ def main():
             _commit_oldest()
         _pool.close()
 
+    # Candidate audit: all pool windows committed above (each emitted its record);
+    # inline windows emitted during the loop.  Final drained summary — its
+    # audit_valid requires windows_begun==windows_emitted AND outstanding==0 AND
+    # zero invariant failures.  outstanding = any audit still attached to an
+    # in-flight item (0 after the drain above).
+    if _cand_mgr is not None:
+        _outstanding = sum(1 for _it in _inflight if _it.get('cand_audit'))
+        _cand_mgr.summary(_outstanding)
+
+    # SOURCE SUMMARY (validation-only, gated): emitted ONCE here — after the
+    # source/window loop exits, BEFORE the decoder drain — so source consumption
+    # is settled while downstream work hasn't obscured the source boundary.  The
+    # atomic StreamBuffer snapshot + window cursor let the offline B0 validator
+    # close the ingress invariant (bytes_read_total==capture_bytes,
+    # partial_bytes_discarded==0, ring_dropped==0, dequeued+residual==ingress).
+    # window_sample_cursor (tot_s) is reported SEPARATELY (not as
+    # 'samples_processed') because non-production branches can double-count carry.
+    if _CAND_AUDIT and is_live:
+        _src = reader.source_snapshot()
+        _src_end = ('clean_eof' if (_src['saw_clean_eof'] and not _src['reader_error'])
+                    else (_src['reader_error'] or 'not_clean_eof'))
+        _run_event('source_summary', schema='source_summary/1',
+                   source_end_reason=_src_end,
+                   window_sample_cursor=int(tot_s),
+                   samples_skipped=int(tot_skip),
+                   **{k: v for k, v in _src.items() if k != 'saw_clean_eof'})
+
     # Drain pending saves first (they submit to decoder), then drain decoder
     if recorder:
         pending_saves = recorder._save_queue.qsize()
@@ -9947,15 +11408,45 @@ def main():
                                        # drain so stragglers decode
         except Exception:
             pass
+    # Instrumentation (validation-only): the live loop has exited; everything
+    # from here is post-input-EOF drain.  Mark the boundary so offline scoring
+    # can separate ordinary pipeline tail from the explicit drain_slow_into_fast.
+    _run_event('live_loop_end',
+               pending=(decoder.pending() if decoder else 0))
     if decoder:
         # Capture has ended (EOF) — move the deferred straggler queue into the
         # fast queue so the workers re-decode them now (big budget), without
         # having competed with the realtime gate during capture.
+        _run_event('slow_drain_begin', pending=decoder.pending())
         decoder.drain_slow_into_fast()
         if decoder.pending() > 0:
             print(f"\nWaiting for {decoder.pending()} pending decode(s)...",
                   file=sys.stderr)
             decoder.drain(timeout=3600.0)
+        # Acceptance invariant: at drain_end, pending=0 AND slow_inflight=0 AND
+        # no reservation present AND both queues empty (read scheduler-lock-
+        # consistent).
+        _run_event('drain_end', pending=decoder.pending(),
+                   **decoder._slow_state_snapshot())
+
+    # Authoritative work/lineage reconciliation — AFTER the decoder drain, so
+    # in-flight work is not mistaken for outstanding (codex ordering req).
+    # Residual slow-scan results at shutdown are DISCARDED, exactly as audit-off
+    # execution discards them (the consume loop lived in the live loop).  We do
+    # NOT consume/decode them (that would change behavior and fake the
+    # invariant); we wait (bounded) for any in-flight scan to land, then COUNT
+    # the residuals as discarded_shutdown.  started == consumed + failed +
+    # discarded is then an honest invariant.
+    if _cand_mgr is not None:
+        try:
+            _tw = time.time()
+            while _slow_busy[0] and time.time() - _tw < 3.0:
+                time.sleep(0.02)
+            _cand_mgr.note_slow_discarded(_slow_results.qsize())
+        except Exception:
+            pass
+        _outstanding_final = sum(1 for _it in _inflight if _it.get('cand_audit'))
+        _cand_mgr.lineage_summary(_outstanding_final)
 
     total_drops = reader.drops if is_live else 0
     _dec_summary = ''
@@ -9966,6 +11457,65 @@ def main():
           + _dec_summary
           + (f" skipped={tot_skip/1e6:.1f}M" if tot_skip else ""),
           file=sys.stderr)
+    if _PP_PROF_ON:
+        _e, _s, _d = _PP_PROF['extract'], _PP_PROF['sc'], _PP_PROF['dechirp']
+        _tot = _e + _s + _d
+        print("[PP-PROF] per-peak cost breakdown (channelizer amortizes EXTRACT):\n"
+              "  extract(crop+IFFT) = %.1fs (%.0f%%, %d calls)  <- channelizer target\n"
+              "  schmidl-cox        = %.1fs (%.0f%%, %d calls)  <- per-signal, stays\n"
+              "  dechirp            = %.1fs (%.0f%%, %d calls)  <- per-signal, stays\n"
+              "  => max channelizer speedup if extract->0: %.2fx"
+              % (_e, 100 * _e / max(1e-9, _tot), _PP_PROF['n_extract'],
+                 _s, 100 * _s / max(1e-9, _tot), _PP_PROF['n_sc'],
+                 _d, 100 * _d / max(1e-9, _tot), _PP_PROF['n_dechirp'],
+                 _tot / max(1e-9, _s + _d)),
+              file=sys.stderr)
+        print("[PP-PROF] extraction memo potential: %d calls, %d distinct (F,bin,n) "
+              "=> %.0f%% are EXACT DUPLICATES (bit-identical memo would eliminate)"
+              % (_EXT_CALLS[0], len(_EXT_KEYS),
+                 100.0 * (1 - len(_EXT_KEYS) / max(1, _EXT_CALLS[0]))),
+              file=sys.stderr)
+    if os.environ.get('LORA_PROF') and _prof.get('n'):
+        _pt = time.time() - t_start
+        _pn = _prof['n']
+        _stages = ('read', 'slide', 'welch', 'notch', 'sat',
+                   'detect', 'tail', 'recorder', 'slow', 'feed', 'catchup')
+        print("[PROF] iters=%d wall=%.1fs  per-iter(ms):" % (_pn, _pt)
+              + "".join(" %s=%.1f" % (k, _prof[k] / _pn * 1000.0) for k in _stages)
+              + ("  sum_acct=%.1f" % (sum(_prof[k] for k in _stages) / _pn * 1000.0)),
+              file=sys.stderr)
+        # THREAD-CPU ms per iter (only stamped for read/welch/notch/sat) — where
+        # wall >> cpu, the stage is BLOCKING (pacing/backpressure), not compute.
+        print("[PROF] cpu-ms/iter:"
+              + "".join(" %s(w=%.0f,c=%.0f)" % (
+                  k, _prof[k] / _pn * 1000.0, _proft[k] / _pn * 1000.0)
+                  for k in ('read', 'welch', 'notch', 'sat')),
+              file=sys.stderr)
+        print("[PROF] read-split: rd_io(convert/fastpath)=%.0fms rd_slide(window-copy)=%.0fms"
+              % (_prof['rd_io'] / _pn * 1000.0, _prof['rd_slide'] / _pn * 1000.0),
+              file=sys.stderr)
+        _sc_tot = _slice_cache_hits + _slice_cache_miss
+        print("[PROF] slice-cache: hits=%d miss=%d hit_rate=%.0f%% (%.1f slices/iter)"
+              % (_slice_cache_hits, _slice_cache_miss,
+                 100.0 * _slice_cache_hits / max(1, _sc_tot), _sc_tot / _pn),
+              file=sys.stderr)
+        print("[PROF] notch-split: sweep=%.0fms (welch=%.0f post=%.0f) rest=%.0fms"
+              % (_prof['sweep'] / _pn * 1000.0, _prof['sweep_welch'] / _pn * 1000.0,
+                 _prof['sweep_post'] / _pn * 1000.0,
+                 (_prof['notch'] - _prof['sweep']) / _pn * 1000.0),
+              file=sys.stderr)
+        print("[PROF] slow-scan: max_qdepth=%d iql_dropped(hitless)=%d "
+              "(qdepth must stay <=1 with the single-flight fix)"
+              % (_slow_max_qdepth[0], _slow_iql_dropped[0]),
+              file=sys.stderr)
+        if _lz is not None:
+            print("[PROF] lazy: converted=%.2fM samples/iter (%.1fx the %dM hop; "
+                  "%.2f full-window materializations/iter of %dM)"
+                  % (_lz._conv_samples / _pn / 1e6,
+                     _lz._conv_samples / _pn / max(1, hop_n),
+                     hop_n // 1_000_000,
+                     _lz._mat_count / _pn, win_n // 1_000_000),
+                  file=sys.stderr)
     if PRESCREEN_ON and (PRESCREEN_VERIFY or _jk_sup_peaks or _jk_junk):
         print(f"[PRESCREEN] summary: {_jk_sup_peaks} peak(s) "
               + ('would be ' if PRESCREEN_VERIFY else '')
@@ -9974,6 +11524,16 @@ def main():
               + (f", DEAFNESS={_jk_deaf}" if PRESCREEN_VERIFY else ""),
               file=sys.stderr, flush=True)
     if a.file: fp.close()
+
+    # Instrumentation (validation-only): a reader-thread failure means the input
+    # was corrupted/truncated — the run drained and printed Done, but its result
+    # set is NOT trustworthy.  Exit NONZERO so the runner's detector_exit_code
+    # independently marks the run invalid (redundant with the input_terminated
+    # event / missing clean input_eof).
+    if getattr(reader, '_reader_error', None):
+        print(f"[FATAL] reader error invalidates run: {reader._reader_error}",
+              file=sys.stderr, flush=True)
+        sys.exit(3)
 
 
 if __name__ == '__main__':
