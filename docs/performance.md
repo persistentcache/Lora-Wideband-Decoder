@@ -10,10 +10,26 @@ receiver throttles its decode workers automatically so the gate keeps
 draining samples. Most live traffic never gets close to that
 threshold.
 
-CPU pinning is automatic. The first four cores in the process's
-affinity set are reserved for the SDR reader and the detect pool;
-decode workers run on the rest. If you want different placement, wrap
-the launch in `taskset -c …`.
+For UHD radios, the web launcher reserves one physical CPU core for capture when at least four cores are available.
+It assigns detection and decoding to the remaining cores.
+Sibling CPU threads stay together, and the launcher respects an existing `taskset` assignment.
+If CPU topology or `taskset` is unavailable, the launcher keeps the existing assignment.
+Set `LORA_CAPTURE_ISOLATION=0` to retain your own CPU placement.
+Other radio drivers keep their existing placement.
+
+The SoapyUHD input uses 1,024 receive buffers by default.
+These buffers hold samples before Python reads them, so they protect against short scheduling pauses.
+The B200 and B210 need about 8 MB for these buffers at the default frame size.
+For direct `src/soapy_rx.py` use, `--uhd-recv-frames N` overrides the count.
+A count of zero restores the UHD default.
+The larger Python queue and `buf_seconds` do not prevent loss inside the USB transport.
+Direct command-line pipelines need their own capture CPU assignment.
+
+Live statistics report recent processing speed, input speed, and queued sample duration.
+The measurement starts after samples arrive, so radio startup time does not lower the displayed rate.
+An `INPUT WARNING` reports input below the requested rate.
+A `KEEP-UP WARNING` reports processing below the received rate with a growing backlog.
+Warnings clear after the rates recover and the backlog drains.
 
 On Linux, the `powersave` governor adds noticeable latency variance.
 For consistent measurements use `performance`:
@@ -41,7 +57,7 @@ Settings live in `lora.toml [detect]`; most are also CLI flags.
 | Short weak bursts vanish | `energy_threshold` 12.0 → 5.0 |
 | Spike at center frequency (LO leak) | `--dc-notch 0.5` |
 | Duplicate detections / saturation | turn SDR gain down in `[radio]` |
-| Dropped samples on a slow host | `buf_seconds` 16 → 32 |
+| Detector buffer overflows during short bursts | Increase `buf_seconds` if RAM permits. For USB input loss, inspect the capture log. |
 
 ## Repo layout
 
@@ -63,3 +79,9 @@ Lora-Wideband-Decoder/
 ├── lora_web/          # runtime state (gitignored)
 └── captures/          # output (gitignored)
 ```
+
+## Regression tests
+
+Install `pytest` in the Python environment that contains the project dependencies.
+Run `python3 -m pytest -q` from the project root.
+The tests use simulated device access and do not require a connected radio.

@@ -34,7 +34,11 @@ def main():
     ap.add_argument('-g', type=float, default=None, help='gain (dB); omit for AGC')
     ap.add_argument('--queue-mb', type=float, default=512.0,
                     help='max in-RAM buffer (MB) that absorbs downstream stalls without dropping')
+    ap.add_argument('--uhd-recv-frames', type=int, default=1024,
+                    help='UHD receive buffers; 0 uses the UHD default (other drivers ignore this)')
     a = ap.parse_args()
+    if a.uhd_recv_frames < 0:
+        ap.error('--uhd-recv-frames must be nonnegative')
     DBG = bool(int(os.environ.get('LORA_DEBUG', '0') or '0'))
     if DBG:
         sys.stderr.write('soapy_rx: --debug ON  driver=%s freq=%g rate=%g bw=%g gain=%s '
@@ -112,6 +116,14 @@ def main():
     # 3.14.4 plus a real HackRF: dict broken, string works. Older stacks
     # (e.g. 24.04 / Python 3.12 / SWIG 4.1) accept both.
     args_str = 'driver=%s' % a.driver
+    # UHD builds the USB transport at device creation, before setupStream.
+    # Its B2xx default is only 16 * 8176 bytes: about 1 ms at 32 Msps CS16.
+    # The Python queue cannot recover samples lost before readStream returns.
+    driver_parts = a.driver.split(',')
+    if (driver_parts[0].strip() == 'uhd' and a.uhd_recv_frames
+            and not any(p.strip().startswith('num_recv_frames=')
+                        for p in driver_parts[1:])):
+        args_str += ',num_recv_frames=%d' % a.uhd_recv_frames
     try:
         dev = SoapySDR.Device(args_str)
     except Exception as e:
