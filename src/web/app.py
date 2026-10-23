@@ -1892,7 +1892,7 @@ SDR_CTL_PATH = '/tmp/lora_sdr_ctl.json'   # live SDR control (gain/freq) — soa
 HEALTH = {'msps': None, 'rate_msps': None, 'drops_m': 0.0, 'save_q': None,
           'dec_q': None, 'det': None, 'pipe_ms': None, 'elapsed': None,
           'warn': None, 'detect_workers': None, 'preflight_note': None,
-          'clip_pct': None}
+          'clip_pct': None, 'input_msps': None, 'backlog_s': None}
 import re as _re
 # Anchor only on the invariant head of the [STAT] line (marker + elapsed +
 # Msps).  Every other field is pulled BY NAME via _stat_field below rather than
@@ -1966,6 +1966,7 @@ def _tail_health():
                 last_stat_at = None
                 last_check = 0.0
                 last_started_at = started_at
+                HEALTH.update(input_msps=None, backlog_s=None)
             if not os.path.exists(PIPELINE_LOG):
                 HEALTH.update(msps=None); time.sleep(0.5); continue
             if os.path.getsize(PIPELINE_LOG) < pos:
@@ -1993,6 +1994,8 @@ def _tail_health():
                     _f_pm = _stat_field(ln, 'pipe')
                     _f_dr = _stat_field(ln, 'drops', float)
                     HEALTH.update(
+                        input_msps=_stat_field(ln, 'input', float),
+                        backlog_s=_stat_field(ln, 'backlog', float),
                         elapsed=float(m.group(1)), msps=float(m.group(2)),
                         det=_f_det if _f_det is not None else HEALTH['det'],
                         save_q=_f_sq if _f_sq is not None else HEALTH['save_q'],
@@ -2025,7 +2028,11 @@ def _tail_health():
                 a = _RE_AUTO.search(ln)
                 if a:
                     HEALTH['detect_workers'] = int(a.group(1))
-                if 'KEEP-UP WARNING' in ln:
+                if '[KEEP-UP RECOVERED]' in ln:
+                    pending_warn = None
+                    immediate_warn = None
+                    changed = True
+                if 'KEEP-UP WARNING' in ln or '[INPUT WARNING]' in ln:
                     pending_warn = ln.strip()[:200]
                 # CATCHUP: detector fell so far behind it had to skip ahead.
                 # Surface IMMEDIATELY (no warmup gate) — this is deterministic
@@ -2049,9 +2056,8 @@ def _tail_health():
                 since_start = now - started_at
                 seconds_since_stat = (now - last_stat_at) if last_stat_at else since_start
                 if since_start > NO_TELEMETRY_S and seconds_since_stat > NO_TELEMETRY_S:
-                    new_w = (f"Pipeline running {since_start:.0f}s with no telemetry — "
-                             f"detector is likely overloaded. Check pipeline log; "
-                             f"consider lowering the sample rate.")
+                    new_w = (f"Pipeline running {since_start:.0f}s with no telemetry. "
+                             "Inspect the capture and detector logs.")
                     if immediate_warn != new_w:
                         immediate_warn = new_w
                         changed = True
@@ -2086,7 +2092,7 @@ def _tail_health():
                             msps = HEALTH.get('msps'); rate = HEALTH.get('rate_msps')
                             keeping_up = (msps is not None and rate
                                           and msps >= rate * 0.97)
-                            if keeping_up:
+                            if keeping_up and HEALTH.get('input_msps') is None:
                                 pending_warn = None
                         want_warn = pending_warn
                 if HEALTH.get('warn') != want_warn:
@@ -2327,6 +2333,11 @@ def _build_pipeline_cmd():
             _g0 = None
         if _g0 is not None:
             gate += f' --agc on --agc-start {_g0:g}'
+    from cpu_affinity import isolate_capture_commands
+    _driver = (r.get('soapy_driver', 'hackrf') if sdr == 'soapy' else
+               sdr_profiles.SDR_PROFILES.get(sdr, {}).get('soapy_driver')
+               if sdr_profiles is not None else None)
+    cap, gate = isolate_capture_commands(cap, gate, _driver)
     return cap + ' | ' + gate
 
 

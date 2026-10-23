@@ -17,6 +17,12 @@ Most people never set any of these. The defaults are fine.
 |---|---|---|
 | `LORA_CONFIG` | auto-locate | Path to `lora.toml`. Overrides the cwd → project-root search. |
 
+## Capture
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LORA_CAPTURE_ISOLATION` | `1` | Reserve a physical core for UHD capture in the web launcher. Set `0` to retain your own CPU placement. |
+
 ## Decode
 
 | Variable | Default | Purpose |

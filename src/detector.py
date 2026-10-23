@@ -652,15 +652,10 @@ class StreamBuffer:
         targets for the drop windows than ~100ms MC packets — measured as
         ~14% MT_unique loss in 4×4 vs subprocess baseline).
         """
-        # Pin to a dedicated core, distinct from where master's other
-        # gate threads tend to run.  Use core 0 — first physical core,
-        # claimed exclusively for iq-reader.  Linux's CFS scheduler
-        # naturally keeps the other gate threads on whichever cores they
-        # were spawned on, so taking core 0 here removes iq-reader from
-        # the OS-level run queue that MainThread / recorders / manager
-        # threads compete for.
-        try: os.sched_setaffinity(0, {0})
-        except (AttributeError, OSError): pass
+        # Respect the launcher's CPU mask. CPU 0 can be outside a taskset
+        # assignment or reserved for a different process.
+        from cpu_affinity import pin_reader
+        pin_reader()
         # Try to raise to SCHED_FIFO real-time scheduling.  Needs
         # CAP_SYS_NICE; if denied (most non-root setups) fall back to
         # the default and rely on affinity isolation alone.
@@ -938,6 +933,12 @@ class StreamBuffer:
         with self._lock:
             return min(self._wp - self._rp, self._ring_n)
 
+    def progress(self):
+        """Return received, consumed, pending, and skipped sample counts."""
+        with self._lock:
+            return (self._wp, self._rp - self._total_drops,
+                    max(0, self._wp - self._rp), self._total_drops)
+
     def skip_to_latest(self, keep_n):
         """Skip ahead so only keep_n samples remain to be read."""
         with self._lock:
@@ -945,6 +946,7 @@ class StreamBuffer:
             if avail > keep_n:
                 skip = avail - keep_n
                 self._rp += skip
+                self._total_drops += skip
                 return skip
             return 0
 
@@ -7964,6 +7966,10 @@ def main():
     tot_skip = 0
     _warned_slow = False   # keep-up monitor: warn once if the gate can't sustain rate
     t_start = time.time()
+    from throughput import ThroughputMeter
+    _rate_meter = ThroughputMeter(a.rate) if is_live else None
+    _recent_rate = None
+    _rate_warning = None
     center_hz = a.center * 1e6
     # Live center frequency: poll the SDR control file (the same file soapy_rx uses
     # to retune the radio) so a center change relabels detections WITHOUT a restart.
@@ -8417,6 +8423,8 @@ def main():
         # In lazy mode `iq` is RAW interleaved elems — 2 per IQ sample.
         _n_iq = (len(iq) // 2) if _lz is not None else len(iq)
         tot_s += _n_iq
+        if is_live and not _rate_meter.started:
+            _rate_meter.sample(time.monotonic(), *reader.progress())
         if _n_iq >= win_n:
             pre_hop = None   # full replacement — no valid lookback
             if _lz is not None:
@@ -9867,22 +9875,19 @@ def main():
 
         _prof['catchup'] += time.time() - _t_step
         _prof['n'] += 1
-        # Keep-up monitor (runs regardless of debug level): the gate must process
-        # at the input rate.  msps = samples processed / elapsed; if it sits below
-        # the input rate after warmup, this host can't sustain the bandwidth and
-        # samples will be dropped — warn ONCE with an actionable recommendation
-        # instead of silently missing packets.
-        if (is_live and not _warned_slow and wc % 10 == 0 and elapsed > 20.0):
-            _msps_now = tot_s / elapsed / 1e6
-            if _msps_now < 0.95 * (a.rate / 1e6):
-                _warned_slow = True
-                print(f"[{elapsed:6.1f}s] *** KEEP-UP WARNING: gate sustaining only "
-                      f"{_msps_now:.1f} Msps vs {a.rate/1e6:.0f} Msps input — this "
-                      f"host is too slow for the full bandwidth and WILL drop "
-                      f"packets.  Reduce -r/-b (e.g. -r {int(a.rate/2e6)}000000 "
-                      f"-b {int(a.bandwidth/2e6)}000000), raise --buf-seconds, "
-                      f"lower --detect-workers contention, or use a faster host. ***",
-                      file=sys.stderr, flush=True)
+        # Use actual reader progress. Startup waits and skipped samples do not
+        # count as processing time or useful work in these recent intervals.
+        if is_live and wc % 10 == 0:
+            _recent_rate = _rate_meter.sample(time.monotonic(), *reader.progress())
+            if _recent_rate is not None:
+                if _recent_rate.warning and _recent_rate.warning != _rate_warning:
+                    print(_recent_rate.warning, file=sys.stderr, flush=True)
+                    _rate_warning = _recent_rate.warning
+                elif _recent_rate.recovered:
+                    print('[KEEP-UP RECOVERED] Input and processing rates recovered.',
+                          file=sys.stderr, flush=True)
+                    _rate_warning = None
+                    _warned_slow = False
         # Adaptive worker throttle: every 5 windows (~2.5 s) check whether
         # the gate is under pressure.  Two signals, either sets _gate_stress:
         #   - reader.drops grew (ring already overwrote — the late signal), or
@@ -9906,7 +9911,8 @@ def main():
                 _dec._gate_stress.clear()
             _dec._prev_drops_obs = _drops_now
         if a.debug >= 1 and wc % 10 == 0:
-            msps = tot_s / elapsed / 1e6 if elapsed > 0 else 0
+            msps = (_recent_rate.processed_msps if is_live and _recent_rate
+                    else tot_s / elapsed / 1e6 if elapsed > 0 else 0)
             # save_queue: wideband batches waiting to be recentred + extracted.
             # dec_queue:  per-preamble files waiting on the decoder subprocess.
             # active:     1 if the decoder is currently inside process_file, else 0.
@@ -9947,6 +9953,8 @@ def main():
                   f"decoded={_dec_u}u/{_dec_t} "
                   f"save_q={save_q} dec_q={dec_q} active={active} "
                   f"pipe={dt * 1000:.0f}ms"
+                  + (f" input={_recent_rate.input_msps:.1f}Msps"
+                     f" backlog={_recent_rate.backlog_s:.2f}s" if _recent_rate else "")
                   + (f" rss={_rss_mb:.0f}M" if _rss_mb else "")
                   + (f" hyb={_hyb_inline}i/{_hyb_pooled}p"
                      if _hybrid and _pool is not None else "")
