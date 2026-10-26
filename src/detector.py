@@ -3343,6 +3343,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
 
         _wh_peak = None
         _psw = None
+        _sc_span = None
         _nseg_tot = len(iq_1m) // 4096
         if _nseg_tot >= 4:
             # STRIDE segments across the WHOLE window: consecutive-only
@@ -3360,6 +3361,19 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             _pp_blk = np.abs(
                 iq_1m[:_nseg_tot * 4096].reshape(_nseg_tot, 4096)) ** 2
             _pp_blk = _pp_blk.mean(axis=1)
+            # ENERGETIC SPAN (1 Msps samples) for the SC pass below: the
+            # multi-lag Schmidl-Cox ran over the whole 1 s crop per BW
+            # class (14.6 s of a 68 s serial replay) although a burst's
+            # preamble can only lie where the burst's own energy is.
+            # Segments >= 3 dB over the crop's median power, widened by 2
+            # segments each side; the SC call adds (n_sym+2) lags at the
+            # end so every window that starts inside the span is scored.
+            # No energetic segment (weak/narrow burst in a wide crop) ->
+            # None -> the full crop, exactly as before.
+            _act = np.flatnonzero(_pp_blk > 2.0 * float(np.median(_pp_blk)))
+            if len(_act):
+                _sc_span = (max(0, int(_act[0]) - 2) * 4096,
+                            min(_nseg_tot, int(_act[-1]) + 3) * 4096)
             _nwin = min(48, _nseg_tot)
             _cum = np.concatenate(([0.0], np.cumsum(_pp_blk)))
             _sums = _cum[_nwin:] - _cum[:-_nwin]
@@ -3416,8 +3430,30 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     _lagx[(_sf, _lag)] = _lx
             if not _lagx:
                 continue
-            _curves = _schmidl_cox_curve_multilag(
-                _nbx, list(set(_lagx.values())), n_sym=8)
+            _lags_c = sorted(set(_lagx.values()))
+            _curves = None
+            if _sc_span is not None:
+                # Score only the windows that start inside the energetic
+                # span (see _sc_span).  The slice starts on a multiple of
+                # the largest lag — every lag in a class is a power-of-two
+                # multiple of the smallest — so each lag's curve is
+                # re-indexed to ABSOLUTE window numbers by zero-padding
+                # the front: scores/positions/plateau consumers downstream
+                # are unchanged.  Full crop when the span is most of it
+                # anyway or too short for the longest lag.
+                _Lmax = _lags_c[-1]
+                _s0 = (int(_sc_span[0] * _fsx / 1e6) // _Lmax) * _Lmax
+                _e0 = min(len(_nbx),
+                          int(_sc_span[1] * _fsx / 1e6) + 10 * _Lmax)
+                if (_e0 - _s0) < 0.7 * len(_nbx) and (_e0 - _s0) >= 10 * _Lmax:
+                    _curves = _schmidl_cox_curve_multilag(
+                        _nbx[_s0:_e0], _lags_c, n_sym=8)
+                    for _lk, _cv in list(_curves.items()):
+                        if _cv is not None and _s0:
+                            _curves[_lk] = np.concatenate(
+                                (np.zeros(_s0 // _lk, dtype=_cv.dtype), _cv))
+            if _curves is None:
+                _curves = _schmidl_cox_curve_multilag(_nbx, _lags_c, n_sym=8)
             for (_sf, _lag), _lx in _lagx.items():
                 _curve = _curves.get(_lx)
                 _scv, _posv = schmidl_cox_score(_nbx, _lx, n_sym=8,
