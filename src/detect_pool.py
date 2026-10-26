@@ -21,6 +21,7 @@ Usage:
     pool.close()
 """
 import os
+import time
 import queue
 import numpy as np
 import multiprocessing as mp
@@ -78,14 +79,22 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
             if spur_db is not None:
                 kw['spur_db'] = spur_db
             _c = task_center if task_center is not None else center
+            _t0 = time.perf_counter()
             dets = L.detect_preamble(iq, wb_fs, wb_bw, _c, **kw)
+            # Measured detect cost rides along with the result: the gate's
+            # proactive peak-budget clamp needs the WORKER's wall time per
+            # peak, not the ~15 ms the main loop spends dispatching (which it
+            # used to read as the per-peak cost in pooled mode — the cap
+            # then climbed to its maximum and 20-peak windows took seconds
+            # each here, wrapping the ring).
+            _cost = (time.perf_counter() - _t0, len(peaks) if peaks else 0)
         except KeyboardInterrupt:
             break   # shutdown SIGINT mid-detect — exit quietly
         except Exception as e:
             dets = []
-            result_q.put((seq, dets, 'ERR:%s' % e))
+            result_q.put((seq, dets, 'ERR:%s' % e, None))
             continue
-        result_q.put((seq, dets, None))
+        result_q.put((seq, dets, None, _cost))
 
     for s in shms:
         s.close()
@@ -122,6 +131,8 @@ class DetectPool:
             p.start()
             self._workers.append(p)
         self._results = {}   # seq -> dets, filled as results arrive
+        self._costs = []     # (detect_seconds, n_peaks) per finished window,
+                             # drained by the gate's budget clamp
 
     def acquire_slot(self):
         # Single-threaded caller (the gate producer), so no lock needed.
@@ -144,7 +155,7 @@ class DetectPool:
         self._task_q.put((slot, seq, n, psd, peaks, spur_db, center,
                           dechirp_chans))
 
-    def _absorb(self, rseq, dets, err):
+    def _absorb(self, rseq, dets, err, cost=None):
         if err is not None:
             # Worker-side detect exceptions used to vanish silently (the
             # third tuple field was read and dropped): a systematic failure
@@ -153,6 +164,14 @@ class DetectPool:
             print(f"[POOL] worker error on window {rseq}: {err}",
                   file=sys.stderr, flush=True)
         self._results[rseq] = dets
+        if cost is not None:
+            self._costs.append(cost)
+
+    def drain_costs(self):
+        """Return and clear the (detect_seconds, n_peaks) samples reported by
+        workers since the last drain — the clamp's per-peak cost feed."""
+        c, self._costs = self._costs, []
+        return c
 
     def result(self, seq):
         """Block until window `seq`'s detection is available; return dets.
@@ -168,7 +187,7 @@ class DetectPool:
                 # Short wait once a worker is down: at SIGINT shutdown ALL
                 # workers die and the EOF drain would otherwise pay the full
                 # 10 s per still-in-flight window.
-                rseq, dets, err = self._result_q.get(
+                _item = self._result_q.get(
                     timeout=10.0 if _all_alive else 0.5)
             except queue.Empty:
                 if _all_alive:
@@ -178,7 +197,7 @@ class DetectPool:
                       f"(no detections)", file=sys.stderr, flush=True)
                 self._results[seq] = []
                 break
-            self._absorb(rseq, dets, err)
+            self._absorb(*_item)
         return self._results.pop(seq)
 
     def ready(self, seq):
@@ -187,8 +206,7 @@ class DetectPool:
         realtime read on a not-yet-finished detection."""
         try:
             while True:
-                rseq, dets, err = self._result_q.get_nowait()
-                self._absorb(rseq, dets, err)
+                self._absorb(*self._result_q.get_nowait())
         except queue.Empty:
             pass
         return seq in self._results
