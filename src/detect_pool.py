@@ -28,7 +28,7 @@ import multiprocessing as mp
 from multiprocessing import shared_memory
 
 
-def _worker_main(shm_names, win_n, task_q, result_q, params):
+def _worker_main(shm_names, win_n, task_q, result_q, params, cap_override=None):
     # Single-threaded inside each worker so N workers ≈ N cores (no
     # oversubscription).  detect_preamble reads these envs.
     os.environ['LORA_FFT_WORKERS'] = '1'
@@ -65,6 +65,19 @@ def _worker_main(shm_names, win_n, task_q, result_q, params):
         if task is None:
             break
         slot, seq, n, psd, peaks, spur_db, task_center, task_chans = task
+        # Emergency cap from the gate, applied at TASK START so it reaches
+        # windows that were already queued: under a sustained deficit the
+        # table fills with 10-24-peak windows (seconds each) dispatched
+        # before the budget clamp engaged, and dispatch then blocks the
+        # main thread until one drains.  Truncating here (strongest peaks
+        # first — the same shed-weakest rule the gate applies) or skipping
+        # (-1) lets that backlog drain in milliseconds instead.
+        if cap_override is not None and peaks:
+            _co = cap_override.value
+            if _co < 0:
+                peaks = []
+            elif 0 < _co < len(peaks):
+                peaks = sorted(peaks, key=lambda p: -p[2])[:_co]
         iq = views[slot][:n]
         try:
             kw = dict(sc_threshold=sc_thr, ethresh=ethr,
@@ -122,11 +135,15 @@ class DetectPool:
         ctx = mp.get_context('fork')
         self._task_q = ctx.Queue()
         self._result_q = ctx.Queue()
+        # Shared emergency cap read by workers at task start (0 = none,
+        # N>0 = keep the N strongest peaks, -1 = skip detection).
+        self._cap_override = ctx.Value('i', 0)
         self._workers = []
         for _ in range(n_workers):
             p = ctx.Process(target=_worker_main,
                             args=(names, win_n, self._task_q,
-                                  self._result_q, params),
+                                  self._result_q, params,
+                                  self._cap_override),
                             daemon=True)
             p.start()
             self._workers.append(p)
@@ -166,6 +183,12 @@ class DetectPool:
         self._results[rseq] = dets
         if cost is not None:
             self._costs.append(cost)
+
+    def set_cap_override(self, cap):
+        """Emergency cap for queued windows: 0 none, N keep the N strongest
+        peaks, -1 skip detection.  Takes effect at each worker's next task."""
+        if self._cap_override.value != int(cap):
+            self._cap_override.value = int(cap)
 
     def drain_costs(self):
         """Return and clear the (detect_seconds, n_peaks) samples reported by

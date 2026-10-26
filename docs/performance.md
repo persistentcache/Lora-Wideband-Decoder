@@ -58,7 +58,7 @@ Settings live in `lora.toml [detect]`; most are also CLI flags.
 | Spike at center frequency (LO leak) | `--dc-notch 0.5` |
 | Duplicate detections / saturation | turn SDR gain down in `[radio]` |
 | Detector buffer overflows during short bursts | Increase `buf_seconds` if RAM permits. For USB input loss, inspect the capture log. |
-| `CATCHUP skip` / ring wraps during dense traffic on a 4-core host | `detect_workers = 3` in `[detect]` (~1.5 GB RAM per worker). Measured on a Pi 5 at 5 Msps: zero drops, where the auto 2 workers wrapped the ring once per burst train. |
+| `CATCHUP skip` / ring wraps during dense traffic on a small host | Automatic. `detect_workers = -1` takes 3 workers on 4-7-core hosts when RAM allows (~0.8 GB per worker + ~2 GB for the gate at 5 Msps), and under a sustained deficit the gate degrades gracefully — strongest peak only, then whole windows skipped (`hyb=…/Ns` in `[STAT]`) — instead of wrapping the ring. Frequent skips mean the host cannot keep up at this rate: lower `rate_hz` or add cooling. |
 
 ## Repo layout
 
