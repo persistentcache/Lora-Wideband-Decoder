@@ -7646,11 +7646,17 @@ class AutoGainGovernor:
         except OSError as e:
             print(f"  [AGC] ctl write failed: {e}", file=sys.stderr, flush=True)
 
-    def observe(self, clipped, busy, clip_frac=None):
+    def observe(self, clipped, busy, clip_frac=None, clamped=False):
         """Feed one 1-s window; may step the gain. busy = detections in the
         previous window (blocks climbing, never blocks backing off).
         clip_frac = fraction of samples clipped this window (for the severe
-        fast-backoff); None keeps the old boolean-only behaviour."""
+        fast-backoff); None keeps the old boolean-only behaviour.
+        clamped = the gate's peak-budget clamp is engaged (the host is
+        shedding candidate peaks): climbing is pointless — more gain means
+        more candidates nobody can examine — so it is blocked outright,
+        without the busy_wait override.  Measured on a Pi 5: the override
+        stepped 40 -> 60 dB while the gate shed 6-10 peaks per window,
+        turning the band into a comb of sub-kHz lines at cap 0."""
         if not self.enabled:
             return
         self.win += 1
@@ -7710,6 +7716,8 @@ class AutoGainGovernor:
                         and not any(self.hist)
                         and _up > self.gain + 0.01
                         and (self.ceiling is None or _up < self.ceiling - 0.01))
+        if _climb_ready and clamped:
+            return
         if _climb_ready and busy:
             # Don't starve on a band with continuous (weak, non-clipping)
             # traffic: after COOL_WIN windows of climb-ready-but-busy, step
@@ -9096,8 +9104,15 @@ def main():
         # real gate peaks keep full service — and resume the moment the
         # deficit clears.  Futility counting pauses too (no trial ran = no
         # evidence).  LORA_TRIAL_DEFER=0 disables (legacy always-force).
+        # Also deferred while the peak-budget clamp sits at its floor or
+        # below (emergency levels): the forced trials — patience slots and
+        # channelizer channels — are appended AFTER the throttle, so on a
+        # Pi 5 at cap 1-2 they outnumbered the energy peaks the window was
+        # allowed to keep, and each cost a full per-peak examination in a
+        # worker that was already the deficit.  They resume with the cap.
         _win_backlogged = (is_live and _TRIAL_DEFER
-                           and reader.available() >= hop_n)
+                           and (reader.available() >= hop_n
+                                or _bgt['cap_last'] <= _BUDGET_CAP_FLOOR))
         if _win_backlogged != _bgt.get('defer_last', False):
             print('[TRIAL-DEFER] backlog — forced trials paused'
                   if _win_backlogged else
@@ -9715,7 +9730,8 @@ def main():
             # gain climbs; keep that behavior identical with prescreen on).
             _agc.observe(_sat_frac > 0.005,
                          busy=bool(_gate_peaks) or _jk_sup_this_win,
-                         clip_frac=_sat_frac)
+                         clip_frac=_sat_frac,
+                         clamped=_bgt['cap_last'] < _PEAK_CAP_HI)
 
         _prof['sat'] += time.time() - _t_step
         _t_step = time.time()
@@ -10149,6 +10165,13 @@ def main():
                 _slow_rate_ok = False
             elif (is_live
                   and reader.available() / float(_ring_n_total) > 0.3):
+                _slow_rate_ok = False
+            elif is_live and _bgt['cap_last'] <= _BUDGET_CAP_FLOOR:
+                # Budget clamp at its floor: the workers are already the
+                # deficit, and this scan (concat + detect_preamble over a
+                # 4 s assembly, 45 % of the gate process's CPU on a Pi 5
+                # under a spur comb) runs in the SAME process.  Triggers
+                # stay pending and fire once the cap recovers.
                 _slow_rate_ok = False
             if not _slow_rate_ok and os.environ.get('LORA_SLOW_DEBUG'):
                 print(f"[SLOW] rate-bound defer tick={_slow_tick} "
