@@ -5518,6 +5518,19 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
                 continue   # re-enter the ladder at the corrected SF
             return  # dominant signal is a different SF — give up immediately
         if status == 'OK':
+            # The rescue arm means "a header was seen whose data never
+            # CRC'd".  A later attempt just decoded a packet — the usual
+            # case being THIS packet (attempt 1 failed off-centre or
+            # mis-parked, attempt 2 succeeded) — so the arm is stale.
+            # Left set, it blocked the all-decoded/residual-clear return
+            # below and the carrier rescue then re-decoded the SAME packet
+            # at ±0.1/±0.2 BW, followed by every Pass-2 shift: measured
+            # 0.95 s to the verified packet, 7.0 s more finding it nine
+            # times over (30-60 s of worker time on a Pi 5).  A genuinely
+            # different undecoded packet still keeps the search alive: its
+            # preamble stays in the masked residual, so _residual_clear
+            # stays False and Pass-2 runs as before.
+            _need_rescue = False
             # Multi-packet recovery via SUCCESSIVE INTERFERENCE CANCELLATION.
             # A capture often holds two concurrent packets — a Meshtastic hop
             # and its relay — at DIFFERENT carriers (and times) in one gate
@@ -5571,6 +5584,13 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
                 # packet's time region and continue so the loop's SC scan can
                 # lock the time-separated concurrent hop.  The decrypt-validity
                 # gate keeps a spurious second decode out of the output.
+                # The rescue arm this attempt may have just set (hdr_ok, data
+                # failed at the crop edge) is for THIS packet, which the
+                # recenter has now decoded — same stale-arm case as the
+                # status=='OK' branch above.  A different, still-undecoded
+                # packet re-arms it on the next attempt (its preamble is
+                # still in the residual).
+                _need_rescue = False
                 if mask_len > 0:
                     mask_end = min(len(iq1_work), mask_start + mask_len)
                     iq1_work[mask_start:mask_end] = 0.0
@@ -5625,6 +5645,7 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
         _rescue_bud = 1.5
         _rescue_offs = [s * bw / 10.0 for s in (1, -1, 2, -2)]   # ±0.1, ±0.2 BW
         _rescue_before = set(_DECODED_SET)
+        _rescue_emit0 = _EMIT_COUNT
         for _coff in _rescue_offs:
             if _BUDGET_S > 0 and (time.process_time() - _process_start) > _BUDGET_S:
                 break
@@ -5643,7 +5664,10 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
             # Stop as soon as a NEW (pkt_id, hop) is recovered — no need to
             # sweep the rest, which keeps the rescue cheap (the common case
             # finds the missing hop in the first shift or two).
-            if _DECODED_SET - _rescue_before:
+            # ... or re-decoded an already-known one: either way the carrier
+            # is reachable and the remaining shifts can only find the same
+            # frame again.
+            if _DECODED_SET - _rescue_before or _EMIT_COUNT > _rescue_emit0:
                 break
 
     # ---- Fast path: skip redundant fallbacks when everything is decoded ----
@@ -5936,6 +5960,10 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
     # preamble+demod+PASS-1+PASS-2 stack) at ~hundreds of ms each.  Predicate
     # mirrors the fast-path at line 4954 but uses _EMIT_COUNT (universal
     # across protocols) and accepts decodes from PASS 2 too.
+    if os.environ.get('LORA_GATE_DEBUG'):
+        print(f"  [VETO-DBG] burst-sweep entry: emits={_EMIT_COUNT} "
+              f"p2_base={_pass2_emit_baseline} residual_clear={_residual_clear} "
+              f"need_rescue={_need_rescue}")
     if _allow_rescue and len(iq) > 0 \
             and _EMIT_COUNT > _pass2_emit_baseline and _residual_clear:
         return
