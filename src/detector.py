@@ -6382,9 +6382,13 @@ while True:
                 import math as _math
                 same_slope = abs(_math.log2(cbw / kbw)
                                  - (csf - ksf) / 2.0) < 1e-6
+                # An alias of the SAME transmission starts at the same RF
+                # instant (plateau skew is tens of ms); relays are ~1 s
+                # apart.  A fixed 0.1 s window keeps relays and separate
+                # packets out regardless of the per-SF airtime tolerance.
                 if (same_slope
                         and abs(cf - df) < max(cbw, kbw) / 2.0 + ftol
-                        and abs(ct - dt) < max(ttol, cttol)):
+                        and abs(ct - dt) <= 0.1):
                     return True
         return False
 
