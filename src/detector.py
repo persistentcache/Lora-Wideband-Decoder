@@ -1570,6 +1570,25 @@ def nb_chunk_for_rate(wb_fs, nominal=65536, top_bw=500_000):
 _DC_EXCISE_HZ = 300.0
 
 
+def _place_wrapped(dst, d0, src, s0, cnt):
+    """Copy `cnt` columns of `src` starting at s0 into `dst` starting at d0,
+    both indices taken modulo their last-axis length, splitting at each
+    wrap.  Lets the crop extractors write the cropped spectrum straight into
+    the UNSHIFTED layout the ifft wants — the old `np.fft.ifftshift` on the
+    (n_chunks, crop) array was a full roll per crop, 4.2 s of an 83 s
+    serial replay (5 %), for a pure relayout."""
+    n_d = dst.shape[-1]
+    n_s = src.shape[-1]
+    while cnt > 0:
+        d0 %= n_d
+        s0 %= n_s
+        m = min(cnt, n_d - d0, n_s - s0)
+        dst[..., d0:d0 + m] = src[..., s0:s0 + m]
+        d0 += m
+        s0 += m
+        cnt -= m
+
+
 def _excise_dc(FF, wb_fs, chunk):
     k = max(1, int(round(_DC_EXCISE_HZ * chunk / float(wb_fs))))
     FF[:, :k + 1] = 0
@@ -1630,14 +1649,13 @@ def extract_nb_fft_multi_bw(iq, wb_fs, offset_hz, target_bws, chunk=65536,
         nc = FF.shape[0]
         cropped = np.zeros((nc, cw), dtype=np.complex64)
         if cnt > 0:
-            if src + cnt <= chunk:
-                cropped[:, dst:dst + cnt] = FF[:, src:src + cnt]
-            else:                         # wraps the DC/Nyquist boundary once
-                f0 = chunk - src
-                cropped[:, dst:dst + f0] = FF[:, src:]
-                cropped[:, dst + f0:dst + cnt] = FF[:, :cnt - f0]
-        nb = _ifft(np.fft.ifftshift(cropped, axes=1), axis=1)
-        results.append((nb.astype(np.complex64).reshape(-1),
+            # written directly in ifftshift layout: shifted column j lands
+            # at (j - cw//2) mod cw — same values the old build + roll gave
+            _place_wrapped(cropped, dst - cw // 2, FF, src, cnt)
+        nb = _ifft(cropped, axis=1)
+        # pyfftw/scipy return a fresh complex64 array (verified: no buffer
+        # aliasing across calls), so no copy is needed here
+        results.append((np.asarray(nb, dtype=np.complex64).reshape(-1),
                         cw * wb_fs / chunk))
     return results
 
@@ -1835,16 +1853,12 @@ def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
     _cnt = src_hi - src_lo
     if _cnt > 0:
         _src = (src_lo - N // 2) % N
-        if _src + _cnt <= N:
-            cropped[dst_lo:dst_hi] = F[_src:_src + _cnt]
-        else:
-            _f0 = N - _src
-            cropped[dst_lo:dst_lo + _f0] = F[_src:]
-            cropped[dst_lo + _f0:dst_hi] = F[:_cnt - _f0]
+        # written directly in ifftshift layout (see _place_wrapped)
+        _place_wrapped(cropped, dst_lo - n_out // 2, F, _src, _cnt)
 
     # IFFT back to time domain — signal is now centered at DC.
     # _ifft preserves complex64 dtype when given complex64 input.
-    result = _ifft(np.fft.ifftshift(cropped))
+    result = _ifft(cropped)   # cropped is already in ifftshift layout
     if result.dtype != np.complex64:
         result = result.astype(np.complex64)
 
@@ -3534,7 +3548,19 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         seen = set()
         tried = set()      # exact (sf, bw, pos) dechirps already evaluated —
                            # different lags often resolve to the same candidate
-        _nb_by_bw = {}     # bw -> (nb, fs): the narrowband extraction depends
+        # Seeded with the matched crops already computed for the SC pass
+        # when their rate is exactly 2*bw (true whenever bw*chunk/wb_fs is
+        # an integer — every supported BW at the rate-aware chunks): the
+        # resolver's own crop of iq_1m is the same centre, the same rate
+        # and the same brick-wall extraction one stage later, so
+        # re-cropping each candidate BW cost 14.6 s of a 78 s serial
+        # replay (3627 crop+ifft calls) for the same signal.  Rates
+        # that round (e.g. 250k at 20 Msps/65536) are left to the
+        # resolver's own extraction as before.
+        _nb_by_bw = {float(_b): _p for _b, _p in _matched_nb.items()
+                     if _p is not None and len(_p) == 2 and _p[0] is not None
+                     and len(_p[0]) > 0 and abs(float(_p[1]) - 2.0 * float(_b)) < 1.0}
+        # bw -> (nb, fs): the narrowband extraction depends
                            # only on bw, so share it across the hit-lag loop
                            # (4 lags resolving to the same bw re-extracted the
                            # SAME slice 4x — pure waste, identical values)
