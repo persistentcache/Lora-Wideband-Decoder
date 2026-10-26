@@ -5646,7 +5646,8 @@ class SignalRecorder:
                         # residual.  Catches multi-packet files when SIC
                         # cancellation is clean (per-symbol amplitude OK).
                         self._decoder.submit(fpath, fname, bucket_key=_bkey,
-                                             slow=bool(d.get('patience_trial')))
+                                             slow=bool(d.get('patience_trial')),
+                                             prio=float(d.get('bw_quality_db', 0.0)))
                         # Family-label decode jobs (trial captures only) —
                         # same bucket, slow tier: once any label in the
                         # bucket decodes, the phase-2 bucket dedup skips the
@@ -5676,7 +5677,9 @@ class SignalRecorder:
                                 relay_after_syms=_iso_after,
                                 relay_before_syms=_iso_before,
                                 bucket_key=_bkey,
-                                slow=bool(d.get('patience_trial')))
+                                slow=bool(d.get('patience_trial')),
+                                # relay search runs after every primary
+                                prio=float(d.get('bw_quality_db', 0.0)) - 100.0)
             except Exception as e:
                 print(f"[RECORDER] save error: {e}", file=sys.stderr, flush=True)
             finally:
@@ -5728,7 +5731,16 @@ class BackgroundDecoder:
         # the CPU/RAM auto-scale below).  Defaults to {} so the reserve
         # degrades safely to just OS_slack when absent.
         self._host_mem_ctx = host_mem_ctx or {}
-        self._queue = queue.Queue()
+        # PRIORITY queue keyed on the gate's dechirp quality (2026-10-26):
+        # one burst yields several captures — overlapping-window copies
+        # plus same-slope alias labels — and FIFO let an alias or off-
+        # centre copy burn its 20-40 s budget ahead of the clean one, so
+        # the packet's row appeared ~30 s after detection.  The true
+        # label wins bw_quality_db by ~10 dB; decoding it first puts the
+        # row up at first-decode time, and its admit lets the bucket dedup
+        # skip the aliases instead of decoding them.
+        self._queue = queue.PriorityQueue()
+        self._qseq = itertools.count()   # FIFO tie-break, keeps jobs uncomparable
         self._lock = threading.Lock()
         # Structured packet log (JSONL) the web UI tails.  Each decoded/encrypted
         # [PKT] record from the workers is appended here with a receive timestamp.
@@ -6470,7 +6482,7 @@ while True:
         self._release_one_slow()
 
     def submit(self, fpath, fname, relay_after_syms=None, relay_before_syms=None,
-               bucket_key=None, slow=False):
+               bucket_key=None, slow=False, prio=0.0):
         """Queue a capture file for background decoding.
 
         relay_after_syms:  blank first N BW-rate symbols → find hop AFTER primary.
@@ -6513,7 +6525,11 @@ while True:
         _slow_tier = slow or self._defer_state
         self._rawlog('SUBMIT', f"{fname} relay={relay_after_syms},{relay_before_syms} "
                                f"tier={'slow' if _slow_tier else 'fast'}")
-        (self._slow_queue if _slow_tier else self._queue).put((fpath, fname, relay_after_syms, relay_before_syms, None))
+        _job = (fpath, fname, relay_after_syms, relay_before_syms, None)
+        if _slow_tier:
+            self._slow_queue.put(_job)
+        else:
+            self._queue.put((-float(prio), next(self._qseq), _job))
 
     def pending(self):
         with self._lock:
@@ -6586,7 +6602,7 @@ while True:
                 return
             self._slow_released_job = _job   # RELEASED_NOT_DEQUEUED
         try:
-            self._queue.put(_job)
+            self._queue.put((1e9, next(self._qseq), _job))   # after any fast job
         except BaseException:
             with self._lock:                 # enqueue failed -> release the claim
                 if self._slow_released_job is _job:
@@ -6633,7 +6649,7 @@ while True:
         re-decodes never compete with the realtime gate."""
         while True:
             try:
-                self._queue.put(self._slow_queue.get_nowait())
+                self._queue.put((1e9, next(self._qseq), self._slow_queue.get_nowait()))
             except queue.Empty:
                 break
 
@@ -6680,7 +6696,7 @@ while True:
             # its items INTO this fast queue at shutdown (drain_slow_into_fast),
             # so these same blocking workers process the stragglers then, with
             # the big per-job budget carried in the job tuple.
-            job = self._queue.get()
+            _, _, job = self._queue.get()
             # Adaptive throttle: if the gate is actively dropping samples,
             # delay this decode start to free memory bandwidth for the
             # gate's reader thread.  Self-clearing event — once the gate
