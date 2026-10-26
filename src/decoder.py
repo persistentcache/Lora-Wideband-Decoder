@@ -19,6 +19,18 @@ import os
 for _v in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS',
            'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
     os.environ.setdefault(_v, '1')
+
+
+# Pin glibc's mmap threshold at 1 MB so the per-capture arrays (a 4 Msps
+# capture is tens of MB, recropped several times per decode) go back to
+# the OS when freed instead of being retained in a fragmented heap — see
+# the detector.py header note for the measurements.  Decode workers are
+# separate processes, so each applies it itself.  glibc only.
+try:
+    import ctypes as _ctypes
+    _ctypes.CDLL('libc.so.6').mallopt(-3, 1 << 20)   # M_MMAP_THRESHOLD = -3
+except (OSError, AttributeError):
+    pass
 import numpy as np
 import glob, sys, time
 from itertools import combinations

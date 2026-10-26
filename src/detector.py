@@ -43,6 +43,32 @@ import sys, os
 for _v in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS', 'MKL_NUM_THREADS',
            'NUMEXPR_NUM_THREADS', 'VECLIB_MAXIMUM_THREADS'):
     os.environ.setdefault(_v, '1')
+
+
+# Pin glibc's mmap threshold so large arrays go back to the OS when freed.
+# By default the threshold is DYNAMIC: freeing an mmap'd block raises it to
+# that block's size (up to 32 MB), so after the first 20 MB hop copy or
+# 40 MB chunk-FFT output is released, every later one is carved from the
+# brk heap instead — and a heap that interleaves those with the thousands
+# of small per-peak allocations can never be trimmed.  Measured on the
+# same 210 s traffic replay (4-core emulation): gate RSS 2.2 → 2.8 GB and
+# climbing at 75 s by default, 1.4 → 2.0 GB and falling with the threshold
+# fixed at 1 MB; live on a Pi 5 the default grew gate + workers from 1.9
+# to 7.9 GB in 13 min and froze an 8 GB board.  tracemalloc showed the
+# Python-visible footprint flat at ~1.6 GB the whole time — the growth was
+# all freed-but-retained heap.  Forked detect workers inherit the setting;
+# decoder.py applies the same for the decode workers.  glibc only; other
+# allocators ignore it.
+def _pin_mmap_threshold():
+    try:
+        import ctypes
+        _libc = ctypes.CDLL('libc.so.6')
+        _libc.mallopt(-3, 1 << 20)      # M_MMAP_THRESHOLD = -3
+    except (OSError, AttributeError):
+        pass
+
+
+_pin_mmap_threshold()
 import time, json, argparse, numpy as np
 import threading, queue, io, subprocess, fcntl, collections, itertools
 
