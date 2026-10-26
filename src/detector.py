@@ -3308,7 +3308,27 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         # vs (7,31.25k) — dechirp-degenerate AND SC-degenerate; the
         # 31.25k table add made these flips real). Only trusted when the
         # peak clears floor+18 (weak signals' width collapses).
+        def _walk_edge(_arr, _thr, _i, _step, _gapw=4):
+            # Gap-tolerant plateau edge walk (see the width measurement
+            # below): bridge up to _gapw sub-threshold bins (~1 kHz at
+            # 244 Hz/bin — the DC excision hole), edge = last bin above.
+            _last = _i
+            _gap = 0
+            _j = _i
+            _n = len(_arr) - 1
+            while 0 < _j < _n:
+                _j += _step
+                if _arr[_j] > _thr:
+                    _last = _j
+                    _gap = 0
+                else:
+                    _gap += 1
+                    if _gap > _gapw:
+                        break
+            return _last
+
         _wh_peak = None
+        _psw = None
         _nseg_tot = len(iq_1m) // 4096
         if _nseg_tot >= 4:
             # STRIDE segments across the WHOLE window: consecutive-only
@@ -3353,25 +3373,8 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 # sub-threshold bins; the edge is still the LAST bin above
                 # the threshold, so an ungapped plateau measures exactly
                 # as before.
-                _gapw = 4                     # ~1 kHz at 244 Hz/bin
-
-                def _walk_edge(_i, _step):
-                    _last = _i
-                    _gap = 0
-                    _j = _i
-                    while 0 < _j < 4095:
-                        _j += _step
-                        if _psw[_j] > _thw:
-                            _last = _j
-                            _gap = 0
-                        else:
-                            _gap += 1
-                            if _gap > _gapw:
-                                break
-                    return _last
-
-                _lo_w2 = _walk_edge(_c0, -1)
-                _hi_w2 = _walk_edge(_c0, 1)
+                _lo_w2 = _walk_edge(_psw, _thw, _c0, -1)
+                _hi_w2 = _walk_edge(_psw, _thw, _c0, 1)
                 _wh_peak = (_hi_w2 - _lo_w2 + 1) * ((_rate1m or 1e6) / 4096.0)
         for _bwc, _pairs in _by_bw.items():
             # width-gated BW evaluation, STRONG PEAKS ONLY: measured
@@ -3898,10 +3901,62 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                 # normalized key hands DOWN-aliases the same handicap
                 # (the dedup comment's SF9/62.5-vs-SF11/125 case).  The
                 # median metric kills both directions categorically.
+                # CARRIER-CENTRED WIDTH RELABEL.  The width above was
+                # measured ±100 kHz around the GATE PEAK; when the resolved
+                # carrier sits well outside that (a distant peak's wide
+                # crop picked the burst up — live: a peak 352 kHz from an
+                # SF7/250k burst resolved it as SF9/500k, the same-slope
+                # sibling only the 500 kHz crop could see) the label was
+                # decided without ever seeing the burst's width.  Measure
+                # the occupied width AT the carrier from the same burst
+                # PSD and, if it contradicts the label by >= 0.6 octave
+                # and fits a same-slope sibling within 0.4, emit the
+                # sibling — the decoder's occupied-width front-end moved to
+                # the gate, so the alias never becomes its own capture.
+                _w_car = None
+                _relabelled = False
+                if (_psw is not None and abs(cfo_hz) > bw / 4.0):
+                    _fres_w = (_rate1m or 1e6) / 4096.0
+                    _cbw = 2048 + int(round(cfo_hz / _fres_w))
+                    _hw = max(2, int(round(bw / 8.0 / _fres_w)))
+                    if 40 < _cbw < 4055:
+                        _flw2 = float(np.median(_psw))
+                        _c1 = (_cbw - _hw
+                               + int(np.argmax(_psw[_cbw - _hw:_cbw + _hw + 1])))
+                        _pk2 = float(_psw[_c1])
+                        if _pk2 > _flw2 * 63.0:
+                            _thw2 = _pk2 / 15.85
+                            _lo3 = _walk_edge(_psw, _thw2, _c1, -1)
+                            _hi3 = _walk_edge(_psw, _thw2, _c1, 1)
+                            if _lo3 > 2 and _hi3 < 4093:
+                                _w_car = (_hi3 - _lo3 + 1) * _fres_w
+                if _w_car:
+                    import math as _mc
+                    _fam = [(sf + 2 * _j, bw * 2.0 ** _j) for _j in (-2, -1, 1, 2)
+                            if 7 <= sf + 2 * _j <= 12
+                            and 31000.0 <= bw * 2.0 ** _j <= 500000.0]
+                    if _fam and abs(_mc.log2(_w_car / bw)) >= 0.6:
+                        _bs = min(_fam, key=lambda t: abs(_mc.log2(_w_car / t[1])))
+                        if abs(_mc.log2(_w_car / _bs[1])) < 0.4:
+                            if debug >= 1:
+                                print(f"    WIDTH-RELABEL SF{sf}/{fmt_bw(bw)} -> "
+                                      f"SF{_bs[0]}/{fmt_bw(_bs[1])} "
+                                      f"(occupied {_w_car/1e3:.0f} kHz at "
+                                      f"cfo {cfo_hz/1e3:+.0f}k)", file=sys.stderr)
+                            sf, bw = int(_bs[0]), (int(round(_bs[1]))
+                                                   if abs(_bs[1] - round(_bs[1])) < 1e-6
+                                                   else _bs[1])
+                            _wh_peak = _w_car
+                            N_sf = 1 << sf
+                            _relabelled = True
                 _med_end = _pos_nb + 192 * N_sf
                 _nb_med = (nb[_pos_nb:_med_end]
                            if 0 < _pos_nb < len(nb) - N_sf * 8 else nb_al)
-                if len(_nb_med) >= N_sf * 8:
+                if _relabelled:
+                    # the matched crop `nb` is at the OLD class's rate — a
+                    # median dechirp at the new (sf, bw) on it is meaningless
+                    _bwq_med = bw_quality
+                elif len(_nb_med) >= N_sf * 8:
                     _bwq_med, _ = dechirp_peak_quality(_nb_med, sf, bw,
                                                        agg='median')
                 else:
@@ -5399,6 +5454,26 @@ class SignalRecorder:
                         _cluster_idx = []
                         _best_diff_q = -1e30   # best q of a same-slope,
                         #   DIFFERENT-(sf,bw) member already in this cluster
+                        # WIDTH FIT of a label: |log2(bw / measured occupied
+                        # width)|, <= 0.85 means the label's bandwidth is the
+                        # one the burst actually occupies.  Same-slope
+                        # siblings are dechirp-DEGENERATE, so their raw q
+                        # cannot rank them — the alias that a distant gate
+                        # peak's wider crop picked up often scores HIGHER
+                        # (live: SF9/500k at bwq 22.4 beat the true SF7/250k
+                        # at 19.6 and took the cluster slot; the decoder
+                        # then relabelled it by occupied width, seconds
+                        # later).  Width can: a different-label sibling
+                        # whose label fits its width beats one whose label
+                        # does not (or whose width was unmeasurable), in
+                        # either direction; only when neither side settles
+                        # it does the q margin below decide, as before.
+                        import math as _mw
+                        _cand_w = _src.get('width_hz')
+                        _cand_fits = bool(_cand_w) and abs(
+                            _mw.log2(_src['bw'] / float(_cand_w))) <= 0.85
+                        _sib_fits = False      # a different-label sibling fits
+                        _sib_misfit_idx = []   # different-label siblings that don't
                         for _i, _e in enumerate(self._saved_abs_t):
                             _sf_hz, _st, _ssf, _sbw = _e[0], _e[1], _e[2], _e[3]
                             if (abs(_cand_freq - _sf_hz) < _ftol
@@ -5415,6 +5490,12 @@ class SignalRecorder:
                                         and (_ssf != _src['sf']
                                              or _sbw != _src['bw'])):
                                     _best_diff_q = max(_best_diff_q, _e[4])
+                                    _ew = _e[5] if len(_e) > 5 else None
+                                    if _ew and abs(_mw.log2(
+                                            _sbw / float(_ew))) <= 0.85:
+                                        _sib_fits = True
+                                    else:
+                                        _sib_misfit_idx.append(_i)
                         # RECORD-TIME same-slope alias gate (the eviction below
                         # only rewrites the registry — it cannot un-create a
                         # decode job for an alias that already filled a free
@@ -5427,13 +5508,23 @@ class SignalRecorder:
                         # A genuinely-strongest same-slope member is never
                         # gated (it clears the margin), preserving a real weak
                         # SF7/62.5k that has no stronger sibling.
-                        if (self._slope_dedup
+                        if (self._slope_dedup and _sib_fits
+                                and not _cand_fits):
+                            _skip = True           # a sibling's label fits, this one's doesn't
+                        elif (self._slope_dedup and _cand_fits
+                                and not _sib_fits and _sib_misfit_idx):
+                            # This label fits the burst's width and the
+                            # recorded sibling's doesn't: take its slot.
+                            self._saved_abs_t[_sib_misfit_idx[0]] = (
+                                _cand_freq, _abs_t_s,
+                                _src['sf'], _src['bw'], _cand_q, _cand_w)
+                        elif (self._slope_dedup
                                 and _best_diff_q - _cand_q > self._slope_margin_db):
                             _skip = True
                         elif _match < _eff_keep:
                             self._saved_abs_t.append(
                                 (_cand_freq, _abs_t_s,
-                                 _src['sf'], _src['bw'], _cand_q))
+                                 _src['sf'], _src['bw'], _cand_q, _cand_w))
                             if len(self._saved_abs_t) > 4000:
                                 _cut = _abs_t_s - 10.0
                                 self._saved_abs_t = [
@@ -5456,7 +5547,7 @@ class SignalRecorder:
                             if _cand_q > self._saved_abs_t[_weak_i][4]:
                                 self._saved_abs_t[_weak_i] = (
                                     _cand_freq, _abs_t_s,
-                                    _src['sf'], _src['bw'], _cand_q)
+                                    _src['sf'], _src['bw'], _cand_q, _cand_w)
                             else:
                                 _skip = True
                         else:
