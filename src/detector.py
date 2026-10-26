@@ -8386,6 +8386,15 @@ def main():
               _pp = _dt / _npk
               _bgt['pp'] = (_pp if _bgt['pp'] == 0.0
                             else 0.3 * _pp + 0.7 * _bgt['pp'])
+
+      def _budget_track_pp(_dt, _npk):
+          # Per-peak cost only — fed from the detect pool's worker-reported
+          # (detect_seconds, n_peaks) samples, the only honest measurement
+          # of a pooled window's cost (the main loop sees just its dispatch).
+          if _npk >= 1:
+              _pp = _dt / _npk
+              _bgt['pp'] = (_pp if _bgt['pp'] == 0.0
+                            else 0.3 * _pp + 0.7 * _bgt['pp'])
       # Hybrid routing threshold + telemetry (UC audit B): windows with more
       # candidate peaks than this go through the pool; fewer run inline.
       try:
@@ -8394,6 +8403,20 @@ def main():
           _HYB_PEAKS = 2
       _hyb_inline = 0
       _hyb_pooled = 0
+      # MEASURED inline cost (Pi 5 @ 5 Msps, 2026-10-26): the peak-count
+      # rule alone routed every 1-2-peak window inline on a host where ONE
+      # such window costs 400-600 ms against the 500 ms hop, so the main
+      # loop fell behind single-threaded while both pool workers sat idle
+      # (observed live: 1 of 4 cores busy, ~20 % of samples dropped, the
+      # ring oscillating between the >50 % shed cap and the <30 % inline
+      # gate).  Keep an EWMA of inline detect wall time and route to the
+      # pool whenever inline would not fit the hop beside the per-window
+      # gate overhead; re-probe inline every 32 pooled windows so a host
+      # whose band goes quiet drifts back to the cheap path.  Hosts where
+      # inline fits (the author's 24-core box) keep the old routing.
+      _hyb_inline_s = 0.0          # EWMA, seconds; 0.0 = not yet measured
+      _hyb_pooled_streak = 0
+      _HYB_REPROBE = 32
 
       def _notch_psd(_pp):
           if a.dc_notch > 0:
@@ -9118,15 +9141,39 @@ def main():
         # touches any of this.
         _cap_budget = _PEAK_CAP_HI
         _avail = reader.available() if is_live else 0
+        if _pool is not None:
+            # POOL-AWARE (Pi 5 @ 5 Msps, 2026-10-26): pooled windows report
+            # their measured detect cost with the result; feed the per-peak
+            # EWMA from those.  Without it the clamp read the main loop's
+            # ~15 ms dispatch as the per-peak cost, raised the cap to its
+            # maximum, 20-peak windows then took 3-4 s each in the workers
+            # and the ring wrapped three times in 150 s (137 M samples
+            # skipped, a packet lost) — while the inline-routed baseline had
+            # measured 50-90 ms/peak and held the cap at 4-7.
+            for _wdt, _wnp in _pool.drain_costs():
+                _budget_track_pp(_wdt, _wnp)
+        # Pooled saturation signal: dispatch never blocks, so a pool that is
+        # falling behind shows up as in-flight depth beyond the commit lag
+        # long before the reader banks a hop — by then six 20-peak windows
+        # (3-4 s each here) were already queued and the ring wrapped before
+        # the clamp could act (measured twice per 150 s).  Tail-aware commit
+        # deferral can also hold depth > lag; engaging then is harmless
+        # because the per-peak cost it clamps on is the workers' measured one.
+        _pool_behind = _pool is not None and len(_inflight) > _LAG
         if (is_live and _bgt['margin'] > 0.0 and _bgt['pp'] > 0.0
-                and _avail >= hop_n):
-            # Engage only on GENUINE backlog (>= one hop of unread samples):
+                and (_avail >= hop_n or _pool_behind)):
+            # Engage only on GENUINE backlog (>= one hop of unread samples,
+            # or a pool running behind its commit lag):
             # a keeping-up host is structurally exempt — its reader never
             # runs ahead — so the clamp cannot degrade healthy hosts (the
             # verify pass measured a real decode lost to a false clamp when
             # this condition was absent).  A deficit host banks a hop within
             # ~0.5 s and engages ~40x sooner than the ring>50% backstop.
-            _bud_s = _hop_budget_s * _bgt['margin'] - _bgt['ovh']
+            # With a detect pool the windows run concurrently on N workers,
+            # so a window may spend N hops of detect time and still sustain
+            # the hop rate: the budget scales by the worker count.
+            _n_det = a.detect_workers if _pool is not None else 1
+            _bud_s = _hop_budget_s * _n_det * _bgt['margin'] - _bgt['ovh']
             _cap_new = min(_PEAK_CAP_HI,
                            max(_BUDGET_CAP_FLOOR, int(_bud_s / _bgt['pp'])))
             # Hysteresis: the int() truncation wobbles +-1 on noisy per-peak
@@ -9135,7 +9182,7 @@ def main():
             if abs(_cap_new - _bgt['cap_last']) >= 2:
                 print(f"[GATE-BUDGET] per-peak {_bgt['pp']*1000:.0f}ms "
                       f"ovh {_bgt['ovh']*1000:.0f}ms "
-                      f"hop {_hop_budget_s*1000:.0f}ms — "
+                      f"hop {_hop_budget_s*1000:.0f}ms x{_n_det} — "
                       f"budget cap -> {_cap_new}",
                       file=sys.stderr, flush=True)
                 _bgt['cap_last'] = _cap_new
@@ -9409,7 +9456,12 @@ def main():
         # through the pool.
         _route_inline = False
         if _pool is not None and _hybrid:
-            if (len(_gate_peaks) <= _HYB_PEAKS
+            _inline_fits = (
+                _hyb_inline_s == 0.0
+                or _hyb_pooled_streak >= _HYB_REPROBE
+                or (_bgt['ovh'] + _hyb_inline_s
+                    <= (_bgt['margin'] or 0.85) * _hop_budget_s))
+            if (len(_gate_peaks) <= _HYB_PEAKS and _inline_fits
                     and (not is_live
                          or reader.available() / float(_ring_n_total) < 0.3)):
                 _ncd = 0
@@ -9423,8 +9475,10 @@ def main():
                 _route_inline = not _inflight
             if _route_inline:
                 _hyb_inline += 1
+                _hyb_pooled_streak = 0
             else:
                 _hyb_pooled += 1
+                _hyb_pooled_streak += 1
         if _pool is not None and not _route_inline:
             # --- Multiprocess detect: dispatch this window, commit lagged ---
             # The producer never blocks on detection; workers run it in
@@ -9469,7 +9523,9 @@ def main():
             dt = time.time() - tw
             _prof['detect'] += dt
             if is_live and _bgt['margin'] > 0.0:
-                _budget_track(dt, _n_pk_det)
+                # overhead EWMA only: this dt is dispatch (+ backpressure),
+                # the per-peak cost arrives from the workers via drain_costs
+                _budget_track(dt, 0)
             _t_step = time.time()
         else:
             if _lz is not None and not _gate_peaks:
@@ -9501,6 +9557,12 @@ def main():
             _prof['detect'] += dt
             if is_live and _bgt['margin'] > 0.0:
                 _budget_track(dt, _n_pk_det)
+            if _hybrid and _gate_peaks:
+                # inline detect actually ran on this window — feed the
+                # routing EWMA (quiet no-peak windows cost nothing and would
+                # only dilute it)
+                _hyb_inline_s = (dt if _hyb_inline_s == 0.0
+                                 else 0.3 * dt + 0.7 * _hyb_inline_s)
             _t_step = time.time()
 
             # Cross-window duplicate suppression is intentionally removed.
