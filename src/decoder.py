@@ -4814,8 +4814,136 @@ def _sic_subtract_wideband(iq_wb, fs, bw, sf, carrier_hz, pkt_start, n_data_syms
         _sub(p, (up * np.exp(2j * np.pi * k * nidx / sps)).astype(np.complex64))
 
 
+def _label_from_name(name):
+    """(sf, bw_hz, fs_hz_or_None) from a capture filename — the same parse
+    _process_file_label applies, factored out for the alias front-end."""
+    parts = name.lstrip('.').split('_')
+    sf = int(parts[0].replace('SF', ''))
+    bw = int(round(float(parts[1].replace('k', '')) * 1000))
+    if bw == 41670:
+        bw = 125000.0 / 3.0
+    fs = None
+    for _p in parts:
+        if _p.endswith('ksps'):
+            try:
+                fs = int(_p[:-4]) * 1000
+            except ValueError:
+                fs = None
+            break
+    return sf, bw, fs
+
+
+def _alias_from_occupied_width(iq, fs, sf, bw):
+    """Same-slope relabel verdict from the burst's OCCUPIED BANDWIDTH.
+
+    The gate labels one burst with several dechirp-degenerate hypotheses —
+    (sf±2k, bw·2^±k) share the chirp slope, so preamble dechirp cannot tell
+    them apart and the resolver's vote sometimes crowns the wrong one
+    (live: SF12/500k for an SF10/250k frame, SF9/62.5k for SF11/125k,
+    SF9/125k for SF11/250k).  Decoding at the wrong label fails every
+    header and burns the whole budget (83-115 s at SF12 on a Pi 5) while
+    the same capture decodes in seconds at the true label.  What DOES
+    separate the siblings is the bandwidth the chirp occupies: a max-hold
+    spectrum of the capture (the burst dominates its bins at any duty
+    cycle), median-filtered so narrow spurs (the SDR's DC spike) cannot
+    pose as the plateau, measured at half the plateau height.
+
+    Returns None (keep the label) unless the width sits within ±32 % of a
+    sibling's bw and at least 1.5x off the label's; 'confident' when the
+    plateau clears the floor by >= 20 dB.  A plateau that reaches the
+    capture's band edge is unmeasurable — keep the label.
+    """
+    import math as _math
+    try:
+        from scipy.ndimage import median_filter as _medf
+    except ImportError:
+        return None
+    nfft = 1024
+    nseg = len(iq) // nfft
+    if nseg < 4 or not fs:
+        return None
+    _win = np.hanning(nfft).astype(np.float32)
+    S = np.abs(np.fft.fft(iq[:nseg * nfft].reshape(nseg, nfft) * _win, axis=1)) ** 2
+    db = 10.0 * np.log10(np.fft.fftshift(S.max(axis=0)) + 1e-20)
+    fres = fs / float(nfft)
+    k = max(3, int(round((bw / 16.0) / fres)) | 1)
+    dbf = _medf(db, size=k, mode='nearest')
+    floor = float(np.median(dbf))
+    ex = float(dbf.max() - floor)
+    if ex < 6.0:
+        return None
+    thr = floor + max(6.0, ex / 2.0)
+    c = int(np.argmax(dbf)); lo = c; hi = c
+    while lo > 0 and dbf[lo - 1] > thr:
+        lo -= 1
+    while hi < nfft - 1 and dbf[hi + 1] > thr:
+        hi += 1
+    if lo <= 1 or hi >= nfft - 2:
+        return None
+    w = (hi - lo + 1) * fres
+    fam = [(sf + 2 * j, bw * 2.0 ** j) for j in (-2, -1, 1, 2)
+           if 7 <= sf + 2 * j <= 12 and 31000.0 <= bw * 2.0 ** j <= 500000.0]
+    if not fam:
+        return None
+    best = min(fam, key=lambda t: abs(_math.log2(w / t[1])))
+    if abs(_math.log2(w / best[1])) >= 0.4 or abs(_math.log2(w / bw)) < 0.6:
+        return None
+    _bw2 = best[1]
+    if abs(_bw2 - round(_bw2)) < 1e-6:
+        _bw2 = int(round(_bw2))
+    return {'sf': int(best[0]), 'bw': _bw2, 'width_hz': w, 'excess_db': ex,
+            'confident': ex >= 20.0}
+
+
 def process_file(fpath, relay_after=None, relay_before=None,
-                 _iq_override=None, _allow_rescue=True, _budget_override=None):
+                 _iq_override=None, _allow_rescue=True, _budget_override=None,
+                 _label_override=None):
+    """Decode a capture: alias front-end around _process_file_label.
+
+    Top-level calls measure the burst's occupied bandwidth once; a
+    confident same-slope mismatch relabels BEFORE decoding (the clean
+    path), a weaker one keeps the filename label and retries at the
+    sibling only if nothing was emitted — so a correct label can never be
+    made worse.  Rescue re-entries (_iq_override / _allow_rescue=False)
+    pass straight through with the relabel they were given.
+    """
+    if (_iq_override is not None or not _allow_rescue
+            or _label_override is not None):
+        return _process_file_label(fpath, relay_after, relay_before,
+                                   _iq_override, _allow_rescue,
+                                   _budget_override, _label_override)
+    alias = None
+    sf0 = bw0 = None
+    try:
+        sf0, bw0, fs0 = _label_from_name(os.path.basename(fpath))
+        if fs0:
+            _iq0 = np.fromfile(fpath, dtype=np.complex64)
+            alias = _alias_from_occupied_width(_iq0, fs0, sf0, bw0)
+            del _iq0
+    except Exception:
+        alias = None
+    if alias is not None and alias['confident']:
+        print("  ALIAS RELABEL: occupied width %.0f kHz (plateau +%.0f dB) fits "
+              "SF%d/%.2fk — filename said SF%d/%.2fk" % (
+                  alias['width_hz'] / 1e3, alias['excess_db'], alias['sf'],
+                  alias['bw'] / 1e3, sf0, bw0 / 1e3))
+        return _process_file_label(fpath, relay_after, relay_before, None, True,
+                                   _budget_override, (alias['sf'], alias['bw']))
+    r = _process_file_label(fpath, relay_after, relay_before, None, True,
+                            _budget_override, None)
+    if alias is not None and not _DECODED_SET and _EMIT_COUNT == 0:
+        print("  ALIAS RETRY: nothing decoded at SF%d/%.2fk; occupied width "
+              "%.0f kHz (plateau +%.0f dB) suggests SF%d/%.2fk — retrying" % (
+                  sf0, bw0 / 1e3, alias['width_hz'] / 1e3, alias['excess_db'],
+                  alias['sf'], alias['bw'] / 1e3))
+        return _process_file_label(fpath, relay_after, relay_before, None, True,
+                                   _budget_override, (alias['sf'], alias['bw']))
+    return r
+
+
+def _process_file_label(fpath, relay_after=None, relay_before=None,
+                 _iq_override=None, _allow_rescue=True, _budget_override=None,
+                 _label_override=None):
     """Decode a captured LoRa IQ file.
 
     relay_after: if set (int), blank out the first relay_after BW-rate symbols
@@ -4901,6 +5029,8 @@ def process_file(fpath, relay_after=None, relay_before=None,
     # real-capture signature. All other preset BWs are filename-exact.
     if bw == 41670:
         bw = 125000.0 / 3.0
+    if _label_override is not None:
+        sf, bw = int(_label_override[0]), _label_override[1]
     N = 1 << sf
     ppm = sf - 2  # reduced rate bits for header
 
@@ -5506,7 +5636,8 @@ def process_file(fpath, relay_after=None, relay_before=None,
             _shifted = (iq * np.exp(-2j * np.pi * _coff * _trescue)).astype(np.complex64)
             try:
                 process_file(fpath, relay_after=relay_after, relay_before=relay_before,
-                             _iq_override=_shifted, _allow_rescue=False, _budget_override=_rescue_bud)
+                             _iq_override=_shifted, _allow_rescue=False, _budget_override=_rescue_bud,
+                             _label_override=_label_override)
             except Exception:
                 pass
             # Stop as soon as a NEW (pkt_id, hop) is recovered — no need to
@@ -5839,7 +5970,8 @@ def process_file(fpath, relay_after=None, relay_before=None,
                     try:
                         process_file(fpath, relay_after=relay_after,
                                      relay_before=relay_before, _iq_override=_iso,
-                                     _allow_rescue=False, _budget_override=6.0)
+                                     _allow_rescue=False, _budget_override=6.0,
+                                     _label_override=_label_override)
                     except Exception:
                         pass
 
