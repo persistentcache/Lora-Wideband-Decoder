@@ -2150,7 +2150,15 @@ def _meshcore_frame_plausible(body):
         return 4 <= body_len <= 16
     if payload_type == 0x04:                # ADVERT: pubkey(32)+ts(4)+sig(64)
         return body_len >= 100
-    return body_len >= 1                    # PATH / TRACE / CONTROL
+    if payload_type == 0x09:                # TRACE: tag(4)|auth(4)|flags(1)|
+        if body_len < 9:                    #        hashes[N*entry]|snr[N]
+            return False
+        _entry = 1 << (body[offset + 8] & 0x03)
+        _rest = body_len - 9
+        # body must split into whole entries and name a plausible route
+        # (same <=16 cap as hop_count); a 39-entry "route" was random bytes
+        return _rest > 0 and _rest % (_entry + 1) == 0 and _rest // (_entry + 1) <= 16
+    return body_len >= 1                    # PATH / CONTROL
 
 
 def parse_meshcore_packet(payload):
@@ -2422,8 +2430,13 @@ def parse_meshcore_packet(payload):
         _flags = payload_rest[8]
         _entry = 1 << (_flags & 0x03)
         _body = payload_rest[9:]
+        # Same implausibility cap as the path hop_count above: a real trace
+        # visits a handful of nodes; a body that parses to >16 entries is
+        # random bytes whose length happened to divide (seen live: 39 hops).
         if _body and len(_body) % (_entry + 1) == 0:
             _n = len(_body) // (_entry + 1)
+            if _n > 16:
+                return None
             rec['mc_trace_tag']  = '%08x' % _tag
             rec['mc_trace_path'] = [_body[i*_entry:(i+1)*_entry].hex() for i in range(_n)]
             rec['mc_trace_snr']  = [int.from_bytes(_body[_n*_entry+i:_n*_entry+i+1],
@@ -4429,8 +4442,22 @@ def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
         meshtastic_shape_ok = False
 
     matches = []
+    # A frame whose explicit header says "no payload CRC" carries no
+    # integrity evidence beyond the 5-bit header checksum, which ~3 % of
+    # random headers pass — and a garbage demod (an alias-labelled capture
+    # of a strong packet) gets dozens of header trials per capture.  Only
+    # LoRaWAN legitimately transmits CRC-off (downlinks; the PHY prior above
+    # already treats CRC-off as a downlink hint).  Meshtastic, MeshCore,
+    # LoRaMesher, Reticulum, RadioHead, APRS and the P2P modules all run
+    # with the payload CRC on, so for them a CRC-less frame cannot be real:
+    # do not let their structural parsers see it (measured live: a CRC-less
+    # alias capture of the user's own SF11/500k burst surfaced as a MeshCore
+    # TRACE with a 39-hop route of random hashes and ±30 dB SNRs).
+    _no_crc = ctx.get('crc_present') is False
     for pname, handler in _proto_candidates(sync_word):
         if pname not in _PROTO_ENABLED:
+            continue
+        if _no_crc and pname != 'lorawan':
             continue
         if len(payload) < 1:
             break
