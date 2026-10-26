@@ -5591,7 +5591,11 @@ class SignalRecorder:
                         # so ACK at +50 ms from DM at SAME carrier stays in
                         # a SEPARATE bucket on SF7 (ttol=49 ms) — exactly
                         # the case a global 0.35 s ceiling would have merged.
-                        _bkey = (_cand_freq, _abs_t_s, _ftol, _dt_win)
+                        # + the capture's (sf, bw) so the decoder's bucket
+                        # dedup can recognise same-slope ALIAS labels of an
+                        # admitted packet (see BackgroundDecoder._bucket_hit).
+                        _bkey = (_cand_freq, _abs_t_s, _ftol, _dt_win,
+                                 int(d['sf']), float(d['bw']))
                         # TRIAL LABEL LADDER (2026-07-16, defect-2 companion):
                         # the decoder locks SF/BW from the capture FILENAME —
                         # it can relabel SF at the same BW (WRONG_SF retry)
@@ -5799,6 +5803,25 @@ class BackgroundDecoder:
         self._decoded_buckets = []       # list of bucket_key tuples (admitted)
         self._inflight_buckets = {}      # bucket_key -> dispatch_timestamp
         self._bucket_lock = threading.Lock()
+        # Host-adaptive sibling wait (Pi 5, 2026-10-26): the in-flight wait
+        # was a fixed 2 s and the in-flight GC 5 s — right where a decode
+        # takes 0.5-1.5 s, wrong where it takes 2-15 s: the mark expired
+        # mid-decode and every overlapping-window capture of the same
+        # packet decoded in full (4 × up to 13 s per packet measured, then
+        # discarded as [DUP]).  Wait as long as a decode can legitimately
+        # take — the fast-tier budget — and track measured job durations;
+        # the wait ends the instant the sibling admits, so fast hosts pay
+        # nothing extra.
+        try:
+            self._fast_budget_s = float(
+                os.environ.get('LORA_DECODE_BUDGET_S', '12.0') or 12.0)
+        except ValueError:
+            self._fast_budget_s = 12.0
+        self._job_dur_ewma = 0.0         # measured decode wall time, EWMA
+        # stale in-flight GC: only a crashed/hung worker leaves an entry
+        # behind (completion clears it), so bound it by the longest legal
+        # fast-tier decode (SF12 scale 2^2.5) with 2x slack
+        self._inflight_max_age_s = max(5.0, 2.0 * self._fast_budget_s * 2 ** 2.5)
         # Diagnostic counters — printed periodically via _diag_print
         self._diag_marks = 0
         self._diag_already_decoded_hits = 0
@@ -6319,10 +6342,37 @@ while True:
             bkey = self._fname_bucket.get(fpath)
             if bkey is None:
                 return False
-            cand_freq, abs_t_s, _, _ = bkey
-            for (df, dt, ftol, ttol) in self._decoded_buckets:
-                if (abs(cand_freq - df) < ftol
-                        and abs(abs_t_s - dt) < ttol):
+            for key in self._decoded_buckets:
+                if self._bucket_hit(bkey, key):
+                    return True
+        return False
+
+    @staticmethod
+    def _bucket_hit(cand, key):
+        """Same RF bucket (exact per-frame tolerances) — OR a same-slope
+        ALIAS of it.  (sf±2k, bw·2^±k) hypotheses are dechirp-degenerate on
+        preamble content, so the gate labels one physical burst with several
+        of them, at carriers up to ±BW/2 apart; each alias capture then burns
+        a full decode budget failing the header checksum (measured 31-47 s
+        per capture on a Pi 5 — 75 % of all decode time on a Meshtastic
+        burst train).  Once one label has ADMITTED (CRC-verified emit), its
+        aliases at an overlapping carrier and the same RF time are copies of
+        that transmission.  Keys without (sf, bw) fall back to the exact
+        bucket test."""
+        cf, ct, cftol, cttol = cand[:4]
+        df, dt, ftol, ttol = key[:4]
+        if abs(cf - df) < ftol and abs(ct - dt) < ttol:
+            return True
+        if len(cand) >= 6 and len(key) >= 6:
+            csf, cbw, ksf, kbw = cand[4], cand[5], key[4], key[5]
+            if ((csf, cbw) != (ksf, kbw) and csf > 0 and ksf > 0
+                    and cbw > 0 and kbw > 0):
+                import math as _math
+                same_slope = abs(_math.log2(cbw / kbw)
+                                 - (csf - ksf) / 2.0) < 1e-6
+                if (same_slope
+                        and abs(cf - df) < max(cbw, kbw) / 2.0 + ftol
+                        and abs(ct - dt) < max(ttol, cttol)):
                     return True
         return False
 
@@ -6351,27 +6401,23 @@ while True:
     # 5.0 s covers SF12 LONG_SLOW decodes (the slowest standard preset) with
     # margin.  If a worker has been holding a bucket longer than this it's
     # presumed crashed/wedged and sibling dispatches proceed normally.
-    _INFLIGHT_MAX_AGE_S = 5.0
-
     def _is_bucket_inflight(self, fpath):
         """True if another worker is currently processing a sibling capture
-        in the same RF bucket as `fpath`.  Auto-GCs entries older than
-        _INFLIGHT_MAX_AGE_S so a crashed worker can't deadlock siblings."""
+        in the same RF bucket (or a same-slope alias bucket) as `fpath`.
+        Auto-GCs entries older than _inflight_max_age_s so a crashed worker
+        can't deadlock siblings."""
         with self._bucket_lock:
             bkey = self._fname_bucket.get(fpath)
             if bkey is None:
                 return False
-            cand_freq, abs_t_s, _, _ = bkey
             now = time.time()
             stale = []
             hit = False
             for key, dispatch_ts in self._inflight_buckets.items():
-                if now - dispatch_ts > self._INFLIGHT_MAX_AGE_S:
+                if now - dispatch_ts > self._inflight_max_age_s:
                     stale.append(key)
                     continue
-                df, dt, ftol, ttol = key
-                if (abs(cand_freq - df) < ftol
-                        and abs(abs_t_s - dt) < ttol):
+                if self._bucket_hit(bkey, key):
                     hit = True
                     break
             for k in stale:
@@ -6730,7 +6776,21 @@ while True:
                 # in-flight entry also has a 5 s GC timeout so a crashed worker
                 # can never deadlock siblings indefinitely.
                 if self._is_bucket_inflight(fpath):
-                    _wait_deadline = time.time() + 2.0
+                    # Wait as long as the sibling can legitimately take: the
+                    # fast-tier budget, or twice the measured job duration if
+                    # that is longer.  The loop exits the moment the sibling
+                    # admits or finishes, so this costs nothing where decodes
+                    # are quick; where they take 2-15 s (Pi 5) the old fixed
+                    # 2 s let every sibling run a full duplicate decode.
+                    # the fast-tier budget scales 2^((sf-7)/2) like the
+                    # decoder's own (SF11 = 4x), so size the wait by the
+                    # capture's SF when the bucket key carries it
+                    _bk = self._fname_bucket.get(fpath)
+                    _sfw = _bk[4] if (_bk is not None and len(_bk) >= 6) else 12
+                    _wait_deadline = time.time() + max(
+                        2.0,
+                        1.5 * self._fast_budget_s * 2.0 ** ((_sfw - 7) * 0.5),
+                        2.0 * self._job_dur_ewma)
                     _skipped = False
                     while time.time() < _wait_deadline:
                         time.sleep(0.1)
@@ -6877,6 +6937,9 @@ while True:
 
                 output = '\n'.join(output_lines)
                 elapsed = time.time() - t_start
+                # measured decode duration → sizes the sibling in-flight wait
+                self._job_dur_ewma = (elapsed if self._job_dur_ewma == 0.0
+                                      else 0.3 * elapsed + 0.7 * self._job_dur_ewma)
                 self._rawlog('JOB', f"{fname} mode={relay_field or '-'} "
                                     f"budget={job_budget} elapsed={elapsed:.1f}s "
                                     f"timed_out={timed_out}", output or '(empty)')
