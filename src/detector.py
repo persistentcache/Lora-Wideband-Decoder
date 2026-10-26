@@ -201,6 +201,49 @@ if _FFT_LIB_CHOICE == 'scipy':
         from numpy.fft import fft as _fft, ifft as _ifft
     _FFT_WORKERS = -1   # high-core hosts: scipy.fft fans out across cores well
 
+
+# Batched per-symbol dechirp FFT (axis=1) through a BOUNDED set of plan
+# shapes.  pyfftw's interface cache plans per full (rows, N) shape and keeps
+# every FFTW object — with its own in/out buffers — alive for 300 s.  The
+# dechirp sites hand it one row per symbol of whatever burst region a
+# candidate peak covers, so rows is a new number nearly every call: a 150 s
+# 5 Msps replay produced 692 distinct shapes (100+ row counts per N) holding
+# ~1.7 GB of buffers, and live on a Pi 5 the gate + 3 workers grew from 1.9
+# to 7.9 GB RSS in 13 min while per-peak detect cost climbed 0.5 → 1.8 s
+# (MEASURE-planning 30-90 ms per new shape, several per peak), driving the
+# budget clamp to cap 0 — windows skipped, short SF8 packets never queued.
+# Rows are zero-padded to a power of two up to a block of ~256k samples and
+# chunked by that block beyond it (each row's transform is independent, so
+# padding rows changes nothing for the real ones): ≤ ~12 shapes per N, each
+# planned once and reused.  scipy's pocketfft has no plan cache and no cost
+# per new shape, so the high-core path stays direct.
+_ROWBLOCK_SAMPLES = 1 << 18
+
+
+def _fft_rows(x):
+    if _FFT_LIB_CHOICE != 'pyfftw':
+        return _fft(x, axis=1)
+    rows, n = x.shape
+    blk = max(16, _ROWBLOCK_SAMPLES // max(1, n))
+    if rows <= blk:
+        p = 1 << max(0, rows - 1).bit_length()
+        if p == rows:
+            return _fft(x, axis=1)
+        buf = np.zeros((p, n), dtype=x.dtype)
+        buf[:rows] = x
+        return _fft(buf, axis=1)[:rows]
+    out = np.empty((rows, n), dtype=np.result_type(x.dtype, np.complex64))
+    for s in range(0, rows, blk):
+        e = min(rows, s + blk)
+        if e - s == blk:
+            out[s:e] = _fft(x[s:e], axis=1)
+        else:
+            buf = np.zeros((blk, n), dtype=x.dtype)
+            buf[:e - s] = x[s:e]
+            out[s:e] = _fft(buf, axis=1)[:e - s]
+    return out
+
+
 MAX_ENERGY_PEAKS = 10
 # Spur rejection: drop peaks more than N dB below the strongest peak.  Only
 # useful when the ADC saturates and generates harmonic spurs; otherwise it
@@ -1935,7 +1978,7 @@ def _hybrid_dechirp_pmr(iq, sf, bw, fs, n_syms=8):
         _r = dechirped.reshape(n_total, N, osf)   # slice-add: see line ~1466
         dechirped = ((_r[:, :, 0] + _r[:, :, 1]) * np.complex64(0.5)
                      if osf == 2 else _r.mean(axis=2))
-    spectra = np.abs(_fft(dechirped, axis=1)) ** 2
+    spectra = np.abs(_fft_rows(dechirped)) ** 2
     peaks = np.max(spectra, axis=1)
     means = np.mean(spectra, axis=1)
     ratios = np.where(means > 0, peaks / means, 0)
@@ -2210,7 +2253,7 @@ def _dechirp_peak_quality_core(iq, sf, bw, agg='best8'):
             dechirped = (_r[:, :, 0] + _r[:, :, 1]) * np.complex64(0.5)
         else:
             dechirped = _r.mean(axis=2)
-    spectra = np.abs(_fft(dechirped, axis=1)) ** 2
+    spectra = np.abs(_fft_rows(dechirped)) ** 2
     peaks = np.max(spectra, axis=1)
     means = np.mean(spectra, axis=1)
     all_ratios = np.where(means > 0, peaks / means, 0)
@@ -2285,7 +2328,7 @@ def _dechirp_scan(nb, sf, bw, nbfs):
             _r = d.reshape(ns, N, osf)            # slice-add: see line ~1466
             d = ((_r[:, :, 0] + _r[:, :, 1]) * np.complex64(0.5)
                  if osf == 2 else _r.mean(axis=2))
-        spec = np.abs(_fft(d, axis=1)) ** 2
+        spec = np.abs(_fft_rows(d)) ** 2
         mn = spec.mean(axis=1)
         ratios = np.where(mn > 0, spec.max(axis=1) / mn, 0.0)
         cs = np.cumsum(ratios)
@@ -2336,7 +2379,7 @@ def find_preamble_bin(iq, sf, bw, fs=None):
     
     iq_syms = iq[:n_syms * N].reshape(n_syms, N)
     dechirped = iq_syms * downchirp
-    spectra = np.abs(_fft(dechirped, axis=1)) ** 2
+    spectra = np.abs(_fft_rows(dechirped)) ** 2
     
     # Find preamble bin via weighted vote histogram (same approach as
     # dechirp_peak_quality).  Preamble symbols all vote for bin K;
