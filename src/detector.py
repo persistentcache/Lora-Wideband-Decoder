@@ -1613,16 +1613,8 @@ def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
         F = fft_cache[0]
         N = len(F)
     else:
+        F = None
         N = _next_fast_len(N0)
-        if N != N0:
-            iqp = np.empty(N, dtype=np.complex64)
-            iqp[:N0] = iq
-            iqp[N0:] = 0
-            F = _fft(iqp)
-        else:
-            F = _fft(iq)
-        if fft_cache is not None:
-            fft_cache.append(F)
 
     # Number of output bins = N * (target_fs / wb_fs)
     n_out = int(round(N * target_fs / wb_fs))
@@ -1632,6 +1624,30 @@ def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
     # Find the center bin corresponding to offset_hz
     freq_per_bin = wb_fs / N
     center_bin = N // 2 + int(round(offset_hz / freq_per_bin))
+
+    # IDENTITY CROP: the whole spectrum at zero offset.  The crop below is
+    # then fftshift(F) and the ifftshift undoes it, so the result is
+    # ifft(fft(iq_padded)) — the input itself, to float rounding.  The
+    # 1 Msps resolver asks for exactly this on most peaks (the 500 kHz
+    # hypothesis of the 1 Msps slice: target_fs == wb_fs, offset 0) and
+    # paid a ~1M-point forward + inverse FFT pair (~130 ms on a Pi 5) to
+    # copy its input.  The forward FFT is still computed — lazily, by the
+    # first narrower hypothesis that needs it.
+    if n_out == N and center_bin == N // 2:
+        result = np.zeros(N, dtype=np.complex64)
+        result[:N0] = iq
+        return result, float(target_fs)
+
+    if F is None:
+        if N != N0:
+            iqp = np.empty(N, dtype=np.complex64)
+            iqp[:N0] = iq
+            iqp[N0:] = 0
+            F = _fft(iqp)
+        else:
+            F = _fft(iq)
+        if fft_cache is not None:
+            fft_cache.append(F)
 
     # Crop n_out bins centered on the signal
     half = n_out // 2
