@@ -100,23 +100,59 @@ if _FFT_LIB_CHOICE == 'pyfftw':
         # minutes per size and crawled a g32 replay to ~45 s/window.  The
         # measured win came from the 262k-1M-pt per-peak sizes, so MEASURE
         # only at or below the cap; ESTIMATE (old behavior) above it.
+        # FACTOR-GATED (Pi 5 @ 5 Msps, 2026-10-26): the planner's search
+        # space explodes with prime factors above 7 — planning the
+        # 997,920 = 2^5·3^4·5·7·11-pt per-peak forward FFT took 184 s on a
+        # 1.5 GHz A76 (vs 1.7 s for a 76×65536 batch, 13 s for 10^6), and
+        # the 76×13108 (= 2^2·29·113) crop 20 s — for a ~10 % execution
+        # gain at those sizes.  Live, the stall sat on the main thread's
+        # [STAT] heartbeat, the web supervisor's 120 s no-telemetry
+        # watchdog killed the detector before the plan (and the wisdom
+        # that would have made it one-time) ever landed, and every restart
+        # paid it again.  So: MEASURE only 7-smooth sizes, where planning
+        # is seconds and the win is real (76×65536: 239 → 152 ms), and cap
+        # at 65536 points per transform: the smooth 10^6-pt sizes measured
+        # 76-97 ms either way on the same Pi 5 while costing 13 s to plan.
+        # LORA_FFTW_MEASURE_MAX raises the cap for hosts that measure a win.
         if os.environ.get('LORA_FFTW_MEASURE', '1') != '0':
             try:
                 _MEASURE_MAX_N = int(os.environ.get('LORA_FFTW_MEASURE_MAX',
-                                                    '4194304'))
+                                                    '65536'))
             except ValueError:
-                _MEASURE_MAX_N = 4194304
+                _MEASURE_MAX_N = 65536
+
+            def _measure_ok(n):
+                if n > _MEASURE_MAX_N:
+                    return False
+                for _p in (2, 3, 5, 7):
+                    while n % _p == 0:
+                        n //= _p
+                return n == 1
+
+            # A call that takes this long planned a new size: persist the
+            # wisdom NOW rather than only at exit — a supervisor recycle or
+            # SIGTERM skips atexit, and the detect-pool workers (forked
+            # children, os._exit) never reach it at all.
+            _PLAN_SAVE_S = 0.5
 
             def _fft(a, axis=-1, workers=None):
-                if a.shape[axis] <= _MEASURE_MAX_N:
-                    return _pyfftw_fft(a, axis=axis,
-                                       planner_effort='FFTW_MEASURE')
+                if _measure_ok(a.shape[axis]):
+                    _t0 = time.perf_counter()
+                    _r = _pyfftw_fft(a, axis=axis,
+                                     planner_effort='FFTW_MEASURE')
+                    if time.perf_counter() - _t0 > _PLAN_SAVE_S:
+                        _save_wisdom()
+                    return _r
                 return _pyfftw_fft(a, axis=axis)
 
             def _ifft(a, axis=-1, workers=None):
-                if a.shape[axis] <= _MEASURE_MAX_N:
-                    return _pyfftw_ifft(a, axis=axis,
-                                        planner_effort='FFTW_MEASURE')
+                if _measure_ok(a.shape[axis]):
+                    _t0 = time.perf_counter()
+                    _r = _pyfftw_ifft(a, axis=axis,
+                                      planner_effort='FFTW_MEASURE')
+                    if time.perf_counter() - _t0 > _PLAN_SAVE_S:
+                        _save_wisdom()
+                    return _r
                 return _pyfftw_ifft(a, axis=axis)
         else:
             _fft, _ifft = _pyfftw_fft, _pyfftw_ifft
