@@ -1529,6 +1529,28 @@ def nb_chunk_for_rate(wb_fs, nominal=65536, top_bw=500_000):
     return best
 
 
+# Zero-IF receivers put their LO-leakage line at exactly DC, inside whatever
+# channel straddles the centre frequency.  A short burst centred on it loses
+# to that line: in the 1 s gate PSD a 40 ms SF7/250k packet averages ~14 dB
+# below the HackRF's DC line, so the per-peak width measured the line (1 bin,
+# 0.2 kHz), the width gate skipped the 250 kHz class, and Schmidl-Cox scored
+# the tone (1.0 at every lag) rather than the chirp — 1 of 11 SF7/250k
+# packets at 915.000 detected, live on a Pi 5 and in replay alike; with the
+# line removed from the IQ, 11 of 11.  The crop spectra are the one place to
+# excise it: exact, free, and every per-peak consumer (matched SC crops,
+# width measurement, resolver dechirp) is downstream of them.  ±300 Hz of a
+# ≥31.25 kHz LoRa channel is a negligible loss, and a genuinely DC-centred
+# chirp spends a vanishing fraction of each symbol inside it.
+_DC_EXCISE_HZ = 300.0
+
+
+def _excise_dc(FF, wb_fs, chunk):
+    k = max(1, int(round(_DC_EXCISE_HZ * chunk / float(wb_fs))))
+    FF[:, :k + 1] = 0
+    FF[:, chunk - k:] = 0
+    return FF
+
+
 def extract_nb_fft_multi_bw(iq, wb_fs, offset_hz, target_bws, chunk=65536,
                             fft_cache=None):
     """
@@ -1555,7 +1577,8 @@ def extract_nb_fft_multi_bw(iq, wb_fs, offset_hz, target_bws, chunk=65536,
     if fft_cache is None or (isinstance(fft_cache, list) and not fft_cache):
         n_chunks = len(iq) // chunk
         if n_chunks >= 1:
-            FF = _fft(iq[:n_chunks * chunk].reshape(n_chunks, chunk), axis=1)
+            FF = _excise_dc(_fft(iq[:n_chunks * chunk].reshape(n_chunks, chunk),
+                                 axis=1), wb_fs, chunk)
         else:
             FF = None
     elif isinstance(fft_cache, np.ndarray):
@@ -3004,7 +3027,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             # is bit-identical (verified) and the dominant per-peak-window win.
             # Kept as the 2-D (n_chunks, chunk) array so each peak's crop is
             # two 2-D slice assignments + one batched ifft (see the extractor).
-            _nb_fft_cache = _ffts
+            _nb_fft_cache = _excise_dc(_ffts, wb_fs, _NB_CHUNK)
         except MemoryError:
             # Heap-fragmented allocation failure (seen on 28Msps + buf-seconds=16
             # ring buffers). Empty cache → per-peak FFTs computed on-demand;
@@ -3294,12 +3317,35 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             if _pkw > _flw * 63.0:            # >= +18 dB: measurable
                 _thw = _pkw / 15.85           # peak - 12 dB
                 _c0 = _wlo + int(np.argmax(_psw[_wlo:_whi]))
-                _lo_w2 = _c0
-                while _lo_w2 > 0 and _psw[_lo_w2 - 1] > _thw:
-                    _lo_w2 -= 1
-                _hi_w2 = _c0
-                while _hi_w2 < 4095 and _psw[_hi_w2 + 1] > _thw:
-                    _hi_w2 += 1
+                # GAP-TOLERANT edge walk: the DC excision (or any narrow
+                # notch/dropout) leaves a few empty bins inside a plateau
+                # that straddles it, and a walk that stops at the first
+                # sub-threshold bin halves the measured width of a
+                # DC-centred chirp — tx150's SF11/250k at 915.000 all
+                # measured ~125 kHz and the same-slope decider handed them
+                # to SF9/125k at ±60 kHz.  Bridge up to _gapw consecutive
+                # sub-threshold bins; the edge is still the LAST bin above
+                # the threshold, so an ungapped plateau measures exactly
+                # as before.
+                _gapw = 4                     # ~1 kHz at 244 Hz/bin
+
+                def _walk_edge(_i, _step):
+                    _last = _i
+                    _gap = 0
+                    _j = _i
+                    while 0 < _j < 4095:
+                        _j += _step
+                        if _psw[_j] > _thw:
+                            _last = _j
+                            _gap = 0
+                        else:
+                            _gap += 1
+                            if _gap > _gapw:
+                                break
+                    return _last
+
+                _lo_w2 = _walk_edge(_c0, -1)
+                _hi_w2 = _walk_edge(_c0, 1)
                 _wh_peak = (_hi_w2 - _lo_w2 + 1) * ((_rate1m or 1e6) / 4096.0)
         for _bwc, _pairs in _by_bw.items():
             # width-gated BW evaluation, STRONG PEAKS ONLY: measured
