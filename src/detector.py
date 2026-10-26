@@ -1415,6 +1415,77 @@ def _emit_run_peaks(psd_db, start, end, min_bins, wide_run_bins, min_sep_bins, p
 
 # ---- Narrowband extraction ----
 
+def _largest_prime_factor(n):
+    n = int(n)
+    if n < 2:
+        return 1
+    lpf, p = 1, 2
+    while p * p <= n:
+        while n % p == 0:
+            lpf, n = p, n // p
+        p += 1
+    return max(lpf, n) if n > 1 else lpf
+
+
+def _odd_part(n):
+    n = int(n)
+    while n > 0 and n % 2 == 0:
+        n //= 2
+    return n
+
+
+_NB_CHUNK_BY_RATE = {}
+
+
+def nb_chunk_for_rate(wb_fs, nominal=65536, top_bw=500_000):
+    """Batched-crop chunk length for the per-peak matched extraction.
+
+    extract_nb_fft_multi_bw crops 2·round(bw·chunk/wb_fs) bins per chunk and
+    the 1 Msps slice comes out at cw·wb_fs/chunk.  At 28 Msps the nominal
+    65536 gives an FFT-friendly width (2340 = 2²·3²·5·13) and the familiar
+    ~999,756 Hz slice; at other rates it does not: 5 Msps → 13108 = 2²·29·113
+    and 6554 = 2·29·113, 10 Msps → 6554, 14 Msps → 4682 = 2·2341 (prime).
+    FFTW and pocketfft fall to generic O(p²) codelets there — measured on a
+    Pi 5: 107 ms for the 76×13108 inverse vs 34 ms for 78×12800 — and the
+    off-1-Msps slice rate (1,000,061 Hz) makes every later
+    extract_narrowband_fft size prime-laden as well (498,930 = 2·3·5·16631,
+    ~100 ms where 28 ms is normal).  So when the nominal chunk's top-BW crop
+    is unfriendly (a prime factor above 13), pick instead the chunk within
+    ±12.5 % of nominal whose top-BW crop is an exact integer bin count, with
+    both the chunk and the crop 13-smooth; prefer the smallest largest-prime,
+    then the most power-of-two content, then proximity to nominal.  The slice
+    then lands at exactly 1.000000 Msps.  Rates where 65536 is already
+    friendly — 28 Msps included — are untouched (byte-identical behaviour).
+    """
+    key = (float(wb_fs), int(nominal), int(top_bw))
+    c = _NB_CHUNK_BY_RATE.get(key)
+    if c is not None:
+        return c
+
+    def _cw(chunk):
+        return 2 * max(4, int(round(top_bw * chunk / wb_fs)))
+
+    best = nominal
+    if _largest_prime_factor(_cw(nominal)) > 13:
+        cands = []
+        span = nominal // 8
+        for chunk in range(nominal - span, nominal + span + 1):
+            m = top_bw * chunk / wb_fs
+            mi = int(round(m))
+            if mi < 4 or abs(m - mi) > 1e-9:
+                continue
+            lp = max(_largest_prime_factor(chunk),
+                     _largest_prime_factor(2 * mi))
+            if lp > 13:
+                continue
+            cands.append((lp, _odd_part(chunk) + _odd_part(2 * mi),
+                          abs(chunk - nominal), chunk))
+        if cands:
+            best = min(cands)[3]
+    _NB_CHUNK_BY_RATE[key] = best
+    return best
+
+
 def extract_nb_fft_multi_bw(iq, wb_fs, offset_hz, target_bws, chunk=65536,
                             fft_cache=None):
     """
@@ -2870,8 +2941,10 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
     # for every energy peak.  We batch-FFT 2D — scipy.fft on a (n_chunks, N)
     # array runs all chunks through pocketfft in one call with `workers=-1`
     # using every CPU core, which is several×faster than a Python loop of
-    # 1-D FFTs.  chunk=65536 is the sweet spot for L2 cache + pocketfft.
-    _NB_CHUNK = 65536
+    # 1-D FFTs.  chunk=65536 is the sweet spot for L2 cache + pocketfft;
+    # nb_chunk_for_rate keeps it unless this rate makes the crop widths
+    # FFT-hostile (5 Msps did — see there).
+    _NB_CHUNK = nb_chunk_for_rate(wb_fs)
     _nc = len(iq) // _NB_CHUNK
     _fftw = int(os.environ.get('LORA_FFT_WORKERS', '-1'))  # -1 = all cores
     if _nc > 0:
