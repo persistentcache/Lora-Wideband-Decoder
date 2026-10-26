@@ -7895,7 +7895,30 @@ def main():
             # pure serial; 2-3-core hosts stay serial (no room to win).
             if str(os.environ.get('LORA_HYBRID', '1')).strip().lower() not in (
                     '0', 'false', 'no', 'off'):
-                _w = 2
+                # THREE workers when memory allows (Pi 5, 4 cores, 5 Msps,
+                # 2026-10-26): with the pool-aware budget a strong-signal
+                # window costs ~2 × 550 ms + 140 ms even at the 2-peak
+                # floor — more than two workers' two hops — so 2-worker
+                # pools wrapped the ring once per dense burst train in every
+                # run (baseline included) while 3 workers had zero drops.
+                # The inline-cost routing keeps quiet windows off the pool,
+                # so the 'constant overhead' that argued for 2 no longer
+                # applies.  Measured footprints at 5 Msps: ~0.8 GB PSS per
+                # worker, ~2 GB main — modelled as a fixed part plus a
+                # multiple of the complex64 window so wider rates size
+                # down; 4 GB hosts stay at 2.
+                _win_b = int(a.rate * a.window) * 8
+                _need_b = ((1.0e9 + 25 * _win_b)            # main
+                           + 3 * (0.5e9 + 8 * _win_b)        # workers
+                           + 1.0e9)                          # reserve
+                try:
+                    with open('/proc/meminfo') as _mi:
+                        _avail_b = 1024 * next(
+                            int(l.split()[1]) for l in _mi
+                            if l.startswith('MemAvailable:'))
+                except Exception:
+                    _avail_b = 0
+                _w = 3 if _avail_b >= _need_b else 2
                 _hybrid = True
         a.detect_workers = _w if _w >= 2 else 0
         print(f"Detect workers: AUTO = "
@@ -7912,18 +7935,26 @@ def main():
         # ring wraps every ~2 min).  Hybrid small hosts get +4: quiet
         # windows bypass the pool entirely there, so the deep slot cushion
         # is unnecessary and shm is the scarce resource on a 4 GB Pi.
-        _n_slots = a.detect_workers + (4 if _hybrid else 8)
+        _n_slots = a.detect_workers + 8
         if _hybrid:
-            # RAM gate: the slots are real anonymous shm.  If they would
-            # eat >30% of MemAvailable, hybrid loses to OOM risk — fall
-            # back to serial (the previous small-host behaviour).
-            _shm_need = _n_slots * _win_n * 8
+            # RAM gate: the slots are real anonymous shm.  Small hosts used
+            # to get +4 slots to save memory, but a shallow table is what
+            # stalls the gate under load: once it fills with heavy windows
+            # (1-3 s each in the workers) dispatch BLOCKS the main thread
+            # until one drains, and the reader banks that time (measured:
+            # a 7-slot table turned a sustained saturated burst into ring
+            # wraps even with the peak budget at its floor).  So take the
+            # +8 the big hosts use when it fits in 30% of MemAvailable,
+            # fall back to +4, and only then to serial.
             try:
                 with open('/proc/meminfo') as _mi:
                     _avail_kb = next(int(l.split()[1]) for l in _mi
                                      if l.startswith('MemAvailable:'))
             except Exception:
                 _avail_kb = 0
+            if _avail_kb and _n_slots * _win_n * 8 > _avail_kb * 1024 * 0.30:
+                _n_slots = a.detect_workers + 4
+            _shm_need = _n_slots * _win_n * 8
             if _avail_kb and _shm_need > _avail_kb * 1024 * 0.30:
                 print(f"Detect pool: hybrid disabled — {_n_slots} slots need "
                       f"{_shm_need/1e9:.1f}GB shm vs "
@@ -8277,7 +8308,12 @@ def main():
                 _sym_t0 = (2 ** _a0['sf']) / _a0['bw']
                 _need_tail_n = int((16 + 4.25 + 8 + 120) * _sym_t0 * a.rate)
                 _acc = 0
+                _prev_seq = it['seq']
                 for _itn in _inflight:
+                    if _itn['seq'] != _prev_seq + 1:
+                        break      # emergency skip left a gap: truncate the
+                                   # tail rather than stitch across it
+                    _prev_seq = _itn['seq']
                     _seg = _pool.slot_array(_itn['slot'])[:win_n][hop_n:]
                     _tparts.append(_seg.copy())
                     _acc += len(_seg)
@@ -8403,6 +8439,7 @@ def main():
           _HYB_PEAKS = 2
       _hyb_inline = 0
       _hyb_pooled = 0
+      _hyb_skipped = 0            # emergency skips (no free slot, pool busy)
       # MEASURED inline cost (Pi 5 @ 5 Msps, 2026-10-26): the peak-count
       # rule alone routed every 1-2-peak window inline on a host where ONE
       # such window costs 400-600 ms against the 500 ms hop, so the main
@@ -8411,12 +8448,12 @@ def main():
       # ring oscillating between the >50 % shed cap and the <30 % inline
       # gate).  Keep an EWMA of inline detect wall time and route to the
       # pool whenever inline would not fit the hop beside the per-window
-      # gate overhead; re-probe inline every 32 pooled windows so a host
-      # whose band goes quiet drifts back to the cheap path.  Hosts where
-      # inline fits (the author's 24-core box) keep the old routing.
+      # gate overhead.  Once the pool has reported costs, its per-peak EWMA
+      # is the estimate (same code, same host), so a host whose band goes
+      # quiet or whose clock recovers drifts back to inline without ever
+      # probing.  Hosts where inline fits (the author's 24-core box) keep
+      # the old routing.
       _hyb_inline_s = 0.0          # EWMA, seconds; 0.0 = not yet measured
-      _hyb_pooled_streak = 0
-      _HYB_REPROBE = 32
 
       def _notch_psd(_pp):
           if a.dc_notch > 0:
@@ -9141,6 +9178,12 @@ def main():
         # touches any of this.
         _cap_budget = _PEAK_CAP_HI
         _avail = reader.available() if is_live else 0
+        # Unfinished pooled windows (results not back yet) — finished-but-
+        # deferred ones (tail assembly for long packets) do not count.
+        _unfinished = 0
+        if _pool is not None and _inflight:
+            _unfinished = sum(1 for _it in _inflight
+                              if not _pool.ready(_it['seq']))
         if _pool is not None:
             # POOL-AWARE (Pi 5 @ 5 Msps, 2026-10-26): pooled windows report
             # their measured detect cost with the result; feed the per-peak
@@ -9174,19 +9217,85 @@ def main():
             # the hop rate: the budget scales by the worker count.
             _n_det = a.detect_workers if _pool is not None else 1
             _bud_s = _hop_budget_s * _n_det * _bgt['margin'] - _bgt['ovh']
-            _cap_new = min(_PEAK_CAP_HI,
-                           max(_BUDGET_CAP_FLOOR, int(_bud_s / _bgt['pp'])))
+            _fit = int(_bud_s / _bgt['pp'])
+            # EMERGENCY FLOOR: when the budget cannot afford even the normal
+            # floor AND the deficit is already real (>= 4 hops of unread
+            # samples), process only the strongest peak per window until the
+            # backlog drains below 2 hops.  Shed-weakest keeps the real
+            # traffic flowing; the alternative is the ring wrapping and a
+            # CATCHUP skip that discards 12+ s wholesale (measured live on a
+            # clipping-strength burst — 3 workers, cap 2, per-peak 560-900 ms
+            # as the clock throttled: two skips, 125 M samples lost).  Both
+            # edges have hysteresis so the floor does not flap.
+            # Level 2 (>= 8 hops banked, whatever the budget math says —
+            # the backlog itself proves the budget was optimistic): skip
+            # whole windows (cap 0: the gate sweep still runs, detect does
+            # not) until it drains below 4 hops.  Measured on a saturated
+            # burst train where one clipped peak alone costs 1.0-1.5 s in
+            # the resolver, level 1 still slipped to a wrap; a skipped
+            # window loses 0.5 s of detection, a wrap loses 12+ s.
+            # Pool-depth trigger for level 2: every worker busy AND the slot
+            # table within one of full means the next heavy dispatch would
+            # block the main thread (the reader banks that time long before
+            # it shows as backlog).  Finished-but-deferred windows (tail
+            # assembly for long packets) do not count — only unfinished ones.
+            # "Choked" = the slot table is (about to be) full AND its head
+            # window is still running — the one configuration in which the
+            # next dispatch would block the main thread (a finished head,
+            # e.g. one held back for a long packet's tail, commits instantly).
+            _pool_choked = (_pool is not None
+                            and len(_inflight) >= _pool.n_slots - 1
+                            and not _pool.ready(_inflight[0]['seq']))
+            _lvl = _bgt.get('emergency', 0)
+            if _avail >= 8 * hop_n or _pool_choked:
+                _lvl = 2
+            elif _lvl == 2 and _avail < 4 * hop_n:
+                _lvl = 1
+            if _lvl < 1 and _fit < _BUDGET_CAP_FLOOR and _avail >= 4 * hop_n:
+                _lvl = 1
+            if _avail < 2 * hop_n:
+                # below a hop of real backlog the pool's backpressure (a
+                # brief blocking commit) is the right response: it costs
+                # latency the ring absorbs, whereas skipping costs detections
+                # (measured: letting a choked pool skip at zero backlog shed
+                # 36 of the first 80 windows of a burst for no gain)
+                _lvl = 0
+            _bgt['emergency'] = _lvl
+            if _lvl >= 2:
+                _cap_new = 0
+            else:
+                _floor = 1 if _lvl == 1 else _BUDGET_CAP_FLOOR
+                _cap_new = min(_PEAK_CAP_HI, max(_floor, _fit))
             # Hysteresis: the int() truncation wobbles +-1 on noisy per-peak
             # EWMAs (measured 34-41 cap transitions per 240 s leg without it);
-            # adopt only >=2 moves.  The ring backstop handles emergencies.
-            if abs(_cap_new - _bgt['cap_last']) >= 2:
+            # adopt only >=2 moves — except into/out of the emergency levels
+            # (caps 0/1), which are 1-step moves that must take effect now.
+            if (_cap_new != _bgt['cap_last']
+                    and (abs(_cap_new - _bgt['cap_last']) >= 2
+                         or min(_cap_new, _bgt['cap_last']) <= 1)):
+                _tag = {0: ' (emergency: skipping windows)',
+                        1: ' (emergency floor)'}.get(_cap_new, '')
                 print(f"[GATE-BUDGET] per-peak {_bgt['pp']*1000:.0f}ms "
                       f"ovh {_bgt['ovh']*1000:.0f}ms "
                       f"hop {_hop_budget_s*1000:.0f}ms x{_n_det} — "
-                      f"budget cap -> {_cap_new}",
+                      f"budget cap -> {_cap_new}{_tag}",
                       file=sys.stderr, flush=True)
                 _bgt['cap_last'] = _cap_new
             _cap_budget = _bgt['cap_last']
+        elif (is_live and _bgt['margin'] > 0.0 and _bgt['pp'] == 0.0
+              and _pool is not None):
+            # BOOTSTRAP: no per-peak cost measured yet.  Until the first
+            # cost report lands, windows go out at the floor rather than
+            # the 24-peak maximum — the first busy window of a session used
+            # to go out uncapped (10-24 peaks, ~7 s in a Pi 5 worker); the
+            # slot table then filled behind it and the forced commit
+            # blocked the main thread on that one result (stack-sampled:
+            # 6.5-7 s in Queue.get at t≈15 s on every start).  Windows at
+            # or below the floor are untouched (they are also the only ones
+            # the hybrid router sends inline), so a small host's quiet
+            # start is unchanged; a big host's first busy window sheds its
+            # weakest peaks once, then runs uncapped.
+            _cap_budget = _BUDGET_CAP_FLOOR
         if is_live:
             _ring_frac = _avail / float(_ring_n_total)
             if _ring_frac > 0.5:
@@ -9201,6 +9310,14 @@ def main():
                     _peak_cap += 1
                     _cap_calm = 0
         _cap_eff = min(_peak_cap, _cap_budget)
+        if _pool is not None:
+            # Propagate floor/emergency caps to windows ALREADY queued (the
+            # workers apply them at task start) so the slot table drains in
+            # milliseconds rather than blocking dispatch for seconds per
+            # heavy window; above the floor the queue runs as dispatched.
+            _pool.set_cap_override(
+                -1 if _cap_eff == 0
+                else (_cap_eff if _cap_eff <= _BUDGET_CAP_FLOOR else 0))
         if len(_gate_peaks) > _cap_eff:
             _gate_peaks.sort(key=lambda p: -p[2])
             _n_shed = len(_gate_peaks) - _cap_eff
@@ -9456,10 +9573,26 @@ def main():
         # through the pool.
         _route_inline = False
         if _pool is not None and _hybrid:
+            # Estimate what THIS window would cost inline: the pool's
+            # worker-reported per-peak cost (same detect_preamble, same
+            # host) once any pooled window has reported, else the inline
+            # EWMA.  No periodic inline re-probe: a probe is a ~1 s stall of
+            # the main thread under load, and 28 of them per 150 s turned a
+            # zero-drop pure-pool run into a ring wrap (measured).
+            if _bgt['pp'] > 0.0:
+                # a no-peak window costs nothing inline (detect is skipped)
+                _est_inline = _bgt['pp'] * len(_gate_peaks)
+            elif _hyb_inline_s > 0.0:
+                _est_inline = _hyb_inline_s
+            else:
+                # nothing measured yet: a window WITH peaks is an unknown-
+                # cost job — keep it off the main thread (the first busy
+                # window of a session stalled the loop ~5 s inline on a
+                # Pi 5); a window without peaks costs nothing inline.
+                _est_inline = 0.0 if not _gate_peaks else float('inf')
             _inline_fits = (
-                _hyb_inline_s == 0.0
-                or _hyb_pooled_streak >= _HYB_REPROBE
-                or (_bgt['ovh'] + _hyb_inline_s
+                _est_inline == 0.0
+                or (_bgt['ovh'] + _est_inline
                     <= (_bgt['margin'] or 0.85) * _hop_budget_s))
             if (len(_gate_peaks) <= _HYB_PEAKS and _inline_fits
                     and (not is_live
@@ -9475,50 +9608,65 @@ def main():
                 _route_inline = not _inflight
             if _route_inline:
                 _hyb_inline += 1
-                _hyb_pooled_streak = 0
             else:
                 _hyb_pooled += 1
-                _hyb_pooled_streak += 1
         if _pool is not None and not _route_inline:
             # --- Multiprocess detect: dispatch this window, commit lagged ---
             # The producer never blocks on detection; workers run it in
             # parallel.  The capture's forward tail is reconstructed in
             # _commit_oldest from the next in-flight window's overlap, so we
             # do NOT read a tail from the ring here.
+            # EMERGENCY (levels >= 1): never block the main thread on a
+            # full slot table.  The oldest window is one already RUNNING
+            # in a worker (queued ones were cut by the cap override), and
+            # waiting on it is exactly the stall that banked 5-7 s of
+            # backlog per burst (stack-sampled in Queue.get).  Skip this
+            # window instead: its samples were read (no ring loss), its
+            # detections are forgone, and the tail builder stops at the
+            # sequence gap so no capture is stitched across it.
+            _skip_win = False
             while _pool.n_free() == 0:
+                if (_bgt.get('emergency', 0) >= 1 and _inflight
+                        and not _pool.ready(_inflight[0]['seq'])):
+                    _skip_win = True
+                    break
                 _commit_oldest()
-            _slot = _pool.acquire_slot()
-            if _lz is not None and buf is None:
-                # MATERIALIZATION TRIGGER (pool): every dispatched window
-                # needs the full c64 window in its slot — commits rebuild
-                # pending packet tails from TRAILING in-flight windows, so
-                # even a no-peak window's slot data can be read later.
-                buf = _lz.materialize()
-            _pool.slot_array(_slot)[:len(buf)] = buf
-            _pool.dispatch(_slot, _seq, len(buf), _psd_gate, _gate_peaks,
-                           spur_db=_spur_db, center=_live_center_mhz,
-                           dechirp_chans=(_win_chans or None))
-            _inflight.append({'seq': _seq, 'slot': _slot,
-                              'pre_hop': pre_hop, 'tot_s': tot_s})
-            _seq += 1
-            # Tail-aware commit: once depth exceeds the base lag, commit the
-            # oldest ONLY when its detection is ready AND enough trailing windows
-            # exist to cover its packet's tail.  Low-SF (tail≈1 window) commits
-            # at the base lag → minimum latency; high-SF (tail spans many
-            # windows) defers until its tail is in flight → complete capture.
-            # Works for EVERY SF/BW with no per-preset tuning.  Capped at 2
-            # commits/iter so a deferral release can't stall the realtime read
-            # (the multi-commit stall that dropped samples in earlier attempts).
-            # The slot-full forced commit above is the backpressure valve.
-            _nc = 0
-            while len(_inflight) > _LAG and _nc < 2:
-                _old = _inflight[0]
-                if not _pool.ready(_old['seq']):
-                    break   # detection not done yet — don't block the reader
-                if len(_inflight) - 1 < _tail_windows_needed(_pool.peek(_old['seq'])):
-                    break   # tail not fully in flight yet — defer (high SF)
-                _commit_oldest()
-                _nc += 1
+            if _skip_win:
+                _hyb_skipped += 1
+                _seq += 1            # the gap the tail builder honours
+            else:
+                _slot = _pool.acquire_slot()
+                if _lz is not None and buf is None:
+                    # MATERIALIZATION TRIGGER (pool): every dispatched window
+                    # needs the full c64 window in its slot — commits rebuild
+                    # pending packet tails from TRAILING in-flight windows, so
+                    # even a no-peak window's slot data can be read later.
+                    buf = _lz.materialize()
+                _pool.slot_array(_slot)[:len(buf)] = buf
+                _pool.dispatch(_slot, _seq, len(buf), _psd_gate, _gate_peaks,
+                               spur_db=_spur_db, center=_live_center_mhz,
+                               dechirp_chans=(_win_chans or None))
+                _inflight.append({'seq': _seq, 'slot': _slot,
+                                  'pre_hop': pre_hop, 'tot_s': tot_s})
+                _seq += 1
+                # Tail-aware commit: once depth exceeds the base lag, commit the
+                # oldest ONLY when its detection is ready AND enough trailing windows
+                # exist to cover its packet's tail.  Low-SF (tail≈1 window) commits
+                # at the base lag → minimum latency; high-SF (tail spans many
+                # windows) defers until its tail is in flight → complete capture.
+                # Works for EVERY SF/BW with no per-preset tuning.  Capped at 2
+                # commits/iter so a deferral release can't stall the realtime read
+                # (the multi-commit stall that dropped samples in earlier attempts).
+                # The slot-full forced commit above is the backpressure valve.
+                _nc = 0
+                while len(_inflight) > _LAG and _nc < 2:
+                    _old = _inflight[0]
+                    if not _pool.ready(_old['seq']):
+                        break   # detection not done yet — don't block the reader
+                    if len(_inflight) - 1 < _tail_windows_needed(_pool.peek(_old['seq'])):
+                        break   # tail not fully in flight yet — defer (high SF)
+                    _commit_oldest()
+                    _nc += 1
             elapsed = time.time() - t_start
             dt = time.time() - tw
             _prof['detect'] += dt
@@ -10144,6 +10292,7 @@ def main():
                      f" backlog={_recent_rate.backlog_s:.2f}s" if _recent_rate else "")
                   + (f" rss={_rss_mb:.0f}M" if _rss_mb else "")
                   + (f" hyb={_hyb_inline}i/{_hyb_pooled}p"
+                     + (f"/{_hyb_skipped}s" if _hyb_skipped else "")
                      if _hybrid and _pool is not None else "")
                   + (f" drops={drops/1e6:.1f}M" if drops else "")
                   + (f" clip={_sat_max*100:.1f}%" if _sat_max > 0.005 else "")
