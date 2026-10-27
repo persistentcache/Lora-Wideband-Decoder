@@ -197,6 +197,8 @@ decoded content.
 
 ## Docs
 
+- [Offline maps](docs/offline-maps.md): local maps and regional map packs for disconnected operation.
+
 - [Identification & protocols](docs/identification.md): how protocols
   are labeled, channel keys, Meshtastic preset list.
 - [Headless mode](docs/headless.md): running it without the web UI.

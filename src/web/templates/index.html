@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LORA Wideband Decoder</title>
 <script src="{{ url_for('static', filename='theme.js') }}"></script>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet/leaflet.css') }}">
+<script src="{{ url_for('static', filename='vendor/leaflet/leaflet.js') }}"></script>
 <link rel="stylesheet" href="{{ url_for('static', filename='workbench.css') }}">
 </head>
 <body>
@@ -81,6 +81,21 @@
   </div>
   <div id="tab-nodes" style="display:none"></div>
   <div id="tab-map" style="display:none">
+    <details id="offline-map-options">
+      <summary>Map settings <span id="offline-map-status" role="status">Loading map…</span></summary>
+      <div class="offline-map-tools">
+        <div class="map-source-setting"><label for="map-source">Map source</label><select id="map-source" aria-describedby="map-source-help"><option value="auto">Auto</option><option value="online">Online</option><option value="offline">Offline</option></select></div>
+        <p id="map-source-help" class="muted">Auto uses the internet map when available and switches to your offline map if the connection drops. Your choice is saved on this device.</p>
+        <h3>Offline maps</h3>
+        <p>The world overview works offline. For streets and trails, load a regional raster MBTiles map onto this receiver before your trip.</p>
+        <div class="offline-map-actions"><label><input type="checkbox" id="offline-map-use" disabled> Use regional map</label><button id="offline-map-fit" disabled>Show map area</button></div>
+        <label for="offline-map-file">Load a map pack (.mbtiles, PNG/JPEG/WebP tiles, up to 1 GB)</label>
+        <input type="file" id="offline-map-file" accept=".mbtiles">
+        <button id="offline-map-upload" disabled>Load onto receiver</button>
+        <div id="offline-map-feedback" role="status"></div>
+        <p class="muted">The map stays on the receiver and is shared with every connected phone. Loading a new pack replaces the previous one. Keep a local or Tailscale connection to the receiver.</p>
+      </div>
+    </details>
     <div id="mapinfo" class="muted" style="padding:6px 2px;font-size:12px"></div>
     <div id="mapc" style="height:calc(100vh - 175px);min-height:420px;border:1px solid var(--line);border-radius:6px"></div>
   </div>
@@ -125,6 +140,7 @@
   </div>
   <button data-mobile-action="btnClear" class="mobile-clear">Clear current session…</button>
 </dialog>
+<script src="{{ url_for('static', filename='offline-map.js') }}"></script>
 <script src="{{ url_for('static', filename='mobile.js') }}"></script>
 <script>
 const PK=[]; let TAB='pkts', FILTER='', PFILT='all', OPEN=new Set(), PK_OPEN=new Set();
@@ -719,7 +735,7 @@ function renderNodes(){
       const _hopline=(n.hopmin!=null?(n.hopmin===0?'<span class="pill">heard directly</span>':'<span class="pill">via '+n.hopmin+' hop'+(n.hopmin===1?'':'s')+'</span>'):'')+(n.mqtt?' <span class="pill" style="color:var(--gateway)">⬆ MQTT gateway</span>':'');
       const ident=(idn||meta.hw||meta.role||_hopline)?`<h4>Identity</h4>${idn?esc(idn)+' ':''}${meta.hw?'<span class="pill">'+esc(meta.hw)+'</span> ':''}${meta.role?'<span class="pill">'+esc(meta.role)+'</span> ':''}${_hopline}<br><br>`:'';
       const um=NODEMETA[n.id]||{}; const note=um.notes?`<h4>Notes</h4>${esc(um.notes)}<br><br>`:''; const watch=um.watch?`<h4>Watchlist</h4><span style="color:var(--warn)">● watching (${esc(um.watch_mode||'highlight')})</span><br><br>`:'';
-      const loc=d.pos?`<h4>Location</h4>📍 ${d.pos.lat}, ${d.pos.lon}${d.pos.alt!=null?' · '+d.pos.alt+'m':''} <a target="_blank" href="https://www.openstreetmap.org/?mlat=${d.pos.lat}&mlon=${d.pos.lon}#map=14/${d.pos.lat}/${d.pos.lon}">map</a><br><br>`:'';
+      const loc=d.pos?`<h4>Location</h4>📍 ${d.pos.lat}, ${d.pos.lon}${d.pos.alt!=null?' · '+d.pos.alt+'m':''} <a href="#map" data-map-lat="${esc(d.pos.lat)}" data-map-lon="${esc(d.pos.lon)}">View on map</a><br><br>`:'';
       const t=d.tel; const tel=t?`<h4>Telemetry</h4>${t.battery!=null?'🔋 '+t.battery+'%':''}${t.voltage!=null?' · '+t.voltage+'V':''}${t.chutil!=null?' · ch '+t.chutil+'%':''}${t.airutil!=null?' · airTX '+t.airutil+'%':''}<br><br>`:'';
       const rt=d.rt; const route=rt?`<h4>Traceroute</h4><span class="mono">${esc(disp(n.id))} → ${rt.route.map(h=>esc(disp(h))).join(' → ')} → ${esc(disp(rt.to))}</span>${rt.snr&&rt.snr.length?'<br><span class="muted">SNR: '+rt.snr.map(s=>esc(s)).join(', ')+'</span>':''}<br><br>`:'';
       const nb=d.nbr; const neigh=nb?`<h4>RF neighbors (${nb.list.length})</h4>${nb.list.map(x=>`<span class="mono">${esc(disp(x.node))}</span>${x.snr!=null?' <span class="muted">'+esc(x.snr)+'dB</span>':''}`).join('<br>')}<br><br>`:'';
@@ -741,6 +757,11 @@ function renderNodes(){
   el.querySelectorAll('.nodemenu').forEach(b=>b.onclick=e=>{e.stopPropagation();
     const tr=b.closest('tr'), r=b.getBoundingClientRect();
     showNodeMenu(tr.dataset.id, r.left, r.bottom);});
+  el.querySelectorAll('[data-map-lat]').forEach(a=>a.onclick=e=>{
+    e.preventDefault();activateTab('map');
+    const lat=Number(a.dataset.mapLat),lon=Number(a.dataset.mapLon);
+    if(MAP&&Number.isFinite(lat)&&Number.isFinite(lon))MAP.setView([lat,lon],15);
+  });
   wireSort(el,'nodes',renderNodes);
   const f2=$('#filter2'); if(f2)f2.oninput=e=>{FILTER=e.target.value.trim();renderNodes();};
 }
@@ -1549,10 +1570,10 @@ function wfRow(d){
 // ---------- MAP (Leaflet) ----------
 let MAP=null, MAP_LAYER=null;
 function renderMap(){
-  if(!window.L){ $('#mapinfo').textContent='map library failed to load (offline? Leaflet loads from a CDN).'; return; }
+  if(!window.L){ $('#mapinfo').textContent='Local map library failed to load. Refresh the page or check the receiver installation.'; return; }
   if(!MAP){
-    MAP=L.map('mapc',{preferCanvas:true}).setView([20,0],2);
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap'}).addTo(MAP);
+    MAP=L.map('mapc',{preferCanvas:false,maxZoom:22}).setView([20,0],2);
+    OfflineMap.init(MAP);
     MAP_LAYER=L.layerGroup().addTo(MAP);
     setTimeout(()=>{MAP.invalidateSize();drawMap();},60);
   } else { MAP.invalidateSize(); }
