@@ -4,123 +4,61 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LORA Wideband Decoder</title>
+<script src="{{ url_for('static', filename='theme.js') }}"></script>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<style>
-  :root{--bg:#0e1116;--panel:#161b22;--panel2:#1c232c;--line:#2b333d;--fg:#d6dee7;
-        --mut:#8b97a5;--acc:#3fa7ff;--ok:#37d67a;--enc:#ffb454;--warn:#ff5d5d;}
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,monospace}
-  header{display:flex;align-items:center;gap:14px;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:6}
-  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:.3px}
-  .stats{display:flex;gap:16px;margin-left:auto;color:var(--mut);font-size:12px;align-items:center}
-  .stats b{color:var(--fg)}
-  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
-  .dot.on{background:var(--ok)} .dot.off{background:var(--warn)}
-  button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 11px;cursor:pointer;font-size:12px}
-  button:hover{border-color:var(--acc)}
-  button.go{border-color:var(--ok);color:var(--ok)} button.stop{border-color:var(--warn);color:var(--warn)}
-  nav{display:flex;gap:2px;padding:0 16px;background:var(--panel);border-bottom:1px solid var(--line)}
-  nav a{padding:9px 16px;color:var(--mut);cursor:pointer;border-bottom:2px solid transparent}
-  nav a.active{color:var(--fg);border-bottom-color:var(--acc)}
-  .toolbar{display:flex;gap:8px;align-items:center;padding:10px 16px;flex-wrap:wrap}
-  .toolbar input[type=text]{background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--fg);padding:6px 10px;width:260px;font-size:12px}
-  #sesspanel input[type=text]{background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--fg);padding:5px 9px;font-size:12px}
-  .toolbar label{color:var(--mut);font-size:12px;display:flex;align-items:center;gap:5px}
-  .chip{padding:4px 10px;border:1px solid var(--line);border-radius:14px;cursor:pointer;color:var(--mut);font-size:12px}
-  .chip.active{color:var(--fg);border-color:var(--acc);background:rgba(63,167,255,.1)}
-  .wrap{padding:0 16px 40px}
-  table{width:100%;border-collapse:collapse;font-size:12px}
-  th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
-  th{position:sticky;top:0;background:var(--panel2);color:var(--mut);cursor:pointer;user-select:none;font-weight:600}
-  th:hover{color:var(--fg)} th.sorted::after{content:" \25BE";color:var(--acc)} th.sorted.asc::after{content:" \25B4"}
-  tbody tr:hover{background:var(--panel)}
-  .mono,td.mono{font-family:ui-monospace,Menlo,monospace}
-  .tag{border-radius:4px;padding:1px 7px;font-size:11px;font-weight:600}
-  .tag.dec{background:rgba(55,214,122,.15);color:var(--ok)}
-  .tag.enc{background:rgba(255,180,84,.15);color:var(--enc)}
-  .pill{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:1px 7px;color:var(--mut);font-size:11px}
-  .rssi{font-variant-numeric:tabular-nums}
-  .muted{color:var(--mut)} .right{text-align:right}
-  .empty{color:var(--mut);padding:40px;text-align:center}
-  tr.noderow{cursor:pointer} tr.noderow .caret{display:inline-block;width:12px;color:var(--mut)}
-  tr.noderow.open .caret{color:var(--acc)}
-  tr.pktrow{cursor:pointer} tr.pktrow .caret{display:inline-block;width:12px;color:var(--mut)}
-  tr.pktrow.open .caret{color:var(--acc)}
-  tr.pktrow:hover{background:rgba(255,255,255,.03)}
-  .pktdetailbox{padding:12px 16px;display:grid;grid-template-columns:1fr 1.2fr;gap:18px}
-  .pktdetailbox > div > div{padding:2px 0;line-height:1.5}
-  .pktdetailbox h4{margin:0 0 6px;font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.4px}
-  .rowbtn{background:rgba(63,167,255,.12);border:1px solid var(--line);border-radius:4px;cursor:pointer;
-          font-size:11px;line-height:1;padding:2px 6px;color:var(--acc);vertical-align:middle;margin-left:4px}
-  .rowbtn:hover{background:rgba(63,167,255,.30)}
-  .detail{background:#10151c}
-  .detail td{padding:0}
-  .detailbox{padding:12px 16px;display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:18px}
-  .detailbox h4{margin:0 0 6px;font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.4px}
-  .msglist{max-height:220px;overflow:auto} .msglist div{padding:2px 0;border-bottom:1px solid var(--line)}
-  .bar{height:6px;background:var(--panel2);border-radius:3px;overflow:hidden;margin-top:3px} .bar>i{display:block;height:100%;background:var(--acc)}
-  #net{width:100%;height:72vh;background:radial-gradient(circle at 50% 40%,#121821,#0e1116);border:1px solid var(--line);border-radius:8px;display:block}
-  .netlegend{display:flex;gap:16px;color:var(--mut);font-size:12px;padding:8px 2px}
-  .swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:5px;vertical-align:middle}
-</style>
+<link rel="stylesheet" href="{{ url_for('static', filename='workbench.css') }}">
 </head>
 <body>
+<a class="skip-link" href="#workspace">Skip to workspace</a>
+<aside class="sidebar">
+  <div class="brand"><span class="brand-mark" aria-hidden="true">≋</span><div>LoRa<span>Wideband Decoder</span></div></div>
+  <div class="nav-label">WORKSPACE</div>
+  <nav aria-label="Workspace">
+    <a href="#pkts" data-tab="pkts" class="active">Packets</a>
+    <a href="#nodes" data-tab="nodes">Nodes</a>
+    <a href="#net" data-tab="net">Network</a>
+    <a href="#wf" data-tab="wf">Waterfall</a>
+    <a href="#map" data-tab="map">Map</a>
+    <a href="#search" data-tab="search">Search</a>
+    <a href="#stats" data-tab="stats">Statistics</a>
+    <a href="#config" data-tab="config">Configuration</a>
+  </nav>
+  <div class="sidebar-bottom">
+    <button id="btnTheme" type="button" aria-label="Switch to light mode">Light mode</button>
+    <div class="sidebar-foot">LoRa receiver<br><span class="muted">Live spectrum · local decoding</span></div>
+  </div>
+</aside>
 <header>
-  <h1>LORA Wideband Decoder</h1>
-  <span class="muted" id="center"></span>
-  <div class="stats">
-    <span><span class="dot off" id="pipedot"></span><span id="pipetxt">stopped</span></span>
-    <span>pkts <b id="s_pkts">0</b></span>
-    <span>decoded <b id="s_dec">0</b></span>
-    <span>encrypted <b id="s_enc">0</b></span>
-    <span>nodes <b id="s_nodes">0</b></span>
-    <button class="go" id="btnStart">Start</button>
-    <button class="stop" id="btnStop" style="display:none">Stop</button>
-    <button id="btnSessions" title="Session manager: save / open / delete sessions, auto-save, session folder, import & export">Sessions<span id="sessauto" class="muted" style="font-size:10px;margin-left:5px"></span></button>
-    <button id="btnClear" title="Start a new session (clears the display; saved sessions are kept)">Clear</button>
+  <div class="receiver"><span class="dot off" id="pipedot"></span><span id="pipetxt">stopped</span><span class="muted mono" id="center"></span></div>
+  <div class="header-actions">
+    <button class="go" id="btnStart">Start receiver</button>
+    <button class="stop" id="btnStop" style="display:none">Stop receiver</button>
+    <button id="btnSessions" title="Save, open, import and export sessions">Sessions<span id="sessauto" class="muted"></span></button>
+    <button id="btnClear" title="Start a new session; saved sessions are kept">Clear</button>
+    <button id="bell" title="Alerts">Alerts <span id="bellct" style="display:none"></span></button>
   </div>
 </header>
-<nav>
-  <a data-tab="pkts" class="active">Packets</a>
-  <a data-tab="nodes">Nodes</a>
-  <a data-tab="net">Network</a>
-  <a data-tab="wf">Waterfall</a>
-  <a data-tab="map">Map</a>
-  <a data-tab="search">Search</a>
-  <a data-tab="stats">Stats</a>
-  <a data-tab="config">Config</a>
-  <span id="bell" title="Alerts" style="margin-left:auto;align-self:center;cursor:pointer;position:relative;padding:0 14px;font-size:15px">🔔<span id="bellct" style="display:none;position:absolute;top:-2px;right:6px;background:var(--warn);color:#fff;border-radius:9px;font-size:10px;padding:0 5px;line-height:15px"></span></span>
-  <span id="healthbar" style="align-self:center;font-size:12px;color:var(--mut);padding-right:12px"></span>
-</nav>
-<div id="warnbar" style="display:none;background:rgba(255,93,93,.15);color:#ff8c8c;padding:7px 16px;border-bottom:1px solid var(--warn);font-size:12px"></div>
-<div class="wrap">
+<section class="session-strip" aria-label="Session totals">
+  <span>Packets <b id="s_pkts">0</b></span><span>Decoded <b id="s_dec">0</b></span>
+  <span>Encrypted <b id="s_enc">0</b></span><span>Nodes <b id="s_nodes">0</b></span>
+  <span id="healthbar"></span>
+</section>
+<div id="warnbar" style="display:none;background:rgba(206,150,146,.15);color:var(--warn);padding:7px 16px;border-bottom:1px solid var(--warn);font-size:12px"></div>
+<main class="wrap" id="workspace" tabindex="-1">
+  <div class="view-heading"><div><h1 id="view-title">Packets</h1><p id="view-description">Received traffic across the band.</p></div><span class="view-label">RECEIVER WORKSPACE</span></div>
   <div id="tab-pkts">
     <div class="toolbar">
-      <input type="text" id="filter" placeholder="filter (node id, text, channel, type)…">
-      <span class="chip active" data-f="all">all</span>
-      <span class="chip" data-f="dec">decoded</span>
-      <span class="chip" data-f="enc">encrypted</span>
-      <span class="chip" data-f="text">text</span>
-      <span class="chip" data-f="pos">position</span>
-      <span class="chip" data-f="nodeinfo">nodeinfo</span>
-      <span class="chip" data-f="telem">telemetry</span>
-      <span class="chip" data-f="meshtastic" style="border-color:var(--ok)">Meshtastic</span>
-      <span class="chip" data-f="lorawan" style="border-color:var(--acc)">LoRaWAN</span>
-      <span class="chip" data-f="meshcore" style="border-color:var(--acc)">MeshCore</span>
-      <span class="chip" data-f="loramesher" style="border-color:var(--acc)">LoRaMesher</span>
-      <span class="chip" data-f="lora_aprs" style="border-color:var(--acc)">LoRa APRS</span>
-      <span class="chip" data-f="reticulum" style="border-color:var(--acc)">Reticulum</span>
-      <span class="chip" data-f="disaster_radio" style="border-color:var(--acc)">disaster.radio</span>
-      <span class="chip" data-f="ebyte_lora" style="border-color:var(--acc)">EByte LoRa</span>
-      <span class="chip" data-f="radiohead" style="border-color:var(--acc)">RadioHead</span>
-      <span class="chip" data-f="sidewalk" style="border-color:var(--acc)">Sidewalk</span>
-      <span class="chip" data-f="meshcom" style="border-color:var(--acc)">MeshCom</span>
-      <span class="chip" data-f="unknown" style="border-color:var(--warn)">unknown</span>
+      <label class="search-field"><span>Search</span><input type="search" id="filter" placeholder="Node, message, channel or type" aria-label="Search packets"></label>
+      <label>Show <select id="packet-kind" aria-label="Filter packets">
+        <option value="all">All packets</option>
+        <optgroup label="Content"><option value="dec">Decoded</option><option value="enc">Encrypted</option><option value="text">Text</option><option value="pos">Position</option><option value="nodeinfo">Node info</option><option value="telem">Telemetry</option></optgroup>
+        <optgroup label="Protocol"><option value="meshtastic">Meshtastic</option><option value="lorawan">LoRaWAN</option><option value="meshcore">MeshCore</option><option value="loramesher">LoRaMesher</option><option value="lora_aprs">LoRa APRS</option><option value="reticulum">Reticulum</option><option value="disaster_radio">disaster.radio</option><option value="ebyte_lora">EByte LoRa</option><option value="radiohead">RadioHead</option><option value="sidewalk">Sidewalk</option><option value="meshcom">MeshCom</option><option value="unknown">Unknown</option></optgroup>
+      </select></label>
       <label title="Combine all receptions of the same Meshtastic message (heard direct + heard via 1+ relays) into one row.  When on, the row shows the highest hop count observed for that pktid; when off, every reception is its own row."><input type="checkbox" id="mergeRelays" checked> Merge relays</label>
       <span class="muted" id="shown"></span>
     </div>
-    <div id="mysterybox" style="display:none;margin:8px 0;padding:8px 12px;background:rgba(255,176,32,.06);border:1px solid rgba(255,176,32,.25);border-radius:6px">
+    <div id="mysterybox" style="display:none;margin:8px 0;padding:8px 12px;background:rgba(198,176,133,.06);border:1px solid rgba(198,176,133,.25);border-radius:6px">
       <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" id="mysterytoggle">
         <span><span id="mysterycaret">▾</span> <b>Mystery Devices</b> <span class="muted" id="mysterycount"></span> — recurring unknown transmitters (≥2 sightings)</span>
         <span class="muted" style="font-size:11px">click a row to filter</span>
@@ -149,16 +87,16 @@
   <div id="tab-net" style="display:none">
     <div id="topsummary" class="muted" style="padding:8px 2px;font-size:13px"></div>
     <div class="netlegend">
-      <span><span class="swatch" style="background:#3fa7ff"></span>router / repeater</span>
-      <span><span class="swatch" style="background:#37d67a"></span>client / leaf</span>
-      <span><span class="swatch" style="background:#c77dff"></span>MQTT gateway ⬆</span>
-      <span><span class="swatch" style="background:#37d67a;height:3px;border-radius:0"></span>RF link (green→red = strong→weak SNR)</span>
+      <span><span class="swatch" style="background:var(--radio)"></span>router / repeater</span>
+      <span><span class="swatch" style="background:var(--ok)"></span>client / leaf</span>
+      <span><span class="swatch" style="background:var(--gateway)"></span>MQTT gateway ⬆</span>
+      <span><span class="swatch" style="background:var(--ok);height:3px;border-radius:0"></span>RF link (green→red = strong→weak SNR)</span>
       <span>hN = relay hops from you · node size = RF neighbors</span>
       <label style="display:flex;gap:5px;align-items:center;cursor:pointer"><input type="checkbox" id="rftoggle" checked> show RF links</label>
     </div>
     <svg id="net"></svg>
   </div>
-</div>
+</main>
 
 <script>
 const PK=[]; let TAB='pkts', FILTER='', PFILT='all', OPEN=new Set(), PK_OPEN=new Set();
@@ -267,18 +205,18 @@ function matchFilter(p){
 //  confirmed = behavioral proof (persistent identity + coherent frame counter)
 //  candidate = structurally valid but unverified — treat with caution
 function confBadge(p){const c=p.confidence;
-  const amb=p.ambiguous?' <span class="tag" title="multiple parsers claimed this packet at the same confidence tier — see alternatives in the expanded detail" style="background:rgba(255,176,32,.16);color:#ffb020">⚠ ambiguous</span>':'';
-  if(c==='verified') return ' <span class="tag" title="cryptographically verified (signature or decrypt) — definitely this protocol" style="background:rgba(46,204,113,.18);color:#2ecc71">✓ verified</span>'+amb;
-  if(c==='confirmed')return ' <span class="tag" title="behaviorally confirmed: persistent identity + coherent counter — effectively certain" style="background:rgba(63,167,255,.18);color:var(--acc)">✓ confirmed</span>'+amb;
-  if(c==='candidate')return ' <span class="tag" title="structurally valid but not crypto/behaviorally proven — treat with caution" style="background:rgba(150,150,150,.18);color:#9aa6b2">? candidate</span>'+amb;
+  const amb=p.ambiguous?' <span class="tag" title="multiple parsers claimed this packet at the same confidence tier — see alternatives in the expanded detail" style="background:rgba(198,176,133,.16);color:var(--enc)">⚠ ambiguous</span>':'';
+  if(c==='verified') return ' <span class="tag" title="cryptographically verified (signature or decrypt) — definitely this protocol" style="background:rgba(154,180,156,.18);color:var(--ok)">✓ verified</span>'+amb;
+  if(c==='confirmed')return ' <span class="tag" title="behaviorally confirmed: persistent identity + coherent counter — effectively certain" style="background:rgba(155,174,185,.18);color:var(--acc)">✓ confirmed</span>'+amb;
+  if(c==='candidate')return ' <span class="tag" title="structurally valid but not crypto/behaviorally proven — treat with caution" style="background:rgba(150,150,150,.18);color:var(--mut)">? candidate</span>'+amb;
   return amb;}
 // An 'unknown' frame may structurally RESEMBLE a protocol without being identified.
 // We never claim it — only show a non-committal hint (could be that protocol, or one
 // we haven't implemented).  Promotes to a named protocol only on positive evidence.
 function hintBadge(p){if(!p.hint)return '';
   const nm=PROTO_LABEL[p.hint]||esc(p.hint);
-  const og=(p.on_grid===false)?' <span class="tag" title="off the LoRaWAN channel grid for this region" style="background:rgba(255,93,93,.16);color:var(--warn)">off-grid</span>':'';
-  const kh=(p.mc_known_hops)?' <span class="tag" title="routed through '+p.mc_known_hops+' crypto-verified MeshCore node(s) — needs 2 to confirm" style="background:rgba(63,167,255,.16);color:var(--acc)">via '+p.mc_known_hops+' known</span>':'';
+  const og=(p.on_grid===false)?' <span class="tag" title="off the LoRaWAN channel grid for this region" style="background:rgba(206,150,146,.16);color:var(--warn)">off-grid</span>':'';
+  const kh=(p.mc_known_hops)?' <span class="tag" title="routed through '+p.mc_known_hops+' crypto-verified MeshCore node(s) — needs 2 to confirm" style="background:rgba(155,174,185,.16);color:var(--acc)">via '+p.mc_known_hops+' known</span>':'';
   // Context-aware label: tell the user EXACTLY why this row couldn't reach
   // 'verified', honestly per payload type.  No 'encrypted' claim on frames
   // whose body isn't actually encrypted (ACK / TRACE / CONTROL / PATH /
@@ -320,7 +258,7 @@ function hintBadge(p){if(!p.hint)return '';
     lbl = '? looks like ' + nm;
     ttl = 'structurally resembles ' + nm + ' but NOT identified — unconfirmed, could be an unimplemented protocol';
   }
-  return ' <span class="tag" title="'+ttl+'" style="background:rgba(255,176,32,.16);color:#ffb020">'+lbl+'</span>'+og+kh;}
+  return ' <span class="tag" title="'+ttl+'" style="background:rgba(198,176,133,.16);color:var(--enc)">'+lbl+'</span>'+og+kh;}
 // Inferred-from badge: when a packet matches the calibrated hardware profile
 // of a known node, surface that match.  Profile sources:
 //   - Real Meshtastic node IDs (e.g. !ba6a783c) — calibrated from labeled
@@ -333,15 +271,15 @@ function inferBadge(p){
   const id = String(p.inferred_from);
   const isMystery = id.startsWith('mystery:');
   const lbl = isMystery ? '≈ ' + id.replace('mystery:', '') : '⊕ ' + id;
-  const color = isMystery ? '#9b6dff' : '#2ecc71';
-  const bg = isMystery ? 'rgba(155,109,255,.18)' : 'rgba(46,204,113,.18)';
+  const color = isMystery ? 'var(--gateway)' : 'var(--ok)';
+  const bg = isMystery ? 'rgba(155,109,255,.18)' : 'rgba(154,180,156,.18)';
   const tip = isMystery
     ? `Hardware fingerprint matches a recurring anonymous transmitter (${id.replace('mystery:','')}).  No Meshtastic identity, but RF profile is consistent.  Confidence: ${pct}%.`
     : `Hardware fingerprint matches the calibrated profile for ${id} (Meshtastic-labeled training).  Confidence: ${pct}%.`;
   return ` <span class="tag" title="${esc(tip)}" style="background:${bg};color:${color}">${esc(lbl)} (${pct}%)</span>`;}
 function pktState(p){const pr=proto(p);
-  if(pr==='meshtastic')return '<span class="tag" style="background:rgba(63,167,255,.15);color:var(--acc)">Meshtastic</span>'+(p.decrypted?'<span class="tag dec">decoded</span>':'<span class="tag enc">encrypted'+(p.enc_hex?' ▸':'')+'</span>')+confBadge(p);
-  if(pr==='unknown')return '<span class="tag" style="background:rgba(150,150,150,.16);color:#9aa6b2">unknown</span>'+hintBadge(p)+inferBadge(p)+confBadge(p);
+  if(pr==='meshtastic')return '<span class="tag" style="background:rgba(155,174,185,.15);color:var(--acc)">Meshtastic</span>'+(p.decrypted?'<span class="tag dec">decoded</span>':'<span class="tag enc">encrypted'+(p.enc_hex?' ▸':'')+'</span>')+confBadge(p);
+  if(pr==='unknown')return '<span class="tag" style="background:rgba(150,150,150,.16);color:var(--mut)">unknown</span>'+hintBadge(p)+inferBadge(p)+confBadge(p);
   const lbl=PROTO_LABEL[pr]||esc(pr);
   // For named protocols that haven't reached 'verified' (crypto-grounded)
   // AND have NOT been decrypted, surface the per-type hint badge
@@ -351,7 +289,7 @@ function pktState(p){const pr=proto(p);
   // the proto+confirmed badges suggested "we know what this is" but the
   // body bytes are still ciphertext we never decrypted.
   const hint=(p.confidence!=='verified' && !p.decrypted && p.hint)?hintBadge(p):'';
-  return '<span class="tag" style="background:rgba(63,167,255,.15);color:var(--acc)">'+esc(lbl)+'</span>'+hint+inferBadge(p)+confBadge(p);}
+  return '<span class="tag" style="background:rgba(155,174,185,.15);color:var(--acc)">'+esc(lbl)+'</span>'+hint+inferBadge(p)+confBadge(p);}
 function pktType(p){const pr=proto(p);
   if(pr==='meshtastic')return esc(p.port_name||(p.decrypted?'':'—'));
   if(pr==='lorawan')return esc(p.msg_type||'LoRaWAN');
@@ -423,7 +361,7 @@ function pktDetail(p){
   if(pr==='meshtastic'){
     if(p.port_name) row('port', `<span class="mono">${esc(p.port_name)}</span>`);
     if(p.want_ack) row('flags', '<span class="pill">want_ack</span>');
-    if(p.via_mqtt) row('via', '<span class="pill" style="color:#c77dff">MQTT gateway</span>');
+    if(p.via_mqtt) row('via', '<span class="pill" style="color:var(--gateway)">MQTT gateway</span>');
     if(p.text) row('text', esc(p.text));
     // Decoded payload — the same parsed fields the message column shows, broken
     // out as their own rows so position accuracy / telemetry values are visible
@@ -450,7 +388,7 @@ function pktDetail(p){
     if(p.msg_type) row('msg type', esc(p.msg_type));
     if(p.devaddr) row('DevAddr', `<span class="mono">${esc(p.devaddr)}</span>`);
     if(p.fcnt!=null) row('FCnt', p.fcnt);
-    if(p.on_grid===false) row('grid', '<span class="tag" style="background:rgba(255,93,93,.16);color:var(--warn)">off-grid</span>');
+    if(p.on_grid===false) row('grid', '<span class="tag" style="background:rgba(206,150,146,.16);color:var(--warn)">off-grid</span>');
   } else if(pr==='meshcore'){
     if(p.mc_route) row('route type', esc(p.mc_route));
     if(p.mc_type) row('payload type', esc(p.mc_type));
@@ -540,13 +478,13 @@ function pktDetail(p){
     const mSum = pr==='meshtastic' ? meshSummary(p) : '';
     const mMeaningful = mSum && !/^<span class="muted"/.test(mSum);
     if(p.text){
-      extra = `<div style="margin-top:3px;padding:4px 8px;background:rgba(55,214,122,.08);border-left:2px solid var(--ok,#37d67a);border-radius:3px"><span class="muted" style="font-size:11px">text:</span> ${esc(p.text)}</div>`;
+      extra = `<div style="margin-top:3px;padding:4px 8px;background:rgba(154,180,156,.08);border-left:2px solid var(--ok,var(--ok));border-radius:3px"><span class="muted" style="font-size:11px">text:</span> ${esc(p.text)}</div>`;
     } else if(mMeaningful){
-      extra = `<div style="margin-top:3px;padding:4px 8px;background:rgba(55,214,122,.08);border-left:2px solid var(--ok,#37d67a);border-radius:3px">${mSum}</div>`;
+      extra = `<div style="margin-top:3px;padding:4px 8px;background:rgba(154,180,156,.08);border-left:2px solid var(--ok,var(--ok));border-radius:3px">${mSum}</div>`;
     } else if(decHex){
       const previewBytes = decHex.length > 96 ? decHex.slice(0, 96) + '…' : decHex;
       const previewAscii = (() => { const a = asciiOf(decHex); return a.length > 48 ? a.slice(0, 48) + '…' : a; })();
-      extra = `<div style="margin-top:3px;padding:4px 8px;background:rgba(55,214,122,.08);border-left:2px solid var(--ok,#37d67a);border-radius:3px;font-size:11px">`
+      extra = `<div style="margin-top:3px;padding:4px 8px;background:rgba(154,180,156,.08);border-left:2px solid var(--ok,var(--ok));border-radius:3px;font-size:11px">`
             + `<div><span class="muted">hex:</span> <span class="mono">${esc(previewBytes)}</span></div>`
             + `<div><span class="muted">ascii:</span> <span class="mono">${esc(previewAscii)}</span></div>`
             + `<div class="muted" style="font-size:10px;margin-top:2px">(full grid in right panel)</div></div>`;
@@ -564,18 +502,18 @@ function pktDetail(p){
   let bytes='';
   if(rawHex){
     bytes += `<h4 style="margin-top:10px">RAW bytes (${rawHex.length/2})</h4>`
-          + `<div class="mono" style="white-space:pre-wrap;background:rgba(0,0,0,.25);padding:6px 8px;border-radius:4px;font-size:.85em">${esc(fmtHex(rawHex))}</div>`
+          + `<div class="mono" style="white-space:pre-wrap;background:var(--payload-bg);padding:6px 8px;border-radius:4px;font-size:.85em">${esc(fmtHex(rawHex))}</div>`
           + `<h4 style="margin-top:8px">RAW ASCII</h4>`
-          + `<div class="mono" style="background:rgba(0,0,0,.25);padding:6px 8px;border-radius:4px;font-size:.9em">${esc(asciiOf(rawHex))}</div>`;
+          + `<div class="mono" style="background:var(--payload-bg);padding:6px 8px;border-radius:4px;font-size:.9em">${esc(asciiOf(rawHex))}</div>`;
   } else {
     bytes += `<div class="muted">(no raw bytes captured)</div>`;
   }
   if(decHex){
     const decLabel = p.decrypted ? 'Decrypted' : 'Post-decode';
     bytes += `<h4 style="margin-top:10px">${decLabel} bytes (${decHex.length/2})</h4>`
-          + `<div class="mono" style="white-space:pre-wrap;background:rgba(0,0,0,.25);padding:6px 8px;border-radius:4px;font-size:.85em">${esc(fmtHex(decHex))}</div>`
+          + `<div class="mono" style="white-space:pre-wrap;background:var(--payload-bg);padding:6px 8px;border-radius:4px;font-size:.85em">${esc(fmtHex(decHex))}</div>`
           + `<h4 style="margin-top:8px">${decLabel} ASCII</h4>`
-          + `<div class="mono" style="background:rgba(0,0,0,.25);padding:6px 8px;border-radius:4px;font-size:.9em">${esc(asciiOf(decHex))}</div>`;
+          + `<div class="mono" style="background:var(--payload-bg);padding:6px 8px;border-radius:4px;font-size:.9em">${esc(asciiOf(decHex))}</div>`;
   }
   return `<div class="pktdetailbox"><div>${rows.join('')}</div><div>${bytes}</div></div>`;
 }
@@ -609,7 +547,7 @@ function refreshMystery(){
       +'</tr></thead><tbody>';
     for(const r of rows){
       const ap=r.ascii_pattern?esc(r.ascii_pattern.slice(0,24)):'';
-      const hint=r.hint?` <span class="tag" style="background:rgba(255,176,32,.12);color:#ffb020;font-size:10px">looks like ${esc(r.hint)}</span>`:'';
+      const hint=r.hint?` <span class="tag" style="background:rgba(198,176,133,.12);color:var(--enc);font-size:10px">looks like ${esc(r.hint)}</span>`:'';
       const exp=MYSTERY_EXPANDED.has(r.prefix);
       html+=`<tr class="myrow" data-prefix="${esc(r.prefix)}" style="cursor:pointer">
         <td class="mono"><span style="color:var(--mut)">${exp?'▾':'▸'}</span> ${esc(r.prefix)}…${hint}</td>
@@ -619,7 +557,7 @@ function refreshMystery(){
         <td class="muted">${fmtAgo(r.last_ts)}</td>
       </tr>`;
       if(exp&&r.devices&&r.devices.length){
-        html+=`<tr class="mydetail"><td colspan="5" style="padding:6px 12px;background:rgba(0,0,0,.18)">`
+        html+=`<tr class="mydetail"><td colspan="5" style="padding:6px 12px;background:var(--payload-bg)">`
           +`<div class="muted" style="font-size:11px;margin-bottom:4px">Device clusters (greedy nearest-neighbor on RF fingerprint — DC offset, I/Q imbalance, CFO):</div>`
           +'<table style="width:100%;font-size:11px"><thead><tr>'
           +'<th style="text-align:left">#</th><th style="text-align:right">sightings</th>'
@@ -696,7 +634,7 @@ function renderPkts(){
       : `<span title="received direct from sender (no relay)">0</span>`;
     const key=pktKey(p); const op=PK_OPEN.has(key);
     const cls=['pktrow', op?'open':'', ret?'encrow':''].filter(Boolean).join(' ');
-    const main=`<tr class="${cls}" data-pkey="${esc(key)}" data-pktid="${esc(p.pktid)}" data-hops="${p.hops}"${hi?' style="background:rgba(255,93,93,.13);box-shadow:inset 3px 0 0 var(--warn)"':''}>
+    const main=`<tr class="${cls}" data-pkey="${esc(key)}" data-pktid="${esc(p.pktid)}" data-hops="${p.hops}"${hi?' style="background:rgba(206,150,146,.13);box-shadow:inset 3px 0 0 var(--warn)"':''}>
     <td class="muted"><span class="caret">${op?'▾':'▸'}</span> ${fmtTime(p.ts)}</td>
     <td class="mono muted">${p.freq_mhz!=null?p.freq_mhz.toFixed(3)+'MHz':''}</td>
     <td>${idCell(p.from)}</td><td>${idCell(p.to)}</td>
@@ -709,7 +647,7 @@ function renderPkts(){
   const el=$('#pktbody');
   // Empty-state hint adapts to pipeline state: don't tell the user to press
   // Start if the pipeline is already running.
-  const emptyMsg = PIPE_RUNNING ? 'no packets yet' : 'no packets yet — press Start';
+  const emptyMsg = PK.length ? '<strong>No matching packets</strong><span>Try another search or packet filter.</span>' : PIPE_RUNNING ? '<strong>Listening for packets</strong><span>Received traffic will appear here.</span>' : '<strong>Ready to receive</strong><span>Configure your radio, then start the receiver. You can also open a saved session.</span>';
   el.innerHTML=`<table><thead>${thead(cols,'pkts')}</thead><tbody>${body||`<tr><td colspan=10 class=empty>${emptyMsg}</td></tr>`}</tbody></table>`;
   wireSort(el,'pkts',renderPkts);
   wireRetryMenu(el);
@@ -747,7 +685,7 @@ function renderNodes(){
       const msgs=d.msgs.map(m=>`<div><span class="muted">${fmtTime(m.ts)}</span> <span class="mono">→${esc(m.to)}</span> ${esc(m.text)}${m.maxhop>0?` <span class="pill">↻ hopped ${m.maxhop}×</span>`:''}</div>`).join('')||'<span class=muted>no decoded messages</span>';
       const rssi=n.avg==null?'<span class=muted>no own-tx samples</span>':`avg <b>${n.avg.toFixed(1)}</b> · min ${n.rssiMin} · max ${n.rssiMax} · ${n.rssiN} samples`;
       const meta=d.meta||{}; const idn=meta.long||meta.short;
-      const _hopline=(n.hopmin!=null?(n.hopmin===0?'<span class="pill">heard directly</span>':'<span class="pill">via '+n.hopmin+' hop'+(n.hopmin===1?'':'s')+'</span>'):'')+(n.mqtt?' <span class="pill" style="color:#c77dff">⬆ MQTT gateway</span>':'');
+      const _hopline=(n.hopmin!=null?(n.hopmin===0?'<span class="pill">heard directly</span>':'<span class="pill">via '+n.hopmin+' hop'+(n.hopmin===1?'':'s')+'</span>'):'')+(n.mqtt?' <span class="pill" style="color:var(--gateway)">⬆ MQTT gateway</span>':'');
       const ident=(idn||meta.hw||meta.role||_hopline)?`<h4>Identity</h4>${idn?esc(idn)+' ':''}${meta.hw?'<span class="pill">'+esc(meta.hw)+'</span> ':''}${meta.role?'<span class="pill">'+esc(meta.role)+'</span> ':''}${_hopline}<br><br>`:'';
       const um=NODEMETA[n.id]||{}; const note=um.notes?`<h4>Notes</h4>${esc(um.notes)}<br><br>`:''; const watch=um.watch?`<h4>Watchlist</h4><span style="color:var(--warn)">● watching (${esc(um.watch_mode||'highlight')})</span><br><br>`:'';
       const loc=d.pos?`<h4>Location</h4>📍 ${d.pos.lat}, ${d.pos.lon}${d.pos.alt!=null?' · '+d.pos.alt+'m':''} <a target="_blank" href="https://www.openstreetmap.org/?mlat=${d.pos.lat}&mlon=${d.pos.lon}#map=14/${d.pos.lat}/${d.pos.lon}">map</a><br><br>`:'';
@@ -829,9 +767,9 @@ function tick(){
 }
 // Colour = ROLE (the overarching topology): gateway > backbone > leaf.
 function nodeColor(n){ if(n.id==='broadcast')return '#3a4654';   // app-layer pseudo-node, muted
-  if(n.mqtt)return '#c77dff';                                    // MQTT gateway (internet bridge)
-  if(n.role&&BACKBONE_ROLES.has(n.role))return '#3fa7ff';        // router / repeater (backbone)
-  return '#37d67a'; }                                            // client / leaf
+  if(n.mqtt)return 'var(--gateway)';                                    // MQTT gateway (internet bridge)
+  if(n.role&&BACKBONE_ROLES.has(n.role))return 'var(--radio)';        // router / repeater (backbone)
+  return 'var(--ok)'; }                                            // client / leaf
 function nodeR(n){ if(n.id==='broadcast')return 9;
   const base=(n.role&&BACKBONE_ROLES.has(n.role))?10:7;          // backbone drawn larger
   return base+Math.sqrt(n.deg||0)*2.0; }                         // + RF-neighbour degree
@@ -842,29 +780,29 @@ function drawGraph(){
   // arrowhead markers (grey for decoded, orange for encrypted)
   let s='<defs>'+
     '<marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#5a6b7d"/></marker>'+
-    '<marker id="ahe" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#ffb454"/></marker></defs>';
+    '<marker id="ahe" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="var(--enc)"/></marker></defs>';
   // RF-neighbor links (NeighborInfo) = the real radio topology.  Colour by link
   // quality: strong ≥ -7 dB green, marginal yellow, weak < -15 dB red; SNR on hover.
   for(const e of G.rfedges){ if(e.a===e.b)continue;
     const on=!hv||(e.a.id===hv||e.b.id===hv);
-    const col=(e.snr==null)?'#5a6b7d':(e.snr>=-7?'#37d67a':(e.snr>=-15?'#e8c06a':'#ff5d5d'));
+    const col=(e.snr==null)?'#5a6b7d':(e.snr>=-7?'var(--ok)':(e.snr>=-15?'var(--enc)':'var(--warn)'));
     s+=`<line x1="${e.a.x}" y1="${e.a.y}" x2="${e.b.x}" y2="${e.b.y}" stroke="${col}" stroke-opacity="${on?0.75:0.07}" stroke-width="2"/>`;
     if(hv&&(e.a.id===hv||e.b.id===hv)&&e.snr!=null)
       s+=`<text x="${(e.a.x+e.b.x)/2}" y="${(e.a.y+e.b.y)/2-3}" fill="${col}" font-size="10" text-anchor="middle">${esc(e.snr)}dB</text>`;
   }
   for(const e of G.edges){ if(e.a===e.b)continue;
-    const on=!hv||(e.a.id===hv||e.b.id===hv); const col=e.enc?'#ffb454':'#3a4654';
+    const on=!hv||(e.a.id===hv||e.b.id===hv); const col=e.enc?'var(--enc)':'#3a4654';
     // stop the line at the receiver's circle edge so the arrow (who→whom) shows
     let dx=e.b.x-e.a.x,dy=e.b.y-e.a.y,d=Math.sqrt(dx*dx+dy*dy)||1, r=nodeR(e.b)+8;
     let x2=e.b.x-dx/d*r, y2=e.b.y-dy/d*r;
     s+=`<line x1="${e.a.x}" y1="${e.a.y}" x2="${x2}" y2="${y2}" stroke="${col}" stroke-opacity="${on?0.75:0.07}" stroke-width="${Math.min(6,1+Math.log2(1+e.count))}" marker-end="url(#${e.enc?'ahe':'ah'})"/>`;
   }
   for(const n of G.nodes){ const on=!hv||conn.has(n.id); const r=nodeR(n);
-    const tag=(n.id!=='broadcast'&&n.hopmin!=null)?` <tspan fill="#8b97a5">h${n.hopmin}</tspan>`:'';
-    const gw=n.mqtt?'<tspan fill="#c77dff"> ⬆</tspan>':'';
+    const tag=(n.id!=='broadcast'&&n.hopmin!=null)?` <tspan fill="var(--mut)">h${n.hopmin}</tspan>`:'';
+    const gw=n.mqtt?'<tspan fill="var(--gateway)"> ⬆</tspan>':'';
     s+=`<g opacity="${on?1:0.18}" data-id="${esc(n.id)}" style="cursor:pointer">
-      <circle cx="${n.x}" cy="${n.y}" r="${r}" fill="${nodeColor(n)}" stroke="#0e1116" stroke-width="1.5"/>
-      <text x="${n.x}" y="${n.y-r-5}" fill="#d6dee7" font-size="12" text-anchor="middle" font-family="ui-monospace">${esc(disp(n.id))}${tag}${gw}</text></g>`;
+      <circle cx="${n.x}" cy="${n.y}" r="${r}" fill="${nodeColor(n)}" stroke="var(--bg)" stroke-width="1.5"/>
+      <text x="${n.x}" y="${n.y-r-5}" fill="var(--fg)" font-size="12" text-anchor="middle" font-family="ui-monospace">${esc(disp(n.id))}${tag}${gw}</text></g>`;
   }
   svg.innerHTML=s;
   svg.querySelectorAll('g[data-id]').forEach(g=>{
@@ -912,9 +850,9 @@ function renderHealth(h){
   const hb=$('#healthbar'); if(hb){
     if(h.msps==null){hb.textContent='';}
     else{const rate=h.rate_msps||28, behind=h.msps<0.95*rate;
-      hb.innerHTML=`gate <b style="color:${behind?'#ff8c8c':'var(--ok)'}">${h.msps.toFixed(1)}</b>/${rate.toFixed(0)} Msps`+
+      hb.innerHTML=`gate <b style="color:${behind?'var(--warn)':'var(--ok)'}">${h.msps.toFixed(1)}</b>/${rate.toFixed(0)} Msps`+
         ` · dec_q ${h.dec_q==null?'–':h.dec_q} · pipe ${h.pipe_ms==null?'–':h.pipe_ms}ms`+
-        (h.drops_m?` · <span style="color:#ff8c8c">drops ${h.drops_m}M</span>`:'')+
+        (h.drops_m?` · <span style="color:var(--warn)">drops ${h.drops_m}M</span>`:'')+
         (h.detect_workers?` · ${h.detect_workers}w`:'');}
   }
   // Two banner sources, both feed #warnbar.  preflight_note (set when the
@@ -967,8 +905,8 @@ function _renderConfigBody(){
   ];
   _KROWS.forEach(r=>{r.scope=(r.nodes&&r.nodes.length)?'nodes':'all';});
   const ptag=p=>p==='meshcore'
-    ?'<span class="tag" style="background:rgba(199,125,255,.16);color:#c77dff">MeshCore</span>'
-    :'<span class="tag" style="background:rgba(63,167,255,.16);color:var(--acc)">Meshtastic</span>';
+    ?'<span class="tag" style="background:rgba(176,163,186,.16);color:var(--gateway)">MeshCore</span>'
+    :'<span class="tag" style="background:rgba(155,174,185,.16);color:var(--acc)">Meshtastic</span>';
   const rowHtml=(r,ri)=>{const lock=r.kind==='builtin';
     const keyCell=lock
       ?'<span class="mono" style="opacity:.5" title="built-in public key — value locked">'+esc(r.value)+' 🔒</span>'
@@ -976,7 +914,7 @@ function _renderConfigBody(){
     const scopeCtl='<select class="kscope" data-ri="'+ri+'"><option value="all"'+(r.scope==='all'?' selected':'')+'>all nodes</option><option value="nodes"'+(r.scope==='nodes'?' selected':'')+'>specific</option></select>'
       +' <input type="text" class="knodes" data-ri="'+ri+'" placeholder="!a, !b" value="'+esc((r.nodes||[]).join(', '))+'" style="width:130px;display:'+(r.scope==='nodes'?'':'none')+'">';
     const action=lock?'<span class="muted" style="font-size:11px" title="built-in keys cannot be deleted">locked</span>':'<button class="kdel" data-ri="'+ri+'">delete</button>';
-    return '<tr'+(lock?' style="background:rgba(63,167,255,.05)"':'')+'>'
+    return '<tr'+(lock?' style="background:rgba(155,174,185,.05)"':'')+'>'
       +'<td><input type="number" class="kprio" data-ri="'+ri+'" value="'+r.prio+'" style="width:56px"'+(r.on?'':' disabled')+'></td>'
       +'<td><input type="checkbox" class="ktoggle" data-ri="'+ri+'"'+(r.on?' checked':'')+' title="enable / disable"></td>'
       +'<td>'+ptag(r.proto)+'</td>'
@@ -1012,8 +950,8 @@ function _renderConfigBody(){
       <table style="margin:8px 0;width:100%"><thead><tr><th style="width:34px">on</th><th style="width:90px">protocol</th><th style="width:80px">kind</th><th>label</th><th>pub (8B prefix)</th><th style="width:120px">node id</th><th style="width:160px">notes</th><th></th></tr></thead><tbody>${(KEYS.identities||[]).map((k,ii)=>{
           const isPubOnly = !(k.priv && k.priv.length);
           const kindTag = isPubOnly
-            ? '<span class="tag" title="public-only contact — seeds the routing-hash registry so inbound DMs from this peer can be decrypted using a separate full identity" style="background:rgba(199,125,255,.16);color:#c77dff">pub only</span>'
-            : '<span class="tag" title="full identity — decrypts DMs addressed to this node" style="background:rgba(46,204,113,.18);color:#2ecc71">identity</span>';
+            ? '<span class="tag" title="public-only contact — seeds the routing-hash registry so inbound DMs from this peer can be decrypted using a separate full identity" style="background:rgba(176,163,186,.16);color:var(--gateway)">pub only</span>'
+            : '<span class="tag" title="full identity — decrypts DMs addressed to this node" style="background:rgba(154,180,156,.18);color:var(--ok)">identity</span>';
           return '<tr>'
           +'<td><input type="checkbox" class="itoggle" data-ii="'+ii+'"'+(k.enabled===false?'':' checked')+'></td>'
           +'<td>'+ptag(k.protocol)+'</td>'
@@ -1155,7 +1093,7 @@ function renderSdrConfig(box){
       cfg(q('#sdrrate'),L.rate_hz,1e6); cfg(q('#sdrbw'),L.bandwidth_hz,1e6); cfg(q('#sdrcen'),L.center_mhz,1);
       q('#sdrnote').innerHTML=esc(p.note||'')+' · stream format '+esc(p.format||'')
         +(L.rate_hz?' · max rate '+(L.rate_hz[1]/1e6)+' MHz':'')+(L.bandwidth_hz?' · max bw '+(L.bandwidth_hz[1]/1e6)+' MHz':'')
-        +(liveLim?' · <span style="color:#2ecc71">✓ queried from device</span>':'');
+        +(liveLim?' · <span style="color:var(--ok)">✓ queried from device</span>':'');
       q('#sdrdrvwrap').style.display=(id==='soapy')?'':'none';
       renderGain(id);};
     const clampInput=el=>{const v=parseFloat(el.value); const lo=parseFloat(el.min), hi=parseFloat(el.max);
@@ -1191,10 +1129,10 @@ function renderSdrConfig(box){
         gain:readGain()}};
       if(q('#sdrsel').value==='soapy')body.radio.soapy_driver=q('#sdrdrv').value.trim();
       return fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(x=>x.json());};
-    q('#sdrsave').onclick=()=>saveSdr().then(()=>{q('#sdrresult').innerHTML='<span style="color:#2ecc71">saved — gain &amp; center applied live; rate on next Start</span>'; const _c=parseFloat(q('#sdrcen').value); if(isFinite(_c)&&typeof setHdrCenter==='function')setHdrCenter(_c);});
+    q('#sdrsave').onclick=()=>saveSdr().then(()=>{q('#sdrresult').innerHTML='<span style="color:var(--ok)">saved — gain &amp; center applied live; rate on next Start</span>'; const _c=parseFloat(q('#sdrcen').value); if(isFinite(_c)&&typeof setHdrCenter==='function')setHdrCenter(_c);});
     q('#sdrdetect').onclick=()=>{q('#sdrresult').textContent='detecting…';
       saveSdr().then(()=>fetch('/api/sdr/detect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdr:q('#sdrsel').value})}).then(x=>x.json()).then(res=>{
-        if(res.found)q('#sdrresult').innerHTML='<span style="color:#2ecc71">✓ Found'+(res.serial?' — serial <span class="mono">'+esc(res.serial)+'</span>':'')+'</span>';
+        if(res.found)q('#sdrresult').innerHTML='<span style="color:var(--ok)">✓ Found'+(res.serial?' — serial <span class="mono">'+esc(res.serial)+'</span>':'')+'</span>';
         else q('#sdrresult').innerHTML='<span style="color:var(--warn)">✗ '+esc(res.error||'device not found')+'</span>';
       }).catch(()=>{q('#sdrresult').innerHTML='<span style="color:var(--warn)">✗ detect failed</span>';}));};
   }).catch(()=>{box.innerHTML='';});
@@ -1383,7 +1321,7 @@ function renderAdvancedConfig(box){
     q('#autorestart').onchange=e=>post({auto_restart:e.target.checked});
     q('#iqmode').onchange=e=>post({iq_invert:e.target.value==='inverted'});
     const capStatus=(j)=>{const st=q('#capstatus');if(!st)return;
-      if(j&&j.capture_error){st.innerHTML='<span style="color:#e5534b">'+esc(j.capture_error)+'</span>';}
+      if(j&&j.capture_error){st.innerHTML='<span style="color:var(--warn)">'+esc(j.capture_error)+'</span>';}
       else{st.innerHTML='Captures → <code>'+esc((j&&j.capture_effective_dir)||'')+'</code>. Blank = default. The path is permission-checked; changing storage restarts a running pipeline.';}};
     q('#capram').onchange=e=>{const on=e.target.checked;const row=q('#caprow');if(row)row.style.display=on?'none':'flex';
       post({capture_ram:on}).then(r=>r.json()).then(capStatus);};
@@ -1619,13 +1557,13 @@ function drawMap(){
   for(const id in tracks){
     const pts=tracks[id].slice().sort((a,b)=>a.ts-b.ts);
     const lls=pts.map(p=>[p.lat,p.lon]);
-    if(lls.length>1)L.polyline(lls,{color:'#3fa7ff',weight:2,opacity:.55}).addTo(MAP_LAYER);
+    if(lls.length>1)L.polyline(lls,{color:'var(--radio)',weight:2,opacity:.55}).addTo(MAP_LAYER);
     const last=pts[pts.length-1];
     const unc=uncByNode[id];
     const popupHtml=`<b>${esc(disp(id))}</b><br>${esc(id)}<br>${last.lat.toFixed(5)}, ${last.lon.toFixed(5)}`
       + (pts.length>1?`<br>${pts.length} fixes`:'')
       + (unc?`<br><span class="muted">precision: ±${unc.unc}m (${unc.prec}-bit)</span>`:'');
-    const marker=L.circleMarker([last.lat,last.lon],{radius:7,color:'#0e1116',weight:1.5,fillColor:'#37d67a',fillOpacity:1}).addTo(MAP_LAYER)
+    const marker=L.circleMarker([last.lat,last.lon],{radius:7,color:'var(--bg)',weight:1.5,fillColor:'var(--ok)',fillOpacity:1}).addTo(MAP_LAYER)
       .bindPopup(popupHtml);
     if(unc){
       // Draw the uncertainty circle on popup-open and clear it on close.
@@ -1635,7 +1573,7 @@ function drawMap(){
       marker.on('popupopen', ()=>{
         clearUncCircle();
         UNC_CIRCLE=L.circle([last.lat,last.lon],{
-          radius:unc.unc, color:'#37d67a', weight:1.5, fillColor:'#37d67a', fillOpacity:0.12,
+          radius:unc.unc, color:'var(--ok)', weight:1.5, fillColor:'var(--ok)', fillOpacity:0.12,
           dashArray:'4,4'}).addTo(MAP_LAYER);
       });
       marker.on('popupclose', clearUncCircle);
@@ -1643,7 +1581,7 @@ function drawMap(){
     lls.forEach(ll=>bounds.push(ll));
   }
   for(const p of wps){const w=p.waypoint;
-    L.circleMarker([w.lat,w.lon],{radius:6,color:'#0e1116',weight:1.5,fillColor:'#ffb454',fillOpacity:1}).addTo(MAP_LAYER)
+    L.circleMarker([w.lat,w.lon],{radius:6,color:'var(--bg)',weight:1.5,fillColor:'var(--enc)',fillOpacity:1}).addTo(MAP_LAYER)
       .bindPopup(`<b>${w.icon?esc(w.icon)+' ':''}${esc(w.name||'waypoint')}</b>`+(w.desc?`<br>${esc(w.desc)}`:'')+`<br>from ${esc(disp(p.from))}`);
     bounds.push([w.lat,w.lon]);
   }
@@ -1681,7 +1619,7 @@ function closeCtxMenu(){document.querySelectorAll('.ctxmenu').forEach(m=>m.remov
 function menuItem(label,onClick){
   const d=document.createElement('div'); d.innerHTML=label;
   d.style.cssText='padding:6px 14px;cursor:pointer;font-size:13px;white-space:nowrap;position:relative';
-  d.onmouseenter=()=>d.style.background='rgba(63,167,255,.15)';
+  d.onmouseenter=()=>d.style.background='rgba(155,174,185,.15)';
   d.onmouseleave=()=>d.style.background='';
   if(onClick)d.onclick=e=>{e.stopPropagation();closeCtxMenu();onClick();};
   return d;
@@ -1695,7 +1633,7 @@ function showDecodeMenu(pktid, hops, x, y){
   menu.appendChild(h);
   menu.appendChild(menuItem('All keys',()=>doRetry(pktid,hops,'all')));
   const spec=menuItem('Specific key&nbsp;&nbsp;▸',null);
-  spec.onmouseenter=()=>{ spec.style.background='rgba(63,167,255,.15)';
+  spec.onmouseenter=()=>{ spec.style.background='rgba(155,174,185,.15)';
     if(spec.querySelector('.ctxmenu'))return;
     const r=spec.getBoundingClientRect();
     const sub=document.createElement('div'); sub.className='ctxmenu'; sub.style.cssText=MENU_CSS(r.right-4,r.top);
@@ -1722,12 +1660,12 @@ function showNodeMenu(id,x,y){
   if(m.watch){
     const lbl=document.createElement('div'); lbl.textContent='On watchlist ('+(m.watch_mode||'highlight')+')'; lbl.style.cssText='padding:6px 14px;color:var(--ok);font-size:12px'; menu.appendChild(lbl);
     const ch=menuItem('Change mode&nbsp;&nbsp;▸',null);
-    ch.onmouseenter=()=>{ch.style.background='rgba(63,167,255,.15)'; if(ch.querySelector('.ctxmenu'))return; const r=ch.getBoundingClientRect(); const sub=document.createElement('div'); sub.className='ctxmenu'; sub.style.cssText=MENU_CSS(r.right-4,r.top); ['highlight','alert','both'].forEach(mo=>sub.appendChild(menuItem(mo,()=>postNodeMeta(id,{watch:true,watch_mode:mo})))); ch.appendChild(sub);};
+    ch.onmouseenter=()=>{ch.style.background='rgba(155,174,185,.15)'; if(ch.querySelector('.ctxmenu'))return; const r=ch.getBoundingClientRect(); const sub=document.createElement('div'); sub.className='ctxmenu'; sub.style.cssText=MENU_CSS(r.right-4,r.top); ['highlight','alert','both'].forEach(mo=>sub.appendChild(menuItem(mo,()=>postNodeMeta(id,{watch:true,watch_mode:mo})))); ch.appendChild(sub);};
     menu.appendChild(ch);
     menu.appendChild(menuItem('Remove from watchlist',()=>postNodeMeta(id,{watch:false})));
   } else {
     const add=menuItem('Add to watchlist&nbsp;&nbsp;▸',null);
-    add.onmouseenter=()=>{add.style.background='rgba(63,167,255,.15)'; if(add.querySelector('.ctxmenu'))return; const r=add.getBoundingClientRect(); const sub=document.createElement('div'); sub.className='ctxmenu'; sub.style.cssText=MENU_CSS(r.right-4,r.top);
+    add.onmouseenter=()=>{add.style.background='rgba(155,174,185,.15)'; if(add.querySelector('.ctxmenu'))return; const r=add.getBoundingClientRect(); const sub=document.createElement('div'); sub.className='ctxmenu'; sub.style.cssText=MENU_CSS(r.right-4,r.top);
       [['highlight','highlight new messages red'],['alert','alert on new messages'],['both','highlight + alert']].forEach(([mo,desc])=>sub.appendChild(menuItem(esc(desc),()=>postNodeMeta(id,{watch:true,watch_mode:mo})))); add.appendChild(sub);};
     menu.appendChild(add);
   }
@@ -1911,16 +1849,20 @@ const TABS=['pkts','nodes','net','wf','map','search','stats','config'];
 function activateTab(name){
   if(!TABS.includes(name))name='pkts';
   document.querySelectorAll('nav a').forEach(x=>x.classList.toggle('active',x.dataset.tab===name));
+  const headings={pkts:['Packets','Received traffic across the band.'],nodes:['Nodes','Identities, activity and messages from nearby devices.'],net:['Network','Connections and relay paths between nodes.'],wf:['Waterfall','Live signal activity across the receive bandwidth.'],map:['Map','Positions reported by received nodes.'],search:['Search','Find messages and devices in this session.'],stats:['Statistics','Traffic, protocols and channel activity.'],config:['Configuration','Radio, protocols, keys and receiver preferences.']};
+  $('#view-title').textContent=headings[name][0]; $('#view-description').textContent=headings[name][1];
+  document.querySelectorAll('nav a').forEach(x=>{if(x.dataset.tab===name)x.setAttribute('aria-current','page');else x.removeAttribute('aria-current');});
   TAB=name; TABS.forEach(t=>$('#tab-'+t).style.display=t===TAB?'':'none');
   if(location.hash.slice(1)!==name) history.replaceState(null,'','#'+name);
   renderCurrent();
 }
-document.querySelectorAll('nav a').forEach(a=>a.onclick=()=>activateTab(a.dataset.tab));
+document.querySelectorAll('nav a').forEach(a=>a.onclick=e=>{e.preventDefault();activateTab(a.dataset.tab);});
+window.addEventListener('hashchange',()=>{const tab=location.hash.slice(1);if(TABS.includes(tab))activateTab(tab);});
 $('#filter').oninput=e=>{FILTER=e.target.value.trim();renderPkts();};
 // Merge-relays toggle: when on, collapse multi-reception rows of the same
 // Meshtastic pktid into one row showing the HIGHEST observed hop count.
 $('#mergeRelays').onchange=()=>renderPkts();
-document.querySelectorAll('.chip[data-f]').forEach(c=>c.onclick=()=>{document.querySelectorAll('.chip[data-f]').forEach(x=>x.classList.remove('active'));c.classList.add('active');PFILT=c.dataset.f;renderPkts();});
+$('#packet-kind').onchange=e=>{PFILT=e.target.value;renderPkts();};
 $('#btnStart').onclick=()=>fetch('/api/pipeline/start',{method:'POST'});
 $('#btnStop').onclick=()=>fetch('/api/pipeline/stop',{method:'POST'});
 fetch('/api/settings').then(r=>r.json()).then(s=>{setSessAuto(!!s.autosave);WFON=s.waterfall!==false;
