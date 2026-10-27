@@ -1501,7 +1501,10 @@ def parse_lorawan_packet(payload, rf=None):
         # Type 0/2: MHDR+RejoinType(1)+NetID(3)+DevEUI(8)+RJcount(2)+MIC(4)=19;
         # type 1 swaps NetID for JoinEUI(8) -> 24.  (Was n<18: accepted an
         # 18-byte frame no Rejoin variant can produce.)
-        if n not in (19, 24): return None
+        # RejoinType 0/2 are 19 bytes, type 1 is 24 (TS001 1.1 §6.2.4); an
+        # unchecked type read MIC bytes as the DevEUI and doubled the FP window.
+        if payload[1] not in (0, 1, 2): return None
+        if n != (24 if payload[1] == 1 else 19): return None
     else:                                           # 0b111 Proprietary — unvalidatable w/o keys
         return None
     msg_type = _LORAWAN_MTYPE.get(mtype, "Unknown (%d)" % mtype)
@@ -1556,11 +1559,17 @@ def parse_lorawan_packet(payload, rf=None):
         fopts_len = fctrl & 0x0F
         adr       = bool(fctrl & 0x80)
         ack       = bool(fctrl & 0x20)
-        fpending  = bool(fctrl & 0x10)
+        # bit 4 is FPending on DOWNLINKS only (uplink: ClassB in 1.1 / RFU);
+        # bit 6 is ADRACKReq on uplinks (downlink: RFU).  Odd MTypes are down.
+        _down     = bool(mtype & 1)
+        fpending  = bool(fctrl & 0x10) and _down
+        classb    = bool(fctrl & 0x10) and not _down
+        adrackreq = bool(fctrl & 0x40) and not _down
         fcnt      = int.from_bytes(payload[6:8], 'little')
         fopts_end = 8 + fopts_len
-        ctrl_flags = ",".join(f for f in ["ADR" if adr else "", "ACK" if ack else "",
-                                          "FPending" if fpending else ""] if f)
+        ctrl_flags = ",".join(f for f in ["ADR" if adr else "", "ADRACKReq" if adrackreq else "",
+                                          "ACK" if ack else "", "FPending" if fpending else "",
+                                          "ClassB" if classb else ""] if f)
         print("  DevAddr: %s" % devaddr)
         print("  FCnt: %d%s" % (fcnt, ("  [%s]" % ctrl_flags) if ctrl_flags else ""))
         rec['devaddr'] = devaddr
@@ -1585,7 +1594,8 @@ def parse_lorawan_packet(payload, rf=None):
 # ============================================================================
 # MeshCore packet parser
 # ============================================================================
-_MESHCORE_ROUTE_TYPES   = {0: 'FLOOD', 1: 'DIRECT', 2: 'BACK', 3: 'DIRECT_OOB'}
+_MESHCORE_ROUTE_TYPES   = {0: 'TRANSPORT_FLOOD', 1: 'FLOOD', 2: 'DIRECT',
+                           3: 'TRANSPORT_DIRECT'}   # Packet.h ROUTE_TYPE_*
 _MESHCORE_PAYLOAD_TYPES = {
     0x00: 'REQ',       0x01: 'RESPONSE',  0x02: 'TXT_MSG',  0x03: 'ACK',
     0x04: 'ADVERT',    0x05: 'GRP_TXT',   0x06: 'GRP_DATA', 0x07: 'ANON_REQ',
@@ -2137,7 +2147,7 @@ def _meshcore_frame_plausible(body):
     if payload_type in (0x0A, 0x0F):        # MULTIPART / RAW_CUSTOM: unfalsifiable
         return False
     offset = 1
-    if route_type in (0x00, 0x03):          # FLOOD / DIRECT_OOB transport codes
+    if route_type in (0x00, 0x03):          # TRANSPORT_FLOOD / TRANSPORT_DIRECT codes
         offset += 4
     if len(body) <= offset:
         return False
@@ -2146,7 +2156,7 @@ def _meshcore_frame_plausible(body):
         return False
     hash_count = path_byte & 0x3F
     hash_size  = ((path_byte >> 6) & 0x03) + 1
-    if hash_count > 16:
+    if hash_count * hash_size > 64:          # MAX_PATH_SIZE (Packet.h); 16 dropped real 20-hop floods
         return False
     offset += 1 + hash_count * hash_size
     if len(body) < offset:
@@ -2158,19 +2168,19 @@ def _meshcore_frame_plausible(body):
         return body_len >= 51 and (body_len - 35) % 16 == 0
     if payload_type in (0x05, 0x06):        # GRP_TXT / GRP_DATA
         return body_len >= 19 and (body_len - 3) % 16 == 0
-    if payload_type == 0x03:                # ACK
-        return 4 <= body_len <= 16
+    if payload_type == 0x03:                # ACK: hash(4) [+ attempt(1) + random(1)]
+        return body_len in (4, 6)
     if payload_type == 0x04:                # ADVERT: pubkey(32)+ts(4)+sig(64)
         return body_len >= 100
-    if payload_type == 0x09:                # TRACE: tag(4)|auth(4)|flags(1)|
-        if body_len < 9:                    #        hashes[N*entry]|snr[N]
-            return False
+    if payload_type == 0x09:                # TRACE: tag(4)|auth(4)|flags(1)|route
+        if body_len < 9:                    #   hashes; the per-hop SNR bytes are
+            return False                    #   appended to the packet PATH (Mesh.cpp)
         _entry = 1 << (body[offset + 8] & 0x03)
         _rest = body_len - 9
-        # body must split into whole entries and name a plausible route
-        # (same <=16 cap as hop_count); a 39-entry "route" was random bytes
-        return _rest > 0 and _rest % (_entry + 1) == 0 and _rest // (_entry + 1) <= 16
-    return body_len >= 1                    # PATH / CONTROL
+        return _rest % _entry == 0 and _rest <= 64
+    if payload_type == 0x08:                # PATH: dest|src|MAC(2)|AES-ECB(...)
+        return body_len >= 20 and (body_len - 4) % 16 == 0
+    return body_len >= 1                    # CONTROL
 
 
 def parse_meshcore_packet(payload):
@@ -2207,11 +2217,11 @@ def parse_meshcore_packet(payload):
     if version:
         print("  Version: %d" % version)
     offset = 1
-    if route_type in (0x00, 0x03):          # FLOOD / DIRECT_OOB have transport codes
+    if route_type in (0x00, 0x03):          # TRANSPORT_* routes carry transport codes
         if len(payload) < offset + 4:
             return None        # truncated — cannot positively identify as MeshCore
-        tc1 = int.from_bytes(payload[offset:offset + 2], 'big')
-        tc2 = int.from_bytes(payload[offset + 2:offset + 4], 'big')
+        tc1 = int.from_bytes(payload[offset:offset + 2], 'little')   # uint16 memcpy (Packet.cpp)
+        tc2 = int.from_bytes(payload[offset + 2:offset + 4], 'little')
         print("  Transport: 0x%04X 0x%04X" % (tc1, tc2))
         offset += 4
     if len(payload) <= offset:
@@ -2231,7 +2241,7 @@ def parse_meshcore_packet(payload):
     # likely to be a structural false positive — random bytes whose
     # path_byte coincidentally encodes a huge hop_count.  Live capture
     # caught a noise frame claiming 39 hops; this gate would reject it.
-    if hash_count > 16:
+    if hash_count * hash_size > 64:          # MAX_PATH_SIZE (Packet.h)
         return None
     offset    += 1
     _mc_path = []                              # routing path-hash (pubkey[0]) of each hop
@@ -2295,7 +2305,10 @@ def parse_meshcore_packet(payload):
         # minimum that rules out noise, gives 12 bytes of headroom for
         # protocol extensions, and bounds the upper end so runaway garbage
         # can't satisfy the gate.
-        if _body_len < 4 or _body_len > 16:
+        if _body_len not in (4, 6):               # Mesh.h / BaseChatMesh.cpp: 4 or 6 bytes
+            return None
+    elif payload_type == 0x08:                       # PATH: encrypted like TXT_MSG
+        if _body_len < 20 or (_body_len - 4) % 16 != 0:
             return None
     elif payload_type in (0x0A, 0x0F):                # MULTIPART / RAW_CUSTOM
         # These two have NO protocol-level body format we can validate
@@ -2435,27 +2448,26 @@ def parse_meshcore_packet(payload):
                 _sum.get('len', 0),
                 _sum.get('ascii', '')))
     elif payload_type == 0x09 and len(payload_rest) >= 9:         # TRACE (unencrypted)
-        # Body = tag(4 LE) | auth_code(4 LE) | flags(1) | hashes[N*entry] | snrs[N int8]
-        # flags bits[1:0] = path_sz; entry_size = 1 << path_sz (∈ {1,2,4,8}).
-        # SNRs are int8 with value = SNR_dB × 4 (Mesh.cpp:42-60).
+        # Wire format (Mesh.cpp sendDirect / onRecvPacket): payload =
+        # tag(4) | auth(4) | flags(1) | ROUTE hashes (entry size from flags);
+        # the sender sets path_len=0 and every repeater appends ITS SNR
+        # (int8, dB*4) to the packet-level PATH.  So the hashes are the
+        # requested route and the packet path holds the collected SNRs —
+        # the previous layout (hashes then SNRs inside the payload) never
+        # occurs on air and rejected most real traces.
         _tag = int.from_bytes(payload_rest[0:4], 'little')
         _flags = payload_rest[8]
         _entry = 1 << (_flags & 0x03)
         _body = payload_rest[9:]
-        # Same implausibility cap as the path hop_count above: a real trace
-        # visits a handful of nodes; a body that parses to >16 entries is
-        # random bytes whose length happened to divide (seen live: 39 hops).
-        if _body and len(_body) % (_entry + 1) == 0:
-            _n = len(_body) // (_entry + 1)
-            if _n > 16:
-                return None
+        if len(_body) % _entry == 0 and len(_body) <= 64:
+            _n = len(_body) // _entry
             rec['mc_trace_tag']  = '%08x' % _tag
             rec['mc_trace_path'] = [_body[i*_entry:(i+1)*_entry].hex() for i in range(_n)]
-            rec['mc_trace_snr']  = [int.from_bytes(_body[_n*_entry+i:_n*_entry+i+1],
-                                                    'little', signed=True) / 4.0
-                                    for i in range(_n)]
-            print("  [TRACE] tag=%s hops=%d entry=%d" % (
-                rec['mc_trace_tag'], _n, _entry))
+            rec['mc_trace_snr'] = ([((_h if isinstance(_h, int) else int(str(_h), 16)) ^ 0x80) / 4.0 - 32.0
+                                    for _h in _mc_path]          # int8 (dB*4)
+                                   if hash_size == 1 else [])
+            print("  [TRACE] tag=%s route=%d hops · %d SNR replies" % (
+                rec['mc_trace_tag'], _n, len(rec.get('mc_trace_snr', []))))
     elif payload_type == 0x0B and len(payload_rest) >= 1:         # CONTROL (unencrypted)
         # flags byte: bit7 must be set (Mesh.cpp:69); upper-4 = sub_type, lower-4
         # = node_type (for DISCOVER_RESP).  Only DISCOVER_REQ/RESP are defined
@@ -2479,28 +2491,16 @@ def parse_meshcore_packet(payload):
                 print("  [DISCOVER_RESP] %s · SNR %.1f dB · pub %s" % (
                     rec['mc_disc_ntype'], _snr_dB,
                     rec.get('mc_disc_pub') or '?'))
-    elif payload_type == 0x08 and len(payload_rest) >= 2:         # PATH (route advertisement)
-        # PATH frames carry a discovered route back to the originator after a
-        # FLOOD reaches its destination — they let the next packet in the
-        # conversation use DIRECT routing along the known hops instead of
-        # flooding again.  Body past the standard preamble:
-        #   extra_path_len(1) | extra_path_hashes(extra_path_len) | metadata
-        # We do a defensive structural parse — only claim a PATH if the
-        # advertised path length fits inside the remaining bytes — otherwise
-        # the frame stays a 'looks like MeshCore' candidate.
-        _epl = payload_rest[0]
-        # extra_path_len > 16 is implausible for a real route (MeshCore
-        # mesh diameters are small) and ~94% of random bytes; the cap is
-        # the cheap structural FP filter for PATH.
-        if 0 < _epl <= 16 and len(payload_rest) >= 1 + _epl:
-            rec['mc_path_advertised'] = payload_rest[1:1 + _epl].hex()
-            rec['mc_path_advertised_len'] = _epl
-            _meta = bytes(payload_rest[1 + _epl:])
-            if _meta:
-                rec['mc_path_meta_hex'] = _meta.hex()
-                rec['mc_path_meta_len'] = len(_meta)
-            print("  [PATH] adv=%s (%d hops) meta=%dB" % (
-                rec['mc_path_advertised'].upper(), _epl, len(_meta)))
+    elif payload_type == 0x08 and len(payload_rest) >= 20:        # PATH (returned path)
+        # Encrypted like a TXT_MSG (Mesh.cpp createPathReturn):
+        # dest_hash(1) | src_hash(1) | MAC(2) | AES-ECB(path_len|path|extra).
+        # It was parsed as plaintext (byte 0 read as a hop count), which
+        # produced fabricated routes.  Without the pair's ECDH secret only
+        # the envelope is readable.
+        rec['mc_dest_hash'] = payload_rest[0]
+        rec['mc_src_hash']  = payload_rest[1]
+        print("  [PATH] %02X -> %02X · %d B encrypted" % (
+            payload_rest[1], payload_rest[0], len(payload_rest) - 4))
     elif payload_type == 0x04:                                    # ADVERT (Ed25519-signed)
         _sig_ok = _verify_advert_sig(payload_rest)
         if _sig_ok is False:
@@ -2531,6 +2531,10 @@ def parse_meshcore_packet(payload):
                 rec['lat'] = int.from_bytes(_ad[_ao:_ao + 4], 'little', signed=True) / 1e6
                 rec['lon'] = int.from_bytes(_ad[_ao + 4:_ao + 8], 'little', signed=True) / 1e6
                 _ao += 8
+            if _flags & 0x20:                         # ADV_FEAT1 (uint16)
+                _ao += 2
+            if _flags & 0x40:                         # ADV_FEAT2 (uint16)
+                _ao += 2
             if (_flags & 0x80) and len(_ad) > _ao:
                 rec['mc_name'] = _ad[_ao:].split(b'\x00')[0].decode('utf-8', 'replace')
             if rec.get('mc_name'):
@@ -2772,22 +2776,9 @@ def parse_meshcore_packet(payload):
             # unique frame identifier — surface it so users can see different
             # ACKs as distinct rows.
             _unk_summary = 'ACK 0x' + bytes(payload_rest[:4]).hex()
-        elif payload_type == 0x08 and rec.get('mc_path_advertised'):
-            # PATH — earlier parsing populated mc_path_advertised regardless
-            # of whether identity-gated promotion fired; surface the same
-            # content the promotion paths use.
-            _unk_summary = 'adv: %s (%d hops)' % (
-                rec['mc_path_advertised'].upper(),
-                rec['mc_path_advertised_len'])
-        elif payload_type == 0x09 and rec.get('mc_trace_path'):
-            _unk_summary = 'route: ' + ' → '.join(
-                '%s (%+.1f dB)' % (h.upper(), s)
-                for h, s in zip(rec['mc_trace_path'], rec['mc_trace_snr']))
-        elif payload_type == 0x0B and rec.get('mc_disc_pub'):
-            _unk_summary = '%s · %s · SNR %+.1f dB' % (
-                rec.get('mc_ctrl_sub', '?'),
-                rec.get('mc_disc_ntype', '?'),
-                rec.get('mc_disc_snr', 0))
+        elif payload_type == 0x08 and 'mc_dest_hash' in rec:
+            _unk_summary = 'PATH %02X→%02X · %d B encrypted' % (
+                rec['mc_src_hash'], rec['mc_dest_hash'], len(payload_rest) - 4)
         elif payload_type == 0x0A:                       # MULTIPART
             _unk_summary = '%d bytes (likely encrypted)' % len(payload_rest)
         elif payload_type == 0x0F:                       # RAW_CUSTOM
@@ -2796,8 +2787,8 @@ def parse_meshcore_packet(payload):
             # Catch-all for any payload type not handled above — show body
             # length so the GUI doesn't dump raw hex as a fallback.
             _unk_summary = '%d bytes' % len(payload_rest)
-        _unk = {'proto': 'meshcore', 'hint': 'meshcore',
-                'confidence': 'candidate',
+        _unk = {'proto': 'unknown', 'hint': 'meshcore',       # structure only: ~1.4 % of
+                'confidence': 'candidate',                     # random bytes pass the gate
                 'mc_route': route_name,
                 'mc_type': ptype_name, 'mc_path': _mc_path, 'decrypted': False,
                 'summary': _unk_summary,
@@ -2809,8 +2800,7 @@ def parse_meshcore_packet(payload):
         for _k in ('mc_trace_tag', 'mc_trace_path', 'mc_trace_snr',
                    'mc_ctrl_sub', 'mc_disc_snr', 'mc_disc_tag',
                    'mc_disc_pub', 'mc_disc_ntype', 'mc_ack_crc',
-                   'mc_path_advertised', 'mc_path_advertised_len',
-                   'mc_path_meta_hex', 'mc_path_meta_len'):
+                   'mc_dest_hash', 'mc_src_hash'):
             if _k in rec:
                 _unk[_k] = rec[_k]
         return _unk
@@ -2863,6 +2853,9 @@ _LORAMESHER_MSG_TYPES = {
 # layer promotes on DevAddr+FCnt agreement across frames; Meshtastic's known-
 # node set is rooted in crypto-verified clean decrypts).  A single CRC-16
 # coincidence that satisfies LoRaMesher's structural validator never promotes.
+_LORAMESHER_LEGACY_TYPES = {    # v0.0.x PacketType bitmasks (RoutingTableService era)
+    0x02: 'DATA_P', 0x03: 'NEED_ACK_P', 0x04: 'HELLO_P', 0x0A: 'ACK_P',
+    0x12: 'XL_DATA_P', 0x22: 'LOST_P', 0x42: 'SYNC_P'}
 _LORAMESHER_PENDING = {}    # src(uint16) -> sighting count
 _KNOWN_LORAMESHER_NODES = set()
 
@@ -2876,34 +2869,26 @@ def parse_loramesher_packet(payload, rf=None):
     src = payload[2] | (payload[3] << 8)
     msg_type = payload[4]
     payload_size = payload[5]
-    # --- Strict structural validity (CRC-independent) ---
-    # 1. msg_type must be one of the 14 defined values
-    if msg_type not in _LORAMESHER_MSG_TYPES:
+    if src == 0 or src == 0xFFFF or dst == src:
         return None
-    # 2. src must be nonzero (real node); dst==0xFFFF means broadcast
-    if src == 0 or src == 0xFFFF:
-        return None
-    # 3. payload_size byte must match actual remaining payload EXACTLY.
-    #    LoRaMesher defines payload_size as "message-specific fields +
-    #    payload" — by spec it equals len(payload) - 6 with no slack.
-    #    Earlier versions allowed ±4 bytes "for PHY padding artifacts",
-    #    but the LoRa PHY's whitening / interleave / CRC stripping happens
-    #    BEFORE this parser sees bytes, so application-layer payload_size
-    #    cannot differ from remaining by any amount in a real frame.
-    #    Observed 2026-06-22: 6 of 7 single-shot "loramesher" mystery
-    #    devices in this session had off-by-1-to-4 mismatches (random
-    #    bytes drifting inside the old ±4 tolerance); the 7th matched
-    #    exactly and may or may not be real.  Tightening to exact-match
-    #    drops the structural FP rate by ~5x (3.5% -> 0.4%) without
-    #    affecting any real LoRaMesher frame.
     remaining = len(payload) - 6
-    if payload_size != remaining:
+    legacy = False
+    if msg_type in _LORAMESHER_MSG_TYPES and payload_size == remaining:
+        type_name = _LORAMESHER_MSG_TYPES[msg_type]          # v2 (v1.0.0, 2026-05)
+    elif (len(payload) >= 7 and msg_type in _LORAMESHER_LEGACY_TYPES
+            and payload[6] == len(payload)):
+        # LEGACY LoRaMesher (every release before May 2026 — the installed
+        # base): PacketHeader is 7 bytes, dst u16 | src u16 | type u8 |
+        # id u8 (running sendId) | packetSize u8 = TOTAL length including
+        # the header; types are bitmasks (NEED_ACK_P 0x03 ... SYNC_P 0x42).
+        # Only the v2 layout was modelled, so legacy HELLO/DATA/ACK frames
+        # returned None (byte 5 is the id counter, compared to len-6).
+        legacy = True
+        type_name = _LORAMESHER_LEGACY_TYPES[msg_type] + ' (legacy)'
+        payload_size = len(payload) - 7
+        remaining = payload_size
+    else:
         return None
-    # 4. dst != src (a node addressing itself is nonsensical at this layer)
-    if dst == src:
-        return None
-
-    type_name = _LORAMESHER_MSG_TYPES[msg_type]
     summary = '%s · %04X→%04X · pl=%d' % (
         type_name, src, 0xFFFF if dst == 0xFFFF else dst, payload_size)
 
@@ -2938,6 +2923,7 @@ def parse_loramesher_packet(payload, rf=None):
         'from': '0x%04X' % src,
         'to': 'BROADCAST' if dst == 0xFFFF else '0x%04X' % dst,
         'lm_payload_size': payload_size,
+        'lm_legacy': legacy,
         'decrypted': False,
         'summary': summary,
     }
@@ -2969,26 +2955,43 @@ def parse_lora_aprs_packet(payload, rf=None):
     payload = bytes(payload)                     # list or bytes — normalise
     if not payload.startswith(_LORA_APRS_MAGIC):
         return None
-    try:
-        text = payload[3:].decode('ascii', errors='strict')
-    except UnicodeDecodeError:
-        return None
+    # The TNC2 header (SRC>DEST[,PATH]:) is 7-bit ASCII, but the APRS body
+    # routinely carries 8-bit text — '°C' and accented names from the common
+    # tracker firmwares, which copy bytes verbatim.  A strict-ASCII decode
+    # dropped those whole frames; decode the header strictly and the body
+    # leniently (UTF-8, falling back to Latin-1).
+    raw = payload[3:]
     # TNC2 requires "SOURCE>DEST...:body".  Reject anything without both.
-    gt = text.find('>')
-    colon = text.find(':', gt + 1) if gt > 0 else -1
+    gt = raw.find(b'>')
+    colon = raw.find(b':', gt + 1) if gt > 0 else -1
     if gt < 1 or colon < 0 or gt > 9:           # callsign ≤ 9 chars (with SSID)
         return None
-    source = text[:gt]
+    try:
+        head = raw[:colon].decode('ascii', errors='strict')
+    except UnicodeDecodeError:
+        return None
+    source = head[:gt]
     # Source must be uppercase-alnum + optional "-SSID".  Quick check: must
     # contain at least one letter and contain only callsign-legal characters.
     _legal = set('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-')
     if not source or not any(c.isalpha() for c in source) or any(c not in _legal for c in source):
         return None
-    after = text[gt + 1:colon]                    # dest[,path]
+    after = head[gt + 1:]                         # dest[,path]
     comma = after.find(',')
     dest = after[:comma] if comma >= 0 else after
     path = after[comma + 1:] if comma >= 0 else ''
-    body = text[colon + 1:]
+    # The destination is an AX.25 address too (the APRS tocall), and a frame
+    # with no body carries nothing — both were accepted, which left the
+    # 'verified' tier resting on the 24-bit magic alone.
+    if not dest or not dest[:1].isalnum() or any(c not in _legal for c in dest):
+        return None
+    try:
+        body = raw[colon + 1:].decode('utf-8')
+    except UnicodeDecodeError:
+        body = raw[colon + 1:].decode('latin-1')
+    body = body.rstrip('\r\n')
+    if not body:
+        return None
     type_char = body[:1] if body else ''
     print("\n  --- LoRa APRS Frame ---")
     print("  Source: %s" % source)
@@ -3062,8 +3065,23 @@ def parse_reticulum_packet(payload, rf=None):
     if len(payload) < 167:
         return None
     payload = bytes(payload)
+    # ON-AIR FRAMING: an RNode (the LoRa interface every Reticulum deployment
+    # uses) prepends ONE header byte to every LoRa frame — RNode_Firmware
+    # transmit(): `header = random(256) & 0xF0 [| 0x01 if split]` — and its
+    # receive_callback strips it before the host ever sees the packet.  The
+    # RNS flags byte is therefore payload[1] on the channel, not payload[0];
+    # read at offset 0 (host format) this parser rejected every real announce
+    # (bit 7 of the random nibble set half the time, packet_type 0 otherwise).
+    # Strip the framing byte when it has the RNode shape (low nibble 0 or 1 —
+    # split frames need reassembly and are not attempted); the host-format
+    # offset stays as a fallback for recorded/relayed captures.
+    _hdr0 = payload[0]
+    if (_hdr0 & 0x0E) == 0 and (payload[1] & 0x80) == 0 and (payload[1] & 0x03) == 1:
+        if _hdr0 & 0x01:
+            return None                         # RNode SPLIT frame — partial
+        payload = payload[1:]
     flags = payload[0]
-    if flags & 0b10000000:                      # reserved bit must be 0
+    if flags & 0b10000000:                      # IFAC flag: masked network — unreadable
         return None
     header_type      = (flags & 0b01000000) >> 6
     context_flag     = (flags & 0b00100000) >> 5
@@ -3198,18 +3216,30 @@ def parse_reticulum_packet(payload, rf=None):
 #   bytes 17+   : datagram (Layer 3): 4 dst + 1 type + message
 # ============================================================================
 def parse_disaster_radio_packet(payload, rf=None):
-    """Parse a disaster.radio Layer 2 packet.  Returns proto='disaster_radio' or None."""
-    if len(payload) < 17 + 5:                   # L2 header + minimum L3 stub
+    """Parse a disaster.radio / LoRaLayer2 packet (17-byte L2 header).
+
+    Layout (LoRaLayer2 Packet struct, the commit disaster-radio pins):
+    ttl, totalLength, sender[4], receiver[4], sequence, source[4], hopCount,
+    metric, datagram.  Layer1 transmits exactly totalLength bytes, so the
+    PHY length must EQUAL totalLength (the old ±2 slack widened the
+    strongest gate 5x for a padding that does not exist at this layer).
+    Routing packets (receiver == AF FF FF FF) carry no L3 header: the
+    datagram is raw [dest(4) distance(1) metric(1)] entries, and the daemon
+    sends one every routing interval even with an EMPTY table (17 bytes),
+    so a fresh or isolated node's only transmissions are those.
+    Confidence: 'candidate' on structure; 'confirmed' once the same source
+    has been seen twice (every other non-crypto parser here requires a
+    repeat — structure alone was ~3e-4 per random frame and, at the
+    confirmed tier, outranked stronger candidates in the dispatcher).
+    """
+    if len(payload) < 17:
         return None
     payload = bytes(payload)                     # list or bytes — normalise
     ttl          = payload[0]
     total_length = payload[1]
-    # Strong structural gate: totalLength byte MUST equal len(payload).
-    # totalLength is a uint8, so it caps at 255.  Allow ±2 for occasional PHY
-    # padding artifacts (LoRa pads to symbol boundary at low SF / high CR).
-    if not (abs(total_length - len(payload)) <= 2):
+    if total_length != len(payload):
         return None
-    if ttl == 0 or ttl > 32:                    # zero is impossible; >32 implausible
+    if ttl == 0 or ttl > 32:                    # default TTL 30; zero impossible
         return None
     sender    = payload[2:6]
     receiver  = payload[6:10]
@@ -3219,51 +3249,66 @@ def parse_disaster_radio_packet(payload, rf=None):
     metric    = payload[16]
     if hop_count > 32:                          # implausible
         return None
-    # All-zero source is invalid (would mean "no originator").
-    if source == b'\x00\x00\x00\x00':
+    if source == b'\x00\x00\x00\x00' or sender == b'\x00\x00\x00\x00':
         return None
-    # Datagram (Layer 3)
     datagram = payload[17:]
-    dst_l3   = datagram[:4]
-    dgram_type = datagram[4]
-    message  = datagram[5:]
+    is_routing = (receiver == b'\xaf\xff\xff\xff')
+    if is_routing:
+        if len(datagram) % 6:
+            return None
+        routes = [(datagram[i:i + 4].hex().upper(), datagram[i + 4], datagram[i + 5])
+                  for i in range(0, len(datagram), 6)]
+        dst_l3, dgram_type, message = None, None, b''
+    else:
+        if len(datagram) < 5:
+            return None
+        routes = None
+        dst_l3   = datagram[:4]
+        dgram_type = datagram[4]
+        message  = datagram[5:]
     src_hex = sender.hex().upper()
     src_orig_hex = source.hex().upper()
     rcv_hex = receiver.hex().upper()
-    dst_hex = dst_l3.hex().upper()
     is_bcast_l2 = (receiver == b'\xff\xff\xff\xff')
-    is_bcast_l3 = (dst_l3   == b'\xff\xff\xff\xff')
+    now = time.time()
+    _seen = _DR_SEEN.get(src_orig_hex)
+    _DR_SEEN[src_orig_hex] = now
+    for _k in [k for k, v in _DR_SEEN.items() if now - v > _RH_STATE_TTL_S]:
+        del _DR_SEEN[_k]
+    confidence = 'confirmed' if _seen is not None else 'candidate'
     print("\n  --- disaster.radio Packet ---")
     print("  TTL: %d  Length: %d  Sequence: %d  HopCount: %d  Metric: %d" % (
         ttl, total_length, sequence, hop_count, metric))
     print("  L2 sender→receiver: %s → %s" % (
-        src_hex, 'BROADCAST' if is_bcast_l2 else rcv_hex))
-    print("  L3 source→dest:     %s → %s  (type 0x%02X, %d bytes)" % (
-        src_orig_hex, 'BROADCAST' if is_bcast_l3 else dst_hex,
-        dgram_type, len(message)))
+        src_hex, 'BROADCAST' if is_bcast_l2 else ('ROUTING' if is_routing else rcv_hex)))
+    if is_routing:
+        print("  Routing table: %d entries %s" % (len(routes), routes[:6]))
+        to_str = 'ROUTING'
+    else:
+        is_bcast_l3 = (dst_l3 == b'\xff\xff\xff\xff')
+        to_str = 'BROADCAST' if is_bcast_l3 else dst_l3.hex().upper()
+        print("  L3 source→dest:     %s → %s  (type 0x%02X, %d bytes)" % (
+            src_orig_hex, to_str, dgram_type, len(message)))
     return {
-        'proto': 'disaster_radio',
-        # 'confirmed' rather than 'verified': the totalLength + TTL + hop-count
-        # gates make a structurally CONFIDENT identification, but the protocol
-        # carries no wire-level MAC or signature.  Our convention reserves
-        # 'verified' for cryptographically grounded claims (HMAC, AES decrypt+
-        # MAC, Ed25519 sig).  Demoting to 'confirmed' matches the existing
-        # invariant note at the bottom of the dispatcher comment block AND
-        # the codebase rule that disaster_radio is NOT in _NONMT_PREEMPT_PROTOS.
-        'confidence': 'confirmed',
+        'proto': 'disaster_radio' if confidence == 'confirmed' else 'unknown',
+        'hint': 'disaster_radio',
+        'confidence': confidence,
         'decrypted': True,
         'from': src_orig_hex,                   # ORIGINAL source (not last-hop)
-        'to': 'BROADCAST' if is_bcast_l3 else dst_hex,
+        'to': to_str,
         'dr_sender': src_hex,                   # last-hop relay
-        'dr_receiver': 'BROADCAST' if is_bcast_l2 else rcv_hex,
+        'dr_receiver': 'BROADCAST' if is_bcast_l2 else ('ROUTING' if is_routing else rcv_hex),
         'dr_ttl': ttl,
         'dr_hop_count': hop_count,
         'dr_sequence': sequence,
         'dr_type': dgram_type,
+        'dr_routes': routes,
         'hops': hop_count,
-        'summary': '%s→%s · TTL %d · hops %d' % (
-            src_orig_hex, 'BCAST' if is_bcast_l3 else dst_hex, ttl, hop_count),
+        'summary': '%s→%s · TTL %d · hops %d' % (src_orig_hex, to_str, ttl, hop_count),
     }
+
+
+_DR_SEEN = {}   # original source hex -> last-seen time (behavioural confirm)
 
 
 # ============================================================================
@@ -3413,15 +3458,31 @@ def parse_lora_p2p_packet(payload, rf=None):
 # promotion to confirmed would require seeing the SAME from-address twice with
 # matching sequential IDs (RadioHead's only intrinsic signal of identity).
 # ============================================================================
-_RADIOHEAD_PENDING = {}                         # from_addr -> [last_msg_id, count]
-_KNOWN_RADIOHEAD_NODES = set()                  # from_addrs with 2+ sequential ids
+_RADIOHEAD_PENDING = {}                         # from_addr -> [last_msg_id, t, to_addr, streak]
+_KNOWN_RADIOHEAD_NODES = {}   # from_addr -> last-seen time                  # from_addrs with 2+ sequential ids
 
 def parse_radiohead_packet(payload, rf=None):
-    """Parse a RadioHead RH_RF95 frame.
+    """Parse a RadioHead RH_RF95 frame: TO, FROM, ID, FLAGS, then data.
 
-    Returns proto='unknown' hint='radiohead' as 'candidate' unless the same
-    from-address has been seen before with a sequential message id, in which
-    case promote to proto='radiohead' / 'confirmed'.
+    Confirmed only on BEHAVIOURAL evidence, never on the 4-byte header alone
+    (it accepts almost any bytes): the same FROM seen with a sequential
+    message ID (RHReliableDatagram increments it per send), or an ACK
+    (FLAGS 0x80 — RHReliableDatagram.h RH_FLAGS_ACK) echoing an ID that
+    node was just sent.  RadioHead facts the gates used to contradict
+    (RHGenericDriver.h / RHReliableDatagram.h):
+      - RH_FLAGS_ACK 0x80 and RH_FLAGS_RETRY 0x40 live in the RESERVED
+        high nibble (RH_FLAGS_RESERVED 0xF0), so rejecting any high-nibble
+        flag threw away every ACK and every retry — half of each reliable
+        exchange, and the strongest evidence available.  Bits 0x30 are the
+        only ones the library never sets.
+      - the driver's default address is RH_BROADCAST_ADDRESS (0xFF); the
+        stock rf95_client/rf95_server sketches never call setThisAddress,
+        so FROM=0xFF TO=0xFF is the most common frame there is.  Address 0
+        is not reserved either.
+    Evidence expires: a FROM address that stops transmitting is forgotten
+    after _RH_STATE_TTL_S, so a sequential-ID coincidence in random traffic
+    cannot keep an address "confirmed" for the rest of a run (measured: the
+    never-pruned table minted 132 false nodes over 50k random frames).
     """
     if len(payload) < 5:                        # header + ≥1 byte data
         return None
@@ -3430,47 +3491,50 @@ def parse_radiohead_packet(payload, rf=None):
     from_addr = payload[1]
     msg_id    = payload[2]
     flags     = payload[3]
-    # RadioHead RH_RF95_FLAGS_RESERVED is the high nibble; conventional usage
-    # leaves it 0.  Reject if any RH-reserved bit is set.
-    if flags & 0xF0:
+    if flags & 0x30:                             # never set by the library
         return None
+    is_ack = bool(flags & 0x80)
     data = payload[4:]
-    # Reject all-zero / all-same data (very common in noise/random garbage).
-    if len(set(data)) <= 1:
-        return None
-    # Reject if FROM is 0 or 0xFF — anonymous TX is rare in practice and 0 is
-    # reserved.  Real RadioHead apps assign each node a 1..253 address.
-    if from_addr in (0x00, 0xFF):
-        return None
-    # TO can be broadcast (0xFF) or a real node 1..253.  Reject TO=0.
-    if to_addr == 0x00:
-        return None
-    # Behavioral promotion: track this from_addr.  RadioHead's 4-byte header has
-    # no magic, so a single structural match has a ~5% random FP rate — too high
-    # to emit anything.  We track candidates silently in _RADIOHEAD_PENDING and
-    # only emit once we've seen the SAME from_addr twice with a sequential
-    # message ID (RH apps increment ID by 1 per packet).  Two sequential IDs from
-    # the same source address are statistically near-impossible from random
-    # bytes (~1 in 4000 even after the structural gate).
+    if not is_ack and len(data) >= 2 and len(set(data)) <= 1:
+        return None                              # constant filler, not data
+    now = time.time()
+    _rh_expire(now)
     prev = _RADIOHEAD_PENDING.get(from_addr)
     is_confirmed = from_addr in _KNOWN_RADIOHEAD_NODES
-    if prev is not None:
-        prev_id, _ = prev
-        delta = (msg_id - prev_id) & 0xFF
-        if 1 <= delta <= 16:
-            _KNOWN_RADIOHEAD_NODES.add(from_addr)
+    reason = 'known'
+    if is_ack:
+        # An ACK carries the ID of the frame it acknowledges, addressed back
+        # to its sender: TO must have sent exactly that ID TO us.
+        sent = _RADIOHEAD_PENDING.get(to_addr)
+        if sent is not None and sent[0] == msg_id and sent[2] == from_addr:
+            _KNOWN_RADIOHEAD_NODES[from_addr] = now
+            _KNOWN_RADIOHEAD_NODES[to_addr] = now
             is_confirmed = True
-    _RADIOHEAD_PENDING[from_addr] = [msg_id, (prev[1] + 1 if prev else 1)]
-    # First sighting (or non-sequential): silently track state, don't emit.
-    # Surfacing every structural match as a hint floods the UI with noise.
+            reason = 'ACK of id %d from %d' % (msg_id, to_addr)
+    else:
+        # Two consecutive sequential steps (three frames) from one FROM: a
+        # single step is 1/16 per repeat address and random CRC-passing junk
+        # minted ~6 % false nodes under fuzz; two steps is 1/256.
+        _streak = 0
+        if prev is not None:
+            delta = (msg_id - prev[0]) & 0xFF
+            if 1 <= delta <= 16:
+                _streak = prev[3] + 1
+        if _streak >= 2:
+            _KNOWN_RADIOHEAD_NODES[from_addr] = now
+            is_confirmed = True
+            reason = 'sequential ids (%d -> %d, streak %d)' % (prev[0], msg_id, _streak)
+        _RADIOHEAD_PENDING[from_addr] = [msg_id, now, to_addr, _streak]
     if not is_confirmed:
         return None
+    _KNOWN_RADIOHEAD_NODES[from_addr] = now
     is_bcast_to = (to_addr == 0xFF)
     print("\n  --- RadioHead RF95 Frame ---")
-    print("  TO: %s  FROM: %d  ID: %d  FLAGS: 0x%02X  data: %d bytes" % (
+    print("  TO: %s  FROM: %d  ID: %d  FLAGS: 0x%02X%s  data: %d bytes" % (
         'BROADCAST' if is_bcast_to else str(to_addr),
-        from_addr, msg_id, flags, len(data)))
-    print("  Behavioral: node %d confirmed via sequential ID" % from_addr)
+        from_addr, msg_id, flags,
+        ' ACK' if is_ack else (' RETRY' if flags & 0x40 else ''), len(data)))
+    print("  Behavioral: node %d confirmed via %s" % (from_addr, reason))
     return {
         'proto': 'radiohead',
         'confidence': 'confirmed',
@@ -3479,9 +3543,21 @@ def parse_radiohead_packet(payload, rf=None):
         'to': 'BROADCAST' if is_bcast_to else str(to_addr),
         'rh_id': msg_id,
         'rh_flags': flags,
-        'summary': 'RH %s→%s id=%d %dB' % (
-            from_addr, 'BC' if is_bcast_to else to_addr, msg_id, len(data)),
+        'rh_ack': is_ack,
+        'summary': 'RH %s→%s id=%d %s%dB' % (
+            from_addr, 'BC' if is_bcast_to else to_addr, msg_id,
+            'ACK ' if is_ack else '', len(data)),
     }
+
+
+_RH_STATE_TTL_S = 300.0
+
+
+def _rh_expire(now):
+    for _d in (_RADIOHEAD_PENDING, _KNOWN_RADIOHEAD_NODES):
+        for _k in [k for k, v in _d.items()
+                   if now - (v[1] if isinstance(v, list) else v) > _RH_STATE_TTL_S]:
+            del _d[_k]
 
 
 # ============================================================================
@@ -7259,7 +7335,9 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         _nib_scale = 8   # bin = nibble*8 (SF-independent); was N//16 (only right at SF7)
         _b1 = int(np.argmax(np.abs(_fft(iq1[_sw1_p:_sw1_p + N] * downchirp))))
         _b2 = int(np.argmax(np.abs(_fft(iq1[_sw2_p:_sw2_p + N] * downchirp))))
-        _sync_word = ((_b1 // _nib_scale & 0xF) << 4) | (_b2 // _nib_scale & 0xF)
+        # round to the NEAREST nibble: floor turned a -1-bin read of 0x2B into
+        # 0x1A (two bits off) while tolerating +7 bins
+        _sync_word = ((((_b1 + _nib_scale // 2) // _nib_scale) & 0xF) << 4) | (((_b2 + _nib_scale // 2) // _nib_scale) & 0xF)
     _brand = _SYNC_BRANDS.get(_sync_word, f'Unknown(0x{_sync_word:02X})' if _sync_word is not None else 'Unknown')
 
     # Compute-saving early bail (before the expensive soft-decode): this sync can't
@@ -8401,6 +8479,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         # invariant is preserved — frames where no non-mt parser verifies
         # still fall through to _h_meshtastic exactly as before.
         _mt_shape_ok = ('meshtastic' in _PROTO_ENABLED and len(raw_bytes) >= 16
+                        and crc_present
                         and _is_plausible_mesh_header_uni(raw_bytes)
                         and _is_chase_acceptable_uni(raw_bytes))
         _early_handled, _, _ = _dispatch_nonmt_or_meshtastic(
@@ -9109,7 +9188,9 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             'clean_crc': _clean_crc, 'rf': _rf, 'is_mesh': _is_meshtastic,
             # 6c PHY facts for the dispatcher's veto/priors
             'pre_len': int(best_pre_len), 'crc_present': bool(crc_present)}
-    _mt_shape_ok = bool(_ctx['is_mesh'] and len(payload) >= 16)
+    # Meshtastic transmits with the PHY CRC on; a CRC-less frame cannot be
+    # one, whatever its sync word (the non-MT loop already applied this rule).
+    _mt_shape_ok = bool(_ctx['is_mesh'] and len(payload) >= 16 and crc_present)
     _handled, _, _ = _dispatch_nonmt_or_meshtastic(
         payload, _ctx, _sync_word, _rf, sf, bw, cr,
         meshtastic_handler=_h_meshtastic,
