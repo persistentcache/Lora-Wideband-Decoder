@@ -5404,8 +5404,10 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
                                 deadline=(_ddl if _rung_cap is None else
                                           (min(_ddl, _rung_cap) if _ddl else _rung_cap)))
             if r is not None and r[0] == 'OK':
-                return True
-        return False
+                return r          # ('OK', preamble_start, pkt_len, bin) — the
+                                  # DECODED packet's span, same time axis as
+                                  # iq1_work (recrop keeps rate and origin)
+        return None
 
 
     _need_rescue = False   # set when a header decoded but its data never CRC'd
@@ -5424,6 +5426,16 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
             return
         if _consec_no_header >= 3:
             print(f"\n  [BAIL] {_consec_no_header} consecutive no-header attempts — likely phantom-preamble cascade")
+            # A phantom cascade AFTER a verified emit: what is left in the
+            # residual never produced a header, so it is the decoded
+            # packet's own remnants (strong SF12 frames leave 16-17 dB
+            # preamble-like runs that never align — "NOT ENOUGH DATA" at
+            # the capture tail).  Treat the residual as accounted for, so
+            # the all-decoded fast path returns instead of PASS 2 and the
+            # burst sweep re-finding the same frame (measured 9.1 -> 2 s
+            # per SF12/125k capture; a 4-core host spent up to 115 s).
+            if _EMIT_COUNT > 0:
+                _residual_clear = True
             break
         if attempt > 0:
             print("\n  --- Retry #%d ---" % attempt)
@@ -5588,8 +5600,27 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
             # fixes it even for a moderate CFO just under bw/8.  This recovers
             # the time-separated hop1 of a concurrent pair (cfo ~58 kHz) via a
             # fast recenter instead of the slow 6-shift carrier rescue.
-            if attempt <= 2 and (abs(cfo_hz_raw) > bw / 8 or _d.get('hdr_ok')) \
-                    and _recenter_and_decode(cfo_hz_raw):
+            _rr = None
+            # After a verified emit, a large-CFO candidate WITHOUT a header
+            # is a remnant of that frame, not an off-centre packet PASS 1
+            # could not read: the recenter only re-decoded the same frame
+            # (SF12/125k: 2 s per duplicate).  A header-OK candidate still
+            # earns its recenter — that is a real second frame.
+            if attempt <= 2 and (_d.get('hdr_ok')
+                                 or (abs(cfo_hz_raw) > bw / 8
+                                     and _EMIT_COUNT == 0)):
+                _rr = _recenter_and_decode(cfo_hz_raw)
+            if _rr is not None:
+                # Mask the span the RECENTERED decode actually covered, not
+                # this failed attempt's guess: the failed attempt's header
+                # was often wrong (PL=101 for a 37-byte frame) so its mask
+                # was short, the packet's tail stayed in the residual, the
+                # next attempts re-decoded the same header, re-armed the
+                # rescue and ran every fallback — a verified SF12/125k frame
+                # took 115 s (budget timeout) on a 4-core host, 3.5 s once
+                # the decoded span is masked.
+                if _rr[2] > 0:
+                    mask_start, mask_len = _rr[1], _rr[2]
                 # Decoded this packet via baseband recenter.  Don't stop here:
                 # a capture often holds hop0 and its relay hop1 at DIFFERENT
                 # times in the same window (e.g. 705 ms apart).  Mask this
