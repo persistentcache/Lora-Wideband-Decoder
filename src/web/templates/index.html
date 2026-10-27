@@ -17,7 +17,6 @@
   <nav aria-label="Workspace">
     <a href="#pkts" data-tab="pkts" class="active">Packets</a>
     <a href="#nodes" data-tab="nodes">Nodes</a>
-    <a href="#net" data-tab="net">Network</a>
     <a href="#wf" data-tab="wf">Waterfall</a>
     <a href="#map" data-tab="map">Map</a>
     <a href="#search" data-tab="search">Search</a>
@@ -30,6 +29,7 @@
   </div>
 </aside>
 <header>
+  <div class="phone-brand mobile-only">LoRa <span>Receiver</span></div>
   <div class="receiver"><span class="dot off" id="pipedot"></span><span id="pipetxt">stopped</span><span class="muted mono" id="center"></span></div>
   <div class="header-actions">
     <button class="go" id="btnStart">Start receiver</button>
@@ -46,9 +46,21 @@
 </section>
 <div id="warnbar" style="display:none;background:rgba(206,150,146,.15);color:var(--warn);padding:7px 16px;border-bottom:1px solid var(--warn);font-size:12px"></div>
 <main class="wrap" id="workspace" tabindex="-1">
+  <section class="mission-summary mobile-only" aria-label="Receiver status">
+    <div class="mission-line"><strong id="mission-state" role="status">Connecting…</strong><span class="mission-radio"><span id="mission-frequency">Frequency unavailable</span><span id="mission-bandwidth">Bandwidth unavailable</span></span></div>
+    <div id="mission-note">Waiting for the receiver.</div>
+    <div class="mission-totals"><div><b id="mission-received">0</b><span>Received</span></div><div><b id="mission-decoded">0</b><span>Decoded</span></div><div><b id="mission-nodes">0</b><span>Nodes</span></div></div>
+    <div id="mission-last">No intercepts yet</div>
+  </section>
   <div class="view-heading"><div><h1 id="view-title">Packets</h1><p id="view-description">Received traffic across the band.</p></div><span class="view-label">RECEIVER WORKSPACE</span></div>
+  <div id="node-view-switch" class="node-view-switch" role="group" aria-label="Node view" hidden>
+    <button data-node-view="nodes" aria-pressed="true">Node list</button>
+    <button data-node-view="net" aria-pressed="false">Network graph</button>
+  </div>
   <div id="tab-pkts">
-    <div class="toolbar">
+    <div class="feed-controls mobile-only"><span>Newest first</span><button id="mobile-filters" aria-expanded="false" aria-controls="packet-tools">Filter</button></div>
+    <button id="feed-refresh" class="mobile-only" hidden>Updates available · Show latest</button>
+    <div class="toolbar" id="packet-tools">
       <label class="search-field"><span>Search</span><input type="search" id="filter" placeholder="Node, message, channel or type" aria-label="Search packets"></label>
       <label>Show <select id="packet-kind" aria-label="Filter packets">
         <option value="all">All packets</option>
@@ -97,7 +109,23 @@
     <svg id="net"></svg>
   </div>
 </main>
-
+<div class="mobile-tabs mobile-only" role="navigation" aria-label="Phone workspace">
+  <button data-mobile-tab="pkts" aria-current="page">Intercepts</button>
+  <button data-mobile-tab="nodes">Nodes</button>
+  <button data-mobile-tab="map">Map</button>
+  <button id="mobile-more" aria-haspopup="dialog">More<span id="mobile-alert-count"></span></button>
+</div>
+<dialog id="mobile-menu" aria-labelledby="mobile-menu-title">
+  <div class="menu-heading"><h2 id="mobile-menu-title">Receiver tools</h2><button id="mobile-menu-close" aria-label="Close receiver tools">Close</button></div>
+  <div class="mobile-menu-grid">
+    <button data-mobile-tab="config">Settings</button>
+    <button data-mobile-tab="wf">Waterfall</button><button data-mobile-tab="search">Search</button>
+    <button data-mobile-tab="stats">Statistics</button><button data-mobile-action="bell">Alerts</button>
+    <button data-mobile-action="btnTheme" id="mobile-theme">Light mode</button>
+  </div>
+  <button data-mobile-action="btnClear" class="mobile-clear">Clear current session…</button>
+</dialog>
+<script src="{{ url_for('static', filename='mobile.js') }}"></script>
 <script>
 const PK=[]; let TAB='pkts', FILTER='', PFILT='all', OPEN=new Set(), PK_OPEN=new Set();
 let CFGW={}, KEYS={try_default:true,keys:[]};
@@ -586,7 +614,9 @@ function refreshMystery(){
 const _mtog=$('#mysterytoggle'); if(_mtog) _mtog.onclick=()=>{MYSTERY_COLLAPSED=!MYSTERY_COLLAPSED;refreshMystery();};
 setInterval(refreshMystery, 4000); refreshMystery();
 
-function renderPkts(){
+function renderPkts(force=false){
+  updateMissionStatus();
+  if(holdMobileFeed(force))return;
   const cols=[{k:'ts',t:'time'},{k:'freq_mhz',t:'freq'},{k:'from',t:'from'},{k:'to',t:'to'},{k:'hops',t:'hops'},
               {k:'chan',t:'chan'},{k:'port_name',t:'type'},{k:'rssi',t:'rssi'},{k:'decrypted',t:'state'},{k:'text',t:'message / payload'}];
   // Reception display: by default each reception is its own row, so a
@@ -617,7 +647,8 @@ function renderPkts(){
   } else {
     reps = PK.filter(matchFilter).slice();
   }
-  reps=sortRows(reps,SORT.pkts.k,SORT.pkts.dir);
+  reps=sortRows(reps,PHONE.matches?'ts':SORT.pkts.k,PHONE.matches?-1:SORT.pkts.dir);
+  if(PHONE.matches){renderMobileIntercepts(reps);return;}
   $('#shown').textContent=reps.length+' shown / '+PK.length+' packets';
   const body=reps.slice(0,3000).map(p=>{const ret=!p.decrypted&&p.enc_hex; const wm=NODEMETA[p.from]; const hi=wm&&wm.watch&&wm.watch_mode!=='alert';
     // Each row = one reception.  Show its hop count straight from the
@@ -847,6 +878,7 @@ function renderStatsTab(){
 
 // ---------- HEALTH panel ----------
 function renderHealth(h){
+  MOBILE_HEALTH=h; updateMissionStatus();
   const hb=$('#healthbar'); if(hb){
     if(h.msps==null){hb.textContent='';}
     else{const rate=h.rate_msps||28, behind=h.msps<0.95*rate;
@@ -1129,7 +1161,7 @@ function renderSdrConfig(box){
         gain:readGain()}};
       if(q('#sdrsel').value==='soapy')body.radio.soapy_driver=q('#sdrdrv').value.trim();
       return fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(x=>x.json());};
-    q('#sdrsave').onclick=()=>saveSdr().then(()=>{q('#sdrresult').innerHTML='<span style="color:var(--ok)">saved — gain &amp; center applied live; rate on next Start</span>'; const _c=parseFloat(q('#sdrcen').value); if(isFinite(_c)&&typeof setHdrCenter==='function')setHdrCenter(_c);});
+    q('#sdrsave').onclick=()=>saveSdr().then(result=>{if(result.radio&&result.radio.bandwidth_hz!=null)MOBILE_BANDWIDTH=result.radio.bandwidth_hz;q('#sdrresult').innerHTML='<span style="color:var(--ok)">saved — gain &amp; center applied live; rate on next Start</span>'; const _c=parseFloat(q('#sdrcen').value); if(isFinite(_c)&&typeof setHdrCenter==='function')setHdrCenter(_c);});
     q('#sdrdetect').onclick=()=>{q('#sdrresult').textContent='detecting…';
       saveSdr().then(()=>fetch('/api/sdr/detect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sdr:q('#sdrsel').value})}).then(x=>x.json()).then(res=>{
         if(res.found)q('#sdrresult').innerHTML='<span style="color:var(--ok)">✓ Found'+(res.serial?' — serial <span class="mono">'+esc(res.serial)+'</span>':'')+'</span>';
@@ -1747,23 +1779,50 @@ function fireAlert(r,p,why){
 }
 let _ac=null;
 function beep(){try{_ac=_ac||new (window.AudioContext||window.webkitAudioContext)();const o=_ac.createOscillator(),g=_ac.createGain();o.connect(g);g.connect(_ac.destination);o.frequency.value=880;g.gain.value=0.07;o.start();setTimeout(()=>o.stop(),160);}catch(e){}}
-function updateBell(){const b=$('#bellct');if(!b)return; if(ALERT_UNREAD>0){b.textContent=ALERT_UNREAD>99?'99+':ALERT_UNREAD;b.style.display='';}else b.style.display='none';}
+function updateBell(){const mc=$('#mobile-alert-count');if(mc)mc.textContent=ALERT_UNREAD?' ('+ALERT_UNREAD+')':'';const b=$('#bellct');if(!b)return; if(ALERT_UNREAD>0){b.textContent=ALERT_UNREAD>99?'99+':ALERT_UNREAD;b.style.display='';}else b.style.display='none';}
 function toggleAlertPanel(){let p=$('#alertpanel'); if(p){p.remove();ALERTPANEL_OPEN=false;return;} ALERT_UNREAD=0;updateBell();ALERTPANEL_OPEN=true;
   p=document.createElement('div');p.id='alertpanel';p.style.cssText='position:fixed;right:12px;top:88px;width:370px;max-height:72vh;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:8px;z-index:9998;box-shadow:0 10px 30px rgba(0,0,0,.55)';document.body.appendChild(p);renderAlertPanel();}
 function renderAlertPanel(){const p=$('#alertpanel');if(!p)return;
   const rows=ALERT_LOG.map((a,i)=>`<div class="alrow" data-i="${i}" style="padding:8px 12px;border-bottom:1px solid var(--line);cursor:pointer"><div><b>${esc(a.label)}</b> <span class="muted" style="font-size:11px">${fmtTime(a.ts)}</span></div><div class="muted" style="font-size:12px">${esc(a.why)}${a.text?' — '+esc(String(a.text).slice(0,50)):''}</div></div>`).join('')||'<div class="muted" style="padding:14px">no alerts yet</div>';
-  p.innerHTML=`<div style="padding:8px 12px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center"><b>Alerts</b><a id="al-clearlog" class="muted" style="cursor:pointer;font-size:12px">clear</a></div>${rows}`;
+  p.innerHTML=`<div style="padding:8px 12px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center"><b>Alerts</b><button id="al-close" aria-label="Close alerts">Close</button><a id="al-clearlog" class="muted" style="cursor:pointer;font-size:12px">clear</a></div>${rows}`;
+  p.querySelector('#al-close').onclick=toggleAlertPanel;
   p.querySelector('#al-clearlog').onclick=()=>{ALERT_LOG.length=0;renderAlertPanel();};
   p.querySelectorAll('.alrow').forEach(r=>r.onclick=()=>{const a=ALERT_LOG[+r.dataset.i]; if(a&&a.from){OPEN.add(a.from);toggleAlertPanel();activateTab('nodes');}});
 }
 function postAlert(id,patch){fetch('/api/alerts/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(r=>r.json()).then(res=>{if(res.alerts)ALERTS=res.alerts;});}
 
 // ---------------------------------------------------------------- Session manager
-function setSessAuto(on){const e=$('#sessauto');if(e)e.textContent=on?'● auto-save':'';}
+function setSessAuto(on){
+  const e=$('#sessauto');if(e)e.textContent=on?'● auto-save':'';
+  const button=$('#btnSessions');
+  if(button){
+    button.dataset.autosave=on?'on':'off';
+    button.setAttribute('aria-label','Sessions, auto-save '+(on?'on':'off'));
+    button.title='Auto-save '+(on?'on':'off')+' — save, open, import and export sessions';
+  }
+}
 function fmtBytes(b){if(b==null)return '?';return b>=1e9?(b/1e9).toFixed(1)+' GB':b>=1e6?(b/1e6).toFixed(1)+' MB':Math.max(1,Math.round(b/1e3))+' KB';}
 function closeSessions(){const o=$('#sessov');if(o)o.remove();}
 function sessPost(path,body){return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(r=>r.json());}
-function reloadState(){return fetch('/api/state').then(r=>r.json()).then(d=>{PK.length=0;PK.push(...d.packets);d.packets.forEach(noteName);renderStats(d.stats);G.nodes=[];OPEN.clear();renderCurrent();});}
+let STATE_RELOAD_SEQUENCE=0;
+function reloadState(force=true){
+  const sequence=++STATE_RELOAD_SEQUENCE, statsRevision=STATS_REVISION;
+  const before=new Set(PK);
+  return fetch('/api/state?full=1').then(r=>{if(!r.ok)throw new Error('State unavailable');return r.json();}).then(d=>{
+    if(sequence!==STATE_RELOAD_SEQUENCE)return;
+    // Preserve packets arriving over SSE while a reconnect snapshot is in flight.
+    const arrived=force?[]:PK.filter(p=>!before.has(p));
+    const receptionKey=p=>JSON.stringify([p.pktid,p.hops,p.ts,p.from,p.raw_hex]);
+    const merged=d.packets.slice(), indexes=new Map(merged.map((p,i)=>[receptionKey(p),i]));
+    arrived.forEach(p=>{const key=receptionKey(p);if(indexes.has(key))merged[indexes.get(key)]=p;else{indexes.set(key,merged.length);merged.push(p);}});
+    PK.length=0;PK.push(...merged);PK.forEach(noteName);
+    if(d.config){CFGW=d.config;MOBILE_BANDWIDTH=CFGW.bandwidth_hz||null;if(CFGW.center_mhz!=null)setHdrCenter(CFGW.center_mhz);}
+    if(statsRevision===STATS_REVISION)renderStats(d.stats);
+    G.nodes=[];OPEN.clear();
+    if(force){PK_OPEN.clear();MOBILE_LIMIT=60;}
+    if(force&&TAB==='pkts')renderPkts(true);else if(force||TAB!=='config')renderCurrent();
+  });
+}
 function openSessions(){closeSessions();const o=document.createElement('div');o.id='sessov';
   o.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9998;display:flex;align-items:flex-start;justify-content:center;padding-top:56px';
   o.onclick=e=>{if(e.target===o)closeSessions();};
@@ -1783,7 +1842,7 @@ function renderSessions(){const p=$('#sesspanel');if(!p)return;
         <button data-a="merge" title="Add its packets to the current session">Merge</button>
         <button data-a="dl" title="Download the file">Download</button>
         <button data-a="del" title="Delete the file" style="color:var(--warn)">Delete</button></td></tr>`).join('');
-    p.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:15px">Session manager</b><a id="sessclose" style="cursor:pointer;font-size:18px;padding:0 4px" title="Close (Esc)">×</a></div>
+    p.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:15px">Session manager</b><button id="sessclose" aria-label="Close sessions" title="Close (Esc)">Close</button></div>
       ${H('Current session')}
       <div style="font-size:12px">${S.current?'<b>'+esc(S.current)+'</b>':'<span class="muted">unnamed — '+(S.autosave?'auto-save names it on the next packet':'not saved yet')+'</span>'} · ${S.current_packets} packets</div>
       <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
@@ -1822,6 +1881,7 @@ function renderSessions(){const p=$('#sesspanel');if(!p)return;
         if(!r.ok){alert('Save failed: '+(r.error||'?'));return;} toast('Saved '+r.packets+' packets as '+r.name);renderSessions();});
       go(false);};
     q('#sessnew').onclick=()=>{if(!confirm('Start a new session? The display is cleared; saved sessions are kept.'))return;
+      STATE_RELOAD_SEQUENCE++;
       fetch('/api/clear',{method:'POST'}).then(()=>{PK.length=0;G.nodes=[];OPEN.clear();renderCurrent();renderSessions();});};
     q('#sessauto_cb').onchange=e=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autosave:e.target.checked})}).then(()=>renderSessions());
     q('#sessfmtset').onclick=()=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autosave_name_fmt:q('#sessfmt').value})}).then(()=>renderSessions());
@@ -1838,61 +1898,91 @@ function renderSessions(){const p=$('#sesspanel');if(!p)return;
       if(a==='del'){if(!confirm('Delete session "'+nm+'"? This removes the file.'))return;
         sessPost('/api/sessions/delete',{name:nm}).then(r=>{if(!r.ok)alert(r.error||'Delete failed');renderSessions();});return;}
       if(a==='open'&&PK.length&&!S.autosave&&!confirm('Open "'+nm+'"? The current session is not auto-saved — its '+PK.length+' packets are dropped unless you Save as first.'))return;
+      STATE_RELOAD_SEQUENCE++;
       sessPost('/api/sessions/open',{name:nm,mode:a==='merge'?'merge':'replace'}).then(r=>{if(!r.ok){alert(r.error||'Open failed');return;}
         reloadState().then(()=>{toast((a==='merge'?'Merged ':'Opened ')+r.imported+' packets from '+nm);renderSessions();});});});
   }).catch(e=>{p.textContent='Could not load sessions: '+e;});}
 function renderCurrent(){ if(TAB==='pkts')renderPkts(); else if(TAB==='nodes')renderNodes(); else if(TAB==='net')startNet(); else if(TAB==='wf')renderWaterfall(); else if(TAB==='map')renderMap(); else if(TAB==='search')renderSearch(); else if(TAB==='stats')renderStatsTab(); else if(TAB==='config')renderConfig(); }
-let PIPE_RUNNING=false;
-function renderStats(s){PIPE_RUNNING=!!s.pipeline_running;$('#s_pkts').textContent=s.packets;$('#s_dec').textContent=s.decoded;$('#s_enc').textContent=s.encrypted;$('#s_nodes').textContent=s.nodes;$('#pipedot').className='dot '+(s.pipeline_running?'on':'off');$('#pipetxt').textContent=s.pipeline_running?'running':'stopped';$('#btnStart').style.display=s.pipeline_running?'none':'';$('#btnStop').style.display=s.pipeline_running?'':'none';}
+let PIPE_RUNNING=false, STATS_REVISION=0;
+function renderStats(s){
+  const running=!!s.pipeline_running, changed=running!==PIPE_RUNNING;
+  STATS_REVISION++;PIPE_RUNNING=running;
+  $('#s_pkts').textContent=s.packets;$('#s_dec').textContent=s.decoded;
+  $('#s_enc').textContent=s.encrypted;$('#s_nodes').textContent=s.nodes;
+  $('#pipedot').className='dot '+(running?'on':'off');
+  $('#pipetxt').textContent=running?'running':'stopped';
+  $('#btnStart').style.display=running?'none':'';$('#btnStop').style.display=running?'':'none';
+  updateMissionStatus();
+  // A start/stop event may be the only update on a quiet band.
+  if(changed&&TAB==='pkts'&&!PK.length)renderPkts(true);
+}
 
 const TABS=['pkts','nodes','net','wf','map','search','stats','config'];
+let NODE_VIEW='nodes';
 function activateTab(name){
   if(!TABS.includes(name))name='pkts';
-  document.querySelectorAll('nav a').forEach(x=>x.classList.toggle('active',x.dataset.tab===name));
-  const headings={pkts:['Packets','Received traffic across the band.'],nodes:['Nodes','Identities, activity and messages from nearby devices.'],net:['Network','Connections and relay paths between nodes.'],wf:['Waterfall','Live signal activity across the receive bandwidth.'],map:['Map','Positions reported by received nodes.'],search:['Search','Find messages and devices in this session.'],stats:['Statistics','Traffic, protocols and channel activity.'],config:['Configuration','Radio, protocols, keys and receiver preferences.']};
+  const section=name==='net'?'nodes':name;
+  if(section==='nodes')NODE_VIEW=name;
+  $('#node-view-switch').hidden=section!=='nodes';
+  document.querySelectorAll('[data-node-view]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.nodeView===name)));
+  document.querySelectorAll('nav a').forEach(x=>x.classList.toggle('active',x.dataset.tab===section));
+  const headings={pkts:['Packets','Received traffic across the band.'],nodes:['Nodes','Identities, activity and messages from nearby devices.'],net:['Nodes','Connections and relay paths between nodes.'],wf:['Waterfall','Live signal activity across the receive bandwidth.'],map:['Map','Positions reported by received nodes.'],search:['Search','Find messages and devices in this session.'],stats:['Statistics','Traffic, protocols and channel activity.'],config:['Configuration','Radio, protocols, keys and receiver preferences.']};
   $('#view-title').textContent=headings[name][0]; $('#view-description').textContent=headings[name][1];
-  document.querySelectorAll('nav a').forEach(x=>{if(x.dataset.tab===name)x.setAttribute('aria-current','page');else x.removeAttribute('aria-current');});
+  document.querySelectorAll('nav a').forEach(x=>{if(x.dataset.tab===section)x.setAttribute('aria-current','page');else x.removeAttribute('aria-current');});
   TAB=name; TABS.forEach(t=>$('#tab-'+t).style.display=t===TAB?'':'none');
   if(location.hash.slice(1)!==name) history.replaceState(null,'','#'+name);
+  updateMobileTab();
   renderCurrent();
 }
-document.querySelectorAll('nav a').forEach(a=>a.onclick=e=>{e.preventDefault();activateTab(a.dataset.tab);});
+document.querySelectorAll('nav a').forEach(a=>a.onclick=e=>{e.preventDefault();activateTab(a.dataset.tab==='nodes'?NODE_VIEW:a.dataset.tab);});
+document.querySelectorAll('[data-node-view]').forEach(b=>b.onclick=()=>activateTab(b.dataset.nodeView));
 window.addEventListener('hashchange',()=>{const tab=location.hash.slice(1);if(TABS.includes(tab))activateTab(tab);});
-$('#filter').oninput=e=>{FILTER=e.target.value.trim();renderPkts();};
+$('#filter').oninput=e=>{FILTER=e.target.value.trim();MOBILE_LIMIT=60;renderPkts(true);};
 // Merge-relays toggle: when on, collapse multi-reception rows of the same
 // Meshtastic pktid into one row showing the HIGHEST observed hop count.
-$('#mergeRelays').onchange=()=>renderPkts();
-$('#packet-kind').onchange=e=>{PFILT=e.target.value;renderPkts();};
+$('#mergeRelays').onchange=()=>renderPkts(true);
+$('#packet-kind').onchange=e=>{PFILT=e.target.value;MOBILE_LIMIT=60;renderPkts(true);};
 $('#btnStart').onclick=()=>fetch('/api/pipeline/start',{method:'POST'});
 $('#btnStop').onclick=()=>fetch('/api/pipeline/stop',{method:'POST'});
 fetch('/api/settings').then(r=>r.json()).then(s=>{setSessAuto(!!s.autosave);WFON=s.waterfall!==false;
   if(s.time_format)TIME_FMT=s.time_format; if(s.date_format)DATE_FMT=s.date_format;
   try{renderCurrent();}catch(e){}}).catch(()=>{});
 $('#btnSessions').onclick=openSessions;
-$('#btnClear').onclick=()=>{if(confirm('Start a new session? This clears the display. Saved sessions are kept (open them from Sessions).')){fetch('/api/clear',{method:'POST'});PK.length=0;G.nodes=[];OPEN.clear();renderCurrent();}};
+$('#btnClear').onclick=()=>{if(confirm('Start a new session? This clears the display. Saved sessions are kept (open them from Sessions).')){STATE_RELOAD_SEQUENCE++;fetch('/api/clear',{method:'POST'});PK.length=0;G.nodes=[];OPEN.clear();renderCurrent();}};
 try{new URLSearchParams(location.search).getAll('open').forEach(id=>OPEN.add(id));}catch(e){}
 try{const _q=new URLSearchParams(location.search).get('q'); if(_q)SEARCHQ=_q;}catch(e){}
 // Header center-freq display — kept current from the effective config (page load),
 // and live from the PSD stream (reflects Config-tab changes + live re-tunes), so it
 // never sticks at the lora.toml default.
 let HDR_KEY='default';
-function setHdrCenter(mhz){ const el=$('#center'); if(el)el.textContent='center '+(+Number(mhz).toFixed(4))+' MHz · key '+HDR_KEY; }
+function setHdrCenter(mhz){ const el=$('#center'); if(el)el.textContent='center '+(+Number(mhz).toFixed(4))+' MHz · key '+HDR_KEY; MOBILE_FREQUENCY=mhz;updateMissionStatus(); }
 
-fetch('/api/state').then(r=>r.json()).then(d=>{PK.push(...d.packets);d.packets.forEach(noteName);d.packets.forEach(p=>{if(p.from)SEEN_NODES.add(p.from);});renderStats(d.stats);CFGW=d.config||{};activateTab(location.hash.slice(1)||'pkts');
-  HDR_KEY=(d.config&&d.config.key)||'default'; if(d.config&&d.config.center_mhz!=null)setHdrCenter(d.config.center_mhz);}).catch(()=>activateTab('pkts'));
+fetch('/api/state').then(r=>r.json()).then(d=>{PK.push(...d.packets);d.packets.forEach(noteName);d.packets.forEach(p=>{if(p.from)SEEN_NODES.add(p.from);});renderStats(d.stats);CFGW=d.config||{};MOBILE_BANDWIDTH=CFGW.bandwidth_hz||null;activateTab(location.hash.slice(1)||'pkts');
+  HDR_KEY=(d.config&&d.config.key)||'default'; if(d.config&&d.config.center_mhz!=null)setHdrCenter(d.config.center_mhz);}).catch(()=>{setMobileConnection('unavailable');activateTab('pkts');});
 fetch('/api/health').then(r=>r.json()).then(renderHealth).catch(()=>{});
 fetch('/api/keys').then(r=>r.json()).then(k=>{KEYS=k;}).catch(()=>{});   // for the retry-decode menu
 fetch('/api/alerts').then(r=>r.json()).then(a=>{ALERTS=a;}).catch(()=>{});   // alert rules
 fetch('/api/nodes/meta').then(r=>r.json()).then(m=>{NODEMETA=m||{}; if(TAB!=='net'&&TAB!=='config')renderCurrent();}).catch(()=>{});   // node labels/notes/watchlist
 {const b=$('#bell'); if(b)b.onclick=toggleAlertPanel;}
+initMobileWorkbench();
 if(!STATIC){
   const es=new EventSource('/api/stream');
+  let streamOpened=false, streamGeneration=0;
+  es.addEventListener('open',()=>{
+    const generation=++streamGeneration;
+    if(streamOpened){
+      setMobileConnection('syncing');
+      reloadState(false).then(()=>{if(generation===streamGeneration)setMobileConnection('live');}).catch(()=>{if(generation===streamGeneration)setMobileConnection('unavailable');});
+    }else setMobileConnection('live');
+    streamOpened=true;
+  });
+  es.addEventListener('error',()=>{streamGeneration++;setMobileConnection('reconnecting');});
   es.addEventListener('packet',e=>{const p=JSON.parse(e.data);evalAlerts(p);PK.push(p);noteName(p); if(TAB!=='net'&&TAB!=='config')renderCurrent();});
   es.addEventListener('update',e=>{const p=JSON.parse(e.data);evalAlerts(p);const i=PK.findIndex(x=>x.pktid===p.pktid&&x.hops===p.hops); if(i>=0)PK[i]=p; else PK.push(p); noteName(p); if(TAB!=='net'&&TAB!=='config')renderCurrent();});
   es.addEventListener('confirm',e=>{const d=JSON.parse(e.data); if(d&&d.devaddr){let ch=false; for(const p of PK){if(p.devaddr===d.devaddr&&p.proto==='unknown'){p.proto='lorawan';p.confidence='confirmed';p.from='LW:'+d.devaddr;delete p.hint;ch=true;}} if(ch&&TAB!=='net'&&TAB!=='config')renderCurrent();}});
   es.addEventListener('stats',e=>renderStats(JSON.parse(e.data)));
   es.addEventListener('health',e=>renderHealth(JSON.parse(e.data)));
-  es.addEventListener('psd',e=>{ const _d=JSON.parse(e.data); if(_d.center_mhz!=null)setHdrCenter(_d.center_mhz); if(TAB==='wf'&&WF)wfRow(_d); });
+  es.addEventListener('psd',e=>{ const _d=JSON.parse(e.data); if(_d.bandwidth_hz!=null){MOBILE_BANDWIDTH=_d.bandwidth_hz;updateMissionStatus();} if(_d.center_mhz!=null)setHdrCenter(_d.center_mhz); if(TAB==='wf'&&WF)wfRow(_d); });
   es.addEventListener('nodemeta',e=>{ const d=JSON.parse(e.data); if(d&&d.id){ if(d.meta&&Object.keys(d.meta).length)NODEMETA[d.id]=d.meta; else delete NODEMETA[d.id]; if(TAB!=='net'&&TAB!=='config')renderCurrent(); } });
   setInterval(()=>{if(TAB==='nodes')renderNodes();else if(TAB==='net')buildGraph();},5000);
 }
