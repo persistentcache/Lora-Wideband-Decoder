@@ -6107,6 +6107,9 @@ class BackgroundDecoder:
         except ValueError:
             self._fast_budget_s = 12.0
         self._job_dur_ewma = 0.0         # measured decode wall time, EWMA
+        self._ok_dur_ewma = 0.0          # wall time of SUCCESSFUL full-budget
+                                         # fast-tier jobs: this host's speed
+        self._wait_since = {}            # fpath -> first time it waited on a sibling
         # stale in-flight GC: only a crashed/hung worker leaves an entry
         # behind (completion clears it), so bound it by the longest legal
         # fast-tier decode (SF12 scale 2^2.5) with 2x slack
@@ -7031,6 +7034,17 @@ while True:
                     _flat = (self._pressure_budget if _press_only
                              else self._stress_budget)
                     job_budget = _flat / (2.0 ** ((_sf_j - 7) * 0.5))
+                    # Fail-fast must still leave room for ONE full attempt on
+                    # THIS host.  The flat 1.5 s (0.75 s at SF9) is right where
+                    # a successful decode takes ~1 s; on a Pi 5, where it takes
+                    # 5-9 s, every pressured job bailed after attempt 0 ("budget
+                    # exhausted after attempt 0") and bounced to the slow tier —
+                    # 47 requeues in one 12-minute test, rows minutes late.
+                    # Floor at 1.5x the measured successful-job time (fast tier,
+                    # full budget, verified emit) so the budget tracks the host:
+                    # unchanged on a host where that EWMA is ~1 s.
+                    if self._ok_dur_ewma > 0.0:
+                        job_budget = max(job_budget, 1.5 * self._ok_dur_ewma)
                     _stress_shrunk = True
                 if self._decoder_script is None:
                     if _slow_token is not None:
@@ -7089,12 +7103,22 @@ while True:
                         1.5 * self._fast_budget_s * 2.0 ** ((_sfw - 7) * 0.5),
                         2.0 * self._job_dur_ewma)
                     _skipped = False
-                    while time.time() < _wait_deadline:
+                    # A worker used to SLEEP here for the whole deadline (up to
+                    # 85 s at SF12) while its sibling decoded: with a cluster of
+                    # SF12 copies that serialised the whole pool — 5 worker
+                    # processes, active=1, queue 19 (Pi 5 live).  Wait briefly,
+                    # then put the job BACK on the queue and take the next one;
+                    # it returns once the sibling has admitted (skip) or finished
+                    # (decode).  The original deadline still bounds the total
+                    # time a job can be deferred this way.
+                    _first_wait = self._wait_since.setdefault(fpath, time.time())
+                    _short_deadline = min(_wait_deadline, time.time() + 2.0)
+                    while time.time() < _short_deadline:
                         time.sleep(0.1)
                         if self._bucket_already_decoded(fpath):
-                            # Sibling admitted while we waited — skip cleanly.
                             self._rawlog('SKIP-INFLIGHT-ADMIT', os.path.basename(fpath))
                             self._ref_dec_and_maybe_unlink(fpath)
+                            self._wait_since.pop(fpath, None)
                             if _slow_token is not None:
                                 self._slow_retire(_slow_token)
                             self._queue.task_done()
@@ -7105,11 +7129,16 @@ while True:
                             _skipped = True
                             break
                         if not self._is_bucket_inflight(fpath):
-                            # Sibling finished without admitting — dispatch
-                            # normally (we may have better luck at this offset).
                             break
                     if _skipped:
                         continue
+                    if (self._is_bucket_inflight(fpath) and _slow_token is None
+                            and time.time() - _first_wait < _wait_deadline - (_short_deadline - 2.0)):
+                        self._rawlog('REQUEUE-SIBLING', os.path.basename(fpath))
+                        self._queue.put((-0.0, next(self._qseq), job))
+                        self._queue.task_done()
+                        continue
+                    self._wait_since.pop(fpath, None)
 
                 # Mark this bucket in-flight BEFORE writing to the worker stdin
                 # so siblings see the in-flight state immediately.
@@ -7237,6 +7266,10 @@ while True:
                 # measured decode duration → sizes the sibling in-flight wait
                 self._job_dur_ewma = (elapsed if self._job_dur_ewma == 0.0
                                       else 0.3 * elapsed + 0.7 * self._job_dur_ewma)
+                if (output and '[PKT]' in output and not timed_out
+                        and job_budget is None and _slow_token is None):
+                    self._ok_dur_ewma = (elapsed if self._ok_dur_ewma == 0.0
+                                         else 0.3 * elapsed + 0.7 * self._ok_dur_ewma)
                 self._rawlog('JOB', f"{fname} mode={relay_field or '-'} "
                                     f"budget={job_budget} elapsed={elapsed:.1f}s "
                                     f"timed_out={timed_out}", output or '(empty)')
