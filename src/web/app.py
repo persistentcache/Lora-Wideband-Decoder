@@ -2165,7 +2165,7 @@ def _tail_psd():
                 _erate, _ebw, _ecen = _effective_radio()
                 _broadcast({'type': 'psd', 'data': {
                     'b64': _b64.b64encode(raw).decode('ascii'),
-                    'center_mhz': _ecen,
+                    'center_mhz': _ecen, 'bandwidth_hz': _ebw,
                     'rate_mhz': _erate / 1e6}})
             time.sleep(0.08)
         except Exception:
@@ -2710,10 +2710,14 @@ def index():
 @app.route('/api/state')
 def api_state():
     with STATE_LOCK:
-        pkts = list(PACKETS)[-2000:]
+        # Reconnecting clients need the complete retained session, not just the initial preview.
+        pkts = list(PACKETS)
+        if request.args.get('full') != '1':
+            pkts = pkts[-2000:]
         nodes = [_node_view(n) for n in NODES.values()]
     return jsonify({'packets': pkts, 'nodes': nodes, 'edges': _edges_view(),
                     'stats': _stats(), 'config': {'center_mhz': _effective_radio()[2],
+                                                  'bandwidth_hz': _effective_radio()[1],
                                                   'key': CFG['decode'].get('key')}})
 
 
@@ -2850,7 +2854,7 @@ def api_psd():
             raw = f.read()
         _erate, _ebw, _ecen = _effective_radio()
         return jsonify({'b64': _b64.b64encode(raw).decode('ascii'),
-                        'center_mhz': _ecen,
+                        'center_mhz': _ecen, 'bandwidth_hz': _ebw,
                         'rate_mhz': _erate / 1e6})
     except Exception:
         return jsonify({'b64': None})
