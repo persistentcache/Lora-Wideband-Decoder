@@ -4449,7 +4449,9 @@ class _StreamDecimator:
     _MIX_BS = 8192   # mixer block size (see _mix)
 
     def __init__(self, f_off_hz, wb_fs, D):
-        from scipy.signal import firwin
+        from scipy.signal import firwin, upfirdn as _ufd
+        global _upfirdn
+        _upfirdn = _ufd
         self.D = int(D)
         self.fs = float(wb_fs)
         self.f = float(f_off_hz)
@@ -4523,13 +4525,18 @@ class _StreamDecimator:
             return np.empty(0, np.complex64)
         n_y = m_hi - self._m_next + 1
         c_min = self._m_next * D + H - s    # seg index of y's first center
-        n_rows = n_y - 1 + K
-        W = seg[1 + (c_min // D - K) * D:
-                1 + (c_min // D - K + n_rows) * D].reshape(n_rows, D)
-        G = W @ self._hp2T                  # (n_rows, K) partial sums
-        y = np.zeros(n_y, np.complex64)
-        for j in range(K):
-            y += G[K - 1 - j: K - 1 - j + n_y, j]
+        # Same FIR, computed by scipy's C upfirdn instead of a Python-level
+        # polyphase matmul + K-loop: the output grid is aligned to absolute
+        # multiples of D by construction (H = 10*D and D | s), so the
+        # decimated full convolution z[i*D] indexes straight onto the
+        # outputs, y[j] = z[c_min + j*D].  Measured on a Pi 5 at 5 Msps:
+        # 518 -> ~130 ms per 0.5 s hop at D=2 — the old cost exceeded the
+        # hop itself, so with 2-4 deferred captures pending during a burst
+        # the single crop thread fell behind and captures were finalized
+        # 25-100 s after detection (median row latency 79 s, 21/21 decoded
+        # but a minute late).
+        zd = _upfirdn(self.h, seg, up=1, down=D)
+        y = np.ascontiguousarray(zd[c_min // D:c_min // D + n_y], dtype=np.complex64)
         self._m_next = m_hi + 1
         # keep L-1 (+ one extra D so the next GEMM's earliest row exists)
         keep_abs = self._m_next * D + H - (L - 1) - D
