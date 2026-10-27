@@ -56,6 +56,8 @@ if load_config is None:
                 'web': {'host': '127.0.0.1', 'port': 5000}, '_path': None}
 
 app = Flask(__name__)
+from web.offline_maps import create_blueprint as create_offline_maps
+app.register_blueprint(create_offline_maps(_DATA_DIR))
 CFG = load_config()
 
 # ---------------------------------------------------------------- settings

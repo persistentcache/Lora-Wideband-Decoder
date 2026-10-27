@@ -284,3 +284,18 @@ input::placeholder,textarea::placeholder { color:var(--mut); opacity:1; }
 #btnSessions[data-autosave=off] { background:#f0deda; border-color:#c9a09a; color:#6b3430; }
 #btnSessions[data-autosave=off]:hover { background:#e8cdc7; }
 #btnSessions[data-autosave] #sessauto { color:inherit; }
+
+#offline-map-options { margin:12px 0; border:1px solid var(--line); border-radius:4px; background:var(--panel); }
+#offline-map-options summary { padding:12px; cursor:pointer; font-weight:500; }
+#offline-map-status { display:block; color:var(--mut); font-size:11px; font-weight:400; margin-top:4px; }
+.offline-map-tools { padding:0 12px 12px; font-size:12px; }
+.offline-map-tools p { max-width:80ch; }
+.map-source-setting { display:flex; align-items:center; gap:12px; }
+#map-source { min-height:40px; min-width:120px; }
+.offline-map-actions { display:flex; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:16px; }
+.offline-map-actions label { display:flex; align-items:center; gap:8px; }
+#offline-map-file { display:block; max-width:100%; margin:8px 0; }
+#offline-map-feedback { margin-top:10px; overflow-wrap:anywhere; }
+#mapc { background:var(--bg); }
+#mapc .leaflet-popup-content-wrapper,#mapc .leaflet-popup-tip { background:var(--panel); color:var(--fg); }
+#mapc .leaflet-control-attribution { background:var(--panel); color:var(--mut); }
