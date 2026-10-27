@@ -25,6 +25,7 @@
   nav a.active{color:var(--fg);border-bottom-color:var(--acc)}
   .toolbar{display:flex;gap:8px;align-items:center;padding:10px 16px;flex-wrap:wrap}
   .toolbar input[type=text]{background:var(--panel2);border:1px solid var(--line);border-radius:6px;color:var(--fg);padding:6px 10px;width:260px;font-size:12px}
+  #sesspanel input[type=text]{background:var(--panel);border:1px solid var(--line);border-radius:6px;color:var(--fg);padding:5px 9px;font-size:12px}
   .toolbar label{color:var(--mut);font-size:12px;display:flex;align-items:center;gap:5px}
   .chip{padding:4px 10px;border:1px solid var(--line);border-radius:14px;cursor:pointer;color:var(--mut);font-size:12px}
   .chip.active{color:var(--fg);border-color:var(--acc);background:rgba(63,167,255,.1)}
@@ -76,11 +77,8 @@
     <span>nodes <b id="s_nodes">0</b></span>
     <button class="go" id="btnStart">Start</button>
     <button class="stop" id="btnStop" style="display:none">Stop</button>
-    <button id="btnImport">Import</button>
-    <button id="btnSave">Save session</button>
-    <label title="auto-save: continuously back the session up to an importable file (the toggle is remembered across restarts)"><input type="checkbox" id="autosave"> auto-save</label>
-    <button id="btnClear">Clear</button>
-    <input type="file" id="importFile" accept=".jsonl,.json,.csv,.txt" style="display:none">
+    <button id="btnSessions" title="Session manager: save / open / delete sessions, auto-save, session folder, import & export">Sessions<span id="sessauto" class="muted" style="font-size:10px;margin-left:5px"></span></button>
+    <button id="btnClear" title="Start a new session (clears the display; saved sessions are kept)">Clear</button>
   </div>
 </header>
 <nav>
@@ -1217,6 +1215,7 @@ const ADV_DEFAULTS = {
   wide_scan: false,
   capture_ram: false,
   capture_dir: '',
+  keep_recordings: false,
   channels_seed: [],
   patience_enabled: true,
   tune: {threshold: 0.55, energy_threshold: 6.0, buf_seconds: 16}
@@ -1243,6 +1242,7 @@ const ADV_TIPS = {
   channels_seed: "Pin channels to the dechirp matched-filter WITHOUT waiting for decodes. The matched filter decodes 10-20 dB below what initial detection needs, but normally a channel is only fed after ~10 decoded packets — so a distant node never bootstraps. A seed gives a known channel (regional default or your own) matched-filter range from the moment the pipeline starts. Seeds are pinned (never evicted by the busiest-N ranking), capped at 6, and applied live (no restart).",
   patience_enabled: "Acquire unknown channels the energy gate cannot see: energy that repeats at the same frequency over minutes is promoted, and the dechirp matched-filter is forced onto that carrier with a rotating SF/BW trial. Validated: an unknown beacon at 0 dB in-band SNR — invisible to the gate (0 detections) — is acquired within ~30 s and every subsequent transmission detects. Zero false promotions on pure noise (6 dB calibrated margin); CW interferers vetoed by duty cycle; wrong promotions expire after bounded extra CPU. On by default; applies on next Start.",
   capture_ram: "Store IQ captures in RAM (/dev/shm tmpfs) instead of on disk. Higher throughput ceiling on RAM-rich hosts, but tmpfs can't spill under memory pressure — a sustained decode backlog fills RAM and the OOM killer terminates the pipeline. OFF (disk) is recommended: the OS page cache serves the read-soon-after-write pattern at RAM speed and short-lived captures often never touch the physical device, while staying evictable to disk under pressure (graceful slowdown, not a crash). Changing this restarts a running pipeline.",
+  keep_recordings: "Move each decoded IQ capture into a 'recordings' folder next to the capture directory (with a .json decode summary) instead of deleting it. Kept until you delete them yourself; about 20-40 MB each.",
   capture_dir: "Directory the pipeline writes IQ captures to (disk mode). Blank = a default folder next to the app data. Must be on a writable filesystem; the path is permission-checked when you set it and again at pipeline start. Prefer a real disk (NVMe/SSD) — avoid /tmp if it is tmpfs on your system, which reintroduces the RAM-fill risk.",
   iq_normal: "Standard LoRa IQ orientation — Meshtastic, MeshCore, LoRaWAN uplink, and virtually all terrestrial LoRa. Leave here unless you are specifically receiving an inverted source.",
   iq_inverted: "Conjugate the input stream to decode IQ-inverted transmitters: LoRaWAN downlink and satellite / tinyGS configs with Invert-IQ enabled. MUTUALLY EXCLUSIVE — in this mode normal (non-inverted) traffic will NOT decode. Use only when monitoring a known-inverted source.",
@@ -1368,6 +1368,8 @@ function renderAdvancedConfig(box){
           <button id="capsave" title="Validate + set the capture directory. Restarts a running pipeline.">Set path</button>
         </div>
         <p class="muted" id="capstatus" style="font-size:11px;margin:5px 0 0;line-height:1.5">Captures → <code>${esc(s.capture_effective_dir||'…')}</code>. Blank = default. The path is permission-checked; changing storage restarts a running pipeline.</p>
+        ${cb('keeprec',s.keep_recordings===true,'<b>Keep recordings forever</b><br><span class="muted" style="font-size:11px">After each capture is decoded, move it to <code>'+esc(s.recordings_dir||'')+'</code> with a <code>.json</code> summary of what it decoded to, instead of deleting it. Survives reboots; never pruned — about 20–40 MB per capture. Changing this restarts a running pipeline.</span>',ADV_TIPS.keep_recordings)}
+        <p class="muted" id="recstatus" style="font-size:11px;margin:2px 0 0 26px"></p>
         <div style="margin-top:20px;padding-top:14px;border-top:1px solid var(--line);display:flex;gap:10px;align-items:center">
           <button id="advreset" title="Restore every Protocols and Advanced option to its built-in default (including capture storage — may restart a running pipeline). Does NOT touch SDR/Radio or Channel keys.">Reset to defaults</button>
           <span class="muted" style="font-size:11px">Restores all Protocols + Advanced options (protocols, unknown, scan, fingerprint, LDRO, IQ, tuning, capture storage — may restart a running pipeline). Doesn't affect SDR/Radio or Channel keys.</span>
@@ -1386,6 +1388,10 @@ function renderAdvancedConfig(box){
     q('#capram').onchange=e=>{const on=e.target.checked;const row=q('#caprow');if(row)row.style.display=on?'none':'flex';
       post({capture_ram:on}).then(r=>r.json()).then(capStatus);};
     q('#capsave').onclick=()=>post({capture_dir:q('#capdir').value}).then(r=>r.json()).then(capStatus);
+    const recStatus=()=>fetch('/api/recordings').then(r=>r.json()).then(j=>{const el=q('#recstatus');if(el)el.innerHTML=
+      (j.count?j.count+' recordings, '+fmtBytes(j.bytes)+' in <code>'+esc(j.dir)+'</code>':'No recordings kept yet')+' · '+fmtBytes(j.free_bytes)+' free';}).catch(()=>{});
+    recStatus();
+    q('#keeprec').onchange=e=>post({keep_recordings:e.target.checked}).then(()=>recStatus());
     const saveTune=()=>post({tune:{
       threshold:parseFloat(q('#tunethresh').value),
       energy_threshold:parseFloat(q('#tuneeth').value),
@@ -1814,6 +1820,89 @@ function renderAlertPanel(){const p=$('#alertpanel');if(!p)return;
 }
 function postAlert(id,patch){fetch('/api/alerts/'+id,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(patch)}).then(r=>r.json()).then(res=>{if(res.alerts)ALERTS=res.alerts;});}
 
+// ---------------------------------------------------------------- Session manager
+function setSessAuto(on){const e=$('#sessauto');if(e)e.textContent=on?'● auto-save':'';}
+function fmtBytes(b){if(b==null)return '?';return b>=1e9?(b/1e9).toFixed(1)+' GB':b>=1e6?(b/1e6).toFixed(1)+' MB':Math.max(1,Math.round(b/1e3))+' KB';}
+function closeSessions(){const o=$('#sessov');if(o)o.remove();}
+function sessPost(path,body){return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(r=>r.json());}
+function reloadState(){return fetch('/api/state').then(r=>r.json()).then(d=>{PK.length=0;PK.push(...d.packets);d.packets.forEach(noteName);renderStats(d.stats);G.nodes=[];OPEN.clear();renderCurrent();});}
+function openSessions(){closeSessions();const o=document.createElement('div');o.id='sessov';
+  o.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9998;display:flex;align-items:flex-start;justify-content:center;padding-top:56px';
+  o.onclick=e=>{if(e.target===o)closeSessions();};
+  o.innerHTML='<div id="sesspanel" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;width:min(900px,94vw);max-height:86vh;overflow:auto;padding:14px 18px;box-shadow:0 12px 40px rgba(0,0,0,.5)">Loading…</div>';
+  document.body.appendChild(o);renderSessions();}
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeSessions();});
+function renderSessions(){const p=$('#sesspanel');if(!p)return;
+  fetch('/api/sessions').then(r=>r.json()).then(S=>{setSessAuto(S.autosave);
+    const H=t=>`<h4 style="margin:16px 0 6px;font-size:13px">${t}</h4>`;
+    const rows=S.sessions.map(x=>`<tr data-n="${esc(x.name)}" style="border-top:1px solid var(--line)">
+      <td style="padding:5px 6px">${esc(x.name)}${x.name===S.current?' <span style="color:var(--ok);font-size:11px">● current</span>':''}${x.file.endsWith('.csv')?' <span class="muted" style="font-size:11px">csv</span>':''}</td>
+      <td style="padding:5px 6px;text-align:right">${x.packets}</td>
+      <td style="padding:5px 6px;text-align:right">${fmtBytes(x.size)}</td>
+      <td style="padding:5px 6px;white-space:nowrap" class="muted">${esc(fmtTime(x.mtime))}</td>
+      <td style="padding:5px 6px;white-space:nowrap;text-align:right">
+        <button data-a="open" title="Make this the current session (replaces what is on screen)">Open</button>
+        <button data-a="merge" title="Add its packets to the current session">Merge</button>
+        <button data-a="dl" title="Download the file">Download</button>
+        <button data-a="del" title="Delete the file" style="color:var(--warn)">Delete</button></td></tr>`).join('');
+    p.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center"><b style="font-size:15px">Session manager</b><a id="sessclose" style="cursor:pointer;font-size:18px;padding:0 4px" title="Close (Esc)">×</a></div>
+      ${H('Current session')}
+      <div style="font-size:12px">${S.current?'<b>'+esc(S.current)+'</b>':'<span class="muted">unnamed — '+(S.autosave?'auto-save names it on the next packet':'not saved yet')+'</span>'} · ${S.current_packets} packets</div>
+      <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+        <input id="sessname" type="text" placeholder="${esc(S.current||S.preview)}" style="flex:1;min-width:180px">
+        <button id="sesssave" title="Write the current session to the session folder under this name (blank = the name shown)">Save as</button>
+        <button id="sessnew" title="Start a new session (clears the display; saved sessions are kept)">New session</button>
+      </div>
+      ${H('Auto-save')}
+      <label style="display:flex;gap:8px;align-items:center;font-size:12px"><input type="checkbox" id="sessauto_cb"${S.autosave?' checked':''}> Auto-save sessions to the session folder (every 8 s while packets arrive; remembered across restarts)</label>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+        <span class="muted" style="font-size:11px;min-width:92px">Name format</span>
+        <input id="sessfmt" type="text" value="${esc(S.name_fmt)}" style="flex:1;min-width:180px">
+        <button id="sessfmtset">Apply</button>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:4px">Tokens: <code>{date}</code> <code>{time}</code> <code>{datetime}</code> <code>{center}</code> <code>{rate}</code> <code>{sdr}</code> · next name: <code id="sessprev">${esc(S.preview)}</code>. A new session starts at server start, on New session / Clear, and when you open a saved one.</div>
+      ${H('Session folder')}
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input id="sessdir" type="text" placeholder="${esc(S.default_dir)}" value="${esc(S.custom_dir)}" style="flex:1;min-width:220px">
+        <button id="sessdirset" title="Validate (create + write test) and use this folder; blank = default">Set folder</button>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:4px">Sessions → <code>${esc(S.dir)}</code> · ${fmtBytes(S.free_bytes)} free</div>
+      ${H('Import / export')}
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button id="sessimport" title="Upload a .jsonl / .csv session: it is stored in the session folder and merged into the current session">Import file…</button>
+        <button id="sessexpcsv" title="Download the current session as CSV">Export current (CSV)</button>
+        <button id="sessexpjson" title="Download the current session as JSONL">Export current (JSONL)</button>
+        <input type="file" id="sessfile" accept=".jsonl,.json,.csv,.txt" style="display:none">
+      </div>
+      ${H('Saved sessions ('+S.sessions.length+')')}
+      ${S.sessions.length?`<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr class="muted" style="text-align:left"><th style="padding:4px 6px">Name</th><th style="padding:4px 6px;text-align:right">Packets</th><th style="padding:4px 6px;text-align:right">Size</th><th style="padding:4px 6px">Modified</th><th></th></tr></thead><tbody>${rows}</tbody></table>`:'<div class="muted" style="font-size:12px">No saved sessions in this folder yet.</div>'}`;
+    const q=id=>p.querySelector(id);
+    q('#sessclose').onclick=closeSessions;
+    q('#sesssave').onclick=()=>{const nm=q('#sessname').value.trim()||S.current||'';
+      const go=ow=>sessPost('/api/sessions/save',{name:nm,overwrite:ow}).then(r=>{
+        if(r.exists){if(confirm('A session named "'+r.name+'" already exists. Overwrite it?'))go(true);return;}
+        if(!r.ok){alert('Save failed: '+(r.error||'?'));return;} toast('Saved '+r.packets+' packets as '+r.name);renderSessions();});
+      go(false);};
+    q('#sessnew').onclick=()=>{if(!confirm('Start a new session? The display is cleared; saved sessions are kept.'))return;
+      fetch('/api/clear',{method:'POST'}).then(()=>{PK.length=0;G.nodes=[];OPEN.clear();renderCurrent();renderSessions();});};
+    q('#sessauto_cb').onchange=e=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autosave:e.target.checked})}).then(()=>renderSessions());
+    q('#sessfmtset').onclick=()=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autosave_name_fmt:q('#sessfmt').value})}).then(()=>renderSessions());
+    q('#sessdirset').onclick=()=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_dir:q('#sessdir').value})}).then(r=>r.json()).then(r=>{if(r.capture_error)alert(r.capture_error);renderSessions();});
+    q('#sessexpcsv').onclick=()=>{window.location='/api/export?fmt=csv';};
+    q('#sessexpjson').onclick=()=>{window.location='/api/export?fmt=json';};
+    q('#sessimport').onclick=()=>q('#sessfile').click();
+    q('#sessfile').onchange=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();
+      r.onload=()=>fetch('/api/sessions/import?name='+encodeURIComponent(f.name),{method:'POST',body:r.result}).then(x=>x.json()).then(res=>{
+        if(!res.ok){alert('Import failed: '+(res.error||'?'));return;} reloadState();toast('Imported '+res.imported+' packets (stored as '+res.name+')');renderSessions();});
+      r.readAsText(f);e.target.value='';};
+    p.querySelectorAll('tr[data-n] button').forEach(b=>b.onclick=()=>{const nm=b.closest('tr').dataset.n,a=b.dataset.a;
+      if(a==='dl'){window.location='/api/sessions/download?name='+encodeURIComponent(nm);return;}
+      if(a==='del'){if(!confirm('Delete session "'+nm+'"? This removes the file.'))return;
+        sessPost('/api/sessions/delete',{name:nm}).then(r=>{if(!r.ok)alert(r.error||'Delete failed');renderSessions();});return;}
+      if(a==='open'&&PK.length&&!S.autosave&&!confirm('Open "'+nm+'"? The current session is not auto-saved — its '+PK.length+' packets are dropped unless you Save as first.'))return;
+      sessPost('/api/sessions/open',{name:nm,mode:a==='merge'?'merge':'replace'}).then(r=>{if(!r.ok){alert(r.error||'Open failed');return;}
+        reloadState().then(()=>{toast((a==='merge'?'Merged ':'Opened ')+r.imported+' packets from '+nm);renderSessions();});});});
+  }).catch(e=>{p.textContent='Could not load sessions: '+e;});}
 function renderCurrent(){ if(TAB==='pkts')renderPkts(); else if(TAB==='nodes')renderNodes(); else if(TAB==='net')startNet(); else if(TAB==='wf')renderWaterfall(); else if(TAB==='map')renderMap(); else if(TAB==='search')renderSearch(); else if(TAB==='stats')renderStatsTab(); else if(TAB==='config')renderConfig(); }
 let PIPE_RUNNING=false;
 function renderStats(s){PIPE_RUNNING=!!s.pipeline_running;$('#s_pkts').textContent=s.packets;$('#s_dec').textContent=s.decoded;$('#s_enc').textContent=s.encrypted;$('#s_nodes').textContent=s.nodes;$('#pipedot').className='dot '+(s.pipeline_running?'on':'off');$('#pipetxt').textContent=s.pipeline_running?'running':'stopped';$('#btnStart').style.display=s.pipeline_running?'none':'';$('#btnStop').style.display=s.pipeline_running?'':'none';}
@@ -1834,19 +1923,11 @@ $('#mergeRelays').onchange=()=>renderPkts();
 document.querySelectorAll('.chip[data-f]').forEach(c=>c.onclick=()=>{document.querySelectorAll('.chip[data-f]').forEach(x=>x.classList.remove('active'));c.classList.add('active');PFILT=c.dataset.f;renderPkts();});
 $('#btnStart').onclick=()=>fetch('/api/pipeline/start',{method:'POST'});
 $('#btnStop').onclick=()=>fetch('/api/pipeline/stop',{method:'POST'});
-$('#btnSave').onclick=()=>{window.location='/api/export?fmt=csv';};
-$('#btnImport').onclick=()=>$('#importFile').click();
-$('#importFile').onchange=e=>{const f=e.target.files[0]; if(!f)return; const r=new FileReader();
-  r.onload=()=>{fetch('/api/import',{method:'POST',body:r.result}).then(x=>x.json()).then(res=>{
-    fetch('/api/state').then(r=>r.json()).then(d=>{PK.length=0;PK.push(...d.packets);d.packets.forEach(noteName);renderStats(d.stats);G.nodes=[];OPEN.clear();renderCurrent();});
-    alert('Imported '+res.imported+' packets. Start the pipeline to add new data, then Save to export old + new.');});};
-  r.readAsText(f); e.target.value='';};
-const _as=$('#autosave');
-fetch('/api/settings').then(r=>r.json()).then(s=>{_as.checked=!!s.autosave;WFON=s.waterfall!==false;
+fetch('/api/settings').then(r=>r.json()).then(s=>{setSessAuto(!!s.autosave);WFON=s.waterfall!==false;
   if(s.time_format)TIME_FMT=s.time_format; if(s.date_format)DATE_FMT=s.date_format;
   try{renderCurrent();}catch(e){}}).catch(()=>{});
-_as.onchange=()=>fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autosave:_as.checked})});
-$('#btnClear').onclick=()=>{if(confirm('Clear all captured packets (also clears the saved log)?')){fetch('/api/clear',{method:'POST'});PK.length=0;G.nodes=[];OPEN.clear();renderCurrent();}};
+$('#btnSessions').onclick=openSessions;
+$('#btnClear').onclick=()=>{if(confirm('Start a new session? This clears the display. Saved sessions are kept (open them from Sessions).')){fetch('/api/clear',{method:'POST'});PK.length=0;G.nodes=[];OPEN.clear();renderCurrent();}};
 try{new URLSearchParams(location.search).getAll('open').forEach(id=>OPEN.add(id));}catch(e){}
 try{const _q=new URLSearchParams(location.search).get('q'); if(_q)SEARCHQ=_q;}catch(e){}
 // Header center-freq display — kept current from the effective config (page load),
