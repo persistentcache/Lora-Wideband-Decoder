@@ -5956,12 +5956,23 @@ class SignalRecorder:
                         if _pass2_enable and _preamble_sym > 0 and _preamble_sample > 0:
                             _iso_after  = max(0, _preamble_sym - 16)
                             _iso_before = _preamble_sym + 149
+                            # Under decode-queue pressure the hop search goes
+                            # to the SLOW tier: it only finds a same-window
+                            # relay hop, so deferring it to the idle gap costs
+                            # that hop some latency, whereas on the fast tier
+                            # it competes with fresh primaries — a Pi 5 at
+                            # 10 Msps spent 15 % of decode-worker time on 33
+                            # such jobs (0 packets found) while the queue
+                            # held 46.  Hosts that never reach the pressure
+                            # threshold are unchanged.
+                            _iso_slow = (self._decoder.pending()
+                                         > getattr(self._decoder, '_pressure_n', 8))
                             self._decoder.submit(
                                 fpath, fname,
                                 relay_after_syms=_iso_after,
                                 relay_before_syms=_iso_before,
                                 bucket_key=_bkey,
-                                slow=bool(d.get('patience_trial')),
+                                slow=_iso_slow or bool(d.get('patience_trial')),
                                 # relay search runs after every primary
                                 prio=float(d.get('bw_quality_db', 0.0)) - 100.0)
             except Exception as e:
