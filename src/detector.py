@@ -10494,6 +10494,31 @@ def main():
                           f"abst={_abst:.2f}s [slow-pass]",
                           flush=True)
                 if recorder:
+                    # The slow pass exists for the 31.25k/41.67k presets; its
+                    # alias-chain vote may still resolve a wider class, and
+                    # then it re-detects a burst the main pass already
+                    # recorded — at a centroid ~bw/4 off, outside the
+                    # recorder's cluster tolerance, so every such hit became
+                    # its own capture (live: 10 of 84 detections, 16 SF12/125k
+                    # decode jobs for 3 frames, up to 115 s each).  Drop a
+                    # non-slow-class slow-pass detection when the recorder
+                    # already holds the same label within ±bw and 1.5 s.
+                    _keep_slow = []
+                    for d in dets_slow:
+                        if int(d['bw']) not in (31250, 41667):
+                            _da = ((_reg_tot_s - len(_iq_long)) / a.rate
+                                   + d.get('preamble_t_s', 0.0))
+                            with recorder._saved_abs_t_lock:
+                                _dup = any(
+                                    _e[2] == d['sf'] and _e[3] == d['bw']
+                                    and abs(_e[0] - d['freq_hz']) < d['bw']
+                                    and abs(_e[1] - _da) < 1.5
+                                    for _e in recorder._saved_abs_t)
+                            if _dup:
+                                continue
+                        _keep_slow.append(d)
+                    dets_slow = _keep_slow
+                if recorder and dets_slow:
                     _slow_pkt_s = max(
                         (148.25 * (2 ** d['sf']) / d['bw']) for d in dets_slow)
                     # 24-window cap, not 12: SF12/31.25k frames run up to
