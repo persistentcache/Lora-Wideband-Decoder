@@ -116,6 +116,8 @@
       <span class="chip" data-f="disaster_radio" style="border-color:var(--acc)">disaster.radio</span>
       <span class="chip" data-f="ebyte_lora" style="border-color:var(--acc)">EByte LoRa</span>
       <span class="chip" data-f="radiohead" style="border-color:var(--acc)">RadioHead</span>
+      <span class="chip" data-f="sidewalk" style="border-color:var(--acc)">Sidewalk</span>
+      <span class="chip" data-f="meshcom" style="border-color:var(--acc)">MeshCom</span>
       <span class="chip" data-f="unknown" style="border-color:var(--warn)">unknown</span>
       <label title="Combine all receptions of the same Meshtastic message (heard direct + heard via 1+ relays) into one row.  When on, the row shows the highest hop count observed for that pktid; when off, every reception is its own row."><input type="checkbox" id="mergeRelays" checked> Merge relays</label>
       <span class="muted" id="shown"></span>
@@ -247,8 +249,8 @@ function nodeDetail(id){
   return {msgs, convo:Object.entries(convo).sort((a,b)=>b[1]-a[1]), pkts:pkts.slice(-30).reverse(), pos, meta, tel, rt, nbr};
 }
 const TYPEMAP={text:'TEXT_MESSAGE_APP',pos:'POSITION_APP',nodeinfo:'NODEINFO_APP',telem:'TELEMETRY_APP'};
-const PROTOS=['meshtastic','lorawan','meshcore','loramesher','lora_aprs','reticulum','disaster_radio','ebyte_lora','radiohead','unknown'];
-const PROTO_LABEL={meshtastic:'Meshtastic',lorawan:'LoRaWAN',meshcore:'MeshCore',loramesher:'LoRaMesher',lora_aprs:'LoRa APRS',reticulum:'Reticulum',disaster_radio:'disaster.radio',ebyte_lora:'EByte LoRa',radiohead:'RadioHead'};
+const PROTOS=['meshtastic','lorawan','meshcore','loramesher','lora_aprs','reticulum','disaster_radio','ebyte_lora','radiohead','sidewalk','meshcom','unknown'];
+const PROTO_LABEL={meshtastic:'Meshtastic',lorawan:'LoRaWAN',meshcore:'MeshCore',loramesher:'LoRaMesher',lora_aprs:'LoRa APRS',reticulum:'Reticulum',disaster_radio:'disaster.radio',ebyte_lora:'EByte LoRa',radiohead:'RadioHead',sidewalk:'Sidewalk',meshcom:'MeshCom'};
 const PROTO_HINT_LABEL=PROTO_LABEL;   // same names for "looks like X" badges
 const proto=p=>p.proto||'meshtastic';
 function matchFilter(p){
@@ -362,6 +364,8 @@ function pktType(p){const pr=proto(p);
   if(pr==='disaster_radio')return esc('TTL '+(p.dr_ttl||'?'));
   if(pr==='ebyte_lora')return esc('ch'+(p.ebyte_chan!=null?p.ebyte_chan:'?'));
   if(pr==='radiohead')return esc('id '+(p.rh_id||'?'));
+  if(pr==='sidewalk')return esc(p.sw_frame_type||'Sidewalk');
+  if(pr==='meshcom')return esc(p.mc_type||'MeshCom');
   return '<span class="muted">—</span>';}
 function meshSummary(p){   // human one-liner for a decoded Meshtastic packet (never blank)
   if(p.text)return esc(p.text);
@@ -1204,7 +1208,8 @@ function renderSdrConfig(box){
 const ADV_DEFAULTS = {
   protocols: {meshtastic:true, meshcore:true, lorawan:true, loramesher:true,
               lora_aprs:true, reticulum:true, disaster_radio:true,
-              ebyte_lora:true, radiohead:true},
+              ebyte_lora:true, radiohead:true, sidewalk:true, meshcom:true,
+              raw_lora:true},
   unknown: false,
   fingerprint: true,
   ldro_fallback: true,
@@ -1228,6 +1233,9 @@ const ADV_TIPS = {
   disaster_radio: "sudomesh emergency mesh. Identified by sudomesh frame structure.",
   ebyte_lora: "Fixed-mode P2P broadcasts from E22 / E220 / E32 modules. xreef Arduino library.",
   radiohead: "RadioHead RH_RF95 frame format. Common in Adafruit / Sparkfun starter projects.",
+  sidewalk: "Amazon Sidewalk SubG-CSS uplinks (Ring / Echo / Tile endpoints). Spec-pinned SF11 / 500 kHz, sync 0x34, 902.5–926.5 MHz. Identified by the link-layer frame-control grammar; confirmed when the same device ID repeats. Payload is encrypted (no keys).",
+  meshcom: "ICSSW MeshCom ham-radio mesh (433.175 MHz default, SF11 / 250 kHz / CR 4/6, sync 0x2B like Meshtastic). Verified by the in-frame FCS sum + callsign grammar; text, position and HEY frames decode in clear.",
+  raw_lora: "Content hints for frames no protocol claims: JSON objects (OpenMQTTGateway etc.) and ≥90 % printable text. Never more than a candidate; runs only after every real parser declined. Like MeshCore, it is sync-agnostic, so while it is on the decoder cannot skip frames by sync word when Unknown is off.",
   unknown: "Surface good-CRC LoRa frames matching no enabled protocol. Off by default. When off, decoder skips them entirely (saves CPU).",
   fingerprint: "Extract UMOP features (CFO jitter, AM ripple, PLL phase, I/Q balance) from the preamble. Feeds Mystery Devices and per-node clustering. ~10–15 % extra decode CPU. Header decode coverage unchanged.",
   ldro_fallback: "When a payload fails CRC, retry it once with the opposite Low Data Rate Optimization (LDRO) setting. LDRO is normally inferred from symbol time (auto-on above 16 ms), but some transmitters force it against that default (e.g. satellite / tinyGS at SF8/41.7 kHz) — without this, those packets never decode or even surface as unknown. The CRC arbitrates, so it only adds decodes. On by default; runs only on CRC-fail, negligible cost.",
@@ -1264,6 +1272,9 @@ function renderProtocolsConfig(box){
         ${cb('pdr',pr.disaster_radio!==false,'disaster.radio <span class="muted" style="font-size:11px">(sudomesh recovery mesh)</span>',ADV_TIPS.disaster_radio)}
         ${cb('peb',pr.ebyte_lora!==false,'EByte LoRa <span class="muted" style="font-size:11px">(E22/E220/E32 fixed-mode broadcast — xreef Arduino library)</span>',ADV_TIPS.ebyte_lora)}
         ${cb('prh',pr.radiohead!==false,'RadioHead RF95 <span class="muted" style="font-size:11px">(Adafruit/Sparkfun starter library)</span>',ADV_TIPS.radiohead)}
+        ${cb('psw',pr.sidewalk!==false,'Amazon Sidewalk <span class="muted" style="font-size:11px">(SubG-CSS LoRa link — SF11 / 500 kHz, sync 0x34)</span>',ADV_TIPS.sidewalk)}
+        ${cb('pmcom',pr.meshcom!==false,'MeshCom <span class="muted" style="font-size:11px">(ICSSW ham mesh, 433 MHz — FCS-verified)</span>',ADV_TIPS.meshcom)}
+        ${cb('praw',pr.raw_lora!==false,'Raw LoRa hints <span class="muted" style="font-size:11px">(JSON / plain-text payloads with no protocol — candidate only)</span>',ADV_TIPS.raw_lora)}
         <h4 style="margin:18px 0 2px">Unknown protocols</h4>
         ${cb('unk',unk,'<b>Unknown (Off / On)</b><br><span class="muted" style="font-size:11px">Surface intact LoRa frames (good CRC) that match no enabled protocol — a possible new/unsupported protocol. Off by default; off also lets the decoder skip them entirely to save compute.</span>',ADV_TIPS.unknown)}
         <h4 style="margin:18px 0 2px">Unknown-protocol report</h4>
@@ -1291,9 +1302,10 @@ function renderProtocolsConfig(box){
       lorawan:q('#plw').checked, loramesher:q('#plm').checked,
       lora_aprs:q('#paprs').checked, reticulum:q('#prns').checked,
       disaster_radio:q('#pdr').checked, ebyte_lora:q('#peb').checked,
-      radiohead:q('#prh').checked,
+      radiohead:q('#prh').checked, sidewalk:q('#psw').checked,
+      meshcom:q('#pmcom').checked, raw_lora:q('#praw').checked,
     }});
-    ['#pmesh','#pmc','#plw','#plm','#paprs','#prns','#pdr','#peb','#prh'].forEach(s=>q(s).onchange=saveProtos);
+    ['#pmesh','#pmc','#plw','#plm','#paprs','#prns','#pdr','#peb','#prh','#psw','#pmcom','#praw'].forEach(s=>q(s).onchange=saveProtos);
     q('#unk').onchange=e=>post({unknown:e.target.checked});
     q('#scanmode').onchange=e=>post({wide_scan:e.target.value==='all'});
     q('#unkdl').onclick=()=>{window.location='/api/unknown?download=1';};
