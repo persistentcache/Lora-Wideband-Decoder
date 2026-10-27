@@ -833,7 +833,7 @@ def _confirm(rec):
         d['fcnts'] = d['fcnts'][-64:]
     just = None
     if not d['confirmed'] and len(d['fcnts']) >= 2:
-        if any(0 <= b - a <= 2000 for a, b in zip(d['fcnts'], d['fcnts'][1:])):
+        if any(1 <= b - a <= 2000 for a, b in zip(d['fcnts'], d['fcnts'][1:])):   # delta 0 = the same frame captured twice, not a counter
             d['confirmed'] = True
             just = devaddr
     if d['confirmed']:
