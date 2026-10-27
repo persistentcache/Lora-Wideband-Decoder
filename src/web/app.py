@@ -66,7 +66,8 @@ def load_settings():
                  # Advanced Options (Config) — persist across sessions:
                  'protocols': {'meshtastic': True, 'meshcore': True, 'lorawan': True,
                                'loramesher': True, 'lora_aprs': True, 'reticulum': True,
-                               'disaster_radio': True, 'ebyte_lora': True, 'radiohead': True},
+                               'disaster_radio': True, 'ebyte_lora': True, 'radiohead': True,
+                               'sidewalk': True, 'meshcom': True, 'raw_lora': True},
                  'unknown': False,          # master: surface unidentified protocols (default OFF)
                  'fingerprint': True,       # RF hardware fingerprinting (Mystery Devices + clustering)
                  'ldro_fallback': True,     # retry payload with opposite LDRO on CRC fail (forced-LDRO TX)
@@ -2432,6 +2433,7 @@ def start_pipeline():
     env['LORA_PROTOCOLS'] = ','.join(k for k in (
         'meshtastic', 'meshcore', 'lorawan', 'loramesher',
         'lora_aprs', 'reticulum', 'disaster_radio', 'ebyte_lora', 'radiohead',
+        'sidewalk', 'meshcom', 'raw_lora',
     ) if _pr.get(k, True))
     if SETTINGS.get('wide_scan'):
         env['LORA_SCAN_FULL'] = '1'  # sweep all SF×BW (any LoRa), not just presets
@@ -2761,7 +2763,8 @@ def api_settings():
         if 'protocols' in d and isinstance(d['protocols'], dict):
             pr = dict(SETTINGS.get('protocols') or {})
             for k in ('meshtastic', 'meshcore', 'lorawan', 'loramesher',
-                      'lora_aprs', 'reticulum', 'disaster_radio', 'ebyte_lora', 'radiohead'):
+                      'lora_aprs', 'reticulum', 'disaster_radio', 'ebyte_lora', 'radiohead',
+                      'sidewalk', 'meshcom', 'raw_lora'):
                 if k in d['protocols']:
                     pr[k] = bool(d['protocols'][k])
             SETTINGS['protocols'] = pr

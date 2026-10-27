@@ -1411,7 +1411,8 @@ _LORAWAN_GRID_TOL_KHZ = float(os.environ.get('LORA_GRID_TOL_KHZ', '60'))
 # AND lets the decoder early-bail on irrelevant sync words to save compute).
 _PROTO_ENABLED = set(p for p in os.environ.get(
     'LORA_PROTOCOLS',
-    'meshtastic,meshcore,lorawan,loramesher,lora_aprs,reticulum,disaster_radio,ebyte_lora,radiohead'
+    'meshtastic,meshcore,lorawan,loramesher,lora_aprs,reticulum,disaster_radio,ebyte_lora,radiohead,'
+    'sidewalk,meshcom,raw_lora'
 ).replace(' ', '').lower().split(',') if p)
 _PROTO_UNKNOWN = os.environ.get('LORA_UNKNOWN', '0') == '1'
 # LORA_FINGERPRINT = '1' (default) enables hardware-fingerprint extraction on
@@ -1434,13 +1435,15 @@ def _protocol_skip(sync):
         return False
     if 'meshcore' in _PROTO_ENABLED:         # arbitrary sync → can't filter by sync
         return False
+    if 'raw_lora' in _PROTO_ENABLED:         # content hints are sync-agnostic too
+        return False
     if sync is None:                         # ambiguous; meshtastic tolerates None
         return 'meshtastic' not in _PROTO_ENABLED
     allowed = set()
-    if 'meshtastic' in _PROTO_ENABLED:
-        allowed |= _MESH_SYNCS
-    if 'lorawan' in _PROTO_ENABLED:
-        allowed.add(0x34)
+    if 'meshtastic' in _PROTO_ENABLED or 'meshcom' in _PROTO_ENABLED:
+        allowed |= _MESH_SYNCS               # MeshCom uses 0x2B as well
+    if 'lorawan' in _PROTO_ENABLED or 'sidewalk' in _PROTO_ENABLED:
+        allowed.add(0x34)                    # Sidewalk SubG-CSS sync is 0x34
     return sync not in allowed
 
 def _on_lorawan_grid(freq_mhz, sf, bw, region=None, tol_khz=None):
@@ -3688,6 +3691,556 @@ def _rh_expire(now):
 
 
 # ============================================================================
+# Amazon Sidewalk — SubG-CSS (LoRa) link.
+#
+# Source: Amazon Sidewalk Specification, Protocol Stack 1.0, rev A.2
+# (docs.sidewalk.amazon/specifications/sidewalk-protocol-spec/, chapter 5
+# "Sub-GHz protocol stack"; the PDF link on that site serves the HTML copy,
+# section numbers below are the spec's own).  Read 2026-10-26.
+#
+# PHY (§5.1.4.2.3 "SubG-CSS frame format details", §5.7.2, Table 5.5):
+#   SF11 with CR 4/5 ("only SF11 with Coding Rate (CR) 4/5 is used"), signal
+#   bandwidth 500 kHz, sync word 0x34, explicit header (PHDR + PHDR_CRC),
+#   payload CRC-16 on (x^16+x^12+x^5+1; "default value for CRC is 16 bits"),
+#   max PHY payload 44 B at SF11.  Uplink preamble 16 symbols, downlink
+#   8..23.  "Upchirps are used in the uplink, downchirps in the downlink. In
+#   the downlink, the symbols are IQ inverted" — so a normal-IQ capture
+#   only ever shows UPLINK (endpoint → gateway) frames.
+#   Region 2 channel plan (Table 5.5): 31 channels, 902.5 MHz + 0.8 MHz·n,
+#   n = 0..30 (800 kHz spacing), channel 26 (923.3 MHz) is the default
+#   working channel.  The public spec gives NO channel plan for ITU
+#   regions 1/3, so frequency is reported, never gated.
+#
+# Link-layer message frame (§5.1.3.2; fig 5.35: 5..255 octets; the spec
+# numbers bits 8..1 = MSB..LSB, rewritten here as [7:0]):
+#   Frame control, 2 octets (§5.1.3.2.1, fig 5.36):
+#     octet 0 [7:5] frame_type   001 Data, 010 Network Data, 011 ACK (all
+#                                other codes undefined)
+#             [4]   epoch_bit    meaningful only on asynchronous-mode Data
+#                                uplink; "reserved and should be set to 0"
+#                                for Network Data and ACK
+#             [3:0] prot_ver     0100 "Halo 2.0 protocol version" — the only
+#                                value the spec defines
+#     octet 1 [7:6] src_frmt     00 cloud, 01 global device ID, 1x reserved
+#             [5:4] dst_frmt     same coding
+#             [3]   nwk_frame_ctrl 1 for Data / Network Data ("shall be set
+#                                to 1"), 0 for ACK ("shall always be set to 0")
+#             [2]   ack_req      "should always be set to 0" in an ACK
+#             [1:0] reserved
+#   src (§5.1.3.2.2, fig 5.37) and dst (§5.1.3.2.3, fig 5.38): 1–5 octets,
+#     the top 3 bits of the first octet give the field size X in octets
+#     (the whole field, first octet included), the other 5 bits plus X-1
+#     octets are the address.
+#   seq_num (§5.1.3.2.4, fig 5.39): 1–3 octets, top 2 bits = size X.
+#   frame_pld (§5.1.3.2.5): 0–240 B Network-layer frame, present iff
+#     nwk_frame_ctrl = 1; never present in an ACK.
+# Network-layer frame (§5.1.2.2, fig 5.15, fig 5.18):
+#   octet 0 [7] is_fragment    "shall be set to 0" (no fragmentation support)
+#           [6] frame_pld_type 1 = Presentation-layer frame, 0 reserved
+#           [5] encr_ena       payload encrypted
+#           [4:2] auth_code_size 0 none, 1 → 2 B, 2 → 4 B, 3 → 8 B,
+#                              4 → 12 B, 5 → 16 B, 6/7 reserved
+#           [1] sec_top        1 = WAN topology, 0 reserved
+#           [0] ext_hdr        sec_ref octet present
+#   if ext_hdr: sec_ref octet [7] sec_ref (0 GCS, 1 COUNTER), [6:0]
+#     reserved; sec_ref = 1 adds a 4-octet counter_val; auth_code is capped
+#     at 12 B in that case (§5.1.2.2.1).
+#   auth_code: auth_code_size octets (the MIC), then frame_pld 1–221 B
+#     (§5.1.2.2.3) — the Presentation-layer frame, ciphertext when
+#     encr_ena = 1, so nothing past this point is parsed.
+#
+# NOT pinned down by the public spec, therefore NOT gated here: the value /
+# size a 'cloud'-format address field carries; whether a global device ID
+# always uses the full 5-octet (37-bit) encoding; the octet order of
+# multi-octet link fields (§5.1.4.1 only states little-endian for the PHY
+# frame) — addresses are therefore shown as the raw octets; ack_req on
+# CSS Data frames (§5.1.3 ties ACKs to synchronous mode but §5.3 does not
+# say whether CSS counts as such).  Deliberate tightening beyond the spec:
+# §5.1.2.2.4 Case 1 allows auth_code_size = 0 (no security block); such a
+# frame is rejected because a registered-device exchange is always
+# authenticated (chapter 4 security) and accepting it would quadruple the
+# random-byte acceptance of the weakest octet.
+#
+# Confidence: 'candidate' on structure alone; 'confirmed' once the same
+# endpoint device ID (device-ID-format src, else dst) has been seen again
+# within _RH_STATE_TTL_S — the structural gate measures ~1e-6 per random
+# frame, so a single frame is not enough and the MIC cannot be checked
+# (no key material).  Never 'verified'.
+# ============================================================================
+_SW_FRAME_TYPES = {1: 'DATA', 2: 'NETWORK_DATA', 3: 'ACK'}
+_SW_AUTH_SIZES = {0: 0, 1: 2, 2: 4, 3: 8, 4: 12, 5: 16}      # §5.1.2.2.1
+_SW_PROT_VER = 0x4                                            # §5.1.3.2.1
+_SW_MAX_PHY_PAYLOAD = 44                                      # §5.1.4.2.3 (SF11)
+_SW_CH0_MHZ, _SW_CH_STEP_MHZ, _SW_N_CH = 902.5, 0.8, 31       # Table 5.5
+_SW_SEEN = {}   # endpoint device-ID hex -> last-seen time (behavioural confirm)
+
+
+def _sw_var_field(buf, off, size_bits):
+    """Decode one size-prefixed Sidewalk field (src/dst: 3 size bits,
+    seq_num: 2).  Returns (X, address_octets) or None when X is 0 or the
+    field overruns the frame.  The first octet's low bits are kept as the
+    first address octet (masked) so no octet-order assumption is made."""
+    if off >= len(buf):
+        return None
+    x = buf[off] >> (8 - size_bits)
+    if x == 0 or off + x > len(buf):
+        return None
+    first = buf[off] & ((1 << (8 - size_bits)) - 1)
+    return x, bytes([first]) + buf[off + 1:off + x]
+
+
+def parse_sidewalk_packet(payload, rf=None):
+    """Parse an Amazon Sidewalk SubG-CSS link-layer message frame.  Returns
+    a record (proto 'sidewalk' when confirmed, else 'unknown' with hint
+    'sidewalk') or None.  See the section comment for the grammar."""
+    payload = bytes(payload)                     # list or bytes — normalise
+    n = len(payload)
+    if n < 5 or n > _SW_MAX_PHY_PAYLOAD:         # fig 5.35 min; §5.1.4.2.3 max
+        return None
+    # PHY signature: the spec pins SF11 / 500 kHz for SubG-CSS.  A measured
+    # SF or BW that contradicts it is a reject, not a prior — radios cannot
+    # be reconfigured by the user here, unlike the mesh protocols.
+    if rf:
+        _sf, _bw = rf.get('sf'), rf.get('bw')
+        if _sf is not None and int(_sf) != 11:
+            return None
+        if _bw is not None and abs(float(_bw) - 500e3) > 50e3:
+            return None
+    b0, b1 = payload[0], payload[1]
+    ftype = b0 >> 5
+    if ftype not in _SW_FRAME_TYPES:
+        return None
+    if (b0 & 0x0F) != _SW_PROT_VER:
+        return None
+    epoch = (b0 >> 4) & 1
+    if epoch and ftype != 1:                     # reserved → 0 except Data
+        return None
+    src_frmt, dst_frmt = b1 >> 6, (b1 >> 4) & 3
+    if src_frmt > 1 or dst_frmt > 1:             # 1x reserved
+        return None
+    nwk, ack_req = (b1 >> 3) & 1, (b1 >> 2) & 1
+    if b1 & 0x03:                                # reserved bits
+        return None
+    if ftype == 3:
+        if nwk or ack_req:
+            return None
+    elif not nwk:
+        return None
+    off = 2
+    f = _sw_var_field(payload, off, 3)
+    if f is None:
+        return None
+    src_len, src = f
+    off += src_len
+    f = _sw_var_field(payload, off, 3)
+    if f is None:
+        return None
+    dst_len, dst = f
+    off += dst_len
+    f = _sw_var_field(payload, off, 2)
+    if f is None:
+        return None
+    seq_len, seq_raw = f
+    off += seq_len
+    rest = payload[off:]
+    encr = sec_ref = counter = None
+    mic = b''
+    pld = b''
+    if ftype == 3:
+        if rest:                                 # §5.1.3.2.5: no payload in ACK
+            return None
+    else:
+        if len(rest) < 2:                        # nwk frame control + ≥1 B
+            return None
+        nb = rest[0]
+        if nb & 0x80:                            # is_fragment
+            return None
+        if not nb & 0x40:                        # frame_pld_type must be 1
+            return None
+        encr = (nb >> 5) & 1
+        acs = (nb >> 2) & 7
+        if acs not in _SW_AUTH_SIZES or acs == 0:
+            return None
+        if not nb & 0x02:                        # sec_top must be 1
+            return None
+        ext_hdr = nb & 1
+        p = 1
+        if ext_hdr:
+            if p >= len(rest):
+                return None
+            sr = rest[p]
+            if sr & 0x7F:                        # reserved bits of sec_ref
+                return None
+            sec_ref = sr >> 7
+            p += 1
+            if sec_ref:
+                if acs > 4:                      # 12 B cap with COUNTER
+                    return None
+                if p + 4 > len(rest):
+                    return None
+                counter = rest[p:p + 4].hex().upper()
+                p += 4
+        mic_len = _SW_AUTH_SIZES[acs]
+        if p + mic_len >= len(rest):             # need ≥1 payload octet after MIC
+            return None
+        mic = rest[p:p + mic_len]
+        pld = rest[p + mic_len:]
+        if len(pld) > 221:                       # §5.1.2.2.3 (unreachable at 44 B)
+            return None
+    src_str = 'cloud' if src_frmt == 0 else src.hex().upper()
+    dst_str = 'cloud' if dst_frmt == 0 else dst.hex().upper()
+    seq = int.from_bytes(seq_raw, 'big')         # display only; order not pinned
+    # Behavioural confirmation keyed on the endpoint identity.  Downlink is
+    # IQ-inverted so in practice src is the device; dst is the fallback for
+    # an inverted-IQ capture (LORA_IQ_INVERT) where the gateway is the sender.
+    key = src.hex() if src_frmt == 1 else (dst.hex() if dst_frmt == 1 else None)
+    now = time.time()
+    _seen = _SW_SEEN.get(key) if key is not None else None
+    if key is not None:
+        _SW_SEEN[key] = now
+    for _k in [k for k, v in _SW_SEEN.items() if now - v > _RH_STATE_TTL_S]:
+        del _SW_SEEN[_k]
+    confidence = 'confirmed' if _seen is not None else 'candidate'
+    ch = None
+    if rf and rf.get('freq_mhz') is not None:
+        _i = int(round((float(rf['freq_mhz']) - _SW_CH0_MHZ) / _SW_CH_STEP_MHZ))
+        if 0 <= _i < _SW_N_CH and abs(
+                float(rf['freq_mhz']) - (_SW_CH0_MHZ + _SW_CH_STEP_MHZ * _i)) < 0.1:
+            ch = _i
+    ftype_name = _SW_FRAME_TYPES[ftype]
+    print("\n  --- Amazon Sidewalk (SubG-CSS) Frame ---")
+    print("  Type: %s  prot_ver %d  epoch %d  ack_req %d  seq %d (%dB)" % (
+        ftype_name, b0 & 0x0F, epoch, ack_req, seq, seq_len))
+    print("  src: %s (%dB, %s)  dst: %s (%dB, %s)" % (
+        src_str, src_len, 'device' if src_frmt else 'cloud',
+        dst_str, dst_len, 'device' if dst_frmt else 'cloud'))
+    if ftype != 3:
+        print("  Network: encrypted %d  MIC %dB  sec_ref %s  counter %s  payload %dB" % (
+            encr, len(mic), sec_ref, counter, len(pld)))
+    if ch is not None:
+        print("  Region-2 channel: %d" % ch)
+    return {
+        'proto': 'sidewalk' if confidence == 'confirmed' else 'unknown',
+        'hint': 'sidewalk',
+        'confidence': confidence,
+        'decrypted': False,
+        'from': src_str,
+        'to': dst_str,
+        'sw_frame_type': ftype_name,
+        'sw_seq': seq,
+        'sw_epoch': bool(epoch),
+        'sw_ack_req': bool(ack_req),
+        'sw_encrypted': bool(encr) if encr is not None else None,
+        'sw_mic_len': len(mic),
+        'sw_mic': mic.hex().upper() or None,
+        'sw_counter': counter,
+        'sw_channel': ch,
+        'sw_payload_len': len(pld),
+        'summary': '%s %s→%s seq %d · MIC %dB · %dB' % (
+            ftype_name, src_str, dst_str, seq, len(mic), len(pld)),
+    }
+
+
+# ============================================================================
+# MeshCom (ICSSW / OE1KBC — Austrian/German amateur-radio LoRa mesh).
+#
+# Source: icssw-org/MeshCom-Firmware (github, master, cloned 2026-10-26):
+#   src/aprs_functions.cpp  encodeStartAPRS() / encodeAPRS() /
+#                           encodePayloadAPRS() (TX) and decodeAPRS() (RX),
+#   src/aprs_structures.h   struct aprsMessage,
+#   src/configuration_global.h  MSG_TYPE_* and SYNC_WORD_SX127x,
+#   src/ack_functions.h / ack_attribution.h  ACK wire layout + plausibility,
+#   src/regex_functions.cpp  regex_call_match (callsign grammar),
+#   src/configuration_default.h / country_profile.cpp  PHY defaults.
+#
+# PHY (configuration_default.h): 433.175 MHz, SF11, BW 250 kHz, CR 4/6,
+#   CRC on (lora_setchip.cpp rf_crc = true), sync word 0x2B on SX127x
+#   (SYNC_WORD_SX127x, configuration_global.h:616) / 0x2B24 on SX126x
+#   (lora_setchip.cpp:303) — i.e. the SAME sync as Meshtastic, so these
+#   frames arrive via the Meshtastic sync path and must be told apart by
+#   content.  Preamble: DEFAULT_PREAMPLE_LENGTH 32 (configuration_global.h
+#   :237) while every country_profile.cpp row carries 8 — the firmware does
+#   not make it clear which wins, so the preamble is not used as a prior.
+#   Country variants (country_profile.cpp): EU 433.175 / 868 → 869.525 MHz
+#   / US 906.875 MHz / UK 439.9125 MHz SF10 BW125 / ON+LA BW125 SF10.
+#
+# On-air frame, text/position/HEY (encodeStartAPRS + encodeAPRS, mirrored
+# by decodeAPRS; all offsets verified against both):
+#   [0]      payload_type   0x3A ':' TEXT, 0x21 '!' POSITION, 0x40 '@' HEY
+#   [1..4]   msg_id         uint32 little-endian (((GW_ID & 0x3FFFFF) << 10)
+#                           | 10-bit counter, loop_functions.cpp)
+#   [5]      [7] server, [6] track, [5] app_offline, [4] mesh flags;
+#            [3:0] max_hop
+#   [6..]    "SRC[,VIA...]>DST[,VIA...]" + payload_type char — printable
+#            ASCII 0x20..0x7E; '>' within 120 B of offset 6, the type char
+#            within 120 B after '>'.  decodeAPRS checks the FIRST source
+#            element (originator) and the LAST (last hop) against
+#            regex_call_match; the destination's last element must be a
+#            group number (CheckGroup: 1..99999 or 100001), a legal call,
+#            or "HN" for a '@' neighbourhood report.
+#   ...      payload bytes up to a 0x00 terminator (mandatory)
+#   +1       HW (board id)   +2  MOD (modulation | country << 4)
+#   +3..4    FCS = big-endian 16-bit plain SUM of every byte from [0] up
+#            to and including MOD (encodeAPRS: FCS_SUMME over msg_buffer
+#            [0..inext)); a 255-byte frame cannot overflow 16 bits, and
+#            decodeAPRS discards the frame on mismatch.
+#   +5..8    optional: FW version, last-hop HW (0x80 = lastHeard bit),
+#            FW sub-version char ('#' / 0x7e), trailing 0x7e.  decodeAPRS
+#            reads at most these four; anything further is ignored.
+# ACK frame (ack_functions.h, isPlausibleAckFrame; ack_attribution.h):
+#   [0] 0x41  [1..4] ACK's own msg_id LE  [5] 0x80 | remaining hops
+#   (bit 7 always set on an over-the-air ACK, hops ≤ MAX_HOP_LIMIT 7)
+#   [6..9] acknowledged msg_id LE  [10] 0x01 ("ACK von GW / Node")
+#   [11] 0x00, or 0x03 when a 3-byte node-hash appendix follows (len 15).
+#   The firmware deliberately does NOT check [10]/[11] (0.4 % of its field
+#   ACKs deviate, presumed older firmware); we DO, because an ACK carries
+#   no checksum and without them the gate is ~1e-4 per random frame.
+#
+# Confidence: text/position/HEY frames with a matching FCS and a callsign
+# grammar that holds are 'verified' (a 16-bit check plus the path grammar
+# measures ~0 per 10^5 random frames — criterion (c) of
+# _NONMT_PREEMPT_PROTOS, which MeshCom needs because it shares Meshtastic's
+# sync word).  An ACK has no FCS: 'candidate', or 'confirmed' when it
+# acknowledges a msg_id of a verified TEXT frame heard within
+# _RH_STATE_TTL_S.  decodeAPRS also drops frames whose FW byte is < 35
+# (pre-4.35a); not mirrored — an old node is still MeshCom on the air.
+# ============================================================================
+import re as _re
+_MC_TYPES = {0x3A: 'TEXT', 0x21: 'POSITION', 0x40: 'HEY', 0x41: 'ACK'}
+# regex_functions.cpp: "^[0-9A-Z]?[A-Z]?[0-9]+[A-Z][A-Z]?[A-Z]?[%-]?[0-9]?[0-9]?$"
+# is a Lua pattern (Arduino Regexp library): "[%-]" is an escaped literal
+# '-', hence "-?" below, not a '%' alternative.
+_MC_CALL_RE = _re.compile(r'^[0-9A-Z]?[A-Z]?[0-9]+[A-Z][A-Z]?[A-Z]?-?[0-9]?[0-9]?$')
+_MC_CALL_SPECIAL = frozenset({'*', 'H', 'HG', 'BOT GATE', 'TEST', 'TESTER',
+                              'WLNK-1', 'APRS2SOTA', 'OE2YOTA-1'})   # checkRegexCall
+_MC_MAX_CALL_LEN = 20                         # MAX_CALL_LEN (aprs_structures.h)
+_MC_MAX_HOP_LIMIT = 7                         # configuration_global.h:374
+_MC_PATH_SPAN = 120                           # decodeAPRS loop bounds
+_MC_TELEM_RE = _re.compile(r'/([ABPHTQ])=(-?[0-9]+(?:\.[0-9]+)?)')
+_MC_TEXT_IDS = {}   # verified TEXT msg_id -> time (ACK corroboration)
+
+
+def _mc_call_ok(call):
+    """checkRegexCall(): special names, the 'DE' SWL exclusion, then the
+    regex; MAX_CALL_LEN bounds it (aprs_structures.h R2-04 note)."""
+    if not call or len(call) > _MC_MAX_CALL_LEN or call == 'DE':
+        return False
+    if call in _MC_CALL_SPECIAL:
+        return True
+    return _MC_CALL_RE.match(call) is not None
+
+
+def _mc_group(call):
+    """CheckGroup(): 1..6 digits → group id 1..99999 or 100001, else 0."""
+    if not (1 <= len(call) <= 6) or not call.isdigit():
+        return 0
+    g = int(call)
+    if g == 100001 or 1 <= g <= 99999:
+        return g
+    return 0
+
+
+def parse_meshcom_packet(payload, rf=None):
+    """Parse a MeshCom LoRa frame (see the section comment for the layout).
+    Returns a record or None."""
+    payload = bytes(payload)                     # list or bytes — normalise
+    n = len(payload)
+    if n < 12:
+        return None
+    t = payload[0]
+    if t not in _MC_TYPES:
+        return None
+    msg_id = int.from_bytes(payload[1:5], 'little')
+    b5 = payload[5]
+    now = time.time()
+    for _k in [k for k, v in _MC_TEXT_IDS.items() if now - v > _RH_STATE_TTL_S]:
+        del _MC_TEXT_IDS[_k]
+    if t == 0x41:
+        if n not in (12, 15):
+            return None
+        if not (b5 & 0x80) or (b5 & 0x7F) > _MC_MAX_HOP_LIMIT:
+            return None
+        if payload[10] != 0x01 or payload[11] not in (0x00, 0x03):
+            return None
+        if (n == 15) != (payload[11] == 0x03):
+            return None
+        acked = int.from_bytes(payload[6:10], 'little')
+        node_hash = None
+        if n == 15:
+            node_hash = (payload[12] | (payload[13] << 8) | (payload[14] << 16)) & 0x3FFFFF
+        seen = _MC_TEXT_IDS.get(acked)
+        confidence = 'confirmed' if seen is not None else 'candidate'
+        print("\n  --- MeshCom ACK ---")
+        print("  ACK id 0x%08X for msg 0x%08X  hops left %d  node-hash %s  %s" % (
+            msg_id, acked, b5 & 0x7F,
+            ('%06X' % node_hash) if node_hash is not None else '-',
+            'acks a heard TEXT' if seen is not None else 'target msg not heard'))
+        return {
+            'proto': 'meshcom' if confidence == 'confirmed' else 'unknown',
+            'hint': 'meshcom',
+            'confidence': confidence,
+            'decrypted': True,
+            'from': ('%06X' % node_hash) if node_hash is not None else None,
+            'to': None,
+            'mc_type': 'ACK',
+            'mcom_msg_id': msg_id,
+            'mcom_ack_id': acked,
+            'mcom_hops_left': b5 & 0x7F,
+            'summary': 'ACK for msg 0x%08X' % acked,
+        }
+    if n < 16:                                   # decodeAPRS: rsize < 16 discarded
+        return None
+    max_hop = b5 & 0x0F
+    flags = {'server': bool(b5 & 0x80), 'track': bool(b5 & 0x40),
+             'app_offline': bool(b5 & 0x20), 'mesh': bool(b5 & 0x10)}
+    # Source path: printable up to '>' within the 120-byte window.
+    j = payload.find(b'>', 6, min(n, 6 + _MC_PATH_SPAN))
+    if j < 7:
+        return None
+    spath = payload[6:j]
+    if any(c < 0x20 or c > 0x7E for c in spath):
+        return None
+    sparts = spath.decode('ascii').split(',')
+    src_call, src_last = sparts[0], sparts[-1]
+    if not _mc_call_ok(src_call) or not _mc_call_ok(src_last):
+        return None
+    # Destination path: printable up to the repeated payload_type char.
+    k = payload.find(bytes([t]), j + 1, min(n, j + 1 + _MC_PATH_SPAN))
+    if k < j + 2:
+        return None
+    dpath = payload[j + 1:k]
+    if any(c < 0x20 or c > 0x7E for c in dpath):
+        return None
+    dparts = dpath.decode('ascii').split(',')
+    dst_call = dparts[-1]
+    if not (_mc_group(dst_call) or (t == 0x40 and dst_call == 'HN')
+            or _mc_call_ok(dst_call)):
+        return None
+    # Payload up to the mandatory NUL, then HW, MOD, FCS.
+    z = payload.find(b'\x00', k + 1)
+    if z < 0 or z + 5 > n:
+        return None
+    body_raw = payload[k + 1:z]
+    hw, mod = payload[z + 1], payload[z + 2]
+    fcs = (payload[z + 3] << 8) | payload[z + 4]
+    if fcs != sum(payload[:z + 3]):
+        return None
+    tail = payload[z + 5:]
+    if len(tail) > 4:                            # FW, last HW, sub-version, 0x7e
+        return None
+    fw_ver = tail[0] if len(tail) > 0 else None
+    last_hw = tail[1] if len(tail) > 1 else None
+    fw_sub = chr(tail[2]) if len(tail) > 2 and 0x20 <= tail[2] <= 0x7E else None
+    try:
+        body = body_raw.decode('utf-8')
+    except UnicodeDecodeError:
+        body = body_raw.decode('latin-1')
+    kind = _MC_TYPES[t]
+    rec = {
+        'proto': 'meshcom',
+        'confidence': 'verified',
+        'decrypted': True,
+        'from': src_call,
+        'to': dst_call,
+        'path': ','.join(sparts[1:]) or None,
+        'mc_type': kind,
+        'mcom_msg_id': msg_id,
+        'mcom_max_hop': max_hop,
+        'mcom_flags': [f for f, v in flags.items() if v],
+        'mcom_hw': hw,
+        'mcom_mod': mod & 0x0F,
+        'mcom_country': mod >> 4,
+        'mcom_fw': fw_ver,
+        'mcom_fw_sub': fw_sub,
+        'mcom_last_hw': (last_hw & 0x7F) if last_hw is not None else None,
+        'text': body,
+        'summary': '%s→%s: %s' % (src_call, dst_call, body[:40]),
+    }
+    if t == 0x21:
+        # Position payload is APRS-style "DDMM.MMN/DDDMM.MME#comment"
+        # (PositionToAPRS, loop_functions.cpp); the comment carries MeshCom's
+        # /A= alt /B= batt /P= pressure /H= humidity /T= temp /Q= QNH.
+        _kind, _fields = _aprs_decode_body('!' + body, dst_call)
+        if _kind == 'position':
+            rec.update({'lat': _fields['lat'], 'lon': _fields['lon'],
+                        'symbol': _fields.get('symbol')})
+            for key, val in _MC_TELEM_RE.findall(_fields.get('comment') or ''):
+                name = {'A': 'alt', 'B': 'battery', 'P': 'pressure',
+                        'H': 'humidity', 'T': 'temperature', 'Q': 'qnh'}[key]
+                rec[name] = float(val) if '.' in val else int(val)
+            rec['summary'] = '%s pos %.4f,%.4f%s' % (
+                src_call, _fields['lat'], _fields['lon'],
+                (' · %dm' % rec['alt']) if 'alt' in rec else '')
+    elif t == 0x3A:
+        _MC_TEXT_IDS[msg_id] = now
+        if '{' in body:                          # "{msg_id" suffix as in APRS
+            rec['text'] = body.rsplit('{', 1)[0]
+    print("\n  --- MeshCom %s Frame ---" % kind)
+    print("  msg_id 0x%08X  max_hop %d  flags %s  HW %d  MOD %d  country %d  FW %s%s" % (
+        msg_id, max_hop, rec['mcom_flags'], hw, mod & 0x0F, mod >> 4,
+        fw_ver if fw_ver is not None else '-', fw_sub or ''))
+    print("  %s>%s  via %s" % (src_call, dpath.decode('ascii'), rec['path'] or '-'))
+    print("  Payload: %s" % (body[:80] + ('...' if len(body) > 80 else '')))
+    return rec
+
+
+# ============================================================================
+# Raw-LoRa content hints — the last resort for frames no protocol claimed.
+#
+# (a) a JSON object / array (balanced, json.loads succeeds) — the shape of
+#     OpenMQTTGateway, Arduino/ESP sketches posting sensor readings, etc.;
+# (b) ≥ 8 bytes, ≥ 90 % printable ASCII — ad-hoc text beacons.
+# These are hints about CONTENT, not a protocol: the record stays
+# proto='unknown' at 'candidate' with hint 'json' / 'text', never confirmed,
+# and the dispatcher only consults it after every real parser has declined
+# and the Meshtastic shape path has not claimed the frame.
+# ============================================================================
+def parse_raw_lora_packet(payload, rf=None):
+    import json as _json
+    payload = bytes(payload)                     # list or bytes — normalise
+    if len(payload) < 2:
+        return None
+    try:
+        s = payload.decode('utf-8')
+    except UnicodeDecodeError:
+        s = None
+    if s is not None:
+        st = s.strip()
+        if st[:1] in ('{', '[') and st[-1:] in ('}', ']'):
+            try:
+                obj = _json.loads(st)
+            except ValueError:
+                obj = None
+            if isinstance(obj, (dict, list)) and obj:
+                print("\n  --- Raw LoRa: JSON ---")
+                print("  %s" % st[:120])
+                rec = {
+                    'proto': 'unknown', 'hint': 'json', 'confidence': 'candidate',
+                    'decrypted': True, 'from': None, 'to': None,
+                    'text': st, 'raw_kind': 'json',
+                    'summary': 'JSON ' + st[:60],
+                }
+                if isinstance(obj, dict):
+                    rec['json_keys'] = list(obj.keys())[:16]
+                    rec['json'] = {k: v for k, v in obj.items()
+                                   if isinstance(v, (int, float, str, bool)) or v is None}
+                return rec
+    if len(payload) >= 8:
+        printable = sum(1 for c in payload if 0x20 <= c <= 0x7E or c in (9, 10, 13))
+        if printable >= 0.9 * len(payload):
+            txt = payload.decode('ascii', errors='replace').rstrip('\r\n\x00')
+            print("\n  --- Raw LoRa: text ---")
+            print("  %r" % txt[:120])
+            return {
+                'proto': 'unknown', 'hint': 'text', 'confidence': 'candidate',
+                'decrypted': True, 'from': None, 'to': None,
+                'text': txt, 'raw_kind': 'text',
+                'summary': 'text ' + txt[:60],
+            }
+    return None
+
+
+# ============================================================================
 # Per-packet hardware fingerprint — RF-layer features that identify the
 # physical transmitter device (not the protocol, not the firmware).  Each
 # feature is a per-radio-unit characteristic that's:
@@ -4491,6 +5044,14 @@ def _h_ebyte_lora(payload, ctx):
     return parse_lora_p2p_packet(payload, ctx.get('rf'))
 
 
+def _h_sidewalk(payload, ctx):
+    return parse_sidewalk_packet(payload, ctx.get('rf'))
+
+
+def _h_meshcom(payload, ctx):
+    return parse_meshcom_packet(payload, ctx.get('rf'))
+
+
 def _proto_candidates(sync):
     """Ordered (name, handler) parsers to try for a non-Meshtastic frame.
 
@@ -4508,18 +5069,25 @@ def _proto_candidates(sync):
     # APRS / disaster.radio / Reticulum / RadioHead / LoRa P2P are sync-word-
     # agnostic (their air format is library-specific and sync word varies).
     # Order: strongest-validator first so the highest-confidence claim wins.
+    # MeshCom sits with the APRS parser: both verify by content (FCS + call
+    # grammar) and MeshCom's sync word is Meshtastic's 0x2B, so no sync
+    # grouping applies.  Sidewalk is pinned to sync 0x34 by its spec, so it
+    # joins the LoRaWAN group there; its parser also checks the SF11/500k
+    # PHY signature, so it costs nothing on the generic path.
     common_tail = [
         ('lora_aprs', _h_lora_aprs),
+        ('meshcom', _h_meshcom),
         ('reticulum', _h_reticulum),
         ('disaster_radio', _h_disaster_radio),
         ('ebyte_lora', _h_ebyte_lora),
         ('radiohead', _h_radiohead),
     ]
     if sync == 0x34:
-        return [('lorawan', _h_lorawan), ('loramesher', _h_loramesher),
+        return [('lorawan', _h_lorawan), ('sidewalk', _h_sidewalk),
+                ('loramesher', _h_loramesher),
                 ('meshcore', _h_meshcore)] + common_tail
     return [('meshcore', _h_meshcore), ('loramesher', _h_loramesher),
-            ('lorawan', _h_lorawan)] + common_tail
+            ('lorawan', _h_lorawan), ('sidewalk', _h_sidewalk)] + common_tail
 
 
 # Tier rank used by both dispatcher sites and the helper below.  Module-scope so
@@ -4576,7 +5144,15 @@ _TIER_RANK = {'verified': 3, 'confirmed': 2, 'candidate': 1}
 #                   are too loose for criterion (c)).
 #   lorawan       — parser never emits 'verified' (caps at 'candidate').
 #   loramesher / radiohead / ebyte — never emit 'verified' (cap at 'confirmed').
-_NONMT_PREEMPT_PROTOS = frozenset({'meshcore', 'lora_aprs'})
+#   sidewalk      — caps at 'confirmed' (the MIC cannot be checked: no keys).
+#   meshcom       — 'verified' only after the in-frame 16-bit FCS sum
+#                   matches AND the source/destination callsign grammar
+#                   holds (criterion (c): measured 0 of 10^5 random frames).
+#                   Whitelisted because MeshCom transmits on Meshtastic's
+#                   sync word 0x2B, so its frames hit the Meshtastic-shape
+#                   collision exactly like MeshCore's do.
+#   raw_lora      — never emits above 'candidate' (content hint only).
+_NONMT_PREEMPT_PROTOS = frozenset({'meshcore', 'lora_aprs', 'meshcom'})
 
 
 def _phy_prior_score(pname, ctx, sync_word, sf, cr):
@@ -4602,7 +5178,44 @@ def _phy_prior_score(pname, ctx, sync_word, sf, cr):
             s += 0.5
         if ctx.get('crc_present') is False:
             s += 0.5    # CRC-off = downlink prior (hint-grade; see 6d IQ-inversion limit)
+    elif pname == 'sidewalk':
+        if sync_word == 0x34:
+            s += 0.5    # Sidewalk spec §5.1.4.2.3: sync word 0x34
+        if cr == 1:
+            s += 0.5    # "only SF11 with CR 4/5 is used"
+    elif pname == 'meshcom':
+        if sync_word == 0x2B:
+            s += 0.5    # SYNC_WORD_SX127x 0x2B (shared with Meshtastic)
+        if cr == 2:
+            s += 0.5    # LORA_CR 6 → 4/6 default (configuration_default.h)
     return s
+
+
+def _is_plausible_mesh_header_uni(tr):
+    """Broadcast OR a self-consistent UNICAST header (a real direct message).
+    Used ONLY on the PRIMARY (no-chase) CRC path — a clean CRC-16 match on the
+    nominal demod is high-confidence (≈1/65536 random), so it's safe to accept
+    node-to-node packets here and surface them (encrypted, header-only) even
+    though the payload won't decrypt with our channel key.  The chase loop keeps
+    the strict broadcast-only gate (_is_plausible_mesh_header, nested in
+    process_file) so chase coincidences stay suppressed.
+
+    Module scope, not a process_file closure: the dispatcher below consults
+    it too (the Meshtastic-sync guard and the raw-LoRa fallback), and a
+    closure is invisible from here — the guard raised NameError the first
+    time a sub-verified parser claimed a 0x2B-sync frame."""
+    if len(tr) < 16:
+        return False
+    dst = tr[0] | tr[1] << 8 | tr[2] << 16 | tr[3] << 24
+    if dst == 0xFFFFFFFF:
+        return True                                  # broadcast
+    src = tr[4] | tr[5] << 8 | tr[6] << 16 | tr[7] << 24
+    flags = tr[12]
+    hop_limit = flags & 0x07
+    hop_start = (flags >> 5) & 0x07
+    # real, distinct endpoints + sane hop counts = a genuine unicast frame
+    return (src not in (0, 0xFFFFFFFF) and dst not in (0, src)
+            and hop_limit <= hop_start)
 
 
 def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
@@ -4688,6 +5301,22 @@ def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
             continue
         if rec is not None:
             matches.append((pname, rec))
+    # Raw-LoRa content hints run LAST and only when nothing else claimed the
+    # frame: they never enter `matches` beside a real parser (a same-tier
+    # tie would flag a genuine candidate 'ambiguous' and let registry order
+    # decide), and a Meshtastic-shaped frame is left alone entirely so it
+    # still reaches the shape path / chase / SITE 2 exactly as before.
+    if (not matches and not meshtastic_shape_ok and not _no_crc
+            and 'raw_lora' in _PROTO_ENABLED and len(payload) >= 2
+            and not ('meshtastic' in _PROTO_ENABLED and len(payload) >= 16
+                     and _is_plausible_mesh_header_uni(bytes(payload)))):
+        try:
+            _raw = parse_raw_lora_packet(payload, ctx.get('rf'))
+        except Exception as _exc:
+            print("  [DISPATCH EXC] raw_lora: %s: %s" % (type(_exc).__name__, _exc))
+            _raw = None
+        if _raw is not None:
+            matches.append(('raw_lora', _raw))
     if matches:
         # 6c rule 4: order by confidence tier first (unchanged backbone),
         # then by PHY-consistency prior so same-tier ties resolve on measured
@@ -8254,25 +8883,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             return False
         return tr[0] == 0xFF and tr[1] == 0xFF and tr[2] == 0xFF and tr[3] == 0xFF
 
-    def _is_plausible_mesh_header_uni(tr):
-        """Broadcast OR a self-consistent UNICAST header (a real direct message).
-        Used ONLY on the PRIMARY (no-chase) CRC path — a clean CRC-16 match on the
-        nominal demod is high-confidence (≈1/65536 random), so it's safe to accept
-        node-to-node packets here and surface them (encrypted, header-only) even
-        though the payload won't decrypt with our channel key.  The chase loop keeps
-        the strict broadcast-only gate above so chase coincidences stay suppressed."""
-        if len(tr) < 16:
-            return False
-        dst = tr[0] | tr[1] << 8 | tr[2] << 16 | tr[3] << 24
-        if dst == 0xFFFFFFFF:
-            return True                                  # broadcast
-        src = tr[4] | tr[5] << 8 | tr[6] << 16 | tr[7] << 24
-        flags = tr[12]
-        hop_limit = flags & 0x07
-        hop_start = (flags >> 5) & 0x07
-        # real, distinct endpoints + sane hop counts = a genuine unicast frame
-        return (src not in (0, 0xFFFFFFFF) and dst not in (0, src)
-                and hop_limit <= hop_start)
+    # _is_plausible_mesh_header_uni lives at module scope (next to the
+    # dispatcher, which also needs it and could not see a closure here).
 
     def chase_decode(nibs, soft_info, max_flips=CHASE_MAX_FLIPS, k=CHASE_K):
         """Try flipping up to max_flips of the k least confident nibbles.
