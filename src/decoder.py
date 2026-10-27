@@ -2948,6 +2948,117 @@ def parse_loramesher_packet(payload, rf=None):
 # ============================================================================
 _LORA_APRS_MAGIC = b'\x3c\xff\x01'
 
+def _aprs_latlon(s):
+    """'DDMM.mmN/DDDMM.mmW' (uncompressed position) -> (lat, lon, sym_table,
+    sym_code, rest) or None.  Ambiguity spaces are treated as zeros."""
+    if len(s) < 19:
+        return None
+    la, lo = s[0:8], s[9:18]
+    if la[7] not in 'NS' or lo[8] not in 'EW' or la[4] != '.' or lo[5] != '.':
+        return None
+    try:
+        lat = int(la[0:2]) + float(la[2:7].replace(' ', '0')) / 60.0
+        lon = int(lo[0:3]) + float(lo[3:8].replace(' ', '0')) / 60.0
+    except ValueError:
+        return None
+    if lat > 90 or lon > 180:
+        return None
+    if la[7] == 'S': lat = -lat
+    if lo[8] == 'W': lon = -lon
+    return lat, lon, s[8], s[18], s[19:]
+
+
+def _aprs_mice(dest, body):
+    """Mic-E (APRS101 ch. 10): latitude, message bits, lon offset and W/E
+    are in the DESTINATION field; longitude, speed, course and symbol in
+    the first 8 info bytes.  Returns a dict or None if the grammar fails."""
+    if len(dest) < 6 or len(body) < 9:
+        return None
+    digs, north, lon_off, west, msg = '', None, 0, None, []
+    for i, c in enumerate(dest[:6]):
+        if '0' <= c <= '9': d, bit, ns, off, we = c, 0, 'S', 0, 'E'
+        elif 'A' <= c <= 'J': d, bit, ns, off, we = chr(ord(c) - 17), 1, None, None, None   # custom
+        elif 'P' <= c <= 'Y': d, bit, ns, off, we = chr(ord(c) - 32), 1, 'N', 100, 'W'
+        elif c in 'KLZ':      d, bit, ns, off, we = ' ', 0 if c == 'L' else 1, ('S' if c == 'L' else None), (0 if c == 'L' else None), ('E' if c == 'L' else None)
+        else:
+            return None
+        digs += d
+        if i < 3: msg.append(bit)
+        if i == 3: north = ns if ns else ('N' if c in 'PQRSTUVWXYZ' else 'S')
+        if i == 4: lon_off = 100 if c in 'PQRSTUVWXYZ' else 0
+        if i == 5: west = 'W' if c in 'PQRSTUVWXYZ' else 'E'
+    try:
+        lat = int(digs[0:2]) + float(digs[2:4] + '.' + digs[4:6]) / 60.0
+    except ValueError:
+        return None
+    if north == 'S': lat = -lat
+    d28, m28, h28 = body[1] if False else ord(body[1]), ord(body[2]), ord(body[3])
+    d = d28 - 28 + lon_off
+    if 180 <= d <= 189: d -= 80
+    elif 190 <= d <= 199: d -= 190
+    m = m28 - 28
+    if m >= 60: m -= 60
+    h = h28 - 28
+    if not (0 <= d <= 180 and 0 <= m < 60 and 0 <= h < 100):
+        return None
+    lon = d + (m + h / 100.0) / 60.0
+    if west == 'W': lon = -lon
+    sp28, dc28, se28 = ord(body[4]), ord(body[5]), ord(body[6])
+    speed = (sp28 - 28) * 10 + (dc28 - 28) // 10
+    course = ((dc28 - 28) % 10) * 100 + (se28 - 28)
+    if speed >= 800: speed -= 800
+    if course >= 400: course -= 400
+    if not (0 <= speed < 800 and 0 <= course <= 360):
+        return None
+    return {'lat': round(lat, 5), 'lon': round(lon, 5), 'speed_kn': speed,
+            'course': course, 'symbol': body[8] + body[7], 'comment': body[9:],
+            'mice_msg': ''.join(str(b) for b in msg)}
+
+
+def _aprs_decode_body(body, dest):
+    """APRS information field -> (kind, fields) with kind None when the data
+    type's grammar does not hold.  Covers what LoRa-APRS trackers/iGates
+    actually emit: uncompressed positions (! = / @), Mic-E, messages,
+    status, objects/items, weather, telemetry."""
+    if not body:
+        return None, {}
+    t = body[0]
+    if t in '!=':
+        p = _aprs_latlon(body[1:])
+        if p: return 'position', {'lat': round(p[0], 5), 'lon': round(p[1], 5), 'symbol': p[2] + p[3], 'comment': p[4]}
+        return None, {}
+    if t in '/@':
+        if len(body) < 8 or body[7] not in 'zh/':
+            return None, {}
+        p = _aprs_latlon(body[8:])
+        if p: return 'position', {'lat': round(p[0], 5), 'lon': round(p[1], 5), 'symbol': p[2] + p[3], 'timestamp': body[1:8], 'comment': p[4]}
+        return None, {}
+    if t in ("`", "'", '\x1c', '\x1d'):
+        m = _aprs_mice(dest, body)
+        return ('mic-e', m) if m else (None, {})
+    if t == ':':
+        if len(body) >= 11 and body[10] == ':':
+            addr = body[1:10].rstrip()
+            txt = body[11:]
+            mid = None
+            if '{' in txt:
+                txt, mid = txt.rsplit('{', 1)
+            if addr and all(c.isalnum() or c == '-' for c in addr):
+                return 'message', {'addressee': addr, 'message': txt, 'msg_id': mid}
+        return None, {}
+    if t == '>':
+        return 'status', {'status': body[1:]}
+    if t == ';' and len(body) >= 37:
+        return 'object', {'object': body[1:10].rstrip(), 'alive': body[10] == '*'}
+    if t == ')' and len(body) >= 18:
+        return 'item', {'item': body[1:].split('!')[0].split('_')[0]}
+    if t == '_' and len(body) >= 16:
+        return 'weather', {}
+    if t == 'T' and body[1:2] == '#':
+        return 'telemetry', {}
+    return None, {}
+
+
 def parse_lora_aprs_packet(payload, rf=None):
     """Parse a LoRa APRS frame.  Returns proto='lora_aprs' record or None."""
     if len(payload) < 6:
@@ -2993,6 +3104,11 @@ def parse_lora_aprs_packet(payload, rf=None):
     if not body:
         return None
     type_char = body[:1] if body else ''
+    # Content check: the prefix is only 24 bits, so 'verified' rests on
+    # the body actually parsing as an APRS data type (a position with a
+    # legal lat/lon, a Mic-E that decodes, a message with an addressee...).
+    # Anything else keeps the frame as a candidate hint.
+    _kind, _fields = _aprs_decode_body(body, dest)
     print("\n  --- LoRa APRS Frame ---")
     print("  Source: %s" % source)
     print("  Destination: %s" % dest)
@@ -3000,17 +3116,28 @@ def parse_lora_aprs_packet(payload, rf=None):
         print("  Path: %s" % path)
     print("  Type: %r" % type_char)
     print("  Body: %s" % (body[:80] + ('...' if len(body) > 80 else '')))
-    return {
-        'proto': 'lora_aprs',
-        'confidence': 'verified',           # 24-bit magic + TNC2 structure
+    if _kind:
+        print("  APRS %s: %s" % (_kind, {k: v for k, v in _fields.items() if k != 'comment'}))
+    rec = {
+        'proto': 'lora_aprs' if _kind else 'unknown',
+        'hint': None if _kind else 'lora_aprs',
+        'confidence': 'verified' if _kind else 'candidate',
         'decrypted': True,
         'from': source,
         'to': dest,
         'path': path or None,
         'aprs_type': type_char,
+        'aprs_kind': _kind,
         'text': body,
         'summary': '%s→%s: %s' % (source, dest, body[:40]),
     }
+    rec.update(_fields)
+    if _kind == 'message':
+        rec['summary'] = '%s→%s: %s' % (source, _fields['addressee'], _fields['message'][:40])
+    elif 'lat' in _fields:
+        rec['summary'] = '%s %s %.4f,%.4f %s' % (source, _kind, _fields['lat'], _fields['lon'],
+                                                 (_fields.get('comment') or '')[:30])
+    return rec
 
 
 # ============================================================================
@@ -4599,6 +4726,19 @@ def _dispatch_nonmt_or_meshtastic(payload, ctx, sync_word, rf, sf, bw, cr,
 
     if matches:
         _pname, _winner = matches[0]
+        # A measured Meshtastic sync (0x2B or a 1-bit neighbour) on a frame
+        # with a plausible Meshtastic header is evidence no sub-verified
+        # parser can outweigh: RadioHead/LoRaMesher/disaster.radio gates
+        # accept such bytes by structure alone, and at SITE 1 a DM between
+        # two not-yet-known nodes (shape path declined by the chase gate)
+        # was emitted as RadioHead and never reached SITE 2, which would
+        # have taken it on the sync.  Leave it unhandled so it falls
+        # through to the chase / SITE-2 path instead.
+        if (_winner.get('confidence') != 'verified'
+                and sync_word in _MESH_SYNCS and 'meshtastic' in _PROTO_ENABLED
+                and len(payload) >= 16
+                and _is_plausible_mesh_header_uni(bytes(payload))):
+            return False, None, None
         if len(matches) > 1:
             _winner['alternatives'] = [
                 {'proto': r.get('proto', n), 'hint': r.get('hint'),
