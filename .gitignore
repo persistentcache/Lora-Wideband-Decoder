@@ -28,6 +28,7 @@ lora_web/lora_autosave.jsonl
 lora_web/lora_unknown.jsonl
 lora_web/lora_packets.jsonl
 lora_web/dec_pkts.jsonl
+lora_web/sessions/
 # Rotated / disabled runtime logs — the *.jsonl rule above misses suffixed
 # variants like lora_unknown.jsonl.off, which slipped in once.
 *.jsonl.*

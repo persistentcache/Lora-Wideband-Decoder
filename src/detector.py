@@ -6042,6 +6042,13 @@ class BackgroundDecoder:
         # Set LORA_PKT_LOG to '' to disable.
         self._pkt_log_path = os.environ.get('LORA_PKT_LOG', '/tmp/lora_packets.jsonl')
         self._pkt_log_lock = threading.Lock()
+        # KEEP RECORDINGS: when set (the web UI's "Keep recordings forever"),
+        # a capture is MOVED here instead of deleted once its last decode job
+        # finishes, with a <name>.json sidecar summarising what it decoded to
+        # (so the recording behind any packet row can be found later).  Same
+        # filesystem → a rename, no copy.  Never pruned by the pipeline.
+        self._keep_dir = os.environ.get('LORA_KEEP_CAPTURES_DIR') or None
+        self._cap_recs = {}               # fpath -> [summary of each [PKT] it produced]
 
         # Opt-in raw decode-job log (LORA_DECODE_RAWLOG=path): appends every
         # job lifecycle event (SUBMIT, SKIP-*, JOB with the worker's full raw
@@ -6635,10 +6642,39 @@ while True:
                     self._pending_bytes -= _sz
         if os.environ.get('LORA_KEEP_IQ'):
             return          # debugging: keep capture files for autopsy
+        with self._refs_lock:
+            _recs = self._cap_recs.pop(fpath, None)
+        if self._keep_dir and self._archive_capture(fpath, _recs):
+            return
         try:
             os.unlink(fpath)
         except OSError:
             pass        # file already gone (manual delete / startup reap)
+
+    def _archive_capture(self, fpath, recs):
+        """Move a finished capture into the recordings directory and write
+        its decode-summary sidecar.  Returns False (caller deletes as before)
+        if the move fails — a full or unwritable archive must never make the
+        live capture directory grow instead."""
+        try:
+            import json as _json, shutil as _sh
+            os.makedirs(self._keep_dir, exist_ok=True)
+            dst = os.path.join(self._keep_dir, os.path.basename(fpath))
+            try:
+                os.replace(fpath, dst)             # same filesystem: rename
+            except OSError:
+                _sh.move(fpath, dst)               # RAM-mode capture → disk
+            with open(dst[:-5] + '.json' if dst.endswith('.cf32') else dst + '.json',
+                      'w') as _f:
+                _json.dump({'file': os.path.basename(dst),
+                            'archived': time.time(),
+                            'decoded': bool(recs),
+                            'packets': recs or []}, _f, separators=(',', ':'))
+            return True
+        except Exception as _e:
+            print(f"[RECORDINGS] archive failed for {os.path.basename(fpath)}: "
+                  f"{_e!r} — deleting instead", file=sys.stderr, flush=True)
+            return False
 
     def _bucket_already_decoded(self, fpath):
         """Phase-2 check: has any capture in the same RF bucket already
@@ -7323,6 +7359,13 @@ while True:
                                     self._confirmed_freqs.append(_cfm * 1e6)
                                     if len(self._confirmed_freqs) > 64:
                                         del self._confirmed_freqs[:-64]
+                            if self._keep_dir:
+                                with self._refs_lock:
+                                    self._cap_recs.setdefault(fpath, []).append(
+                                        {k: _r.get(k) for k in (
+                                            'proto', 'confidence', 'pktid', 'from',
+                                            'to', 'text', 'summary', 'sf', 'bw',
+                                            'freq_mhz', 'hops') if _r.get(k) is not None})
                             if self._pkt_log_path:
                                 _r['ts'] = _now
                                 _out.append(_json.dumps(_r, separators=(',', ':')))

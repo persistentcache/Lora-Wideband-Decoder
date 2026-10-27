@@ -81,6 +81,14 @@ def load_settings():
                  # backlog (see issue #6 follow-up).
                  'capture_ram': False,      # Advanced: True = /dev/shm (RAM), False = disk
                  'capture_dir': '',         # disk-mode write path; '' = default (<data>/captures)
+                 # Keep recordings forever: decoded captures are MOVED to
+                 # <capture dir>/recordings (with a .json decode summary)
+                 # instead of deleted.  Never pruned.
+                 'keep_recordings': False,
+                 # Session manager: where saved/auto-saved sessions live
+                 # ('' = <data>/sessions) and how auto-saved sessions are named.
+                 'session_dir': '',
+                 'autosave_name_fmt': 'session_{date}_{time}',
                  'time_format': '12',       # display: '12' (AM/PM) or '24' — rows + exports
                  'date_format': 'MMDDYY',   # display: MMDDYY|MMDDYYYY|DDMMYY|DDMMYYYY|YYYYMMDD
                  'sdr': 'bladerf',          # selected SDR profile (persists across sessions)
@@ -167,6 +175,14 @@ def _effective_capture_dir():
     d = (SETTINGS.get('capture_dir') or '').strip()
     return _resolve_path(d) if d else _default_capture_dir()
 
+def _recordings_dir():
+    """Where kept recordings go: a 'recordings' folder beside the disk capture
+    dir (RAM mode keeps them on the disk default — tmpfs is no keep-forever
+    store).  A SUBFOLDER on purpose: the startup/stop orphan sweep only
+    touches top-level SF*.cf32 files, so it can never reach the archive."""
+    base = (_default_capture_dir() if SETTINGS.get('capture_ram')
+            else _effective_capture_dir())
+    return os.path.join(base, 'recordings')
 def _validate_capture_dir(path):
     """Create `path` if needed and verify it is writable by writing+removing a
     probe file.  Returns (ok, resolved_path, error_or_None) — the permission
@@ -2156,35 +2172,119 @@ def _tail_psd():
             time.sleep(0.3)
 
 
-AUTOSAVE_PATH = os.path.join(_DATA_DIR, "lora_autosave.jsonl")
-
-
+AUTOSAVE_PATH = os.path.join(_DATA_DIR, "lora_autosave.jsonl")   # legacy single file
+# ---------------------------------------------------------------- sessions
+# A SESSION is the in-memory packet set.  A new one starts at web-server
+# start, on Clear, and when a saved session is opened; with auto-save on it
+# is mirrored to <session dir>/<name>.jsonl, the name generated from
+# autosave_name_fmt when the first packet arrives.  Server restarts never
+# continue an old file (after a reboot the in-memory set is empty — writing
+# it into the previous name would overwrite that session with a fragment).
+CURRENT_SESSION = {'name': None}
+_SESSION_TOKENS = ('{date} {time} {datetime} {center} {rate} {sdr} '
+                   '— e.g. session_{date}_{time}')
+def _default_session_dir():
+    return os.path.join(_DATA_DIR, 'sessions')
+def _effective_session_dir():
+    d = (SETTINGS.get('session_dir') or '').strip()
+    return _resolve_path(d) if d else _default_session_dir()
+def _safe_session_name(name):
+    import re as _re_s
+    return _re_s.sub(r'[^A-Za-z0-9._+-]+', '_', str(name or '')).strip('._')[:120]
+def _session_name_from_fmt(fmt=None):
+    fmt = fmt or SETTINGS.get('autosave_name_fmt') or 'session_{date}_{time}'
+    try:
+        rad = _radio_cfg()
+        center = float(rad.get('center_mhz') or 0)
+        rate = float(rad.get('rate_hz') or 0)
+    except Exception:
+        center, rate = 0.0, 0.0
+    tok = {'date': time.strftime('%Y%m%d'), 'time': time.strftime('%H%M%S'),
+           'datetime': time.strftime('%Y%m%d_%H%M%S'),
+           'center': '%gMHz' % center if center else 'center',
+           'rate': '%gMsps' % (rate / 1e6) if rate else 'rate',
+           'sdr': str(SETTINGS.get('sdr') or 'sdr')}
+    class _Keep(dict):
+        def __missing__(self, k):
+            return '{' + k + '}'
+    try:
+        out = str(fmt).format_map(_Keep(tok))
+    except (ValueError, IndexError):
+        out = str(fmt)
+    return _safe_session_name(out)
+def _session_path(name, ext='.jsonl'):
+    return os.path.join(_effective_session_dir(), _safe_session_name(name) + ext)
+def _find_session_file(name):
+    for ext in ('.jsonl', '.csv'):
+        p = _session_path(name, ext)
+        if os.path.isfile(p):
+            return p
+    return None
+def _new_session_name():
+    base = _session_name_from_fmt() or 'session'
+    name, i = base, 2
+    while _find_session_file(name):
+        name = '%s_%d' % (base, i)
+        i += 1
+    return name
+def _write_session(path, pkts):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        for p in pkts:
+            f.write(json.dumps(p, separators=(',', ':')) + '\n')
+    os.replace(tmp, path)
+def _migrate_legacy_autosave():
+    """One-time: the old single lora_autosave.jsonl becomes a named session."""
+    try:
+        if os.path.getsize(AUTOSAVE_PATH) > 0:
+            os.makedirs(_effective_session_dir(), exist_ok=True)
+            _n = 'autosave_' + time.strftime('%Y%m%d_%H%M%S',
+                                             time.localtime(os.path.getmtime(AUTOSAVE_PATH)))
+            shutil.move(AUTOSAVE_PATH, _session_path(_n))
+        else:
+            os.unlink(AUTOSAVE_PATH)
+    except OSError:
+        pass
 def _autosave_loop():
-    """When auto-save is ON, continuously mirror the FULL current session
-    (imported + captured) to an importable file, so it survives a crash/restart.
-    It is NOT auto-loaded on startup — the user imports it to resume (data does
-    not carry over automatically; only the toggle STATE persists)."""
-    last_n = -1
+    """With auto-save on, mirror the current session to its file whenever
+    it changes (checked every 8 s)."""
+    last = None
     while True:
         time.sleep(8)
         if not SETTINGS.get('autosave'):
             continue
         with STATE_LOCK:
-            n = len(PACKETS)
-            pkts = list(PACKETS) if n != last_n else None
+            if not PACKETS:
+                continue
+            if CURRENT_SESSION['name'] is None:
+                CURRENT_SESSION['name'] = _new_session_name()
+            name = CURRENT_SESSION['name']
+            # length alone stops changing once the deque is full (maxlen)
+            key = (name, len(PACKETS), id(PACKETS[-1]), PACKETS[-1].get('ts'))
+            pkts = list(PACKETS) if key != last else None
         if pkts is None:
             continue
         try:
-            tmp = AUTOSAVE_PATH + '.tmp'
-            with open(tmp, 'w') as f:
-                for p in pkts:
-                    f.write(json.dumps(p, separators=(',', ':')) + '\n')
-            os.replace(tmp, AUTOSAVE_PATH)
-            last_n = n
-        except Exception:
-            pass
-
-
+            _write_session(_session_path(name), pkts)
+            last = key
+        except Exception as _e:
+            print('[SESSIONS] auto-save failed: %r' % (_e,), file=sys.stderr, flush=True)
+_SESS_COUNT_CACHE = {}
+def _session_packet_count(path, st):
+    k = (path, st.st_mtime, st.st_size)
+    if k not in _SESS_COUNT_CACHE:
+        try:
+            with open(path, 'rb') as f:
+                n = sum(1 for l in f if l.strip())
+            if path.endswith('.csv'):
+                n = max(0, n - 1)                  # header row
+        except OSError:
+            n = 0
+        if len(_SESS_COUNT_CACHE) > 500:
+            _SESS_COUNT_CACHE.clear()
+        _SESS_COUNT_CACHE[k] = n
+    return _SESS_COUNT_CACHE[k]
 # ---------------------------------------------------------------- pipeline
 def _radio_cfg():
     """Effective radio settings: lora.toml defaults overlaid with web overrides
@@ -2453,6 +2553,15 @@ def start_pipeline():
         PIPELINE['err'] = _msg
         return {'ok': False, 'error': _msg}
     env['LORA_CAPTURE_BUDGET_MB'] = str(_capture_budget_mb(_cap_dir))
+    env.pop('LORA_KEEP_CAPTURES_DIR', None)
+    if SETTINGS.get('keep_recordings'):
+        _rec_dir = _recordings_dir()
+        try:
+            os.makedirs(_rec_dir, exist_ok=True)
+            env['LORA_KEEP_CAPTURES_DIR'] = _rec_dir
+        except OSError as _e:
+            print('[RECORDINGS] cannot create %s (%s) — recordings NOT kept this run'
+                  % (_rec_dir, _e), file=sys.stderr, flush=True)
     cmd = _build_pipeline_cmd()
     try:
         proc = subprocess.Popen(cmd, shell=True, env=env, preexec_fn=os.setsid,
@@ -2865,6 +2974,23 @@ def api_settings():
                     _cap_changed = True
             else:
                 _cap_error = 'Capture path not writable: %s (%s)' % (_res, _err)
+        if 'keep_recordings' in d:
+            _kr = bool(d['keep_recordings'])
+            if _kr != bool(SETTINGS.get('keep_recordings')):
+                SETTINGS['keep_recordings'] = _kr
+                _cap_changed = True          # launch env -> restart a running pipeline
+        # --- Session manager ---
+        if 'session_dir' in d:
+            _sd = str(d['session_dir']).strip()
+            _ok, _res, _err = _validate_capture_dir(_sd or _default_session_dir())
+            if _ok:
+                SETTINGS['session_dir'] = _sd
+            else:
+                _cap_error = 'Session directory not writable: %s (%s)' % (_res, _err)
+        if 'autosave_name_fmt' in d:
+            _fmt = str(d['autosave_name_fmt']).strip()[:80]
+            if _fmt and _safe_session_name(_session_name_from_fmt(_fmt)):
+                SETTINGS['autosave_name_fmt'] = _fmt
         # --- Channelizer settings (ADDITIVE / AUTO) ---
         _chan_changed = False
         if 'channelize_enabled' in d:
@@ -2939,6 +3065,9 @@ def api_settings():
     _s = dict(SETTINGS)
     _s['capture_effective_dir'] = _effective_capture_dir()
     _s['capture_default_dir'] = _default_capture_dir()
+    _s['recordings_dir'] = _recordings_dir()
+    _s['session_effective_dir'] = _effective_session_dir()
+    _s['session_default_dir'] = _default_session_dir()
     return jsonify(_s)
 
 
@@ -3606,14 +3735,188 @@ def api_clear():
     # Users who want a registry reset can delete the file manually
     # (/tmp/lora_mc_advert_registry.jsonl) or pipeline-restart with the
     # LORA_MC_ADVERT_REG env override pointing to a tmpfile.
-    for _p in (CFG['decode'].get('packet_log', '/tmp/lora_packets.jsonl'),
-               AUTOSAVE_PATH):
-        try:
-            open(_p, 'w').close()
-        except Exception:
-            pass
+    try:
+        open(CFG['decode'].get('packet_log', '/tmp/lora_packets.jsonl'), 'w').close()
+    except Exception:
+        pass
+    # Saved sessions are KEPT: Clear starts a new session (auto-save names a
+    # new file on the next packet) instead of truncating the old one.
+    CURRENT_SESSION['name'] = None
     _broadcast({'type': 'stats', 'data': _stats()})
     return jsonify({'ok': True})
+
+
+def _ingest_text(data):
+    """Ingest a JSONL or CSV session body; returns the number of new packets."""
+    lines = [l for l in (data or '').splitlines() if l.strip()]
+    n = 0
+    if not lines:
+        return 0
+    if lines[0].lstrip().startswith('{'):
+        for l in lines:
+            try:
+                if ingest(json.loads(l)) is not None:
+                    n += 1
+            except Exception:
+                pass
+    else:
+        import io, csv
+        for row in csv.DictReader(io.StringIO(data)):
+            try:
+                if ingest(_csv_row_to_rec(row)) is not None:
+                    n += 1
+            except Exception:
+                pass
+    return n
+
+
+@app.route('/api/sessions')
+def api_sessions():
+    d = _effective_session_dir()
+    rows = []
+    try:
+        for e in os.scandir(d):
+            if e.is_file() and e.name.endswith(('.jsonl', '.csv')):
+                st = e.stat()
+                rows.append({'name': e.name.rsplit('.', 1)[0], 'file': e.name,
+                             'size': st.st_size, 'mtime': st.st_mtime,
+                             'packets': _session_packet_count(e.path, st)})
+    except OSError:
+        pass
+    rows.sort(key=lambda r: -r['mtime'])
+    with STATE_LOCK:
+        n = len(PACKETS)
+    _e = d
+    while _e and not os.path.isdir(_e):
+        _e = os.path.dirname(_e)
+    try:
+        free = shutil.disk_usage(_e or '/').free
+    except OSError:
+        free = None
+    return jsonify({'dir': d, 'default_dir': _default_session_dir(),
+                    'custom_dir': SETTINGS.get('session_dir') or '',
+                    'current': CURRENT_SESSION['name'], 'current_packets': n,
+                    'autosave': bool(SETTINGS.get('autosave')),
+                    'name_fmt': SETTINGS.get('autosave_name_fmt') or 'session_{date}_{time}',
+                    'preview': _session_name_from_fmt(), 'tokens': _SESSION_TOKENS,
+                    'free_bytes': free, 'sessions': rows})
+
+
+@app.route('/api/sessions/save', methods=['POST'])
+def api_sessions_save():
+    d = request.get_json(force=True, silent=True) or {}
+    name = _safe_session_name(d.get('name') or '') or _new_session_name()
+    path = _session_path(name)
+    if os.path.exists(path) and not d.get('overwrite') and name != CURRENT_SESSION['name']:
+        return jsonify({'ok': False, 'exists': True, 'name': name})
+    with STATE_LOCK:
+        pkts = list(PACKETS)
+        CURRENT_SESSION['name'] = name      # auto-save continues into this file
+    try:
+        _write_session(path, pkts)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+    return jsonify({'ok': True, 'name': name, 'packets': len(pkts)})
+
+
+@app.route('/api/sessions/open', methods=['POST'])
+def api_sessions_open():
+    """mode 'replace' (default): the saved session becomes the current one
+    (auto-save continues into it).  mode 'merge': add its packets to the
+    current session."""
+    d = request.get_json(force=True, silent=True) or {}
+    name = _safe_session_name(d.get('name'))
+    path = _find_session_file(name) if name else None
+    if not path:
+        return jsonify({'ok': False, 'error': 'no such session'}), 404
+    try:
+        with open(path) as f:
+            data = f.read()
+    except OSError as e:
+        return jsonify({'ok': False, 'error': str(e)})
+    if d.get('mode', 'replace') == 'replace':
+        api_clear()
+        CURRENT_SESSION['name'] = name if path.endswith('.jsonl') else None
+    n = _ingest_text(data)
+    _broadcast({'type': 'stats', 'data': _stats()})
+    return jsonify({'ok': True, 'imported': n, 'current': CURRENT_SESSION['name']})
+
+
+@app.route('/api/sessions/delete', methods=['POST'])
+def api_sessions_delete():
+    d = request.get_json(force=True, silent=True) or {}
+    name = _safe_session_name(d.get('name'))
+    if name and name == CURRENT_SESSION['name'] and SETTINGS.get('autosave'):
+        return jsonify({'ok': False, 'error': 'This is the session being auto-saved. '
+                        'Start a new session (or turn auto-save off) before deleting it.'})
+    path = _find_session_file(name) if name else None
+    if not path:
+        return jsonify({'ok': False, 'error': 'no such session'}), 404
+    try:
+        os.unlink(path)
+    except OSError as e:
+        return jsonify({'ok': False, 'error': str(e)})
+    if name == CURRENT_SESSION['name']:
+        CURRENT_SESSION['name'] = None
+    return jsonify({'ok': True})
+
+
+@app.route('/api/sessions/download')
+def api_sessions_download():
+    name = _safe_session_name(request.args.get('name'))
+    path = _find_session_file(name) if name else None
+    if not path:
+        return jsonify({'ok': False, 'error': 'no such session'}), 404
+    with open(path, 'rb') as f:
+        body = f.read()
+    return Response(body, mimetype='text/csv' if path.endswith('.csv') else 'application/x-ndjson',
+                    headers={'Content-Disposition': 'attachment; filename=%s' % os.path.basename(path)})
+
+
+@app.route('/api/sessions/import', methods=['POST'])
+def api_sessions_import():
+    """Upload a session file from the browser: stored in the session
+    directory (so it is listed and kept) and merged into the current
+    session — the old header Import button's behaviour."""
+    data = request.get_data(as_text=True) or ''
+    fname = request.args.get('name') or 'imported'
+    base = _safe_session_name(fname.rsplit('.', 1)[0]) or 'imported'
+    ext = '.jsonl' if data.lstrip().startswith('{') else '.csv'
+    name, i = base, 2
+    while _find_session_file(name):
+        name = '%s_%d' % (base, i)
+        i += 1
+    try:
+        os.makedirs(_effective_session_dir(), exist_ok=True)
+        with open(_session_path(name, ext), 'w') as f:
+            f.write(data)
+    except OSError as e:
+        return jsonify({'ok': False, 'error': str(e)})
+    n = _ingest_text(data)
+    _broadcast({'type': 'stats', 'data': _stats()})
+    return jsonify({'ok': True, 'name': name, 'imported': n})
+
+
+@app.route('/api/recordings')
+def api_recordings():
+    d = _recordings_dir()
+    n = b = 0
+    try:
+        for e in os.scandir(d):
+            if e.is_file() and e.name.endswith('.cf32'):
+                n += 1
+                b += e.stat().st_size
+    except OSError:
+        pass
+    _e = d
+    while _e and not os.path.isdir(_e):           # not created yet: nearest ancestor
+        _e = os.path.dirname(_e)
+    try:
+        free = shutil.disk_usage(_e or '/').free
+    except OSError:
+        free = None
+    return jsonify({'dir': d, 'enabled': bool(SETTINGS.get('keep_recordings')),
+                    'count': n, 'bytes': b, 'free_bytes': free})
 
 
 @app.route('/api/stream')
@@ -3769,6 +4072,7 @@ def main():
     except Exception:
         pass
     threading.Thread(target=_watch_pipeline, daemon=True).start()
+    _migrate_legacy_autosave()
     threading.Thread(target=_autosave_loop, daemon=True).start()
     threading.Thread(target=_channelize_apply_loop, daemon=True).start()
     # Periodic persistence of node hardware profiles (saves the classifier's
