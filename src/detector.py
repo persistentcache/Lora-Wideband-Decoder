@@ -5443,7 +5443,16 @@ class SignalRecorder:
                     # hops are preserved.  RF time → immune to replay speed.
                     _cand_freq = anchor['freq_hz'] + carrier_hz
                     _abs_t_s = (sample_pos / self.wb_fs) + p.get('preamble_t_s', 0.0)
-                    _ftol = max(anchor['bw'] * 0.5, 60000.0)
+                    # 0.75 bw (was 0.5): the slow pass reports the same burst
+                    # the main pass records at a centroid ~bw/4 off (live
+                    # SF12/125k: 914.971 vs 915.035, 64 kHz apart), and it
+                    # usually lands FIRST, so at 0.5 bw the two never
+                    # clustered and each frame got 3-5 captures (17 of 96
+                    # detections, 23 SF12 decode jobs for 3 frames).  Genuine
+                    # neighbours sit >= 1 bw apart (channel spacing), so
+                    # they still cluster separately; a cluster keeps two
+                    # slots either way.
+                    _ftol = max(anchor['bw'] * 0.75, 60000.0)
                     # Dedup time window must be < the hop0→hop1 relay gap (else
                     # it MERGES the two hops on one carrier and drops hop1) and
                     # > the abs_t jitter of one preamble's overlapping-window
@@ -8415,6 +8424,8 @@ def main():
         _SLOW_MIN_TICKS = 0
     _slow_last_fire = -10**9
     _slow_pending = {}   # bucket -> (exact_bin, expiry_tick): triggers that
+    _slow_hold = []      # (due_tick, dets, assembly, reg_tot_s): non-slow-class
+                         # slow-pass hits held so the main pass can claim them
                          # fired while a scan was in flight, deferred instead
                          # of dropped (the drop-if-busy race lost ~2/29 real
                          # SF12 frames per leg whose trigger ticks all landed
@@ -10417,6 +10428,22 @@ def main():
             for _b in _trig:
                 _slow_pending[int(_b) // 8] = (_b, _slow_tick + 4)
 
+        if _slow_hold and recorder:
+            _due = [h for h in _slow_hold if h[0] <= _slow_tick]
+            _slow_hold = [h for h in _slow_hold if h[0] > _slow_tick]
+            for _dl, _dets_h, _iql_h, _rts_h in _due:
+                _keep_h = []
+                for d in _dets_h:
+                    _da = (_rts_h - len(_iql_h)) / a.rate + d.get('preamble_t_s', 0.0)
+                    with recorder._saved_abs_t_lock:
+                        _dup = any(_e[2] == d['sf'] and _e[3] == d['bw']
+                                   and abs(_e[0] - d['freq_hz']) < d['bw']
+                                   and abs(_e[1] - _da) < 1.5
+                                   for _e in recorder._saved_abs_t)
+                    if not _dup:
+                        _keep_h.append(d)
+                if _keep_h:
+                    _record_slow(_keep_h, _iql_h, _rts_h)
         # consume finished background scans (bookkeeping on main thread)
         while not _slow_results.empty():
             dets_slow, _iq_long, _reg_tot_s, _trig_done = _slow_results.get()
@@ -10493,79 +10520,74 @@ def main():
                           f"pwr={d['peak_power_db']:.1f}dB "
                           f"abst={_abst:.2f}s [slow-pass]",
                           flush=True)
+                def _record_slow(_dets, _iql, _rts):
+                        _slow_pkt_s = max(
+                            (148.25 * (2 ** d['sf']) / d['bw']) for d in _dets)
+                        # 24-window cap, not 12: SF12/31.25k frames run up to
+                        # ~19.4 s and the 12 s cap GUARANTEED truncation (the
+                        # soak's zero-decode wall for every >=9 s-airtime
+                        # preset). Deferred tails accumulate from loop hops —
+                        # NOT ring reads — so the old ring/2 bound does not
+                        # apply to the live path.
+                        _slow_tail_n = min(int(_slow_pkt_s * a.rate),
+                                           24 * win_n)
+                        # DEFERRED IN BOTH MODES: the file-mode blocking read
+                        # CONSUMED stream the loop would otherwise process —
+                        # every long-frame tail literally ate the next
+                        # beacon's windows (12-window tails halved straddler
+                        # detections; 24 made it worse). feed_tail() runs
+                        # unconditionally below, so pending jobs complete
+                        # from the hops in either mode.
+                        # ASYNC-SCAN GAP FILL: hops that streamed while the
+                        # background scan ran are still in _slow_halves —
+                        # hand them to the job so the base abuts the first
+                        # feed_tail hop (they were silently MISSING before:
+                        # 0.5-1.0 s hole at every live slow capture's seam).
+                        _gap_n = tot_s - _rts
+                        _gap_parts = None
+                        _reg_pos = _rts
+                        if _gap_n > 0 and hop_n > 0:
+                            _k = int(_gap_n) // hop_n
+                            if (_k * hop_n == _gap_n
+                                    and 0 < _k <= len(_slow_halves)):
+                                _gap_parts = list(_slow_halves)[-_k:]
+                                _reg_pos = tot_s
+                                _slow_tail_n = max(0, _slow_tail_n
+                                                   - _k * hop_n)
+                            else:
+                                # catchup/discontinuity between snapshot and
+                                # registration — cannot fill seamlessly; the
+                                # tail would splice. Register with the base
+                                # only and let it truncate.
+                                print(f"         [SLOW-GAP] unfillable gap "
+                                      f"{_gap_n} samples — truncated base "
+                                      f"capture", flush=True)
+                                _slow_tail_n = 0
+                        recorder.update_deferred(_dets, _iql,
+                                                 _reg_pos, pre_hop=None,
+                                                 need_tail_n=_slow_tail_n,
+                                                 owned_buf=True,
+                                                 gap_parts=_gap_parts)
                 if recorder:
                     # The slow pass exists for the 31.25k/41.67k presets; its
-                    # alias-chain vote may still resolve a wider class, and
-                    # then it re-detects a burst the main pass already
-                    # recorded — at a centroid ~bw/4 off, outside the
-                    # recorder's cluster tolerance, so every such hit became
-                    # its own capture (live: 10 of 84 detections, 16 SF12/125k
-                    # decode jobs for 3 frames, up to 115 s each).  Drop a
-                    # non-slow-class slow-pass detection when the recorder
-                    # already holds the same label within ±bw and 1.5 s.
-                    _keep_slow = []
-                    for d in dets_slow:
-                        if int(d['bw']) not in (31250, 41667):
-                            _da = ((_reg_tot_s - len(_iq_long)) / a.rate
-                                   + d.get('preamble_t_s', 0.0))
-                            with recorder._saved_abs_t_lock:
-                                _dup = any(
-                                    _e[2] == d['sf'] and _e[3] == d['bw']
-                                    and abs(_e[0] - d['freq_hz']) < d['bw']
-                                    and abs(_e[1] - _da) < 1.5
-                                    for _e in recorder._saved_abs_t)
-                            if _dup:
-                                continue
-                        _keep_slow.append(d)
-                    dets_slow = _keep_slow
-                if recorder and dets_slow:
-                    _slow_pkt_s = max(
-                        (148.25 * (2 ** d['sf']) / d['bw']) for d in dets_slow)
-                    # 24-window cap, not 12: SF12/31.25k frames run up to
-                    # ~19.4 s and the 12 s cap GUARANTEED truncation (the
-                    # soak's zero-decode wall for every >=9 s-airtime
-                    # preset). Deferred tails accumulate from loop hops —
-                    # NOT ring reads — so the old ring/2 bound does not
-                    # apply to the live path.
-                    _slow_tail_n = min(int(_slow_pkt_s * a.rate),
-                                       24 * win_n)
-                    # DEFERRED IN BOTH MODES: the file-mode blocking read
-                    # CONSUMED stream the loop would otherwise process —
-                    # every long-frame tail literally ate the next
-                    # beacon's windows (12-window tails halved straddler
-                    # detections; 24 made it worse). feed_tail() runs
-                    # unconditionally below, so pending jobs complete
-                    # from the hops in either mode.
-                    # ASYNC-SCAN GAP FILL: hops that streamed while the
-                    # background scan ran are still in _slow_halves —
-                    # hand them to the job so the base abuts the first
-                    # feed_tail hop (they were silently MISSING before:
-                    # 0.5-1.0 s hole at every live slow capture's seam).
-                    _gap_n = tot_s - _reg_tot_s
-                    _gap_parts = None
-                    _reg_pos = _reg_tot_s
-                    if _gap_n > 0 and hop_n > 0:
-                        _k = int(_gap_n) // hop_n
-                        if (_k * hop_n == _gap_n
-                                and 0 < _k <= len(_slow_halves)):
-                            _gap_parts = list(_slow_halves)[-_k:]
-                            _reg_pos = tot_s
-                            _slow_tail_n = max(0, _slow_tail_n
-                                               - _k * hop_n)
-                        else:
-                            # catchup/discontinuity between snapshot and
-                            # registration — cannot fill seamlessly; the
-                            # tail would splice. Register with the base
-                            # only and let it truncate.
-                            print(f"         [SLOW-GAP] unfillable gap "
-                                  f"{_gap_n} samples — truncated base "
-                                  f"capture", flush=True)
-                            _slow_tail_n = 0
-                    recorder.update_deferred(dets_slow, _iq_long,
-                                             _reg_pos, pre_hop=None,
-                                             need_tail_n=_slow_tail_n,
-                                             owned_buf=True,
-                                             gap_parts=_gap_parts)
+                    # alias-chain vote may still resolve a wider class and then
+                    # re-detect a burst the main pass records — at a centroid
+                    # ~bw/4 off (slow to decode) and usually FIRST, so the
+                    # recorder cannot know it is a copy yet.  Live: 17 of 96
+                    # detections, 23-25 SF12/125k decode jobs for 3 frames, the
+                    # off-centre copies 30-50 s each.  Slow-class hits record
+                    # now; any other class is HELD commit-lag + 6 hops (the
+                    # main pass commits _LAG hops late and its tail assembly
+                    # adds a few more — measured 2-5 s behind the slow pass)
+                    # and recorded only if the main pass has not claimed the
+                    # same label within +-bw and 1.5 s by then.
+                    _slow_now = [d for d in dets_slow if int(d['bw']) in (31250, 41667)]
+                    _slow_later = [d for d in dets_slow if int(d['bw']) not in (31250, 41667)]
+                    if _slow_now:
+                        _record_slow(_slow_now, _iq_long, _reg_tot_s)
+                    if _slow_later:
+                        _slow_hold.append((_slow_tick + min(_LAG + 6, _slow_halves.maxlen),
+                                           _slow_later, _iq_long, _reg_tot_s))   # gap fill needs <= maxlen hops
         _prof['slow'] += time.time() - _t_slowblk0
         _t_step = time.time()
 
