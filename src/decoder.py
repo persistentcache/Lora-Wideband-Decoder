@@ -5940,8 +5940,16 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
     print("=== %s ===" % name)
     print("SF%d BW=%dk N=%d ppm=%d fs=%dk" % (sf, bw // 1000, N, ppm, fs // 1000))
 
-    # Keep full FFT for re-centering in pass 2
-    F = np.fft.fftshift(_fft(iq))
+    # Pad the transform, not iq: awkward capture lengths can spend tens of
+    # seconds in pocketfft before the first decode attempt.  A fast BW-rate
+    # length times dec keeps both transforms efficient and the output sample
+    # clock exactly at BW.  Padding only to next_fast_len(len(iq)) could leave
+    # a remainder after decimation and stretch that clock.  Keep the original
+    # iq for fingerprints, burst measurements and carrier-rescue re-entry.
+    _bw_samples = (len(iq) + dec - 1) // dec
+    _capture_fft_len = dec * _next_fast_len(_bw_samples)
+    # Keep full FFT for re-centering in pass 2.
+    F = np.fft.fftshift(_fft(iq, n=_capture_fft_len))
     keep = len(F) // dec
     start_f = len(F) // 2 - keep // 2
     # Bins-per-Hz of the cached spectrum (used by recrop_centered to translate
@@ -5960,10 +5968,12 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
         bin_shift = int(round(cfo_hz_value * _F_bin_per_hz))
         Fs = np.roll(F, -bin_shift) if bin_shift else F
         out = _ifft(np.fft.ifftshift(Fs[start_f:start_f + keep])) * (keep / len(Fs))
-        return out.astype(np.complex64)
+        # The padded tail is not recorded signal.  All crops share the same
+        # original time origin and extent, including a final partial decimation
+        # interval when the input length is not divisible by dec.
+        return out[:_bw_samples].astype(np.complex64)
 
-    iq1_orig = _ifft(np.fft.ifftshift(F[start_f:start_f + keep])) * (keep / len(F))
-    iq1_orig = iq1_orig.astype(np.complex64)
+    iq1_orig = recrop_centered(0.0)
 
     # Time-window isolation.  Both relay_after and relay_before can be set
     # simultaneously to isolate a *specific* preamble — e.g. when the caller
