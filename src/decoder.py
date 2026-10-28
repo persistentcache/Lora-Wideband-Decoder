@@ -6930,16 +6930,22 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
                         pass
 
 
+def _frame_data_symbols(ppm, ppm_pay, cr, need_bytes):
+    """Header and payload symbol count for the accepted FEC/LDRO mode."""
+    # The eight header symbols also carry ppm-5 payload nibbles. Each
+    # subsequent CR+4-symbol block supplies ppm_pay nibbles, not bits.
+    # need_bytes includes the payload CRC when present.
+    remaining_nibbles = max(0, 2 * need_bytes - max(0, ppm - 5))
+    payload_blocks = (remaining_nibbles + ppm_pay - 1) // ppm_pay
+    return 8 + payload_blocks * (cr + 4)
+
+
 def _decoded_span_samples(preamble_start, data_start, N, ppm, ppm_pay,
                           cr, need_bytes):
     """Span of a decoded frame at BW rate, including one symbol of margin."""
-    # The eight header symbols also carry ppm-5 payload nibbles. Each
-    # subsequent CR+4-symbol block supplies ppm_pay nibbles, not bits.
-    # Use the accepted LDRO mode and measured header start so long preambles
-    # and timing adjustments are included without masking the next packet.
-    remaining_nibbles = max(0, 2 * need_bytes - max(0, ppm - 5))
-    payload_blocks = (remaining_nibbles + ppm_pay - 1) // ppm_pay
-    data_symbols = 8 + payload_blocks * (cr + 4)
+    # Measured header start includes long preambles and timing adjustments
+    # without extending the successful mask over the next packet.
+    data_symbols = _frame_data_symbols(ppm, ppm_pay, cr, need_bytes)
     return int(data_start - preamble_start + (data_symbols + 1) * N)
 
 
@@ -8851,7 +8857,10 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
         _r = 0.0
         _curve = []
-        for _si in range(min(_nd, 96)):
+        # Keep the legacy horizon for short frames, but track every FEC
+        # block of long frames instead of freezing their tail correction.
+        _horizon = max(96, _frame_data_symbols(ppm, ppm_pay, cr, need_bytes))
+        for _si in range(min(_nd, _horizon)):
             _fb, _pmr = _fine_at(_si, _r)
             if _fb is not None and _pmr > 15.0:
                 _grp = 4 if _si < 8 else pay_bin_group
@@ -8883,7 +8892,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         _vals = []
         _r = 0.0
         _started = False
-        for _si in range(min(_nd, 96)):
+        _horizon = max(96, _frame_data_symbols(ppm, ppm_pay, cr, need_bytes))
+        for _si in range(min(_nd, _horizon)):
             _adj = int(round(float(ds_off) + float(slope) * _si))
             _p = data_start + _si * N + _adj
             if 0 <= _p and _p + N <= len(iq1):
