@@ -1061,17 +1061,32 @@ class StreamBuffer:
                 return None
             return (self._rp, self._total_drops, self._history_generation)
 
+    def received_history_anchor(self):
+        """Snapshot fully published raw samples without advancing detection.
+
+        _reader_loop copies both wrap segments and only then advances _wp
+        under this same lock. The snapshot never exposes an unfinished write.
+        """
+        with self._lock:
+            return (self._wp, self._total_drops, self._history_generation)
+
     def invalidate_history(self):
         """Separate samples on either side of a radio retune."""
         with self._lock:
             self._history_generation += 1
 
-    def history_parts(self, anchor, count, chunk_n):
+    def received_history_parts(self, anchor, count, chunk_n):
+        """Copy published samples, including those not yet consumed by read()."""
+        yield from self.history_parts(anchor, count, chunk_n, True)
+
+    def history_parts(self, anchor, count, chunk_n, _received=False):
         """Yield owned, hop-bounded past samples; never move the read pointer.
 
         The writer may run during conversion. Validate both sides of every
         copy, using the same lap rule as read(), plus skip/retune identity.
         A failure is terminal: callers may retain the contiguous prefix only.
+        The received-history wrapper selects _wp as the upper bound; ordinary
+        callers retain the consumed _rp bound and detector-clock semantics.
         """
         if anchor is None or count < 0 or chunk_n <= 0:
             raise StreamHistoryUnavailable('invalid history range/anchor')
@@ -1084,7 +1099,7 @@ class StreamBuffer:
                 if (self._total_drops != drops
                         or self._history_generation != generation):
                     raise StreamHistoryUnavailable('stream skipped or retuned')
-                if (pos < 0 or end > self._rp
+                if (pos < 0 or end > (self._wp if _received else self._rp)
                         or self._wp - pos > self._ring_n):
                     raise StreamHistoryUnavailable('ring history unavailable or overwritten')
             with self._lock:
