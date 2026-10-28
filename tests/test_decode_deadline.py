@@ -27,7 +27,12 @@ def production_dispatch():
                 and any(assigned(child, '_bud_tok') for child in n.body))
     start = next(i for i, n in enumerate(body) if assigned(n, '_bud_tok'))
     end = next(i for i, n in enumerate(body) if assigned(n, 'output'))
-    return compile(ast.Module(body=body[start:end], type_ignores=[]),
+    # One real manager iteration gives the new fatal-abort continue its
+    # production loop context while preserving the actual deadline body.
+    once = ast.For(target=ast.Name(id='_once', ctx=ast.Store()),
+                   iter=ast.Tuple(elts=[ast.Constant(None)], ctx=ast.Load()),
+                   body=body[start:end], orelse=[])
+    return compile(ast.fix_missing_locations(ast.Module(body=[once], type_ignores=[])),
                    detector.__file__, 'exec')
 
 
@@ -54,7 +59,7 @@ def dispatch(code, monkeypatch, *, sf=10, override=None, default='10', finish=No
                relay_field='', worker=worker,
                os=SimpleNamespace(environ=os.environ, read=lambda fd, size: b'__END__\n'),
                time=SimpleNamespace(time=lambda: now[0]),
-               self=SimpleNamespace(_rawlog=lambda *args: logs.append(args)))
+               self=SimpleNamespace(_rawlog=lambda *args: logs.append(args), _aborting=lambda:False))
     exec(code, env)
     return env, worker, now[0], logs
 

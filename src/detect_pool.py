@@ -115,6 +115,7 @@ def _worker_main(shm_names, win_n, task_q, result_q, params, cap_override=None):
 
 class DetectPool:
     def __init__(self, n_workers, n_slots, win_n, params):
+        self._aborted = False
         self.win_n = win_n
         self.n_slots = n_slots
         # Shared-memory slots, each holds one full window (complex64).
@@ -169,6 +170,8 @@ class DetectPool:
         # center (MHz) and dechirp_chans are passed per-task so a live
         # center-frequency change / live channel apply / patience trial takes
         # effect without re-spawning workers; None → use the spawn-time params.
+        if self._aborted:
+            raise RuntimeError('detect pool has been aborted')
         self._task_q.put((slot, seq, n, psd, peaks, spur_db, center,
                           dechirp_chans))
 
@@ -237,6 +240,61 @@ class DetectPool:
     def peek(self, seq):
         """Return `seq`'s dets without removing them (call after ready())."""
         return self._results.get(seq)
+
+    def abort(self, timeout=2.0):
+        """Failure-only discard of queued work; never wait on queue feeders."""
+        self._aborted = True
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        clean = True
+        # Consumers are about to stop. Joining a task feeder whose pipe is full
+        # would hang interpreter exit even after every worker has been reaped.
+        for q in (self._task_q, self._result_q):
+            try:
+                q.cancel_join_thread()
+                q.close()
+            except Exception:
+                clean = False
+        for worker in self._workers:
+            if worker.is_alive():
+                try:
+                    worker.terminate()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    clean = False
+        term_deadline = time.monotonic() + max(0.0, deadline-time.monotonic()) / 2
+        for worker in self._workers:
+            try:
+                worker.join(timeout=max(0.0, term_deadline-time.monotonic()))
+            except Exception:
+                clean = False
+        for worker in self._workers:
+            if worker.is_alive():
+                try:
+                    worker.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    clean = False
+        for worker in self._workers:
+            try:
+                worker.join(timeout=max(0.0, deadline-time.monotonic()))
+                clean = clean and not worker.is_alive()
+            except Exception:
+                clean = False
+        self._views.clear()
+        for memory in self._shms:
+            try:
+                memory.close()
+            except Exception:
+                clean = False
+            try:
+                memory.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                clean = False
+        return clean
 
     def close(self):
         for _ in self._workers:
