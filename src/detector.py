@@ -7592,13 +7592,23 @@ while True:
                 # Fast-pass straggler recovery: if a PRIMARY fast decode BAILED
                 # on its realtime budget it may still hold an undecoded packet
                 # (marginal CFO/SNR needing the rescue, or a 2nd packet).
+                # A wall preemption can happen before the CPU-budget marker:
+                # retain one slow turn after a plausible explicit-header parse.
+                # This is search progress, not a verified packet: header-like
+                # noise can qualify once. Silence, no parse and worker EOF do not.
                 # Re-queue it to the SLOW tier with a big budget; the same
                 # workers run it in the post-burst idle gap.  post-decode
                 # _packet_dedup suppresses anything already emitted → no
                 # double-count.  Only PRIMARY (not relay/iso) jobs, only from
                 # the fast tier (is_slow guards against infinite re-queue).
                 if ((job_budget is None or _stress_shrunk) and output
-                        and '[BUDGET]' in output
+                        and ('[BUDGET]' in output or
+                             (timed_out and not worker_died and any(
+                                 4 <= int(_hm.group(1)) <= 237
+                                 for _hm in _re_t.finditer(
+                                     r'(?m)^\s*Header:\s+PL=(\d+)\s+CR=4/[5-8]\s+'
+                                     r'CRC=(?:yes|no)\s+HDR_CHK=(?:OK|FAIL)\b',
+                                     output))))
                         and relay_after_syms is None
                         and relay_before_syms is None):
                     self._ref_inc(fpath)

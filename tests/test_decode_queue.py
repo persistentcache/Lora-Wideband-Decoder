@@ -240,3 +240,121 @@ for line in sys.stdin:
                 worker.stdin.close()
             worker.wait(timeout=5)
             worker.stdout.close()
+
+
+@pytest.fixture(scope='module')
+def production_retry():
+    # Keep the actual manager eligibility and refcount/queue transfer together;
+    # no decoder, device or long watchdog wait is needed for these transitions.
+    import ast
+    from pathlib import Path
+    import detector
+    tree = ast.parse(Path(detector.__file__).read_text())
+    manager = next(n for c in tree.body if isinstance(c, ast.ClassDef)
+                   and c.name == 'BackgroundDecoder' for n in c.body
+                   if isinstance(n, ast.FunctionDef) and n.name == '_manager')
+    retry = next(n for n in ast.walk(manager) if isinstance(n, ast.If)
+                 and '_stress_shrunk' in ast.unparse(n.test)
+                 and '_slow_queue.put' in ast.unparse(n))
+    return compile(ast.Module(body=[retry], type_ignores=[]), detector.__file__, 'exec')
+
+
+VALID_HEADER = '  Header: PL=57 CR=4/8 CRC=yes HDR_CHK=OK  nibs=[3, 9]'
+# Exact final header/termination excerpt from Retest007's live decode log.
+# Its checksum-valid PL57 header appeared only in host replay. The live failed
+# parse proves search progress, not a verified packet or a noise-free capture.
+RETEST_007_WALL_OUTPUT = '''
+  Header: PL=85 CR=4/5 CRC=no HDR_CHK=FAIL  nibs=[5, 5, 2, 2, 7, 14, 0, 0, 3, 0]
+  *** HEADER CHECKSUM FAILED ***
+
+  --- Pass2 Retry #1 ---
+ERROR: DECODE TIMEOUT (115s wall)
+'''
+
+
+def retry_env(decoder, path, output, **overrides):
+    import re
+    state = dict(self=decoder, fpath=str(path), fname=path.name, output=output,
+                 job_budget=None, _stress_shrunk=False, timed_out=True,
+                 worker_died=False, relay_after_syms=None, relay_before_syms=None,
+                 _re_t=re)
+    state.update(overrides)
+    return state
+
+
+@pytest.mark.parametrize('output', [
+    VALID_HEADER, RETEST_007_WALL_OUTPUT,
+    'Header: PL=4 CR=4/5 CRC=no HDR_CHK=FAIL',
+    'Header: PL=237 CR=4/8 CRC=yes HDR_CHK=FAIL',
+])
+@pytest.mark.parametrize('budget,stressed', [(None, False), (54.6, True)])
+def test_parsed_header_wall_timeout_gets_one_slow_turn_without_losing_capture(
+        decoder, monkeypatch, tmp_path, production_retry, budget, stressed, output):
+    path = tmp_path / 'SF12_62.50k_test.cf32'
+    path.write_bytes(b'iq')
+    submit(decoder, str(path))
+    fast, fast_token = take(decoder)
+    state = retry_env(decoder, path, output,
+                      job_budget=budget, _stress_shrunk=stressed)
+    exec(production_retry, state)
+    assert decoder._slow_queue.qsize() == 1
+    finish(decoder, fast, fast_token)
+    assert path.exists() and decoder._refs[str(path)] == 1
+    decoder.maybe_release_straggler()
+    slow, slow_token = take(decoder)
+    assert slow[4] == decoder._slow_budget
+    # The explicit slow budget makes a second timeout terminal, even if its
+    # header parses too. A single capture cannot retry indefinitely.
+    state.update(job_budget=slow[4], _stress_shrunk=False)
+    exec(production_retry, state)
+    assert decoder._slow_queue.empty()
+    finish(decoder, slow, slow_token)
+    assert decoder.pending() == 0 and decoder._refs == {}
+    assert not path.exists()
+    assert decoder._queue.unfinished_tasks == decoder._slow_queue.unfinished_tasks == 0
+
+
+@pytest.mark.parametrize('output,overrides', [
+    ('', {}),
+    ('no preamble', {}),
+    ('Header: PL=3 CR=4/8 CRC=yes HDR_CHK=OK', {}),
+    ('Header: PL=238 CR=4/8 CRC=yes HDR_CHK=FAIL', {}),
+    ('Header: PL=255 CR=4/8 CRC=yes HDR_CHK=OK', {}),
+    ('Header: PL=-1 CR=4/8 CRC=yes HDR_CHK=OK', {}),
+    ('Header: PL=57 CR=4/4 CRC=yes HDR_CHK=OK', {}),
+    ('Header: PL=57 CR=4/9 CRC=yes HDR_CHK=FAIL', {}),
+    ('Header: PL=57 CR=4/8 CRC=unknown HDR_CHK=FAIL', {}),
+    ('Header: PL=57 CR=4/8 CRC=yes HDR_CHK=unknown', {}),
+    ('diagnostic mentions HDR_CHK=OK without a parsed header', {}),
+    (VALID_HEADER, {'worker_died': True}),
+    (VALID_HEADER, {'timed_out': False}),
+    (VALID_HEADER, {'job_budget': 45.0}),
+    (VALID_HEADER, {'job_budget': 2.0}),
+    (VALID_HEADER, {'relay_after_syms': 100}),
+    (VALID_HEADER, {'relay_before_syms': 200}),
+])
+def test_wall_retry_excludes_no_parse_invalid_header_death_overrides_and_isolation(
+        decoder, tmp_path, production_retry, output, overrides):
+    path = tmp_path / 'SF12_62.50k_test.cf32'
+    path.write_bytes(b'iq')
+    submit(decoder, str(path))
+    job, token = take(decoder)
+    exec(production_retry, retry_env(decoder, path, output, **overrides))
+    assert decoder._slow_queue.empty()
+    finish(decoder, job, token)
+    assert decoder.pending() == 0 and not path.exists()
+
+
+def test_existing_cpu_budget_fallback_still_needs_no_header(
+        decoder, tmp_path, production_retry):
+    path = tmp_path / 'SF10_125k_test.cf32'
+    path.write_bytes(b'iq')
+    submit(decoder, str(path))
+    job, token = take(decoder)
+    exec(production_retry, retry_env(decoder, path, '[BUDGET] exhausted', timed_out=False))
+    assert decoder._slow_queue.qsize() == 1
+    finish(decoder, job, token)
+    decoder.maybe_release_straggler()
+    job, token = take(decoder)
+    finish(decoder, job, token)
+    assert not path.exists()
