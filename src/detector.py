@@ -8897,8 +8897,8 @@ def main():
     # no per-preset tuning.  Env-overridable for experiments.
     _LAG = int(os.environ.get('LORA_COMMIT_LAG', 4)) if _pool is not None else 0
     # Samples one trailing window contributes to a tail — must match the slice
-    # _commit_oldest uses (slot[:win_n][hop_n:] = win_n-hop_n samples).
-    _tail_seg_n = max(1, win_n - hop_n)
+    # _commit_oldest uses (the last hop_n samples, capped by the window).
+    _tail_seg_n = max(1, min(hop_n, win_n))
 
     def _tail_windows_needed(dets):
         """Trailing in-flight windows required to fully cover the tail of the
@@ -8948,7 +8948,7 @@ def main():
                 # packets are ~1.4 s and SF12/125 ~2.9 s, so a 2 s capture
                 # truncates the payload and the decoder yields only the header
                 # plus a handful of nibbles (LONG_MODERATE was 38/120 for this
-                # reason).  Gather the forward-overlap (hop_n:) of as many
+                # reason). Gather the new hop (-hop_n:) from as many
                 # subsequent in-flight windows as needed to span max_pkt_s for
                 # the detected SF/BW.  Short-SF presets need only 1 window, so
                 # their behaviour is unchanged.  Copies (slots get reused).
@@ -8959,7 +8959,7 @@ def main():
                         break      # emergency skip left a gap: truncate the
                                    # tail rather than stitch across it
                     _prev_seq = _itn['seq']
-                    _seg = _pool.slot_array(_itn['slot'])[:win_n][hop_n:]
+                    _seg = _pool.slot_array(_itn['slot'])[:win_n][-hop_n:]
                     _tparts.append(_seg.copy())
                     _acc += len(_seg)
                     if _acc >= _need_tail_n:

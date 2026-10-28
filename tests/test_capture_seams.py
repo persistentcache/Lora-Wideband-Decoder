@@ -93,9 +93,11 @@ def test_actual_inline_registration_then_current_loop_feed_has_no_duplicate(reco
     assert_saved_contiguous(recorder, 2000)
 
 
+@pytest.mark.parametrize('hop', [250, 500, 750], ids=['75pct_overlap', '50pct_overlap', '25pct_overlap'])
 @pytest.mark.parametrize('last_seed_seq', [1, 2], ids=['current_hop_needed', 'current_hop_already_seeded'])
-def test_actual_pool_commit_and_loop_feed_keep_contiguous_seed_seam(recorder, production, last_seed_seq):
-    windows = {0: samples(0, 1000), 1: samples(500, 1000), 2: samples(1000, 1000)}
+def test_actual_pool_commit_and_loop_feed_keep_contiguous_seed_seam(recorder, production, last_seed_seq, hop):
+    windows = {i: samples(i * hop, 1000) for i in range(3)}
+    recorder.hop_n = hop
     det = detection()
     needed = 9488
     if not recorder._nb_mode:
@@ -105,19 +107,19 @@ def test_actual_pool_commit_and_loop_feed_keep_contiguous_seed_seam(recorder, pr
         det.update(sf=12, bw=62500)
         needed = 9715
     env = dict(vars(detector), recorder=recorder, dets0=[det], win_n=1000,
-               hop_n=500, _inflight=deque({'seq': i, 'slot': i}
+               hop_n=hop, _inflight=deque({'seq': i, 'slot': i}
                                         for i in range(1, last_seed_seq + 1)),
                _pool=SimpleNamespace(slot_array=lambda slot: windows[slot]),
                it={'seq': 0, 'slot': 0, 'tot_s': 1000, 'pre_hop': None})
     exec(production['pool'], env)
-    assert recorder._pending[0]['got'] == last_seed_seq * 500
-    # A slot-full commit may be seeded only through1500: current hop IS needed.
-    # An ordinary commit seeded through2000 must skip this same current hop.
-    feed_loop(production['feed'], env, 1500)
-    start = 2000
+    assert recorder._pending[0]['got'] == last_seed_seq * hop
+    # A slot-full commit seeded only through the prior window needs this hop;
+    # an ordinary commit seeded through the current window already has it.
+    feed_loop(production['feed'], env, 1000 + hop, hop)
+    start = 1000 + 2 * hop
     while recorder._pending:
-        feed_loop(production['feed'], env, start)
-        start += 500
+        feed_loop(production['feed'], env, start, hop)
+        start += hop
     assert_saved_contiguous(recorder, 1000 + needed)
 
 
@@ -180,3 +182,18 @@ def test_explicit_stream_break_still_prevents_splice_when_consumed_clock_hides_d
     recorder.feed_tail(samples(2000, 500), sample_pos=2000)
     assert_saved_contiguous(recorder, 1500)
     assert 'physical sample drop' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('hop', [250, 500, 750])
+def test_pool_tail_window_count_matches_new_samples_per_window(recorder, hop):
+    tree = ast.parse(Path(detector.__file__).read_text())
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
+    assignment = next(n for n in ast.walk(main) if isinstance(n, ast.Assign)
+                      and ast.unparse(n.targets[0]) == '_tail_seg_n')
+    function = next(n for n in ast.walk(main) if isinstance(n, ast.FunctionDef)
+                    and n.name == '_tail_windows_needed')
+    env = dict(vars(detector), recorder=recorder, win_n=1000, hop_n=hop)
+    exec(compile(ast.Module(body=[assignment, function], type_ignores=[]),
+                 detector.__file__, 'exec'), env)
+    needed = detector._capture_tail_n(recorder, [detection()], 1000, warn=False)
+    assert env['_tail_windows_needed']([detection()]) == -(-needed // hop)
