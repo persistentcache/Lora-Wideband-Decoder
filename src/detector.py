@@ -4803,6 +4803,7 @@ class SignalRecorder:
             for _f in os.listdir(export_dir):
                 if not ((_f.startswith('SF') and _f.endswith('.cf32'))
                         or _f.endswith('.spool')
+                        or (_f.startswith('.header-') and _f.endswith('.prefix'))
                         or _f == '.lora_write_test'):
                     continue
                 _p = os.path.join(export_dir, _f)
@@ -4816,6 +4817,7 @@ class SignalRecorder:
 
         self._decoder = None
         self._shared = None
+        self._header = None
         self._history_reader = None
         # RAM-PROPORTIONAL SPOOL (UC audit (s) re-exam 2026-07-12): the class
         # default (600 MB) is the threshold above which a save job spills its
@@ -4966,7 +4968,10 @@ class SignalRecorder:
 
     def set_history_reader(self, reader):
         """Enable the independently gated shared live-capture experiment."""
+        header_enabled = os.environ.get('LORA_HEADER_CHECKPOINT') == '1'
         if os.environ.get('LORA_SHARED_CAPTURE') != '1':
+            if header_enabled:
+                raise RuntimeError('LORA_HEADER_CHECKPOINT requires LORA_SHARED_CAPTURE=1')
             return
         if not hasattr(reader, 'history_parts'):
             raise RuntimeError('LORA_SHARED_CAPTURE requires validated live ring history')
@@ -4975,6 +4980,18 @@ class SignalRecorder:
         from capture_timeline import CaptureBudget, SharedCapture
         budget = CaptureBudget(int(os.environ.get('LORA_SHARED_CAPTURE_MB', '2048')) * 1024 * 1024,
                                int(os.environ.get('LORA_SHARED_CAPTURE_VIEWS', '64')))
+        if header_enabled:
+            prefix_bytes = int(os.environ.get('LORA_HEADER_PREFIX_MB', '64')) * 1024 * 1024
+            if prefix_bytes <= 0:
+                raise RuntimeError('header prefix memory budget must be positive')
+            header_workspace = 8 * prefix_bytes + 128 * 1024 * 1024
+            # Explicit diagnostic allocation, not a host-aware default. Keep
+            # the existing2GiB capture plan intact plus one persistent worker
+            # and two file-backed prefixes (3GiB total with default knobs).
+            minimum = 2048 * 1024 * 1024 + header_workspace + 2 * prefix_bytes + 65536
+            if ('LORA_SHARED_CAPTURE_MB' not in os.environ or budget.total_bytes < minimum):
+                raise RuntimeError('header checkpoint memory requires explicit aggregate '
+                                   'LORA_SHARED_CAPTURE_MB budget (3072 with default prefix)')
         self._history_reader = reader
         self._shared = SharedCapture(
             rate=self.wb_fs, center=self.center_hz, hop_n=self.hop_n,
@@ -4982,6 +4999,27 @@ class SignalRecorder:
             submit=self._queue_shared_save, budget=budget,
             writer_stall_s=float(os.environ.get('LORA_SHARED_WRITER_TIMEOUT', '30')),
             report=lambda message: print(message, file=sys.stderr, flush=True))
+        if header_enabled:
+            from header_checkpoint_service import HeaderCheckpointService
+            from header_capture_controller import HeaderCaptureController
+            workspace = budget.reserve('header_worker_workspace', header_workspace)
+            service = None
+            try:
+                service = HeaderCheckpointService(workspace_lease=workspace,
+                    max_pending=2, max_prefix_bytes=prefix_bytes)
+                self._header = HeaderCaptureController(self._shared, service,
+                    directory=self.export_dir, max_prefix_bytes=prefix_bytes)
+                self._shared.header_controller = self._header
+            except Exception:
+                if service is not None:
+                    service.close(timeout_s=2)
+                else:
+                    workspace.release()
+                self._shared.close(wait=False)
+                raise
+            print(f'[HEADER-CHECKPOINT] enabled; permanent_workspace={header_workspace} '
+                  f'prefix_limit={prefix_bytes} pending=2 aggregate_limit={budget.total_bytes}',
+                  file=sys.stderr, flush=True)
         self._nb_mode = True
         self._shared.advance(reader.history_anchor())
         print(f'[SHARED-CAPTURE] enabled; memory={budget.total_bytes} bytes '
@@ -5467,8 +5505,11 @@ class SignalRecorder:
                 if (isinstance(extended_full, tuple)
                         and extended_full[0] == 'NB_SHARED'):
                     _shared_save = extended_full[1]
-                    _capture_role = 'shared_full'
-                    _role_name = f'_shared_full_{_shared_save.number}'
+                    if _shared_save.role == 'header_prefix':
+                        self._header.write_prefix(_shared_save)
+                        continue  # finally releases only this optional source view
+                    _capture_role = _shared_save.role
+                    _role_name = f'_{_capture_role}_{_shared_save.number}'
                     _nb_job = {'nb_fs': _shared_save.nb_fs,
                                'export_bw': _shared_save.export_bw}
                     extended_full = None
@@ -5815,156 +5856,158 @@ class SignalRecorder:
                         _dt_win = DECHIRP_DEDUP_WIN_S
                     _match = 0
                     _skip = False
-                    with self._saved_abs_t_lock:
-                        # PER-LABEL keep-N (2026-07-08): the cluster key now
-                        # includes (sf, bw).  Same-label re-detections of one
-                        # frame across overlapping windows still collapse to
-                        # keep-N exactly as before — but a CONFLICTING-label
-                        # detection of the same frame gets its own slots.
-                        # Ground truth (matrix, SF12/62.5k = the only 0/5
-                        # combo): separate slow-scan assemblies emitted the
-                        # same burst as SF10/31.25k (partial-burst evidence,
-                        # sc 0.67) and SF12/62.5k (full evidence, sc 0.98);
-                        # first-arriving mislabels consumed both (freq, time)
-                        # slots and the correct-label save was REFUSED —
-                        # whichever label arrived first won regardless of
-                        # merit.  With per-label slots both are captured and
-                        # the decoder's CRC arbitrates (mislabeled captures
-                        # fail fast; the post-decode dedup absorbs the
-                        # duplicate emit).  Bounded cost: one extra capture
-                        # pair per label-conflict, which only slow-pass
-                        # straddle presets exhibit.
-                        # Patience-trial dets dedup by CARRIER ONLY: the
-                        # rotating (sf,bw) hypothesis must not hand each rung
-                        # its own keep-N slots (soundness review: one promoted
-                        # carrier fanned out into N differently-labeled
-                        # captures per packet).
-                        # _src label, not the stale loop variable `d` (the
-                        # WEAKEST det from the batch power-sort — UC audit a):
-                        # the registry must match/register under the label
-                        # the save actually carries.
-                        # Option A extends the cluster key: besides exact
-                        # (sf, bw), a same-SLOPE member collapses onto the
-                        # cluster too (bw^2/2^sf identical) — so a down-alias
-                        # (SF7/62.5k of a real SF9/125k, SF9/62.5k of SF11/125k)
-                        # no longer opens its own keep-2 slots and its own
-                        # never-CRCing decode jobs.  The registry tuple now
-                        # carries bw_quality_db as a 5th field for the quality-
-                        # ranked eviction below.  LORA_SLOPE_DEDUP=0 → exact
-                        # per-(sf,bw) HEAD behaviour.
-                        _lbl_blind = bool(_src.get('patience_trial'))
-                        _cand_slope = _slope(_src['sf'], _src['bw'])
-                        _cand_q = float(_src.get('bw_quality_db', 0.0))
-                        # Option B: effective keep collapses 2→1 under decode
-                        # backlog so a real beacon's 2nd fallback capture is not
-                        # queued while the single slow worker is saturated.
-                        _eff_keep = self._dedup_keep
-                        if (self._keep1_under_load and self._dedup_keep > 1
-                                and self._decoder is not None
-                                and self._decoder.pending()
-                                    > self._keep1_load_thresh):
-                            _eff_keep = 1
-                        _cluster_idx = []
-                        _best_diff_q = -1e30   # best q of a same-slope,
-                        #   DIFFERENT-(sf,bw) member already in this cluster
-                        # WIDTH FIT of a label: |log2(bw / measured occupied
-                        # width)|, <= 0.85 means the label's bandwidth is the
-                        # one the burst actually occupies.  Same-slope
-                        # siblings are dechirp-DEGENERATE, so their raw q
-                        # cannot rank them — the alias that a distant gate
-                        # peak's wider crop picked up often scores HIGHER
-                        # (live: SF9/500k at bwq 22.4 beat the true SF7/250k
-                        # at 19.6 and took the cluster slot; the decoder
-                        # then relabelled it by occupied width, seconds
-                        # later).  Width can: a different-label sibling
-                        # whose label fits its width beats one whose label
-                        # does not (or whose width was unmeasurable), in
-                        # either direction; only when neither side settles
-                        # it does the q margin below decide, as before.
-                        import math as _mw
-                        _cand_w = _src.get('width_hz')
-                        _cand_fits = bool(_cand_w) and abs(
-                            _mw.log2(_src['bw'] / float(_cand_w))) <= 0.85
-                        _sib_fits = False      # a different-label sibling fits
-                        _sib_misfit_idx = []   # different-label siblings that don't
-                        for _i, _e in enumerate(self._saved_abs_t):
-                            _sf_hz, _st, _ssf, _sbw = _e[0], _e[1], _e[2], _e[3]
-                            if (abs(_cand_freq - _sf_hz) < _ftol
-                                    and abs(_abs_t_s - _st) < _dt_win
-                                    and (_lbl_blind
-                                         or (_ssf == _src['sf']
-                                             and _sbw == _src['bw'])
-                                         or (self._slope_dedup
-                                             and _slope(_ssf, _sbw)
-                                                 == _cand_slope))):
-                                _match += 1
-                                _cluster_idx.append(_i)
-                                if (self._slope_dedup
-                                        and (_ssf != _src['sf']
-                                             or _sbw != _src['bw'])):
-                                    _best_diff_q = max(_best_diff_q, _e[4])
-                                    _ew = _e[5] if len(_e) > 5 else None
-                                    if _ew and abs(_mw.log2(
-                                            _sbw / float(_ew))) <= 0.85:
-                                        _sib_fits = True
-                                    else:
-                                        _sib_misfit_idx.append(_i)
-                        # RECORD-TIME same-slope alias gate (the eviction below
-                        # only rewrites the registry — it cannot un-create a
-                        # decode job for an alias that already filled a free
-                        # keep-N slot or beat the weakest one).  A same-slope
-                        # member whose raw dechirp quality is MARGIN dB below a
-                        # different-label sibling already in the cluster is the
-                        # 3-6 dB-weaker down-alias (SF7/62.5k of a real
-                        # SF9/125k) — skip RECORDING it entirely so it never
-                        # becomes a decode job, regardless of slot availability.
-                        # A genuinely-strongest same-slope member is never
-                        # gated (it clears the margin), preserving a real weak
-                        # SF7/62.5k that has no stronger sibling.
-                        if (self._slope_dedup and _sib_fits
-                                and not _cand_fits):
-                            _skip = True           # a sibling's label fits, this one's doesn't
-                        elif (self._slope_dedup and _cand_fits
-                                and not _sib_fits and _sib_misfit_idx):
-                            # This label fits the burst's width and the
-                            # recorded sibling's doesn't: take its slot.
-                            self._saved_abs_t[_sib_misfit_idx[0]] = (
-                                _cand_freq, _abs_t_s,
-                                _src['sf'], _src['bw'], _cand_q, _cand_w)
-                        elif (self._slope_dedup
-                                and _best_diff_q - _cand_q > self._slope_margin_db):
-                            _skip = True
-                        elif _match < _eff_keep:
-                            self._saved_abs_t.append(
-                                (_cand_freq, _abs_t_s,
-                                 _src['sf'], _src['bw'], _cand_q, _cand_w))
-                            if len(self._saved_abs_t) > 4000:
-                                _cut = _abs_t_s - 10.0
-                                self._saved_abs_t = [
-                                    e for e in self._saved_abs_t
-                                    if e[1] > _cut]
-                        elif self._slope_dedup and _cluster_idx:
-                            # Cluster full: quality-ranked eviction.  If this
-                            # det's bw_quality_db beats the weakest slot's, evict
-                            # + replace that slot so the true higher-q member
-                            # always wins; the 3-6 dB-weaker alias never
-                            # displaces the real parent.  Registry stays bounded
-                            # (replace, not add) — at most a few evictions until
-                            # the highest-q member holds the slot.  REGRESSION
-                            # GUARD: the SF12/62.5k-vs-SF10/31.25k GT pair is
-                            # same-slope (~954); keeping the higher-raw-q member
-                            # preserves the required decode of both texts.
-                            _weak_i = min(
-                                _cluster_idx,
-                                key=lambda _j: self._saved_abs_t[_j][4])
-                            if _cand_q > self._saved_abs_t[_weak_i][4]:
-                                self._saved_abs_t[_weak_i] = (
+                    _lbl_blind = bool(_src.get('patience_trial'))
+                    if _capture_role != 'early':
+                        with self._saved_abs_t_lock:
+                            # PER-LABEL keep-N (2026-07-08): the cluster key now
+                            # includes (sf, bw).  Same-label re-detections of one
+                            # frame across overlapping windows still collapse to
+                            # keep-N exactly as before — but a CONFLICTING-label
+                            # detection of the same frame gets its own slots.
+                            # Ground truth (matrix, SF12/62.5k = the only 0/5
+                            # combo): separate slow-scan assemblies emitted the
+                            # same burst as SF10/31.25k (partial-burst evidence,
+                            # sc 0.67) and SF12/62.5k (full evidence, sc 0.98);
+                            # first-arriving mislabels consumed both (freq, time)
+                            # slots and the correct-label save was REFUSED —
+                            # whichever label arrived first won regardless of
+                            # merit.  With per-label slots both are captured and
+                            # the decoder's CRC arbitrates (mislabeled captures
+                            # fail fast; the post-decode dedup absorbs the
+                            # duplicate emit).  Bounded cost: one extra capture
+                            # pair per label-conflict, which only slow-pass
+                            # straddle presets exhibit.
+                            # Patience-trial dets dedup by CARRIER ONLY: the
+                            # rotating (sf,bw) hypothesis must not hand each rung
+                            # its own keep-N slots (soundness review: one promoted
+                            # carrier fanned out into N differently-labeled
+                            # captures per packet).
+                            # _src label, not the stale loop variable `d` (the
+                            # WEAKEST det from the batch power-sort — UC audit a):
+                            # the registry must match/register under the label
+                            # the save actually carries.
+                            # Option A extends the cluster key: besides exact
+                            # (sf, bw), a same-SLOPE member collapses onto the
+                            # cluster too (bw^2/2^sf identical) — so a down-alias
+                            # (SF7/62.5k of a real SF9/125k, SF9/62.5k of SF11/125k)
+                            # no longer opens its own keep-2 slots and its own
+                            # never-CRCing decode jobs.  The registry tuple now
+                            # carries bw_quality_db as a 5th field for the quality-
+                            # ranked eviction below.  LORA_SLOPE_DEDUP=0 → exact
+                            # per-(sf,bw) HEAD behaviour.
+                            _lbl_blind = bool(_src.get('patience_trial'))
+                            _cand_slope = _slope(_src['sf'], _src['bw'])
+                            _cand_q = float(_src.get('bw_quality_db', 0.0))
+                            # Option B: effective keep collapses 2→1 under decode
+                            # backlog so a real beacon's 2nd fallback capture is not
+                            # queued while the single slow worker is saturated.
+                            _eff_keep = self._dedup_keep
+                            if (self._keep1_under_load and self._dedup_keep > 1
+                                    and self._decoder is not None
+                                    and self._decoder.pending()
+                                        > self._keep1_load_thresh):
+                                _eff_keep = 1
+                            _cluster_idx = []
+                            _best_diff_q = -1e30   # best q of a same-slope,
+                            #   DIFFERENT-(sf,bw) member already in this cluster
+                            # WIDTH FIT of a label: |log2(bw / measured occupied
+                            # width)|, <= 0.85 means the label's bandwidth is the
+                            # one the burst actually occupies.  Same-slope
+                            # siblings are dechirp-DEGENERATE, so their raw q
+                            # cannot rank them — the alias that a distant gate
+                            # peak's wider crop picked up often scores HIGHER
+                            # (live: SF9/500k at bwq 22.4 beat the true SF7/250k
+                            # at 19.6 and took the cluster slot; the decoder
+                            # then relabelled it by occupied width, seconds
+                            # later).  Width can: a different-label sibling
+                            # whose label fits its width beats one whose label
+                            # does not (or whose width was unmeasurable), in
+                            # either direction; only when neither side settles
+                            # it does the q margin below decide, as before.
+                            import math as _mw
+                            _cand_w = _src.get('width_hz')
+                            _cand_fits = bool(_cand_w) and abs(
+                                _mw.log2(_src['bw'] / float(_cand_w))) <= 0.85
+                            _sib_fits = False      # a different-label sibling fits
+                            _sib_misfit_idx = []   # different-label siblings that don't
+                            for _i, _e in enumerate(self._saved_abs_t):
+                                _sf_hz, _st, _ssf, _sbw = _e[0], _e[1], _e[2], _e[3]
+                                if (abs(_cand_freq - _sf_hz) < _ftol
+                                        and abs(_abs_t_s - _st) < _dt_win
+                                        and (_lbl_blind
+                                             or (_ssf == _src['sf']
+                                                 and _sbw == _src['bw'])
+                                             or (self._slope_dedup
+                                                 and _slope(_ssf, _sbw)
+                                                     == _cand_slope))):
+                                    _match += 1
+                                    _cluster_idx.append(_i)
+                                    if (self._slope_dedup
+                                            and (_ssf != _src['sf']
+                                                 or _sbw != _src['bw'])):
+                                        _best_diff_q = max(_best_diff_q, _e[4])
+                                        _ew = _e[5] if len(_e) > 5 else None
+                                        if _ew and abs(_mw.log2(
+                                                _sbw / float(_ew))) <= 0.85:
+                                            _sib_fits = True
+                                        else:
+                                            _sib_misfit_idx.append(_i)
+                            # RECORD-TIME same-slope alias gate (the eviction below
+                            # only rewrites the registry — it cannot un-create a
+                            # decode job for an alias that already filled a free
+                            # keep-N slot or beat the weakest one).  A same-slope
+                            # member whose raw dechirp quality is MARGIN dB below a
+                            # different-label sibling already in the cluster is the
+                            # 3-6 dB-weaker down-alias (SF7/62.5k of a real
+                            # SF9/125k) — skip RECORDING it entirely so it never
+                            # becomes a decode job, regardless of slot availability.
+                            # A genuinely-strongest same-slope member is never
+                            # gated (it clears the margin), preserving a real weak
+                            # SF7/62.5k that has no stronger sibling.
+                            if (self._slope_dedup and _sib_fits
+                                    and not _cand_fits):
+                                _skip = True           # a sibling's label fits, this one's doesn't
+                            elif (self._slope_dedup and _cand_fits
+                                    and not _sib_fits and _sib_misfit_idx):
+                                # This label fits the burst's width and the
+                                # recorded sibling's doesn't: take its slot.
+                                self._saved_abs_t[_sib_misfit_idx[0]] = (
                                     _cand_freq, _abs_t_s,
                                     _src['sf'], _src['bw'], _cand_q, _cand_w)
+                            elif (self._slope_dedup
+                                    and _best_diff_q - _cand_q > self._slope_margin_db):
+                                _skip = True
+                            elif _match < _eff_keep:
+                                self._saved_abs_t.append(
+                                    (_cand_freq, _abs_t_s,
+                                     _src['sf'], _src['bw'], _cand_q, _cand_w))
+                                if len(self._saved_abs_t) > 4000:
+                                    _cut = _abs_t_s - 10.0
+                                    self._saved_abs_t = [
+                                        e for e in self._saved_abs_t
+                                        if e[1] > _cut]
+                            elif self._slope_dedup and _cluster_idx:
+                                # Cluster full: quality-ranked eviction.  If this
+                                # det's bw_quality_db beats the weakest slot's, evict
+                                # + replace that slot so the true higher-q member
+                                # always wins; the 3-6 dB-weaker alias never
+                                # displaces the real parent.  Registry stays bounded
+                                # (replace, not add) — at most a few evictions until
+                                # the highest-q member holds the slot.  REGRESSION
+                                # GUARD: the SF12/62.5k-vs-SF10/31.25k GT pair is
+                                # same-slope (~954); keeping the higher-raw-q member
+                                # preserves the required decode of both texts.
+                                _weak_i = min(
+                                    _cluster_idx,
+                                    key=lambda _j: self._saved_abs_t[_j][4])
+                                if _cand_q > self._saved_abs_t[_weak_i][4]:
+                                    self._saved_abs_t[_weak_i] = (
+                                        _cand_freq, _abs_t_s,
+                                        _src['sf'], _src['bw'], _cand_q, _cand_w)
+                                else:
+                                    _skip = True
                             else:
                                 _skip = True
-                        else:
-                            _skip = True
                     if _skip:
                         if self.debug >= 1:
                             print(f"         [RFDEDUP] skip "
@@ -6179,6 +6222,10 @@ class SignalRecorder:
                         _admit, _drop, _pend = self._decoder._cap_try_reserve(
                             fpath, _fsize)
                         if not _admit:
+                            if _capture_role == 'early':
+                                print('[HEADER-EARLY] decode file capacity unavailable; '
+                                      'full fallback retained', file=sys.stderr, flush=True)
+                                continue
                             if _shared_save is not None:
                                 raise RuntimeError('admitted shared capture cannot be saved: '
                                                    'decoder file capacity exhausted')
@@ -6273,7 +6320,8 @@ class SignalRecorder:
                         # cancellation is clean (per-symbol amplitude OK).
                         self._decoder.submit(fpath, fname, bucket_key=_bkey,
                                              slow=bool(d.get('patience_trial')),
-                                             prio=float(d.get('bw_quality_db', 0.0)),
+                                             prio=(float('inf') if _capture_role == 'early'
+                                                   else float(d.get('bw_quality_db', 0.0))),
                                              role=_capture_role)
                         # Family-label decode jobs (trial captures only) —
                         # same bucket, slow tier: once any label in the
@@ -6322,7 +6370,8 @@ class SignalRecorder:
             except Exception as e:
                 if _shared_save is not None:
                     _shared_save._render_failed = True
-                    _shared_save._owner._fail(f'save worker failed: {e}')
+                    if _shared_save.role not in ('header_prefix', 'early'):
+                        _shared_save._owner._fail(f'save worker failed: {e}')
                 print(f"[RECORDER] save error: {e}", file=sys.stderr, flush=True)
             finally:
                 if _spool_path is not None:
