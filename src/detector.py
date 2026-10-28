@@ -10010,6 +10010,13 @@ def main():
                         if not _gate_peaks:
                             _jk_sup_windows += 1
 
+        # Preserve measured energy for slow-preamble accumulation. Fast-worker
+        # shedding bounds compute; it must not turn observed narrow RF into
+        # an absent seed (cap0 lost the third observation of a real preamble).
+        # Snapshot AFTER prescreen, BEFORE fast caps/forced channel placeholders.
+        # Slow width/strength, cooldown, busy and admission guards stay below.
+        _slow_observed_peaks = tuple(_gate_peaks)
+
         # ---- Keep-up-driven peak throttle ----
         # The energy gate's job is bounding COMPUTE, not judging what's real —
         # SC + dechirp reject noise (measured: zero false positives even at
@@ -10726,7 +10733,7 @@ def main():
                                     / (a.rate / 4096.0))) + 2048)
         _floor_gate_db = float(np.median(_psd_gate))
         _new_seeds = {}
-        for _p in _gate_peaks:
+        for _p in _slow_observed_peaks:
             # PEAK-RELATIVE narrowness: the gate's contour width is floor-
             # relative and useless for strong signals (a 55 dB same-room
             # SF12/31.25k beacon spans 1.1 MHz at floor+6 via its phase-
