@@ -62,7 +62,7 @@ it is given.
 | Host | Sustained rate / IBW | Notes |
 |---|---|---|
 | Desktop / laptop, many fast cores (dev host: 24-core x86, 64 GB) | **20-28 Msps / the full band** | validated default |
-| Raspberry Pi 4 (4× Cortex-A72, 8 GB) | **~5 Msps / ~5 MHz** | 20 Msps overruns it (~75 % of the air dropped) |
+| Raspberry Pi 5 (16 GB) | **~5 Msps / ~5 MHz** | Recommend max of 10 Msps / 10 MHz |
 
 Between those two the ceiling tracks **cores × per-core speed**. If a host
 cannot keep up it degrades gracefully - the gate skips ahead to stay
