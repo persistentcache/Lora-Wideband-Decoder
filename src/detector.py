@@ -4625,8 +4625,13 @@ class _StreamDecimator:
         # the single crop thread fell behind and captures were finalized
         # 25-100 s after detection (median row latency 79 s, 21/21 decoded
         # but a minute late).
-        zd = _upfirdn(self.h, seg, up=1, down=D)
-        y = np.ascontiguousarray(zd[c_min // D:c_min // D + n_y], dtype=np.complex64)
+        # The taps are real: filter I/Q separately instead of paying scipy's
+        # complex-convolution cost. This preserves the FIR/grid arithmetic
+        # while letting several pending streams keep up with live input.
+        take = slice(c_min // D, c_min // D + n_y)
+        y = np.empty(n_y, dtype=np.complex64)
+        y.real = _upfirdn(self.h, seg.real, up=1, down=D)[take]
+        y.imag = _upfirdn(self.h, seg.imag, up=1, down=D)[take]
         self._m_next = m_hi + 1
         # keep L-1 (+ one extra D so the next GEMM's earliest row exists)
         keep_abs = self._m_next * D + H - (L - 1) - D
@@ -6800,6 +6805,60 @@ while True:
         except Exception:
             pass
 
+    def _publish_packet_line(self, line, fpath, *, received_at=None):
+        """Publish a complete worker record without ending its capture search.
+
+        Return the timestamped line for the final raw JOB log. Invalid records
+        return None before changing counters, capture summaries or packet logs.
+        Result dedup, bucket completion and capture lifetime remain separate.
+        """
+        if not line.startswith('[PKT] '):
+            return None
+        import json as _json
+        try:
+            record = _json.loads(line[6:])
+            if not isinstance(record, dict):
+                return None
+            key = (record.get('pkt_id') or record.get('packet_id')
+                   or record.get('raw_hex') or record.get('text'))
+            identity = (record.get('proto'), key)
+            if key is not None:
+                hash(identity)
+            record['ts'] = time.time() if received_at is None else received_at
+            encoded = _json.dumps(record, separators=(',', ':'))
+        except (ValueError, TypeError):
+            return None
+
+        # Preserve the existing all-protocol publication and feedback path.
+        # This runs in a decoder manager thread, never the acquisition loop.
+        with self._decoded_lock:
+            self._decoded_total += 1
+            if key is not None:
+                self._decoded_keys.add(identity)
+            try:
+                carrier_mhz = float(record.get('freq_mhz') or 0.0)
+            except (TypeError, ValueError):
+                carrier_mhz = 0.0
+            if carrier_mhz > 0.0:
+                self._confirmed_freqs.append(carrier_mhz * 1e6)
+                if len(self._confirmed_freqs) > 64:
+                    del self._confirmed_freqs[:-64]
+        if self._keep_dir:
+            with self._refs_lock:
+                self._cap_recs.setdefault(fpath, []).append(
+                    {k: record.get(k) for k in (
+                        'proto', 'confidence', 'pktid', 'from', 'to', 'text',
+                        'summary', 'sf', 'bw', 'freq_mhz', 'hops')
+                     if record.get(k) is not None})
+        if self._pkt_log_path:
+            try:
+                with self._pkt_log_lock:
+                    with open(self._pkt_log_path, 'a') as stream:
+                        stream.write(encoded + '\n')
+            except Exception:
+                pass
+        return '[PKT] ' + encoded
+
     def _cap_try_reserve(self, fpath, size):
         """Reserve `size` bytes for a new capture against the pending-capture
         budget.  Returns (admitted, dropped_total, pending_bytes).  admitted=
@@ -7507,6 +7566,12 @@ while True:
                         break
                     if line.startswith('__BEGIN__'):
                         continue
+                    if line.startswith('[PKT] '):
+                        # A completed frame need not wait for later-frame
+                        # searches, recovery passes or the worker deadline.
+                        # Keep the same receipt timestamp in JSONL and raw JOB
+                        # evidence; finalization must not publish it again.
+                        line = self._publish_packet_line(line, fpath) or line
                     output_lines.append(line)
 
                 if timed_out:
@@ -7539,55 +7604,6 @@ while True:
                 self._rawlog('JOB', f"{fname} mode={relay_field or '-'} "
                                     f"budget={job_budget} elapsed={elapsed:.1f}s "
                                     f"timed_out={timed_out}", output or '(empty)')
-
-                # Structured packet log: append each [PKT] record (decoded or
-                # encrypted-header-only) with a receive timestamp to the JSONL the
-                # web UI tails.  The web dedups by (pktid,hop); here we just append.
-                if '[PKT]' in output:
-                    import json as _json
-                    _now = time.time()
-                    _out = []
-                    for _ln in output.split('\n'):
-                        if _ln.startswith('[PKT] '):
-                            try:
-                                _r = _json.loads(_ln[6:])
-                            except Exception:
-                                continue
-                            # Authoritative decode count (data-path truth, not the
-                            # noisy compact stdout).  Distinct-packet key prefers a
-                            # stable identity: Meshtastic PacketID+hop, else the raw
-                            # payload hex, else the decoded text.
-                            _uk = (_r.get('pkt_id') or _r.get('packet_id')
-                                   or _r.get('raw_hex') or _r.get('text'))
-                            with self._decoded_lock:
-                                self._decoded_total += 1
-                                if _uk is not None:
-                                    self._decoded_keys.add((_r.get('proto'), _uk))
-                                try:
-                                    _cfm = float(_r.get('freq_mhz') or 0.0)
-                                except (TypeError, ValueError):
-                                    _cfm = 0.0
-                                if _cfm > 0.0:
-                                    self._confirmed_freqs.append(_cfm * 1e6)
-                                    if len(self._confirmed_freqs) > 64:
-                                        del self._confirmed_freqs[:-64]
-                            if self._keep_dir:
-                                with self._refs_lock:
-                                    self._cap_recs.setdefault(fpath, []).append(
-                                        {k: _r.get(k) for k in (
-                                            'proto', 'confidence', 'pktid', 'from',
-                                            'to', 'text', 'summary', 'sf', 'bw',
-                                            'freq_mhz', 'hops') if _r.get(k) is not None})
-                            if self._pkt_log_path:
-                                _r['ts'] = _now
-                                _out.append(_json.dumps(_r, separators=(',', ':')))
-                    if _out and self._pkt_log_path:
-                        try:
-                            with self._pkt_log_lock:
-                                with open(self._pkt_log_path, 'a') as _pf:
-                                    _pf.write('\n'.join(_out) + '\n')
-                        except Exception:
-                            pass
 
                 # Fast-pass straggler recovery: if a PRIMARY fast decode BAILED
                 # on its realtime budget it may still hold an undecoded packet
@@ -11071,14 +11087,6 @@ def main():
             _commit_oldest()
         _pool.close()
 
-    # Drain pending saves first (they submit to decoder), then drain decoder
-    if recorder:
-        pending_saves = recorder._save_queue.qsize()
-        if pending_saves > 0:
-            print(f"\nWaiting for {pending_saves} pending save(s)...",
-                  file=sys.stderr)
-        recorder.flush()
-
     if recorder:
         try:
             recorder.flush_pending(wait=True)   # deferred tails: finalize
@@ -11086,6 +11094,14 @@ def main():
                                        # drain so stragglers decode
         except Exception:
             pass
+        # Finalizing pending tails can enqueue NEW saves. Join those saves
+        # before testing decoder.pending(), or EOF can exit before their
+        # captures are submitted to the decoder.
+        pending_saves = recorder._save_queue.qsize()
+        if pending_saves > 0:
+            print(f"\nWaiting for {pending_saves} pending save(s)...",
+                  file=sys.stderr)
+        recorder.flush()
     if decoder:
         # Capture has ended (EOF) — move the deferred straggler queue into the
         # fast queue so the workers re-decode them now (big budget), without
