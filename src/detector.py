@@ -6400,17 +6400,12 @@ class BackgroundDecoder:
                       "using CPU scale only", file=sys.stderr, flush=True)
         self._n_workers = (_env_nw_i if _env_nw_i > 0 else _w_auto)
         # ---- Two-tier decode on the SAME workers (no oversubscription) ----
-        # Each manager serves the FAST queue first; only when it's empty does it
-        # pull from the SLOW queue.  A capture the fast pass BAILS on ("[BUDGET]
-        # … exhausted" → ran out of realtime budget, may still hold an undecoded
-        # packet) is re-queued to the slow queue and re-decoded with a big
-        # per-job budget.  Because it's the same worker pool, total CPU is
-        # unchanged (no extra processes to oversubscribe the gate) — the slow
-        # re-decodes simply run in the idle gaps after each burst.  Captures live
-        # on /dev/shm so nothing is lost; the rare budget-bound straggler just
-        # arrives a few seconds later instead of being dropped → 100% of
-        # captured packets without slowing the realtime path.
+        # Fast work keeps its quality ordering. Deferred work gets one slot
+        # after eight fast dispatches, or immediately when fast is empty, while
+        # live ring pressure and gate stress permit it. The same fixed worker
+        # pool serves both tiers; at most one slow job is reserved at a time.
         self._slow_queue = queue.Queue()
+        self._fast_since_slow = 0
         # CAPTURE-FIRST DECODE DEFERRAL (2026-07-06): under ring pressure
         # the decode workers' memory-bandwidth load starves the reader
         # (measured: 33 concurrent SF12 decodes -> 17.5 of 20 Msps
@@ -6443,12 +6438,7 @@ class BackgroundDecoder:
         self._slow_released_job = None   # released to fast queue, not yet dequeued
         self._slow_inflight_job = None   # dequeued + decoding
         self._slow_budget = float(os.environ.get('LORA_SLOW_BUDGET_S', '45'))
-        # Slow mop-up runs ONLY when capture is not active.  A big-budget
-        # re-decode running DURING live capture holds workers and starves the
-        # gate's 28 Msps intake → sample drops (measured).  The gate clears this
-        # flag at shutdown/EOF so the slow tier drains the straggler queue then
-        # (captures are on disk; for a continuously-running deployment, clear it
-        # during genuinely idle stretches instead).
+        # Legacy capture-state flag; live release uses pressure/stress guards.
         self._capture_active = True
         self._threads = []
         for _ in range(self._n_workers):
@@ -6813,10 +6803,6 @@ while True:
     def maybe_release_pressure(self):
         """Pressure-clear release: one deferred job at a time while the
         ring is comfortable, without requiring full radio-idle."""
-        if self._defer_state or self._pressure > 0.20:
-            return
-        if self._slow_queue.qsize() == 0 or not self._queue.empty():
-            return
         self._release_one_slow()
 
     def submit(self, fpath, fname, relay_after_syms=None, relay_before_syms=None,
@@ -6855,11 +6841,7 @@ while True:
         # The post-decode _packet_dedup collapses any duplicate RESULTS, so
         # submitting them all is safe (no FP / no double-count).
         self._ref_inc(fpath)
-        # slow=True (patience trials): a trial capture is a HYPOTHESIS — it
-        # must never compete with real traffic for the fast decode workers
-        # (measured: trial jobs reordered a knife-edge marginal decode's
-        # worker assignment and flipped it).  The slow tier drains in idle
-        # gaps, which is exactly the right priority for acquisition probes.
+        # Trials and pressure-deferred captures share the bounded slow tier.
         _slow_tier = slow or self._defer_state
         self._rawlog('SUBMIT', f"{fname} relay={relay_after_syms},{relay_before_syms} "
                                f"tier={'slow' if _slow_tier else 'fast'}")
@@ -6892,60 +6874,56 @@ while True:
         return _o
 
     def maybe_release_straggler(self):
-        """Release ONE deferred straggler for a big-budget re-decode IF the
-        decode system is idle right now — fast queue empty AND nothing decoding.
-        The GATE calls this on a no-signal window, so the trigger is the gate's
-        own real-time idle state (no signal in the air + no decode backlog), not
-        a guessed time threshold.  That makes it fully SELF-ADAPTING to traffic
-        density: dense traffic → few no-signal windows / busy decoders → rarely
-        fires (stragglers wait); sparse traffic → many idle windows → drains
-        freely.  active_count==0 caps it to one slow re-decode at a time so it
-        never piles onto a burst, and being driven by real idle it never starves
-        the realtime gate.  No tunable, no polling thread."""
-        if self._slow_queue.qsize() == 0:
-            return
-        if not self._queue.empty():
-            return
+        """Offer one deferred job a pressure-safe, bounded dispatch turn."""
         self._release_one_slow()
 
     def _release_one_slow(self):
         """Move ONE slow-tier job into the fast queue, at most one in flight.
 
-        Callers have already established that no fast-tier work is waiting.
-        The released job is consumed by the SAME fixed worker pool, so this
-        adds no processes and cannot oversubscribe the gate; if every worker
-        is busy it simply waits its turn in the fast queue instead of rotting
-        in the slow one.
+        The fast tier gets eight dispatches between slow turns while both
+        queues remain busy. A released job has priority over new fast arrivals
+        so its reservation guarantees a turn, rather than another starvation
+        point. When fast is empty, no quota delay is necessary.
 
         Realtime guard: gate on LIVE ring occupancy, not on the _defer_state
         latch.  The latch exists to route NEW jobs to the slow tier and holds
         for a 20 s min-dwell; gating releases on it would re-starve the queue
         on exactly the busy hosts this fix targets.  Live pressure is the
         honest "is there room for heavy work right now" signal, and the
-        _gate_stress throttle still pauses a running re-decode if the reader
-        starts dropping.  File mode leaves _pressure at 0.0 → unchanged."""
-        if self._pressure > 0.20:
-            return
+        gate stress blocks admission too. File mode leaves _pressure at 0.0.
+        These guards can delay a turn while capture needs the resources."""
         # ATOMIC guard+dequeue+claim under one lock: the old split (guard in one
         # lock, get_nowait between, increment in another) let two release paths
         # both observe "free" and admit two heavy re-decodes.  get_nowait on a
         # thread-safe queue is cheap enough to hold the lock across.
         with self._lock:
+            if self._pressure > 0.20 or self._gate_stress.is_set():
+                return
             if (self._slow_released_job is not None
                     or self._slow_inflight_job is not None):
                 return                       # occupied — one slow job at a time
+            if not self._queue.empty() and self._fast_since_slow < 8:
+                return
             try:
                 _job = self._slow_queue.get_nowait()
             except queue.Empty:
                 return
             self._slow_released_job = _job   # RELEASED_NOT_DEQUEUED
         try:
-            self._queue.put((1e9, next(self._qseq), _job))   # after any fast job
+            self._queue.put((float('-inf'), next(self._qseq), _job))
         except BaseException:
-            with self._lock:                 # enqueue failed -> release the claim
+            with self._lock:
+                # Keep the existing reference and original FIFO position if
+                # transfer is cancelled before the fast queue accepts it.
+                # get_nowait did not finish the slow queue's task, so restore
+                # its deque directly without counting a second submission.
+                with self._slow_queue.not_empty:
+                    self._slow_queue.queue.appendleft(_job)
+                    self._slow_queue.not_empty.notify()
                 if self._slow_released_job is _job:
                     self._slow_released_job = None
             raise
+        self._slow_queue.task_done()
 
     def _slow_take(self, job):
         """Claim the slow-tier reservation iff `job` IS the released slow job.
@@ -6960,7 +6938,9 @@ while True:
                     and job is self._slow_released_job):
                 self._slow_released_job = None
                 self._slow_inflight_job = job    # RELEASED -> INFLIGHT (atomic)
+                self._fast_since_slow = 0
                 return job                        # identity token for _slow_retire
+            self._fast_since_slow = min(8, self._fast_since_slow + 1)
         return None
 
     def _slow_retire(self, token):
@@ -6990,6 +6970,7 @@ while True:
                 self._queue.put((1e9, next(self._qseq), self._slow_queue.get_nowait()))
             except queue.Empty:
                 break
+            self._slow_queue.task_done()
 
     def drain(self, timeout=30.0):
         """Wait for pending decodes to finish (e.g. on shutdown).  Keeps folding
@@ -7022,12 +7003,10 @@ while True:
             pass
 
     def _manager(self):
-        """Manager thread: drives its OWN persistent worker subprocess.  Serves
-        the FAST queue first; only when it is empty does it pull from the SLOW
-        queue (fast-pass stragglers re-decoded with a big per-job budget).  Same
-        worker pool for both → no CPU oversubscription of the realtime gate."""
+        """Drive one persistent worker, sharing bounded turns between tiers."""
         worker = None
         while True:
+            self._release_one_slow()
             # Plain blocking get on the fast queue — NO polling loop (10 threads
             # waking on a timeout competed with the gate's realtime thread and
             # caused sample drops).  The slow mop-up queue is drained by moving
@@ -9923,16 +9902,9 @@ def main():
                         % len(PATIENCE_TRIALS)]
                     _win_chans.append((_phz - _cen_pat, _tsf, _tbw, True))
 
-        # Try to release ONE deferred straggler for a big-budget re-decode.  Drive
-        # this off the decode system's ACTUAL idle state — maybe_release_straggler
-        # self-gates on (slow queue non-empty AND fast queue empty AND nothing
-        # decoding) — NOT off the gate's per-window peak count.  Peak count was a
-        # broken proxy for "idle": at high gain find_peaks returns spur peaks every
-        # window, so the old `if not has_energy` guard was never true and the slow
-        # queue never drained (observed: 4 SF11 stragglers stuck indefinitely while
-        # the gate sat with no real traffic).  Realtime stays protected by the
-        # _gate_stress throttle, which pauses the heavy re-decode if the gate starts
-        # dropping samples; this call itself is just a few cheap checks.
+        # Offer deferred work a turn every window, including under sustained
+        # traffic. The scheduler limits it to one reservation, uses a fast-job
+        # quota, and blocks release while ring pressure or gate stress is high.
         if decoder is not None:
             decoder.maybe_release_straggler()
         if decoder and is_live and (wc & 3) == 0:
