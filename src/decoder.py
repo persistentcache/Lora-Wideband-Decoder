@@ -6902,6 +6902,19 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
                         pass
 
 
+def _decoded_span_samples(preamble_start, data_start, N, ppm, ppm_pay,
+                          cr, need_bytes):
+    """Span of a decoded frame at BW rate, including one symbol of margin."""
+    # The eight header symbols also carry ppm-5 payload nibbles. Each
+    # subsequent CR+4-symbol block supplies ppm_pay nibbles, not bits.
+    # Use the accepted LDRO mode and measured header start so long preambles
+    # and timing adjustments are included without masking the next packet.
+    remaining_nibbles = max(0, 2 * need_bytes - max(0, ppm - 5))
+    payload_blocks = (remaining_nibbles + ppm_pay - 1) // ppm_pay
+    data_symbols = 8 + payload_blocks * (cr + 4)
+    return int(data_start - preamble_start + (data_symbols + 1) * N)
+
+
 def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     grid_sweep=False, force_td=None,
                     sweep_budget=2.0, diag_out=None, deadline=None):
@@ -9267,9 +9280,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # gates+chase+sweep — they have nothing to add to an already-clean decode —
     # and return success with the same packet-length info as the normal path.
     if _early_handled:
-        n_pay_syms = int(np.ceil(need_bytes * 8 / sf)) * (cr + 4)
-        total_syms = 8 + 4.25 + 8 + n_pay_syms
-        pkt_len_samples = int(total_syms * N) + N
+        pkt_len_samples = _decoded_span_samples(
+            preamble_start, data_start, N, ppm, ppm_pay, cr, need_bytes)
         print()
         if _HARNESS_OUT:
             _harness_emit('attempt_end', status='OK', via='early_dispatch',
@@ -9977,14 +9989,9 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
     print()
     # Compute the packet's total length so the caller can mask it from
-    # iq and re-search for additional concurrent packets.
-    #  - preamble (8 syms)
-    #  - sync words (2 syms) + downchirps (2.25 syms) ≈ 4.25 from preamble end
-    #  - header (8 syms at SF7-ppm reduced rate)
-    #  - payload syms ≈ ceil(need_bytes * 8 / sf) * (cr + 4)
-    n_pay_syms = int(np.ceil(need_bytes * 8 / sf)) * (cr + 4)
-    total_syms = 8 + 4.25 + 8 + n_pay_syms
-    pkt_len_samples = int(total_syms * N) + N  # +1 sym safety
+    # iq and re-search without erasing later frames retained in this capture.
+    pkt_len_samples = _decoded_span_samples(
+        preamble_start, data_start, N, ppm, ppm_pay, cr, need_bytes)
     if _HARNESS_OUT:
         _harness_emit('attempt_end', status='OK', via='full_path',
                       payload_hex=''.join('%02x' % b for b in payload),
