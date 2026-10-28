@@ -4633,6 +4633,56 @@ def _slope(sf, bw):
     return round(bw * bw / (2.0 ** sf) / 1e3)
 
 
+def _capture_duration_s(detection):
+    """Bound supported frames, without needing an already-decoded header.
+
+    Semtech SX1276 datasheet section 4.1.1.7: explicit header, payload CRC,
+    CR4/8 and the longer LDRO=1 form. decoder.py's LDRO fallback supports
+    either setting even below 16 ms/symbol. Its universal payload guard
+    is 4..237 bytes (including Unknown/MeshCore/LoRaWAN), not the PHY's 255.
+    Allow the known 32-symbol MeshCore preamble as well as Meshtastic's 16.
+    https://cdn.sparkfun.com/assets/a/a/0/b/5/DS_SX1276-7-8-9_W_APP_V5.pdf
+    """
+    override = os.environ.get('LORA_PAYLOAD_SYM_BUDGET')
+    if override is not None:
+        # Preserve the explicit override's historical symbol semantics.
+        return (16 + 4.25 + 8 + int(override)) * patience_cap_params(detection)[1]
+    sf, bw = int(detection['sf']), float(detection['bw'])
+    family = (patience_trial_family(sf, bw)
+              if detection.get('patience_trial') else [(sf, bw)])
+    durations = []
+    for sf, bw in family:
+        symbol_s = (2 ** sf) / bw
+        denominator = 4 * (sf - 2)  # DE=1 bounds both supported LDRO settings
+        numerator = 8 * 237 - 4 * sf + 28 + 16
+        blocks = max(0, -(-numerator // denominator))
+        payload_symbols = 8 + blocks * 8  # CR4/8
+        durations.append((32 + 4.25 + payload_symbols) * symbol_s)
+    return max(durations)
+
+
+def _legacy_tail_limit_n(detections, rate, window_n):
+    """Keep the pre-existing wideband retention ceiling on fallback paths."""
+    return min(int(max(148.25 * patience_cap_params(d)[1]
+                       for d in detections) * rate), 24 * window_n)
+
+
+def _capture_tail_n(recorder, detections, window_n, *, allow_nb=True, warn=True):
+    if not detections:
+        return 0
+    requested = int(np.ceil(max(_capture_duration_s(d) for d in detections)
+                            * recorder.wb_fs))
+    if recorder._nb_mode and allow_nb:
+        return requested
+    limit = _legacy_tail_limit_n(detections, recorder.wb_fs, window_n)
+    if requested > limit and warn:
+        print(f'[CAPTURE-LIMIT] wideband tail limited to '
+              f'{limit / recorder.wb_fs:.3f}s of '
+              f'{requested / recorder.wb_fs:.3f}s requested; long frames '
+              'may be truncated', file=sys.stderr, flush=True)
+    return min(requested, limit)
+
+
 def _slow_record_immediately(detection, window_s):
     """No main-pass dedup hold for modes that cannot fit its 16-symbol gate."""
     return (int(detection['bw']) in (31250, 41667)
@@ -4643,8 +4693,7 @@ def _record_slow_capture(recorder, detections, base, base_end, *, sample_pos,
                          hop_n, win_n, recent_hops, history_reader=None,
                          history_anchor=None):
     """Register a contiguous slow assembly, recovering delayed tails in hops."""
-    tail_n = min(int(max(148.25 * (2 ** d['sf']) / d['bw']
-                         for d in detections) * recorder.wb_fs), 24 * win_n)
+    tail_n = _capture_tail_n(recorder, detections, win_n)
     gap_n = sample_pos - base_end
     gap_parts = tail_parts = None
     reg_pos = base_end
@@ -4700,11 +4749,13 @@ class SignalRecorder:
     Recording = wideband_buf + tail, trimmed per SF/BW.
     """
 
-    def __init__(self, export_dir, wb_fs, center_hz, hop_n, debug=0):
+    def __init__(self, export_dir, wb_fs, center_hz, hop_n, debug=0,
+                 window_n=None):
         self.export_dir = export_dir
         self.wb_fs = wb_fs
         self.center_hz = center_hz
         self.hop_n = hop_n
+        self.window_n = int(window_n if window_n is not None else 2 * hop_n)
         self.debug = debug
         os.makedirs(export_dir, exist_ok=True)
         # Reap orphan captures from a previous crashed run.  The pipeline holds
@@ -5018,6 +5069,19 @@ class SignalRecorder:
                     # cropper drowning — degrade this job to the legacy
                     # wideband path rather than block the loop
                     del job['nb']
+        if 'nb' not in job:
+            # Decide after NB setup/BASE enqueue: missing scipy, degenerate
+            # decimation and a full crop queue all take the wideband fallback.
+            # Its pre-existing memory bound must not inherit the larger NB
+            # allowance. Gap parts already consume part of that allowance.
+            limit = max(0, _legacy_tail_limit_n(
+                job['dets'], self.wb_fs, self.window_n) - _gap_n)
+            if job['need'] > limit:
+                print(f'[CAPTURE-LIMIT] wideband fallback tail limited to '
+                      f'{limit / self.wb_fs:.3f}s of '
+                      f'{job["need"] / self.wb_fs:.3f}s requested; long '
+                      'frames may be truncated', file=sys.stderr, flush=True)
+                job['need'] = limit
         if os.environ.get('LORA_SLOW_DEBUG'):
             print(f"[UPDEF-JOB] created dets={[(d['sf'], d['bw'], round(d['freq_hz']/1e6,4)) for d in job['dets']]} need={job['need']}", flush=True)
         # POOL-MODE SEED (UC audit q + p): feed the fully-known in-flight tail
@@ -5354,23 +5418,11 @@ class SignalRecorder:
                 # partner, which would truncate the true payload).  Non-trial
                 # anchors get exactly the historic (bw, (2**sf)/bw).
                 _cap_bw, sym_time = patience_cap_params(anchor)
-                # Capture extent past the preamble = preamble (16) + SFD (4.25)
-                # + sync (8) + payload-symbol budget.  Originally 120 syms covered
-                # the absolute Meshtastic max (PL=237 / CR4/5 / LDRO) — but that
-                # tail is mostly silence for the typical 20-90 byte Meshtastic
-                # packet.  Slow SFs especially suffer: at SF12 sym_time≈33 ms so
-                # the unused tail adds ~3 s per capture, which both raises
-                # send→decoded latency by that much AND inflates the decode
-                # workload proportionally.  100 syms covers Meshtastic up to
-                # ~80 bytes after FEC (>99 % of real traffic incl. all standard
-                # text, telemetry, position, nodeinfo, routing); larger packets
-                # are truncated and may fail CRC.  Live SF11 4-core: latency
-                # p50 18s → 11s with this trim, 20/20 hops preserved.
-                # Tunable via LORA_PAYLOAD_SYM_BUDGET for users who need to
-                # capture giant packets at the cost of latency.
-                _pay_syms = int(os.environ.get('LORA_PAYLOAD_SYM_BUDGET', '100'))
-                max_pkt_syms = 16 + 4.25 + 8 + _pay_syms
-                max_pkt_s = max_pkt_syms * sym_time
+                # Use the same supported-frame bound as live retention.
+                # A later save trim must not discard the tail we just kept.
+                max_pkt_s = max(_capture_duration_s(d) for d in detections)
+                if _nb_job is None:
+                    max_pkt_s = min(max_pkt_s, 148.25 * sym_time)
                 buf_dur_s = pre_hop_s + wb_n / self.wb_fs
                 max_record_n = int((buf_dur_s + max_pkt_s) * self.wb_fs)
                 extended = (extended_full[:max_record_n]
@@ -8739,7 +8791,8 @@ def main():
     recorder = None
     if a.export_iq:
         recorder = SignalRecorder(
-            a.export_iq, a.rate, center_hz, hop_n, debug=a.debug)
+            a.export_iq, a.rate, center_hz, hop_n, debug=a.debug,
+            window_n=win_n)
         print(f"Export: {a.export_iq}/ (window+pre-read tail, fs=8×BW)",
               file=sys.stderr)
 
@@ -8834,13 +8887,9 @@ def main():
         used in _commit_oldest so the commit never fires before the capture's
         forward samples exist — which is what makes a low _LAG safe for EVERY SF
         (SF12's multi-second packet needs several trailing windows; SF7 needs 1)."""
-        if not dets:
+        if not dets or recorder is None:
             return 0
-        _a0 = max(dets, key=lambda x: x.get('peak_power_db', 0.0))
-        # patience_trial dets size for the same-slope family's slowest
-        # symbol time (see patience_cap_params) — an alias-sized tail
-        # truncates the true payload.  Non-trial: identical to 2**sf/bw.
-        _need = int((16 + 4.25 + 8 + 120) * patience_cap_params(_a0)[1] * a.rate)
+        _need = _capture_tail_n(recorder, dets, win_n, warn=False)
         return -(-_need // _tail_seg_n)   # ceil
 
     def _commit_oldest():
@@ -8870,7 +8919,9 @@ def main():
         if recorder:
             buf0 = _pool.slot_array(it['slot'])[:win_n]
             _tparts = []
-            _need_tail_n = 0
+            # Even with no trailing pool window yet, an NB job must pend
+            # for the required future tail instead of finalizing base-only.
+            _need_tail_n = _capture_tail_n(recorder, dets0, win_n)
             if _inflight and dets0:
                 # Tail must cover the FULL packet AFTER the preamble.  A single
                 # next-window overlap (~0.5 s) is enough for short-SF packets,
@@ -8882,9 +8933,6 @@ def main():
                 # subsequent in-flight windows as needed to span max_pkt_s for
                 # the detected SF/BW.  Short-SF presets need only 1 window, so
                 # their behaviour is unchanged.  Copies (slots get reused).
-                _a0 = max(dets0, key=lambda x: x.get('peak_power_db', 0.0))
-                _sym_t0 = (2 ** _a0['sf']) / _a0['bw']
-                _need_tail_n = int((16 + 4.25 + 8 + 120) * _sym_t0 * a.rate)
                 _acc = 0
                 _prev_seq = it['seq']
                 for _itn in _inflight:
@@ -10329,18 +10377,11 @@ def main():
                 # feed_tail() below completes it from the hops the loop
                 # processes anyway — identical samples, zero stall, and
                 # capture length no longer depends on pipeline speed.
-                _max_pkt_s = max(
-                    148.25 * patience_cap_params(d)[1] for d in dets)
-                # Cap = min(airtime, 24*win_n) (UC audit p).  Was
-                # min(airtime, 3*win_n, ring/2) — a stale blocking-read-era
-                # bound that truncated every frame past ~4.5 s (SF12/62.5k =
-                # 9.7 s, SF12/125k = 4.9 s) to a decoded header + cut payload.
-                # The deferred tail accumulates from LOOP HOPS (refs), not ring
-                # reads, so the ring/2 bound never applied; the slow-pass path
-                # already raised to 24*win_n for exactly this reason.  NB-mode
-                # crops each hop to KB as it arrives, so the longer pending job
-                # is tiny (and still bounded by the 3-job cap).
-                _max_tail_n = min(int(_max_pkt_s * a.rate), 24 * win_n)
+                # Only the streaming NB path receives the larger allowance.
+                # LORA_NO_DEFER remains a bounded blocking wideband read.
+                _max_tail_n = _capture_tail_n(
+                    recorder, dets, win_n,
+                    allow_nb=not bool(os.environ.get('LORA_NO_DEFER')))
                 if os.environ.get('LORA_NO_DEFER'):
                     # owned: the tail is retained as _carry_tail across the
                     # next read (and can become `buf` via iq[-win_n:])
@@ -10377,6 +10418,11 @@ def main():
                 _max_pkt_s = max(
                     148.25 * patience_cap_params(d)[1] for d in dets)
                 _max_tail_n = min(int(_max_pkt_s * a.rate), 3 * win_n)
+                _wanted = max(_capture_duration_s(d) for d in dets) * a.rate
+                if _max_tail_n < _wanted:
+                    print('[CAPTURE-LIMIT] blocking file tail retains its '
+                          'legacy bound; long frames may be truncated',
+                          file=sys.stderr, flush=True)
                 if _max_tail_n > 0:
                     # owned: retained as _carry_tail across the next read
                     # (and can become `buf` via iq[-win_n:])
