@@ -35,6 +35,8 @@ def ring_reader(consumed, *, received=None, capacity=16000):
 
 @pytest.fixture
 def recorder(tmp_path, monkeypatch):
+    # Preserve this seam regression's explicit legacy-length fixture.
+    monkeypatch.setenv('LORA_PAYLOAD_SYM_BUDGET', '120')
     monkeypatch.setenv('LORA_NB_PENDING', '0')
     monkeypatch.setattr(detector, '_IQ_INVERT', False)
     # Exercise real registration/feed/finalize; only the disk/DSP save sink is off.
@@ -154,6 +156,7 @@ def test_immediate_recording_preserves_legacy_and_main_window_ineligible_modes(s
 
 @pytest.fixture(params=[False, True], ids=['wideband', 'narrowband'])
 def seeded_recorder(tmp_path, monkeypatch, request):
+    monkeypatch.setenv('LORA_PAYLOAD_SYM_BUDGET', '120')
     monkeypatch.setenv('LORA_NB_PENDING', str(int(request.param)))
     monkeypatch.setattr(detector, '_IQ_INVERT', False)
     monkeypatch.setattr(detector.SignalRecorder, '_save_worker', lambda self: None)
