@@ -9589,6 +9589,27 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         except Exception as _ge:
             print("  [GATE-DBG] failed: %r" % (_ge,), flush=True)
 
+    # One measured primary drift correction before the combinatorial sweep.
+    # Long frames can drift outside every constant timing hypothesis. The
+    # existing late DD path already recovers these; try its primary geometry
+    # first, accepting only a direct received CRC with the same shape gate.
+    # A failed trial adds no soft-combine vote and changes no fallback state.
+    if (crc_present and not crc_ok and hdr_ok and not _fluke_junk
+            and sym_time_ms > 16.0
+            and (deadline is None or time.process_time() < deadline)):
+        _primary_dd_curve = _dd_resid_curve(0, 0.0, tau_frac)
+        if (_primary_dd_curve
+                and max(_primary_dd_curve) - min(_primary_dd_curve) >= 0.12
+                and (deadline is None or time.process_time() < deadline)):
+            _dd_raw, _dd_payload, _dd_soft, _dd_nibs = soft_decode_payload(
+                0, 0.0, frac_tau=tau_frac, resid_curve=_primary_dd_curve)
+            if len(_dd_raw) >= payload_len + 2:
+                _dd_ok, _dd_method = check_crc(_dd_raw, payload_len, strict=True)
+                if _dd_ok and _is_chase_acceptable_uni(_dd_raw):
+                    print("  PRIMARY-DD: direct CRC %s OK before timing sweep" % _dd_method)
+                    crc_ok, crc_method, _clean_crc = True, _dd_method, True
+                    raw_bytes, payload, pay_soft_info = _dd_raw, _dd_payload, _dd_soft
+
     # ---- Cross-attempt soft-combining accumulator (UC audit h) ----
     # Every failed soft_decode_payload trial carries per-nibble
     # (idx, best, second, margin) that was previously DISCARDED on CRC
