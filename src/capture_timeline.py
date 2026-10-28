@@ -192,6 +192,10 @@ class SharedCapture:
         if self.rate <= 0 or self.hop_n <= 0:
             raise ValueError('invalid shared capture clock')
         self.reader, self.factory, self.submit = reader, decimator_factory, submit
+        # Older/fake history readers retain explicit consumed-watermark feeds.
+        # The opt-in live reader supplies both ends of the published-copy API.
+        self._published_history = all(callable(getattr(reader, name, None)) for name in
+            ('received_history_anchor', 'received_history_parts'))
         self.budget = budget
         self.clock = clock
         self.writer_stall_s = float(writer_stall_s)
@@ -235,7 +239,7 @@ class SharedCapture:
         return int(anchor[1]), int(anchor[2])  # drop epoch AND retune generation
 
     def advance(self, anchor):
-        """Publish the consumed raw watermark without touching sample arrays."""
+        """Publish a validated raw watermark without touching sample arrays."""
         try:
             identity = self._identity(anchor)
             with self._lock:
@@ -246,6 +250,30 @@ class SharedCapture:
         except Exception as exc:
             self._fail(str(exc))
         self._wake.set()
+
+    def _poll_received_history(self):
+        if not self._published_history:
+            return
+        with self._lock:
+            if self._closing or self.failure:
+                return
+        try:
+            anchor = self.reader.received_history_anchor()
+            identity = self._identity(anchor)
+            received = int(anchor[0])
+        except Exception as exc:
+            self._fail(f'published history snapshot failed: {exc}')
+            return
+        with self._lock:
+            # close may have frozen the final published boundary while this
+            # snapshot was in flight. Never extend a closed generation.
+            # advance wakes the service. Do not wake our own idle loop for an
+            # unchanged/stale position; identity changes must still propagate.
+            changed = (self._watermark is None
+                or identity != self._identity(self._watermark)
+                or received > int(self._watermark[0]))
+            if not self._closing and not self.failure and changed:
+                self.advance(anchor)
 
     def _spec(self, target_factor, frequency):
         target_factor = int(target_factor)
@@ -547,6 +575,7 @@ class SharedCapture:
 
     def step(self):
         """One bounded crop service turn plus a nonblocking save transfer."""
+        self._poll_received_history()
         if self.header_controller is not None:
             self.header_controller.step()
             for event in self.header_controller.drain_events():
@@ -611,7 +640,9 @@ class SharedCapture:
             try:
                 if band.factor > 1 and band.decimator is None:
                     band.decimator = self.factory(band.center - self.center, self.rate, band.factor)
-                data = next(self.reader.history_parts((start, *band.identity), n, self.hop_n))
+                history_parts = (self.reader.received_history_parts if self._published_history
+                                 else self.reader.history_parts)
+                data = next(history_parts((start, *band.identity), n, self.hop_n))
                 if band.factor == 1:
                     output = data  # D1 is the actual full-rate original band
                 else:
@@ -779,6 +810,13 @@ class SharedCapture:
         if self.header_controller is not None:
             self.header_controller.close(wait=wait)
         with self._lock:
+            if self._published_history and not self._closing and not self.failure:
+                try:
+                    # Freeze once at close, including already-published final
+                    # partial-hop context. Later producer writes are excluded.
+                    self.advance(self.reader.received_history_anchor())
+                except Exception as exc:
+                    self._fail_locked(f'final published history snapshot failed: {exc}')
             self._closing = True
             self._retire(); self._release_idle_credits()
         self._wake.set()
