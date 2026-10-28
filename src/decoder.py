@@ -6268,6 +6268,9 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
     _need_rescue = False   # set when a header decoded but its data never CRC'd
     _residual_clear = False  # set when the masked residual has NO preamble left
     _sf_relabel_tried = False  # one-shot same-bw SF relabel (UC audit o)
+    _prior_verified_frame = False
+    _preamble_fit_retry_used = False
+    _retry_without_preamble_fit = False
     # Counter for consecutive attempts that produced NO valid LoRa header.  Real
     # packets of any protocol that pass the 4..237 byte sanity range reset this
     # counter; only sustained phantom-preamble cascades (gate fires on noise
@@ -6295,8 +6298,12 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
         if attempt > 0:
             print("\n  --- Retry #%d ---" % attempt)
         _d = {}
+        _attempt_skip_bins = list(skip_bins)
+        _fit_preamble = not _retry_without_preamble_fit
+        _retry_without_preamble_fit = False
         result = _decode_attempt(iq1_work.copy(), sf, bw, N, ppm, fs, dec, name, Counter,
-                                 skip_bins=skip_bins, diag_out=_d, deadline=_ddl)
+                                 skip_bins=skip_bins, diag_out=_d, deadline=_ddl,
+                                 preamble_fit=_fit_preamble)
         if (attempt == 0 and result is not None and result[0] == 'FAIL'
                 and bw <= 62500):
             # broadened 2026-07-05: ANY failed first attempt with a found
@@ -6397,6 +6404,8 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
                 continue   # re-enter the ladder at the corrected SF
             return  # dominant signal is a different SF — give up immediately
         if status == 'OK':
+            if _d.get('verified'):
+                _prior_verified_frame = True
             # The rescue arm means "a header was seen whose data never
             # CRC'd".  A later attempt just decoded a packet — the usual
             # case being THIS packet (attempt 1 failed off-centre or
@@ -6466,6 +6475,8 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
                                      and _EMIT_COUNT == 0)):
                 _rr = _recenter_and_decode(cfo_hz_raw)
             if _rr is not None:
+                if _LAST_EMIT_VERIFIED[0]:
+                    _prior_verified_frame = True
                 # Mask the span the RECENTERED decode actually covered, not
                 # this failed attempt's guess: the failed attempt's header
                 # was often wrong (PL=101 for a 37-byte frame) so its mask
@@ -6494,6 +6505,23 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
                     iq1_work[mask_start:mask_end] = 0.0
                     continue
                 return
+        # A valid later narrowband frame can fail when a noisy preamble fit
+        # extrapolates the wrong intercept/slope over its payload. Try the
+        # existing mean-CFO, zero-slope path once, only after a verified frame.
+        # Schedule it in the next ordinary attempt: neither the capture's
+        # attempt count nor CPU deadline is reset, and no failed span is lost.
+        if (status == 'FAIL' and _prior_verified_frame
+                and not _preamble_fit_retry_used and bw <= 62500
+                and _d.get('header_decoded') and _d.get('crc_ok') is False
+                and _d.get('preamble_fit_applied')
+                and not _d.get('fluke_gated') and not _d.get('no_rescue')):
+            _preamble_fit_retry_used = True
+            _retry_without_preamble_fit = True
+            # The failed attempt may have banned this genuine preamble bin.
+            # Retry its fit without losing skips earned by earlier attempts.
+            skip_bins[:] = _attempt_skip_bins
+            print("  [PREAMBLE-FIT RETRY] later frame: mean CFO without regression")
+            continue
         # Also mask for the last couple attempts as fallback
         if attempt >= 2:
             mask_end = min(len(iq1_work), mask_start + mask_len)
@@ -6917,7 +6945,8 @@ def _decoded_span_samples(preamble_start, data_start, N, ppm, ppm_pay,
 
 def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     grid_sweep=False, force_td=None,
-                    sweep_budget=2.0, diag_out=None, deadline=None):
+                    sweep_budget=2.0, diag_out=None, deadline=None,
+                    preamble_fit=True):
     # deadline (process_time seconds, or None): the header-variant sweep below
     # is otherwise UNBOUNDED within one attempt — up to 128 grid_sweep offsets
     # x 8 symbols of FFT — so a phantom preamble can blow the whole per-file
@@ -7862,7 +7891,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
     k_hat_fine = np.mean(cfo_vals)
     drift_bins_per_sym = 0.0
-    if len(cfo_vals) >= 4:
+    if preamble_fit and len(cfo_vals) >= 4:
         x = np.array(cfo_indices, dtype=np.float64)
         y = np.array(cfo_vals, dtype=np.float64)
         n = len(x)
@@ -7871,6 +7900,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         if abs(denom) > 1e-10:
             drift_bins_per_sym = (n * sxy - sx * sy) / denom
             k_hat_fine = (sy - drift_bins_per_sym * sx) / n
+            if diag_out is not None:
+                diag_out['preamble_fit_applied'] = True
 
     print("  Preamble bin: %d, fine: %.4f, drift: %.6f bins/sym" % (
         preamble_bin, k_hat_fine, drift_bins_per_sym))
