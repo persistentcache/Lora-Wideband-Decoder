@@ -1339,6 +1339,24 @@ def _emit_psd_frame(path, psd_db, out_bins=512, span_db=55.0):
         pass
 
 
+def _slow_seed_is_narrow(psd_db, peak_bin, sample_rate, floor_db):
+    """Measure a slow seed at peak-minus-12 dB, above the floor-plus-6 bar."""
+    peak_db = float(psd_db[peak_bin - 2:peak_bin + 3].max())
+    threshold = max(peak_db - 12.0, floor_db + 6.0)
+    lo = hi = peak_bin
+    while lo > 0 and psd_db[lo - 1] > threshold:
+        lo -= 1
+    while hi < len(psd_db) - 1 and psd_db[hi + 1] > threshold:
+        hi += 1
+    # Sixteen 4096-point bins at the original 20 Msps rate span 78.125 kHz.
+    # Keep that physical allowance at lower rates (32 bins at 10 Msps),
+    # where a fixed 16-bin gate excluded SF12/62.5k from its required slow pass.
+    # Do not tighten established >=20 Msps behavior; coarse-bin width and
+    # other high-rate slow-pass limits need separate validation.
+    max_bins = max(16.0, 16.0 * 20_000_000.0 / sample_rate)
+    return hi - lo + 1 <= max_bins
+
+
 def find_peaks(psd_db, thresh_db=8.0, min_bins=3, max_peaks=MAX_ENERGY_PEAKS,
                wide_run_bins=None, min_sep_bins=20,
                base_contour_db=4.0, base_min_bins=4, fres_hz=None):
@@ -10314,19 +10332,14 @@ def main():
             # noise skirt — it was dismissed as 'wide' while its -41 dB IQ
             # image seeded instead). A narrow signal is narrow at
             # PEAK-12 dB at any strength: 31.25/41.67k span 7-9 bins
-            # there, 125 kHz spans ~26. Bound: 16 bins (78 kHz).
+            # there, 125 kHz spans ~26 at 20 Msps. Scale the original
+            # 16-bin allowance up at lower sample rates so its physical
+            # width does not shrink (10 Msps needs 32 bins, not 16).
             _b0 = int(_p[0])
             if not (2 <= _b0 <= 4093):
                 continue
-            _pkdb = float(_psd_gate[_b0-2:_b0+3].max())
-            _wthr = max(_pkdb - 12.0, _floor_gate_db + 6.0)
-            _lo_w = _b0
-            while _lo_w > 0 and _psd_gate[_lo_w-1] > _wthr:
-                _lo_w -= 1
-            _hi_w = _b0
-            while _hi_w < 4095 and _psd_gate[_hi_w+1] > _wthr:
-                _hi_w += 1
-            if _hi_w - _lo_w + 1 > 16:
+            if not _slow_seed_is_narrow(_psd_gate, _b0, a.rate,
+                                        _floor_gate_db):
                 continue                      # not narrow at peak-12
             if _p[2] - _floor_gate_db < 10.0:
                 continue                      # ambient-junk strength — slow
