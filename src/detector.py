@@ -6621,8 +6621,8 @@ class BackgroundDecoder:
                   file=sys.stderr, flush=True)
             self._decoder_script = None
 
-        # Worker POOL: K persistent decoder subprocesses, each driven by its
-        # own manager thread, all pulling from the shared self._queue.  A single
+        # Worker POOL: at most K persistent decoder subprocesses, exclusively
+        # leased per job by manager threads pulling from shared self._queue.  A single
         # serial decoder was the throughput bottleneck once the gate was made
         # fast (dec_q grew to ~220 on a 60-msg burst, ~11x slower than real
         # time).  Dedup (_packet_dedup / _fp_dedup / _submit_recent) is all
@@ -6632,6 +6632,7 @@ class BackgroundDecoder:
         self._active_count = 0          # decodes currently in flight (for pending())
         self._workers = []              # subprocess handles, for drain cleanup
         self._workers_lock = threading.Lock()
+        self._idle_workers = []         # LIFO idle children, exclusive lease per job
         # CPU-affinity isolation: on multi-core hosts, reserve the first 4
         # cores for the GATE process (main, stdin-reader, save-worker, detect
         # pool) and pin DECODE workers to the remaining cores.  Without this
@@ -6973,6 +6974,62 @@ while True:
             print(f"[DECODE] Failed to start worker: {e}",
                   file=sys.stderr, flush=True)
             return None
+
+    @staticmethod
+    def _discard_worker(worker):
+        """Retire one unusable child; managers never cache an unframed pipe."""
+        if worker is None:
+            return
+        try:
+            if worker.poll() is None:
+                worker.kill()
+        except Exception:
+            pass
+        try:
+            worker.wait(timeout=1.0)
+        except Exception:
+            pass
+        for pipe in (getattr(worker, 'stdin', None),
+                     getattr(worker, 'stdout', None),
+                     getattr(worker, 'stderr', None)):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+
+    def _lease_worker(self):
+        """Reuse a warm idle child without changing job priority or capacity."""
+        while True:
+            with self._workers_lock:
+                if self._aborting():
+                    return None
+                worker = self._idle_workers.pop() if self._idle_workers else None
+                if (worker is not None and worker.poll() is None
+                        and not worker.stdin.closed):
+                    return worker
+            if worker is None:
+                # Creation/registration remains atomic with fatal abort. Each
+                # manager owns at most one lease, so the existing manager count
+                # still bounds child concurrency; there is no prewarming.
+                worker = self._start_worker()
+                if worker is not None and self._aborting():
+                    self._discard_worker(worker)
+                    return None
+                return worker
+            self._discard_worker(worker)
+
+    def _return_worker(self, worker):
+        """Return only a fully completed live child, never after fatal abort."""
+        if worker is None:
+            return
+        with self._workers_lock:
+            if (not self._aborting() and worker.poll() is None
+                    and not worker.stdin.closed):
+                if worker not in self._idle_workers:
+                    self._idle_workers.append(worker)
+                return
+        self._discard_worker(worker)
 
     def _rawlog(self, tag, what, text=''):
         """Append one job-lifecycle event to the raw decode log (no-op unless
@@ -7476,6 +7533,7 @@ while True:
             return False  # truthful bounded failure if worker creation is wedged
         try:
             workers = list(self._workers)
+            self._idle_workers.clear()
         finally:
             self._workers_lock.release()
         clean = True
@@ -7529,6 +7587,7 @@ while True:
         # Close every pool worker's stdin so it exits cleanly; kill stragglers.
         with self._workers_lock:
             _workers = list(self._workers)
+            self._idle_workers.clear()
         for w in _workers:
             if w and w.poll() is None:
                 try:
@@ -7549,7 +7608,7 @@ while True:
             pass
 
     def _manager(self):
-        """Drive one persistent worker, sharing bounded turns between tiers."""
+        """Lease one child per job, sharing bounded turns between tiers."""
         worker = None
         while not self._aborting():
             self._release_one_slow()
@@ -7728,9 +7787,10 @@ while True:
                 # so siblings see the in-flight state immediately.
                 self._mark_bucket_inflight(fpath)
 
-                # Start this thread's worker if not running
+                # Lease a warm child regardless of which manager dequeued the
+                # job. Cold managers must not bypass already-idle children.
                 if worker is None or worker.poll() is not None:
-                    worker = self._start_worker()
+                    worker = self._lease_worker()
                     if worker is None:
                         if _slow_token is not None:
                             self._slow_retire(_slow_token)
@@ -7741,6 +7801,7 @@ while True:
                     self._active_count += 1
 
                 t_start = time.time()
+                _job_worker = worker  # retain handle for reaping after EOF/kill
             except BaseException:
                 # unexpected error in the early admission/dedup/worker-start
                 # section (I/O, logging, MemoryError): retire the slow reservation
@@ -7832,6 +7893,7 @@ while True:
                         timed_out = False
                         break
                     if line.startswith('__BEGIN__'):
+                        self._rawlog('WORKER-READY', f"{fname} pid={worker.pid}")
                         continue
                     if line.startswith('[PKT] '):
                         # A completed frame need not wait for later-frame
@@ -7947,6 +8009,8 @@ while True:
                         pass
                     worker = None
             finally:
+                if worker is None:
+                    self._discard_worker(_job_worker)
                 # RSS-bound worker recycle: decode workers ratchet to ~2 GB
                 # anon each (numpy scratch never returned to the OS) and
                 # nothing ever recycled them — the measured OOM driver on
@@ -7969,10 +8033,8 @@ while True:
                                 worker.stdin.close()
                                 worker.wait(timeout=5)
                             except Exception:
-                                try:
-                                    worker.kill()
-                                except Exception:
-                                    pass
+                                pass
+                            self._discard_worker(worker)
                             worker = None
                     except Exception:
                         pass
@@ -7992,6 +8054,8 @@ while True:
                 # on exception / timeout / worker crash — those decrement paths
                 # are exactly when leaks would otherwise accumulate.
                 self._ref_dec_and_maybe_unlink(fpath)
+                self._return_worker(worker)
+                worker = None
 
     @staticmethod
     def _payload_fingerprint(payload_bytes):
