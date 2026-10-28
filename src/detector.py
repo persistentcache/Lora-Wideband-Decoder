@@ -5124,8 +5124,12 @@ class SignalRecorder:
             self._finalize(self._pending.pop(0))
         return []
 
-    def feed_tail(self, hop):
-        """Give every pending deferred job the freshly-arrived hop; jobs
+    def feed_tail(self, hop, sample_pos=None):
+        """Give pending jobs the hop ending at consumed position sample_pos.
+
+        Positioned feeds skip data already in the base/pool seed and reject
+        missing intervals. Unpositioned callers retain the legacy append API.
+        Jobs
         finalize once their tail requirement is met. ZERO-COPY: the hop
         is an owned array (the caller's per-hop copy) — jobs hold
         REFERENCES; trimming and concatenation happen in the save
@@ -5136,8 +5140,23 @@ class SignalRecorder:
         done = []
         for job in self._pending:
             if job['got'] < job['need']:
+                fresh = hop
+                if sample_pos is not None:
+                    expected = job['sample_pos'] + job['got']
+                    if sample_pos <= expected:
+                        continue  # current hop is already in the base/seed
+                    start = sample_pos - len(hop)
+                    if start > expected:
+                        print(f'[PENDING-BREAK] missing {start - expected} '
+                              'samples before tail hop; finalizing contiguous '
+                              'prefix', file=sys.stderr, flush=True)
+                        done.append(job)
+                        continue
+                    if start < expected:
+                        fresh = hop[expected - start:]
                 if job['got'] == 0 and os.environ.get('LORA_SEAM_DEBUG'):
-                    _ff = getattr(self, '_dbg_tot_s', 0) - len(hop)
+                    _ff = ((sample_pos if sample_pos is not None
+                            else getattr(self, '_dbg_tot_s', 0)) - len(fresh))
                     print(f"[SEAMDBG] first-feed: base_end={job['sample_pos']} "
                           f"feed_start={_ff} gap={_ff - job['sample_pos']} "
                           f"({(_ff - job['sample_pos'])/self.wb_fs*1000:.2f} ms)",
@@ -5147,7 +5166,7 @@ class SignalRecorder:
                     # the save worker; the cropper must never see samples
                     # past 'need' or the stream lengths diverge)
                     _room = job['need'] - job['got']
-                    _h = hop if len(hop) <= _room else hop[:_room]
+                    _h = fresh if len(fresh) <= _room else fresh[:_room]
                     try:
                         self._crop_queue.put_nowait(('HOP', job, _h))
                         job['got'] += len(_h)
@@ -5161,8 +5180,8 @@ class SignalRecorder:
                         done.append(job)
                         continue
                 else:
-                    job['tail'].append(hop)
-                    job['got'] += len(hop)
+                    job['tail'].append(fresh)
+                    job['got'] += len(fresh)
             if job['got'] >= job['need']:
                 done.append(job)
         for job in done:
@@ -10482,7 +10501,7 @@ def main():
         if recorder:
             _t_feed0 = time.time()
             recorder._dbg_tot_s = tot_s
-            recorder.feed_tail(_hop_own)
+            recorder.feed_tail(_hop_own, sample_pos=tot_s)
             _prof['feed'] += time.time() - _t_feed0
         _t_slowblk0 = time.time()
         _slow_tick += 1

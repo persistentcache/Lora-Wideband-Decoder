@@ -76,7 +76,7 @@ def test_real_recorder_retains_full_frame_after_async_and_optional_hold_delay(re
         sample_pos=current, hop_n=hop, win_n=1000, recent_hops=recent,
         history_reader=reader, history_anchor=anchor)
     while recorder._pending:
-        recorder.feed_tail(samples(current, hop))
+        recorder.feed_tail(samples(current, hop), sample_pos=current + hop)
         current += hop
     captured = saved_samples(recorder)
     expected_size = base_end + int(148.25 * 4096 / 62500 * 1000)
@@ -201,7 +201,7 @@ def test_one_pass_history_seed_then_future_tail_through_real_cropper(seeded_reco
     assert rec._pending[0]['got'] == 7000
     pos = 11000
     while rec._pending:
-        rec.feed_tail(samples(pos, 500))
+        rec.feed_tail(samples(pos, 500), sample_pos=pos + 500)
         pos += 500
     assert_saved_prefix(rec, 4000 + int(148.25 * 4 / 62.5 * 1000))
 
