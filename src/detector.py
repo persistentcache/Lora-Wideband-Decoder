@@ -1952,9 +1952,9 @@ def _nb_plateau_offset(iq, fs, bw):
     median: at fs = 2*bw the plateau itself spans ~half the bins.
 
     Returns the plateau edge-midpoint offset from DC (Hz) — i.e. how far
-    off-center the crop is — or None to ABSTAIN (slice too short, or no
-    contiguous floor+6dB run of width 0.6-1.4x bw).  Callers MUST treat
-    None as "keep the original center" (fail-safe contract: a correction
+    off-center the crop is — or None to ABSTAIN (slice too short, or the
+    dominant sufficiently wide floor+6dB run is not 0.6-1.4x bw). Callers MUST
+    treat None as "keep the original center" (fail-safe contract: a correction
     is only ever applied on a positive, bw-wide plateau identification).
     """
     n = 2048
@@ -1981,11 +1981,15 @@ def _nb_plateau_offset(iq, fs, bw):
     best, be = None, -1.0
     for s, e in zip(st, en):
         wd = (e - s + 1) * (fs / n)
-        if 0.6 * bw <= wd <= 1.4 * bw:
+        # Ignore narrow CW, but rank broad regions BEFORE the upper-width
+        # check. Strong signal skirts can exceed 1.4*bw; dropping them here
+        # would promote a weak, unrelated bw-wide feature and move a good
+        # gate center far away from the packet. In that case abstain.
+        if wd >= 0.6 * bw:
             es = float(mh[s:e + 1].sum())
             if es > be:
-                be, best = es, (s, e)
-    if best is None:
+                be, best = es, (s, e, wd)
+    if best is None or best[2] > 1.4 * bw:
         return None
     return 0.5 * (frq[best[0]] + frq[best[1]])
 
