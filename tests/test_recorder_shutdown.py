@@ -18,7 +18,12 @@ def production_footer():
     main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
     # Preserve actual source order, exercising the calls rather than asserting
     # the textual order. Queue joins and finalization below are real methods.
-    body = [n for n in main.body if isinstance(n, ast.If) and any(
+    # The normal footer now has a fatal-error boundary. Inspect its real
+    # statements in order, retaining the same finalization/drain behavior.
+    footer = next((n.body for n in main.body if isinstance(n, ast.Try)
+                   and any(isinstance(c, ast.If) and 'recorder.flush()' in ast.unparse(c)
+                           for c in n.body)), main.body)
+    body = [n for n in footer if isinstance(n, ast.If) and any(
         token in ast.unparse(n) for token in (
             'recorder.flush()', 'recorder.flush_pending(wait=True)',
             'decoder.drain(timeout=3600.0)'))]
@@ -30,6 +35,7 @@ def production_footer():
 def test_final_pending_capture_is_saved_and_submitted_before_decoder_drain(narrowband):
     # Delay the saver until shutdown actually joins its outstanding work.
     # This is a valid scheduling interleaving, with no sleeps or CPU races.
+    code = production_footer()  # validate extraction before starting owned threads
     permit_saver = threading.Event()
 
     class SaveQueue(queue.Queue):
@@ -69,7 +75,7 @@ def test_final_pending_capture_is_saved_and_submitted_before_decoder_drain(narro
     if cropper:
         cropper.start()
     try:
-        exec(production_footer(), dict(recorder=recorder, decoder=decoder, sys=sys))
+        exec(code, dict(recorder=recorder, decoder=decoder, sys=sys))
         assert calls == [('fold',), ('drain', 1, 0)]
         assert len(submitted) == 1 and recorder._pending == []
         assert recorder._save_queue.unfinished_tasks == 0

@@ -6391,6 +6391,7 @@ class BackgroundDecoder:
         # label wins bw_quality_db by ~10 dB; decoding it first puts the
         # row up at first-decode time, and its admit lets the bucket dedup
         # skip the aliases instead of decoding them.
+        self._abort_event = threading.Event()
         self._queue = queue.PriorityQueue()
         self._qseq = itertools.count()   # FIFO tie-break, keeps jobs uncomparable
         self._lock = threading.Lock()
@@ -6811,7 +6812,7 @@ class BackgroundDecoder:
     def _start_worker(self, budget_s=None):
         """Launch persistent worker subprocess.  budget_s overrides the decode
         CPU-time budget (the slow tier passes a large value)."""
-        if self._decoder_script is None:
+        if self._decoder_script is None or self._aborting():
             return None
 
         # Build the key argument for the worker
@@ -6897,14 +6898,20 @@ while True:
             for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
                        'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
                 _env[_v] = '1'
-            proc = subprocess.Popen(
-                [sys.executable, '-c', worker_code],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                env=_env,
-                preexec_fn=self._lower_priority)
+            # Register creation atomically with fatal-abort enumeration. A
+            # manager cannot respawn a worker after abort has taken its snapshot.
+            with self._workers_lock:
+                if self._aborting():
+                    return None
+                proc = subprocess.Popen(
+                    [sys.executable, '-c', worker_code],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    env=_env,
+                    preexec_fn=self._lower_priority)
+                self._workers.append(proc)
             # Pin worker to the non-gate cores so it cannot preempt the
             # gate's stdin-reader / detect-pool threads on cores 0-3.
             if self._worker_affinity:
@@ -6912,8 +6919,6 @@ while True:
                     os.sched_setaffinity(proc.pid, self._worker_affinity)
                 except (AttributeError, OSError):
                     pass
-            with self._workers_lock:
-                self._workers.append(proc)
             return proc
         except Exception as e:
             print(f"[DECODE] Failed to start worker: {e}",
@@ -7031,6 +7036,8 @@ while True:
         file.  Called once per worker job completion (success, failure, or
         crash) from the manager thread's `finally` block, so the count is
         guaranteed to wind down even on exceptions."""
+        if self._aborting():
+            return  # fatal evidence remains at its existing path
         with self._refs_lock:
             n = self._refs.get(fpath, 1) - 1
             if n > 0:
@@ -7045,7 +7052,7 @@ while True:
                 _sz = self._cap_bytes.pop(fpath, None)
                 if _sz:
                     self._pending_bytes -= _sz
-        if os.environ.get('LORA_KEEP_IQ'):
+        if self._aborting() or os.environ.get('LORA_KEEP_IQ'):
             return          # debugging: keep capture files for autopsy
         with self._refs_lock:
             _recs = self._cap_recs.pop(fpath, None)
@@ -7233,7 +7240,7 @@ while True:
         """
         if role not in ('default', 'early', 'shared_full', 'continuation'):
             raise ValueError('unknown capture role')
-        if not self._decoder_script:
+        if not self._decoder_script or self._aborting():
             return
         with self._refs_lock:
             previous = self._capture_roles.get(fpath)
@@ -7326,6 +7333,8 @@ while True:
         # lock, get_nowait between, increment in another) let two release paths
         # both observe "free" and admit two heavy re-decodes.  get_nowait on a
         # thread-safe queue is cheap enough to hold the lock across.
+        if self._aborting():
+            return False
         with self._lock:
             if self._pressure > 0.20 or self._gate_stress.is_set():
                 return
@@ -7402,6 +7411,64 @@ while True:
                 break
             self._slow_queue.task_done()
 
+    def _aborting(self):
+        event = getattr(self, '_abort_event', None)
+        return event is not None and event.is_set()
+
+    def abort(self, timeout=2.0):
+        """Stop owned subprocesses/managers without decoding or deleting inputs."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        self._abort_event.set()
+        # Wake idle managers. Active managers see the event at read/loop bounds.
+        for _ in self._threads:
+            self._queue.put((float('-inf'), next(self._qseq), None))
+        acquired = self._workers_lock.acquire(timeout=max(0.0, deadline-time.monotonic()))
+        if not acquired:
+            return False  # truthful bounded failure if worker creation is wedged
+        try:
+            workers = list(self._workers)
+        finally:
+            self._workers_lock.release()
+        clean = True
+        for worker in workers:
+            if worker.poll() is None:
+                try:
+                    worker.terminate()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    clean = False
+        term_deadline = time.monotonic() + max(0.0, deadline-time.monotonic()) / 2
+        for worker in workers:
+            try:
+                worker.wait(timeout=max(0.0, term_deadline-time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                clean = False
+        for worker in workers:
+            if worker.poll() is None:
+                try:
+                    worker.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    clean = False
+        for worker in workers:
+            try:
+                worker.wait(timeout=max(0.0, deadline-time.monotonic()))
+            except Exception:
+                clean = False
+        for thread in self._threads:
+            thread.join(timeout=max(0.0, deadline-time.monotonic()))
+            clean = clean and not thread.is_alive()
+        if clean:
+            for worker in workers:
+                for pipe in (worker.stdin, worker.stdout, worker.stderr):
+                    if pipe is not None:
+                        pipe.close()
+        return clean
+
     def drain(self, timeout=30.0):
         """Wait for pending decodes to finish (e.g. on shutdown).  Keeps folding
         the slow mop-up queue into the fast queue so stragglers re-queued during
@@ -7435,7 +7502,7 @@ while True:
     def _manager(self):
         """Drive one persistent worker, sharing bounded turns between tiers."""
         worker = None
-        while True:
+        while not self._aborting():
             self._release_one_slow()
             # Plain blocking get on the fast queue — NO polling loop (10 threads
             # waking on a timeout competed with the gate's realtime thread and
@@ -7444,6 +7511,9 @@ while True:
             # so these same blocking workers process the stragglers then, with
             # the big per-job budget carried in the job tuple.
             _, _, job = self._queue.get()
+            if job is None or self._aborting():
+                self._queue.task_done()
+                break
             # Adaptive throttle: if the gate is actively dropping samples,
             # delay this decode start to free memory bandwidth for the
             # gate's reader thread.  Self-clearing event — once the gate
@@ -7578,7 +7648,7 @@ while True:
                     # time a job can be deferred this way.
                     _first_wait = self._wait_since.setdefault(fpath, time.time())
                     _short_deadline = min(_wait_deadline, time.time() + 2.0)
-                    while time.time() < _short_deadline:
+                    while time.time() < _short_deadline and not self._aborting():
                         time.sleep(0.1)
                         if self._bucket_already_decoded(fpath):
                             self._rawlog('SKIP-INFLIGHT-ADMIT', os.path.basename(fpath))
@@ -7689,7 +7759,7 @@ while True:
                 # buffer stays empty and can't steal bytes from us.
                 _rbuf = b''
                 _wfd = worker.stdout.fileno()
-                while time.time() < deadline:
+                while time.time() < deadline and not self._aborting():
                     _nl = _rbuf.find(b'\n')
                     if _nl < 0:
                         _rdy, _, _ = _select.select(
@@ -7721,6 +7791,9 @@ while True:
                         # evidence; finalization must not publish it again.
                         line = self._publish_packet_line(line, fpath) or line
                     output_lines.append(line)
+
+                if self._aborting():
+                    continue  # finally balances job state; preserve the input file
 
                 if timed_out:
                     # Distinguish worker death (EOF mid-job) from a genuine
@@ -8408,6 +8481,34 @@ class AutoGainGovernor:
             self._write()
             self.hist.clear()
             self.cool = self.COOL_WIN
+
+
+def _abort_failed_pipeline(pool, decoder, recorder):
+    """Best-effort bounded failure cleanup; never replace the original error."""
+    for label, owner in (('decoder', decoder), ('detect pool', pool)):
+        if owner is None:
+            continue
+        try:
+            if not owner.abort(timeout=2.0):
+                print(f'[FATAL CLEANUP] {label} did not confirm complete shutdown',
+                      file=sys.stderr, flush=True)
+        except BaseException as error:
+            print(f'[FATAL CLEANUP] {label}: {error!r}', file=sys.stderr, flush=True)
+    # Stop the optional header worker without finalizing/draining new captures.
+    shared = getattr(recorder, '_shared', None) if recorder is not None else None
+    if shared is not None:
+        controller = getattr(shared, 'header_controller', None)
+        if controller is not None:
+            try:
+                if controller.close(wait=True) is False:
+                    print('[FATAL CLEANUP] header worker did not confirm shutdown',
+                          file=sys.stderr, flush=True)
+            except BaseException as error:
+                print(f'[FATAL CLEANUP] header worker: {error!r}', file=sys.stderr, flush=True)
+        try:
+            shared.close(wait=False)
+        except BaseException as error:
+            print(f'[FATAL CLEANUP] shared capture: {error!r}', file=sys.stderr, flush=True)
 
 
 def main():
@@ -11248,38 +11349,46 @@ def main():
 
     except KeyboardInterrupt:
         pass
+    except BaseException:
+        _abort_failed_pipeline(_pool, decoder, recorder)
+        raise
 
-    # Drain any in-flight multiprocess-detect windows (commit them to the
-    # recorder), then shut the detect pool down.
-    if _pool is not None:
-        while _inflight:
-            _commit_oldest()
-        _pool.close()
+    try:
+        # Drain any in-flight multiprocess-detect windows (commit them to the
+        # recorder), then shut the detect pool down.
+        if _pool is not None:
+            while _inflight:
+                _commit_oldest()
+            _pool.close()
 
-    if recorder:
-        try:
-            recorder.flush_pending(wait=True)   # deferred tails: finalize
-                                       # (and crop) before the decoder
-                                       # drain so stragglers decode
-        except Exception:
-            pass
-        # Finalizing pending tails can enqueue NEW saves. Join those saves
-        # before testing decoder.pending(), or EOF can exit before their
-        # captures are submitted to the decoder.
-        pending_saves = recorder._save_queue.qsize()
-        if pending_saves > 0:
-            print(f"\nWaiting for {pending_saves} pending save(s)...",
-                  file=sys.stderr)
-        recorder.flush()
-    if decoder:
-        # Capture has ended (EOF) — move the deferred straggler queue into the
-        # fast queue so the workers re-decode them now (big budget), without
-        # having competed with the realtime gate during capture.
-        decoder.drain_slow_into_fast()
-        if decoder.pending() > 0:
-            print(f"\nWaiting for {decoder.pending()} pending decode(s)...",
-                  file=sys.stderr)
-            decoder.drain(timeout=3600.0)
+        if recorder:
+            try:
+                recorder.flush_pending(wait=True)   # deferred tails: finalize
+                                           # (and crop) before the decoder
+                                           # drain so stragglers decode
+            except Exception:
+                pass
+            # Finalizing pending tails can enqueue NEW saves. Join those saves
+            # before testing decoder.pending(), or EOF can exit before their
+            # captures are submitted to the decoder.
+            pending_saves = recorder._save_queue.qsize()
+            if pending_saves > 0:
+                print(f"\nWaiting for {pending_saves} pending save(s)...",
+                      file=sys.stderr)
+            recorder.flush()
+        if decoder:
+            # Capture has ended (EOF) — move the deferred straggler queue into the
+            # fast queue so the workers re-decode them now (big budget), without
+            # having competed with the realtime gate during capture.
+            decoder.drain_slow_into_fast()
+            if decoder.pending() > 0:
+                print(f"\nWaiting for {decoder.pending()} pending decode(s)...",
+                      file=sys.stderr)
+                decoder.drain(timeout=3600.0)
+
+    except BaseException:
+        _abort_failed_pipeline(_pool, decoder, recorder)
+        raise
 
     total_drops = reader.drops if is_live else 0
     _dec_summary = ''
