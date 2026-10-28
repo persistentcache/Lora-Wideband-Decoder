@@ -4718,6 +4718,13 @@ def _record_slow_capture(recorder, detections, base, base_end, *, sample_pos,
                          history_anchor=None):
     """Register a contiguous slow assembly, recovering delayed tails in hops."""
     tail_n = _capture_tail_n(recorder, detections, win_n)
+    if getattr(recorder, '_shared', None) is not None:
+        # Shared crop service recovers the whole validated raw range in its
+        # own worker. Do not enumerate/copy a delayed tail in acquisition.
+        recorder.update_deferred(detections, base, base_end, pre_hop=None,
+                                 need_tail_n=tail_n, owned_buf=True,
+                                 history_anchor=history_anchor)
+        return
     gap_n = sample_pos - base_end
     gap_parts = tail_parts = None
     reg_pos = base_end
@@ -4808,6 +4815,8 @@ class SignalRecorder:
             pass
 
         self._decoder = None
+        self._shared = None
+        self._history_reader = None
         # RAM-PROPORTIONAL SPOOL (UC audit (s) re-exam 2026-07-12): the class
         # default (600 MB) is the threshold above which a save job spills its
         # wideband concat to a disk-backed memmap instead of holding it in RAM.
@@ -4955,9 +4964,74 @@ class SignalRecorder:
     def set_decoder(self, decoder):
         self._decoder = decoder
 
+    def set_history_reader(self, reader):
+        """Enable the independently gated shared live-capture experiment."""
+        if os.environ.get('LORA_SHARED_CAPTURE') != '1':
+            return
+        if not hasattr(reader, 'history_parts'):
+            raise RuntimeError('LORA_SHARED_CAPTURE requires validated live ring history')
+        if os.environ.get('LORA_NO_DEFER') == '1':
+            raise RuntimeError('LORA_SHARED_CAPTURE cannot use blocking LORA_NO_DEFER')
+        from capture_timeline import CaptureBudget, SharedCapture
+        budget = CaptureBudget(int(os.environ.get('LORA_SHARED_CAPTURE_MB', '2048')) * 1024 * 1024,
+                               int(os.environ.get('LORA_SHARED_CAPTURE_VIEWS', '64')))
+        self._history_reader = reader
+        self._shared = SharedCapture(
+            rate=self.wb_fs, center=self.center_hz, hop_n=self.hop_n,
+            reader=reader, decimator_factory=_StreamDecimator,
+            submit=self._queue_shared_save, budget=budget,
+            writer_stall_s=float(os.environ.get('LORA_SHARED_WRITER_TIMEOUT', '30')),
+            report=lambda message: print(message, file=sys.stderr, flush=True))
+        self._nb_mode = True
+        self._shared.advance(reader.history_anchor())
+        print(f'[SHARED-CAPTURE] enabled; memory={budget.total_bytes} bytes '
+              f'outbox={budget.outbox_limit}', file=sys.stderr, flush=True)
+
+    def _queue_shared_save(self, view):
+        """Nonblocking transfer; save worker retains the lease until finally."""
+        dt_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+        meta = view.metadata
+        item = (('NB_SHARED', view), view.detections, dt_str,
+                meta['pre_hop_n'], meta['wb_n'], meta['sample_pos'])
+        try:
+            self._save_queue.put_nowait(item)
+            return True
+        except queue.Full:
+            return False
+
+    def raise_shared_failure(self):
+        if getattr(self, '_shared', None) is not None:
+            self._shared.raise_if_failed()
+
+    def _register_shared(self, detections, wideband_n, sample_pos, pre_hop_n,
+                         need_tail_n, history_anchor):
+        shared = self._shared
+        current = self._history_reader.history_anchor()
+        source = history_anchor
+        if source is None:
+            source = self._history_reader.history_anchor(sample_pos)
+        if (source is None or source[1:] != current[1:]
+                or source[0] - source[1] != sample_pos):
+            shared._fail('stale/missing source identity for capture registration')
+            shared.raise_if_failed()
+        shared.advance(current)
+        anchor = max(detections, key=lambda d: d.get('peak_power_db', 0.0))
+        export_dec = int(os.environ.get('LORA_EXPORT_DEC', '2'))
+        export_bw = min(int(patience_cap_params(anchor)[0] * export_dec / 2),
+                        int(self.wb_fs) // 2)
+        factor = int(round(self.wb_fs / float(export_bw * 2)))
+        base_end = sample_pos + source[1]
+        capture_detections = [dict(d, _capture_signal_bw=patience_cap_params(d)[0])
+                              for d in detections]
+        shared.register(capture_detections, base_start=base_end-wideband_n-pre_hop_n,
+                        base_end=base_end, end=base_end+int(need_tail_n),
+                        anchor=source, target_factor=factor, export_bw=export_bw,
+                        pre_hop_n=pre_hop_n, wb_n=wideband_n, sample_pos=sample_pos)
+        shared.raise_if_failed()
+
     def update_deferred(self, detections, wideband_buf, sample_pos=0,
                         pre_hop=None, need_tail_n=0, owned_buf=False,
-                        gap_parts=None, tail_parts=None):
+                        gap_parts=None, tail_parts=None, history_anchor=None):
         """Register a save whose TAIL arrives later: instead of BLOCKING
         the main loop for an airtime-sized ring read (2.4 s per SF11/125k
         detection — measured as the dominant live-loop stall: CATCHUP
@@ -4999,6 +5073,11 @@ class SignalRecorder:
                     continue
                 _pre.append(_d)
             detections = _pre
+        if getattr(self, '_shared', None) is not None:
+            self._register_shared(detections, len(wideband_buf), sample_pos,
+                                  len(pre_hop) if pre_hop is not None else 0,
+                                  need_tail_n, history_anchor)
+            return []
         # ONE PENDING JOB PER PHYSICAL FRAME: overlapping windows re-detect
         # the same long frame every hop, and each registration held a full
         # wideband base (up to 640 MB for slow-pass assemblies) — the
@@ -5159,6 +5238,11 @@ class SignalRecorder:
         REFERENCES; trimming and concatenation happen in the save
         worker. (Per-job copies here cost 46 ms median / 1.48 s max on
         the loop during long-frame phases — the top stall driver.)"""
+        if getattr(self, '_shared', None) is not None:
+            anchor = self._history_reader.history_anchor(sample_pos)
+            self._shared.advance(anchor)
+            self._shared.raise_if_failed()
+            return
         if not self._pending:
             return
         done = []
@@ -5213,6 +5297,10 @@ class SignalRecorder:
             self._finalize(job)
 
     def flush_pending(self, wait=False):
+        if getattr(self, '_shared', None) is not None:
+            self._shared.close(wait=wait)
+            self._shared.raise_if_failed()
+            return
         for job in self._pending:
             self._finalize(job)
         self._pending = []
@@ -5229,6 +5317,10 @@ class SignalRecorder:
         splice and decoded as structured garbage). Finalize everything
         with the contiguous data collected so far — a truncated real
         capture beats a spliced one."""
+        if getattr(self, '_shared', None) is not None:
+            self._shared._fail('raw stream discontinuity: ' + reason)
+            self._shared.raise_if_failed()
+            return
         if self._pending:
             print(f"         [PENDING-BREAK] finalizing "
                   f"{len(self._pending)} job(s) at discontinuity "
@@ -5364,10 +5456,22 @@ class SignalRecorder:
             if item is None:
                 self._save_queue.task_done()
                 break
+            _shared_save = None
+            _spool_path = None
             try:
                 extended_full, detections, dt_str, pre_hop_n, wb_n, sample_pos = item
                 _spool_path = None
                 _nb_job = None
+                _capture_role = 'default'
+                _role_name = ''
+                if (isinstance(extended_full, tuple)
+                        and extended_full[0] == 'NB_SHARED'):
+                    _shared_save = extended_full[1]
+                    _capture_role = 'shared_full'
+                    _role_name = f'_shared_full_{_shared_save.number}'
+                    _nb_job = {'nb_fs': _shared_save.nb_fs,
+                               'export_bw': _shared_save.export_bw}
+                    extended_full = None
                 if (isinstance(extended_full, tuple)
                         and extended_full[0] == 'NB'):
                     # NARROWBAND PENDING: the cropper already extracted
@@ -5623,7 +5727,8 @@ class SignalRecorder:
                         # hop0/hop1 same-capture recovery never ran (UC
                         # audit g).
                         'time_sample': int(max(
-                            0.0, pre_hop_s + float(d.get('preamble_t_s', 0.0)))
+                            0.0, pre_hop_s + float(d.get('preamble_t_s', 0.0))
+                            - float(d.get('_capture_start_offset_s', 0.0)))
                             * nb_fs),
                         'pmr_db':      float(d.get('bw_quality_db', 0.0)),
                         'peak_pwr_db': d_pwr,
@@ -5937,7 +6042,9 @@ class SignalRecorder:
                         # this detection's own carrier (preambles come
                         # 1:1 from gate detections, and the extraction
                         # centre below is exactly the detection freq).
-                        nb = _nb_job['streams'].get(p.get('nb_ix'))
+                        nb = (_shared_save.stream(p.get('nb_ix'))
+                              if _shared_save is not None
+                              else _nb_job['streams'].get(p.get('nb_ix')))
                         if nb is None or len(nb) == 0:
                             continue
                         nb = nb[:int((buf_dur_s + max_pkt_s) * nb_fs)]
@@ -6055,6 +6162,7 @@ class SignalRecorder:
                              f"_{(d['freq_hz'] + _crop_corr) / 1e6:.4f}MHz"
                              f"_{int(round(nb_fs / 1000))}ksps"
                              f"_pwr{int(round(d.get('peak_power_db', 0.0)))}"
+                             f"{_role_name}"
                              f"_{dt_str[:-3]}{_sq % 1000:03d}.cf32")
                     fpath = os.path.join(self.export_dir, fname)
                     # Capacity guard: shed this capture if the undecoded backlog
@@ -6071,6 +6179,9 @@ class SignalRecorder:
                         _admit, _drop, _pend = self._decoder._cap_try_reserve(
                             fpath, _fsize)
                         if not _admit:
+                            if _shared_save is not None:
+                                raise RuntimeError('admitted shared capture cannot be saved: '
+                                                   'decoder file capacity exhausted')
                             if _drop == 1 or _drop % 25 == 0:
                                 print(f"         → [CAPTURE-DROP] backlog "
                                       f"{_pend/1e6:.0f}MB ≥ budget "
@@ -6138,6 +6249,7 @@ class SignalRecorder:
                                     f"_{(d['freq_hz'] + _crop_corr) / 1e6:.4f}MHz"
                                     f"_{int(round(nb_fs / 1000))}ksps"
                                     f"_pwr{int(round(d.get('peak_power_db', 0.0)))}"
+                                    f"{_role_name}"
                                     f"_{dt_str[:-3]}{_sq2 % 1000:03d}.cf32")
                                 _fpath2 = os.path.join(self.export_dir,
                                                        _fname2)
@@ -6161,14 +6273,15 @@ class SignalRecorder:
                         # cancellation is clean (per-symbol amplitude OK).
                         self._decoder.submit(fpath, fname, bucket_key=_bkey,
                                              slow=bool(d.get('patience_trial')),
-                                             prio=float(d.get('bw_quality_db', 0.0)))
+                                             prio=float(d.get('bw_quality_db', 0.0)),
+                                             role=_capture_role)
                         # Family-label decode jobs (trial captures only) —
                         # same bucket, slow tier: once any label in the
                         # bucket decodes, the phase-2 bucket dedup skips the
                         # rest, so the ladder costs nothing after a confirm.
                         for _fp2, _fn2 in _fam_links:
                             self._decoder.submit(_fp2, _fn2, bucket_key=_bkey,
-                                                 slow=True)
+                                                 slow=True, role=_capture_role)
                         # Pass 2 — TIME-ISOLATED on this preamble.  Useful at
                         # FAST SF where the hop1 relay arrives ~50-200 ms
                         # after hop0 and they share a single capture file;
@@ -6204,8 +6317,12 @@ class SignalRecorder:
                                 bucket_key=_bkey,
                                 slow=_iso_slow or bool(d.get('patience_trial')),
                                 # relay search runs after every primary
-                                prio=float(d.get('bw_quality_db', 0.0)) - 100.0)
+                                prio=float(d.get('bw_quality_db', 0.0)) - 100.0,
+                                role=_capture_role)
             except Exception as e:
+                if _shared_save is not None:
+                    _shared_save._render_failed = True
+                    _shared_save._owner._fail(f'save worker failed: {e}')
                 print(f"[RECORDER] save error: {e}", file=sys.stderr, flush=True)
             finally:
                 if _spool_path is not None:
@@ -6221,8 +6338,12 @@ class SignalRecorder:
                 # workers on a 4 GB Pi.
                 item = extended_full = nb = None
                 extended = _ext_fft_cache = None
+                _ph = _nb2 = None
                 _all = _bparts = _tparts = _tp = _mm = None
                 detections = _nb_job = _dets_sorted = preambles = None
+                if _shared_save is not None:
+                    _shared_save.release()
+                    _shared_save = None
                 self._save_queue.task_done()
 
     def _extract_nb(self, iq, offset_hz, target_bw):
@@ -6230,6 +6351,12 @@ class SignalRecorder:
 
     def flush(self):
         """Wait for all pending saves to complete."""
+        if getattr(self, '_shared', None) is not None:
+            self._shared.close(wait=True)
+            self._shared.raise_if_failed()
+            # Shared close includes the transferred writer lease; no legacy
+            # queue join can hide a stalled/failed writer after that check.
+            return
         if self._crop_queue is not None:
             self._crop_queue.join()
         self._save_queue.join()
@@ -6413,6 +6540,9 @@ class BackgroundDecoder:
         # Deterministic — no time-based reaper guessing safe intervals.
         self._refs = {}
         self._refs_lock = threading.Lock()
+        # A shared capture view covers a sample interval, not one RF packet.
+        # Keep its role through same-file retries without changing wire/jobs.
+        self._capture_roles = {}
 
         # ---- Pending-capture byte budget (backpressure the unbounded decode
         # queues never provided) ----
@@ -6907,6 +7037,7 @@ while True:
                 self._refs[fpath] = n
                 return
             self._refs.pop(fpath, None)
+            self._capture_roles.pop(fpath, None)
         # Release this file's reserved bytes from the capacity budget (whether or
         # not the file is actually unlinked below — its decode is done either way).
         if self._cap_budget:
@@ -7090,16 +7221,31 @@ while True:
         self._release_one_slow()
 
     def submit(self, fpath, fname, relay_after_syms=None, relay_before_syms=None,
-               bucket_key=None, slow=False, prio=0.0):
+               bucket_key=None, slow=False, prio=0.0, *, role='default'):
         """Queue a capture file for background decoding.
 
         relay_after_syms:  blank first N BW-rate symbols → find hop AFTER primary.
         relay_before_syms: blank from symbol N onward   → find hop BEFORE primary.
         bucket_key:        (cand_freq_hz, abs_t_s) for Phase-2 cross-worker
                            bucket dedup; None disables the dedup for this job.
+        role:              early/shared_full/continuation views must search all
+                           their frames; they never consume whole-window buckets.
         """
+        if role not in ('default', 'early', 'shared_full', 'continuation'):
+            raise ValueError('unknown capture role')
         if not self._decoder_script:
             return
+        with self._refs_lock:
+            previous = self._capture_roles.get(fpath)
+            if previous is not None and previous != role:
+                raise ValueError('capture path reused with a different role')
+            self._capture_roles[fpath] = role
+            self._refs[fpath] = self._refs.get(fpath, 0) + 1
+
+        if role != 'default':
+            bucket_key = None
+            with self._bucket_lock:
+                self._fname_bucket.pop(fpath, None)
 
         # Phase-2: remember which RF bucket this fpath belongs to so the
         # dispatch loop can later skip captures whose bucket already produced
@@ -7124,11 +7270,11 @@ while True:
         # get here the captures are already keep-N-limited per true RF cluster.
         # The post-decode _packet_dedup collapses any duplicate RESULTS, so
         # submitting them all is safe (no FP / no double-count).
-        self._ref_inc(fpath)
         # Trials and pressure-deferred captures share the bounded slow tier.
         _slow_tier = slow or self._defer_state
         self._rawlog('SUBMIT', f"{fname} relay={relay_after_syms},{relay_before_syms} "
-                               f"tier={'slow' if _slow_tier else 'fast'}")
+                               f"tier={'slow' if _slow_tier else 'fast'}"
+                               + (f" role={role}" if role != 'default' else ''))
         _job = (fpath, fname, relay_after_syms, relay_before_syms, None)
         if _slow_tier:
             self._slow_queue.put(_job)
@@ -7306,6 +7452,8 @@ while True:
             if self._gate_stress.is_set():
                 time.sleep(self._stress_pause_s)
             fpath, fname, relay_after_syms, relay_before_syms, job_budget = job
+            with self._refs_lock:
+                capture_role = self._capture_roles.get(fpath, 'default')
             # Claim the slow-tier reservation ONCE, here, by job identity; every
             # exit path below must retire it (see _slow_retire).
             _slow_token = self._slow_take(job)
@@ -7648,7 +7796,8 @@ while True:
                         _display_fname = fname + '[pre]'
                     else:
                         _display_fname = fname
-                    text = self._compact(output or '', _display_fname, elapsed)
+                    text = self._compact(output or '', _display_fname, elapsed,
+                                         role=capture_role)
                     if text:
                         sys.stdout.write(text)
                         # Latency markers: wall-clock emit time per decoded packet
@@ -7744,7 +7893,7 @@ while True:
         """Hamming distance between two 64-bit integers."""
         return bin(a ^ b).count('1')
 
-    def _compact(self, output, fname, elapsed=0):
+    def _compact(self, output, fname, elapsed=0, *, role='default'):
         """Extract key decode results from full process_file output.
 
         When the decoder's chained-mask produces MULTIPLE decode results
@@ -7771,16 +7920,18 @@ while True:
             for sec in sections:
                 if sec.strip():
                     r = self._compact_single(sec, fname, elapsed,
-                                              _is_relay, _is_pre, _is_secondary)
+                                              _is_relay, _is_pre, _is_secondary,
+                                              admit_bucket=role == 'default')
                     if r:
                         results.append(r)
             return ''.join(results)
 
         return self._compact_single(output, fname, elapsed,
-                                     _is_relay, _is_pre, _is_secondary)
+                                     _is_relay, _is_pre, _is_secondary,
+                                     admit_bucket=role == 'default')
 
     def _compact_single(self, output, fname, elapsed,
-                         _is_relay, _is_pre, _is_secondary):
+                         _is_relay, _is_pre, _is_secondary, *, admit_bucket=True):
         """Parse one decoder section (single decode attempt)."""
         lines = output.split('\n')
         crc_line = None
@@ -7973,7 +8124,8 @@ while True:
                 # Phase-2: tell the dispatch loop that this RF bucket is
                 # covered so sibling captures (KEEP-2 second save + PASS-2-iso
                 # resubmit) skip their decode at dispatch time.
-                self._mark_bucket_decoded(fname)
+                if admit_bucket:
+                    self._mark_bucket_decoded(fname)
 
         # Payload fingerprint dedup: suppress same raw payload within 30s.
         # Targets non-Meshtastic frames (LoRaWAN, MeshCore, CRC-only) that have no
@@ -8031,7 +8183,8 @@ while True:
                             # Phase-2: same as for _packet_dedup admit —
                             # bucket is now covered; sibling captures
                             # skip decode at dispatch.
-                            self._mark_bucket_decoded(fname)
+                            if admit_bucket:
+                                self._mark_bucket_decoded(fname)
             except Exception:
                 pass
 
@@ -8865,6 +9018,8 @@ def main():
         recorder = SignalRecorder(
             a.export_iq, a.rate, center_hz, hop_n, debug=a.debug,
             window_n=win_n)
+        if is_live:
+            recorder.set_history_reader(reader)
         print(f"Export: {a.export_iq}/ (window+pre-read tail, fs=8×BW)",
               file=sys.stderr)
 
@@ -8959,7 +9114,7 @@ def main():
         used in _commit_oldest so the commit never fires before the capture's
         forward samples exist — which is what makes a low _LAG safe for EVERY SF
         (SF12's multi-second packet needs several trailing windows; SF7 needs 1)."""
-        if not dets or recorder is None:
+        if not dets or recorder is None or getattr(recorder, '_shared', None) is not None:
             return 0
         _need = _capture_tail_n(recorder, dets, win_n, warn=False)
         return -(-_need // _tail_seg_n)   # ceil
@@ -8994,7 +9149,7 @@ def main():
             # Even with no trailing pool window yet, an NB job must pend
             # for the required future tail instead of finalizing base-only.
             _need_tail_n = _capture_tail_n(recorder, dets0, win_n)
-            if _inflight and dets0:
+            if _inflight and dets0 and getattr(recorder, '_shared', None) is None:
                 # Tail must cover the FULL packet AFTER the preamble.  A single
                 # next-window overlap (~0.5 s) is enough for short-SF packets,
                 # but long ones run past it and lose their payload: SF11/125
@@ -9027,7 +9182,8 @@ def main():
                 recorder.update_deferred(dets0, buf0, it['tot_s'],
                                          pre_hop=it['pre_hop'],
                                          need_tail_n=_need_tail_n,
-                                         tail_parts=_tparts)
+                                         tail_parts=_tparts,
+                                         history_anchor=it.get('history_anchor'))
             else:
                 # Legacy wideband path (LORA_NB_PENDING=0, or NB setup
                 # degenerate): eager concat, save worker FFT-crops.
@@ -9164,6 +9320,8 @@ def main():
                   _nb = max(1, int(round(_hw / _fr2)))
                   _pp[max(0, _sb - _nb):min(4096, _sb + _nb + 1)] = np.median(_pp)
       while True:
+        if recorder is not None:
+            recorder.raise_shared_failure()
         _t_step = time.time()
         dets = []   # per-iteration default: the detect-pool path commits its
                     # detections asynchronously and never binds `dets` in this
@@ -10350,7 +10508,11 @@ def main():
                                spur_db=_spur_db, center=_live_center_mhz,
                                dechirp_chans=(_win_chans or None))
                 _inflight.append({'seq': _seq, 'slot': _slot,
-                                  'pre_hop': pre_hop, 'tot_s': tot_s})
+                                  'pre_hop': pre_hop, 'tot_s': tot_s,
+                                  'history_anchor': (reader.history_anchor(tot_s)
+                                      if is_live and recorder is not None
+                                      and getattr(recorder, '_shared', None) is not None
+                                      else None)})
                 _seq += 1
                 # Tail-aware commit: once depth exceeds the base lag, commit the
                 # oldest ONLY when its detection is ready AND enough trailing windows
