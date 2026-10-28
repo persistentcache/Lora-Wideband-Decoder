@@ -624,6 +624,10 @@ class IQReader:
         return np.frombuffer(raw, dtype=np.int16 if self.sc16 else np.int8)
 
 
+class StreamHistoryUnavailable(RuntimeError):
+    """The requested past samples no longer form a validated contiguous span."""
+
+
 class StreamBuffer:
     """Background-threaded IQ reader with ring buffer.
 
@@ -686,6 +690,7 @@ class StreamBuffer:
         self._lock = threading.Lock()
         self._eof = False
         self._total_drops = 0
+        self._history_generation = 0
         # CONVERT-AHEAD (2026-07-05): live reads are 100% uniform hop-sized
         # since the deferred-tail work, so a dedicated thread converts the
         # NEXT hop while the main loop processes the current one — read()
@@ -1043,6 +1048,54 @@ class StreamBuffer:
         with self._lock:
             return (self._wp, self._rp - self._total_drops,
                     max(0, self._wp - self._rp), self._total_drops)
+
+    def history_anchor(self, consumed_pos=None):
+        """Map a detector position to raw ring coordinates without consuming.
+
+        Drops advance the raw read pointer but not the detector's sample clock.
+        Reject a mismatched clock (e.g. outstanding carry) instead of guessing.
+        """
+        with self._lock:
+            if (consumed_pos is not None
+                    and consumed_pos != self._rp - self._total_drops):
+                return None
+            return (self._rp, self._total_drops, self._history_generation)
+
+    def invalidate_history(self):
+        """Separate samples on either side of a radio retune."""
+        with self._lock:
+            self._history_generation += 1
+
+    def history_parts(self, anchor, count, chunk_n):
+        """Yield owned, hop-bounded past samples; never move the read pointer.
+
+        The writer may run during conversion. Validate both sides of every
+        copy, using the same lap rule as read(), plus skip/retune identity.
+        A failure is terminal: callers may retain the contiguous prefix only.
+        """
+        if anchor is None or count < 0 or chunk_n <= 0:
+            raise StreamHistoryUnavailable('invalid history range/anchor')
+        start, drops, generation = anchor
+        end = start + count
+        pos = start
+        while pos < end:
+            n = min(chunk_n, end - pos)
+            def validate():
+                if (self._total_drops != drops
+                        or self._history_generation != generation):
+                    raise StreamHistoryUnavailable('stream skipped or retuned')
+                if (pos < 0 or end > self._rp
+                        or self._wp - pos > self._ring_n):
+                    raise StreamHistoryUnavailable('ring history unavailable or overwritten')
+            with self._lock:
+                validate()
+            part = self._convert_span(pos, n)
+            with self._lock:
+                validate()
+                if part is None or len(part) != n:
+                    raise StreamHistoryUnavailable('ring history lost during copy')
+            yield part
+            pos += n
 
     def skip_to_latest(self, keep_n):
         """Skip ahead so only keep_n samples remain to be read."""
@@ -4580,6 +4633,61 @@ def _slope(sf, bw):
     return round(bw * bw / (2.0 ** sf) / 1e3)
 
 
+def _slow_record_immediately(detection, window_s):
+    """No main-pass dedup hold for modes that cannot fit its 16-symbol gate."""
+    return (int(detection['bw']) in (31250, 41667)
+            or 16 * (2 ** detection['sf']) / detection['bw'] > window_s)
+
+
+def _record_slow_capture(recorder, detections, base, base_end, *, sample_pos,
+                         hop_n, win_n, recent_hops, history_reader=None,
+                         history_anchor=None):
+    """Register a contiguous slow assembly, recovering delayed tails in hops."""
+    tail_n = min(int(max(148.25 * (2 ** d['sf']) / d['bw']
+                         for d in detections) * recorder.wb_fs), 24 * win_n)
+    gap_n = sample_pos - base_end
+    gap_parts = tail_parts = None
+    reg_pos = base_end
+    continuous = True
+    if history_reader is not None:
+        identity = history_reader.history_anchor()
+        current = history_reader.history_anchor(sample_pos)
+        # Check retune identity independently of the sample-clock check: a
+        # clock mismatch must not hide an old-center assembly.
+        if (history_anchor is not None
+                and identity[2] != history_anchor[2]):
+            print('[SLOW-GAP] discarded slow result across retune',
+                  file=sys.stderr, flush=True)
+            return
+        continuous = (history_anchor is not None and current is not None
+                      and current[1:] == history_anchor[1:]
+                      and history_anchor[0] - history_anchor[1] == base_end
+                      and current[0] - history_anchor[0] == gap_n)
+    if gap_n < 0 or not continuous:
+        print('[SLOW-GAP] stream position changed — truncated base capture',
+              file=sys.stderr, flush=True)
+        tail_n = 0
+    elif gap_n > 0:
+        k = gap_n // hop_n if hop_n > 0 else 0
+        if hop_n > 0 and k * hop_n == gap_n and 0 < k <= len(recent_hops):
+            gap_parts = list(recent_hops)[-k:]
+            reg_pos = sample_pos
+            tail_n = max(0, tail_n - gap_n)
+        elif history_reader is not None and hop_n > 0:
+            # Keep the 8-hop fast path and existing ring size. Feed older
+            # history through the recorder's NB cropper one owned hop at a
+            # time; no second multi-second wideband assembly is allocated.
+            tail_parts = history_reader.history_parts(
+                history_anchor, min(gap_n, tail_n), hop_n)
+        else:
+            print(f'[SLOW-GAP] unfillable gap {gap_n} samples '
+                  '— truncated base capture', file=sys.stderr, flush=True)
+            tail_n = 0
+    recorder.update_deferred(detections, base, reg_pos, pre_hop=None,
+                             need_tail_n=tail_n, owned_buf=True,
+                             gap_parts=gap_parts, tail_parts=tail_parts)
+
+
 class SignalRecorder:
     """One file per detection, saved in a background thread.
 
@@ -4888,6 +4996,8 @@ class SignalRecorder:
         # in-flight window depth) it PENDS and feed_tail completes it from
         # future loop hops (UC audit p — was silently truncated to the
         # n_slots-hop ceiling).  Fallback to the seed length if no need given.
+        if tail_parts is not None and not need_tail_n:
+            tail_parts = list(tail_parts)
         _need = (int(need_tail_n) if need_tail_n
                  else (sum(len(t) for t in tail_parts)
                        if tail_parts is not None else 0))
@@ -4920,23 +5030,29 @@ class SignalRecorder:
         # future loop hops (the seed + future hops are contiguous — the
         # in-flight forward-overlaps ARE the _hop_own's already emitted).
         if tail_parts is not None:
-            if 'nb' in job:
+            try:
                 for _h in tail_parts:
-                    try:
-                        self._crop_queue.put_nowait(('HOP', job, _h))
-                        job['got'] += len(_h)
-                    except queue.Full:
-                        # cropper full mid-tail: truncate here (same
-                        # degradation feed_tail takes) rather than stall the
-                        # realtime commit path.
+                    _room = job['need'] - job['got']
+                    if _room <= 0:
                         break
-            else:
-                job['tail'] = list(tail_parts)
-                job['got'] = sum(len(t) for t in tail_parts)
-            if job['got'] >= job['need']:
-                self._finalize(job)     # seed covers the airtime — done
+                    _h = _h[:_room]
+                    if 'nb' in job:
+                        self._crop_queue.put_nowait(('HOP', job, _h))
+                    else:
+                        job['tail'].append(_h)
+                    job['got'] += len(_h)
+            except (StreamHistoryUnavailable, queue.Full) as exc:
+                # Never pend across a missing history hop: future feed_tail
+                # would splice across the hole and masquerade as a full frame.
+                print(f'[SLOW-GAP] tail recovery stopped ({type(exc).__name__}: '
+                      f'{exc}) — finalizing contiguous prefix '
+                      f'({job["got"]}/{job["need"]} tail samples)',
+                      file=sys.stderr, flush=True)
+                self._finalize(job)
                 return []
-            # long frame — feed_tail finishes it (bounded by the 3-job cap)
+        if job['got'] >= job['need']:
+            self._finalize(job)
+            return []
         self._pending.append(job)
         if len(self._pending) > 3:
             if os.environ.get('LORA_SLOW_DEBUG'):
@@ -4977,8 +5093,9 @@ class SignalRecorder:
                         # fixed) — finalize now with the contiguous data
                         # already cropped instead
                         print("         [NB-CROP] queue full — early "
-                              "finalize of a pending job", flush=True)
-                        job['got'] = job['need']
+                              "finalize of a pending job", file=sys.stderr, flush=True)
+                        done.append(job)
+                        continue
                 else:
                     job['tail'].append(hop)
                     job['got'] += len(hop)
@@ -5008,7 +5125,7 @@ class SignalRecorder:
         if self._pending:
             print(f"         [PENDING-BREAK] finalizing "
                   f"{len(self._pending)} job(s) at discontinuity "
-                  f"{reason}", flush=True)
+                  f"{reason}", file=sys.stderr, flush=True)
         self.flush_pending()
 
     def _finalize(self, job):
@@ -8515,14 +8632,14 @@ def main():
         _SLOW_MIN_TICKS = 0
     _slow_last_fire = -10**9
     _slow_pending = {}   # bucket -> (exact_bin, expiry_tick): triggers that
-    _slow_hold = []      # (due_tick, dets, assembly, reg_tot_s): non-slow-class
+    _slow_hold = []      # (due_tick, dets, assembly, reg_tot_s, history_anchor)
                          # slow-pass hits held so the main pass can claim them
                          # fired while a scan was in flight, deferred instead
                          # of dropped (the drop-if-busy race lost ~2/29 real
                          # SF12 frames per leg whose trigger ticks all landed
                          # in another bucket's busy shadow — typically their
                          # own IQ-image's scan)
-    _slow_results = queue.Queue()   # (dets_slow, _iq_long, reg_tot_s, trig)
+    _slow_results = queue.Queue()   # (dets_slow, _iq_long, reg_tot_s, trig, history_anchor)
     # Tail samples consumed last iter (for save).  Prepended to this iter's iq
     # so the audio timeline stays continuous — without this, every save creates
     # a `tail_n` audio gap between adjacent Welch windows and packets that land
@@ -8947,6 +9064,9 @@ def main():
                         _nc = float(_cc['center_hz']) / 1e6
                         if _nc != _live_center_mhz:
                             _live_center_mhz = _nc
+                            if is_live:
+                                reader.invalidate_history()
+                            _slow_halves.clear()
                             # The recorder reads center_hz live to compute each
                             # capture's wideband crop offset (off = freq_hz -
                             # center_hz).  It MUST track the retune or it crops the
@@ -9018,6 +9138,7 @@ def main():
                                      else np.zeros(0, dtype=np.complex64)), 0
 
             if skipped > 0:
+                _slow_halves.clear()
                 # Temporal discontinuity — reset state
                 tot_skip += skipped
                 skip_s = skipped / a.rate
@@ -10455,10 +10576,15 @@ def main():
             _trig_bg = list(_fire)
             _seedpk_bg = [(float(_b), 13, 20.0, None) for _b in _trig_bg]
             _regpos_bg = tot_s
+            # Retain identity even if a carry makes the sample clocks
+            # disagree; registration validates the mapping before recovery.
+            _history_bg = reader.history_anchor() if is_live else None
+            _center_bg = _live_center_mhz
             _slow_busy[0] = True
 
             def _slow_scan_bg(_hv=_halves_bg, _spk=_seedpk_bg,
-                              _tg=_trig_bg, _rp=_regpos_bg):
+                              _tg=_trig_bg, _rp=_regpos_bg,
+                              _ha=_history_bg, _center=_center_bg):
                 # BACKGROUND slow scan (0.5-0.6 s of FFT work): ran on the
                 # main loop before and, stacked with p90 read+dispatch,
                 # pushed iterations past the 500 ms hop budget -> ring
@@ -10474,7 +10600,7 @@ def main():
                     _iql = np.concatenate(_hv)   # off-loop
                     try:
                         _ds = detect_preamble(
-                            _iql, a.rate, a.bandwidth, _live_center_mhz,
+                            _iql, a.rate, a.bandwidth, _center,
                             sc_threshold=a.threshold,
                             ethresh=a.energy_threshold,
                             spur_db=_spur_db, dc_notch_mhz=a.dc_notch,
@@ -10487,7 +10613,7 @@ def main():
                         print(f"[SLOW-SCAN] {time.time() - _t0:.2f}s "
                               f"seeds={len(_tg)} hits={len(_ds or [])} (bg)",
                               file=sys.stderr, flush=True)
-                    _slow_results.put((_ds or [], _iql, _rp, _tg))
+                    _slow_results.put((_ds or [], _iql, _rp, _tg, _ha))
                 except Exception as _se:
                     print(f"[SLOW-SCAN] bg scan failed: {_se!r}",
                           file=sys.stderr, flush=True)
@@ -10510,7 +10636,7 @@ def main():
         if _slow_hold and recorder:
             _due = [h for h in _slow_hold if h[0] <= _slow_tick]
             _slow_hold = [h for h in _slow_hold if h[0] > _slow_tick]
-            for _dl, _dets_h, _iql_h, _rts_h in _due:
+            for _dl, _dets_h, _iql_h, _rts_h, _ha_h in _due:
                 _keep_h = []
                 for d in _dets_h:
                     _da = (_rts_h - len(_iql_h)) / a.rate + d.get('preamble_t_s', 0.0)
@@ -10522,10 +10648,14 @@ def main():
                     if not _dup:
                         _keep_h.append(d)
                 if _keep_h:
-                    _record_slow(_keep_h, _iql_h, _rts_h)
+                    _record_slow_capture(
+                        recorder, _keep_h, _iql_h, _rts_h, sample_pos=tot_s,
+                        hop_n=hop_n, win_n=win_n, recent_hops=_slow_halves,
+                        history_reader=reader if is_live else None,
+                        history_anchor=_ha_h)
         # consume finished background scans (bookkeeping on main thread)
         while not _slow_results.empty():
-            dets_slow, _iq_long, _reg_tot_s, _trig_done = _slow_results.get()
+            dets_slow, _iq_long, _reg_tot_s, _trig_done, _history_done = _slow_results.get()
             _hit_bins = set()
             _hit_cool = {}       # hit bin -> post-hit cooldown (ticks)
             for d in dets_slow:
@@ -10599,54 +10729,6 @@ def main():
                           f"pwr={d['peak_power_db']:.1f}dB "
                           f"abst={_abst:.2f}s [slow-pass]",
                           flush=True)
-                def _record_slow(_dets, _iql, _rts):
-                        _slow_pkt_s = max(
-                            (148.25 * (2 ** d['sf']) / d['bw']) for d in _dets)
-                        # 24-window cap, not 12: SF12/31.25k frames run up to
-                        # ~19.4 s and the 12 s cap GUARANTEED truncation (the
-                        # soak's zero-decode wall for every >=9 s-airtime
-                        # preset). Deferred tails accumulate from loop hops —
-                        # NOT ring reads — so the old ring/2 bound does not
-                        # apply to the live path.
-                        _slow_tail_n = min(int(_slow_pkt_s * a.rate),
-                                           24 * win_n)
-                        # DEFERRED IN BOTH MODES: the file-mode blocking read
-                        # CONSUMED stream the loop would otherwise process —
-                        # every long-frame tail literally ate the next
-                        # beacon's windows (12-window tails halved straddler
-                        # detections; 24 made it worse). feed_tail() runs
-                        # unconditionally below, so pending jobs complete
-                        # from the hops in either mode.
-                        # ASYNC-SCAN GAP FILL: hops that streamed while the
-                        # background scan ran are still in _slow_halves —
-                        # hand them to the job so the base abuts the first
-                        # feed_tail hop (they were silently MISSING before:
-                        # 0.5-1.0 s hole at every live slow capture's seam).
-                        _gap_n = tot_s - _rts
-                        _gap_parts = None
-                        _reg_pos = _rts
-                        if _gap_n > 0 and hop_n > 0:
-                            _k = int(_gap_n) // hop_n
-                            if (_k * hop_n == _gap_n
-                                    and 0 < _k <= len(_slow_halves)):
-                                _gap_parts = list(_slow_halves)[-_k:]
-                                _reg_pos = tot_s
-                                _slow_tail_n = max(0, _slow_tail_n
-                                                   - _k * hop_n)
-                            else:
-                                # catchup/discontinuity between snapshot and
-                                # registration — cannot fill seamlessly; the
-                                # tail would splice. Register with the base
-                                # only and let it truncate.
-                                print(f"         [SLOW-GAP] unfillable gap "
-                                      f"{_gap_n} samples — truncated base "
-                                      f"capture", flush=True)
-                                _slow_tail_n = 0
-                        recorder.update_deferred(_dets, _iql,
-                                                 _reg_pos, pre_hop=None,
-                                                 need_tail_n=_slow_tail_n,
-                                                 owned_buf=True,
-                                                 gap_parts=_gap_parts)
                 if recorder:
                     # The slow pass exists for the 31.25k/41.67k presets; its
                     # alias-chain vote may still resolve a wider class and then
@@ -10655,18 +10737,27 @@ def main():
                     # recorder cannot know it is a copy yet.  Live: 17 of 96
                     # detections, 23-25 SF12/125k decode jobs for 3 frames, the
                     # off-centre copies 30-50 s each.  Slow-class hits record
-                    # now; any other class is HELD commit-lag + 6 hops (the
+                    # now, including modes whose 16-symbol gate exceeds the
+                    # main window. Other classes are HELD commit-lag + 6 hops (the
                     # main pass commits _LAG hops late and its tail assembly
                     # adds a few more — measured 2-5 s behind the slow pass)
                     # and recorded only if the main pass has not claimed the
                     # same label within +-bw and 1.5 s by then.
-                    _slow_now = [d for d in dets_slow if int(d['bw']) in (31250, 41667)]
-                    _slow_later = [d for d in dets_slow if int(d['bw']) not in (31250, 41667)]
+                    _slow_now = [d for d in dets_slow
+                                 if _slow_record_immediately(d, win_n / a.rate)]
+                    _slow_later = [d for d in dets_slow
+                                   if not _slow_record_immediately(d, win_n / a.rate)]
                     if _slow_now:
-                        _record_slow(_slow_now, _iq_long, _reg_tot_s)
+                        _record_slow_capture(
+                            recorder, _slow_now, _iq_long, _reg_tot_s,
+                            sample_pos=tot_s, hop_n=hop_n, win_n=win_n,
+                            recent_hops=_slow_halves,
+                            history_reader=reader if is_live else None,
+                            history_anchor=_history_done)
                     if _slow_later:
                         _slow_hold.append((_slow_tick + min(_LAG + 6, _slow_halves.maxlen),
-                                           _slow_later, _iq_long, _reg_tot_s))   # gap fill needs <= maxlen hops
+                                           _slow_later, _iq_long, _reg_tot_s,
+                                           _history_done))
         _prof['slow'] += time.time() - _t_slowblk0
         _t_step = time.time()
 
@@ -10688,6 +10779,7 @@ def main():
             if avail > int(0.8 * _ring_n):
                 skipped_ahead = reader.skip_to_latest(win_n)
                 if skipped_ahead > 0:
+                    _slow_halves.clear()
                     tot_skip += skipped_ahead
                     skip_s = skipped_ahead / a.rate
                     print(f"[{elapsed:6.1f}s] CATCHUP skip {skipped_ahead/1e6:.1f}M "

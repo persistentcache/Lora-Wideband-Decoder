@@ -1,4 +1,4 @@
-"""The production slow-pass width gate must have a stable frequency limit."""
+"""Low-rate slow seeds preserve physical width and legacy wideband behavior."""
 import numpy as np
 import pytest
 import detector
