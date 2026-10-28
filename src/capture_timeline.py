@@ -120,7 +120,7 @@ class _Reference:
 class SharedSave:
     """One ready batch; the save worker releases it in its finally block."""
     def __init__(self, owner, number, detections, start, end, target_factor,
-                 export_bw, metadata, credit):
+                 export_bw, metadata, credit, role='shared_full'):
         self._owner = owner
         self.number = number
         self.detections = detections
@@ -128,6 +128,7 @@ class SharedSave:
         self.target_factor, self.export_bw = target_factor, export_bw
         self.metadata = metadata
         self.credit = credit
+        self.role = role
         self.refs = []
         self.state = 'collecting'
         self.complete = False
@@ -145,11 +146,31 @@ class SharedSave:
             return self._owner._render(self, index)
         except Exception as exc:
             self._render_failed = True
-            self._owner._fail(f'view {self.number} recrop failed: {exc}')
+            if self.role not in ('header_prefix', 'early'):
+                self._owner._fail(f'view {self.number} recrop failed: {exc}')
             raise
 
     def release(self):
         self._owner._release_view(self)
+
+
+class _HeaderHold:
+    """Pin the full reference while an optional header decision is in flight."""
+    state = 'holding'
+
+    def __init__(self, owner, ref, credit):
+        self.owner, self.ref, self.credit = owner, ref, credit
+
+    def release(self):
+        with self.owner._lock:
+            if self.state == 'done':
+                return
+            self.state = 'done'
+            self.ref.band.refs = [(v, r) for v, r in self.ref.band.refs if v is not self]
+            self.credit.release()
+            self.owner._retire()
+            self.owner._release_idle_credits()
+        self.owner._wake.set()
 
 
 class SharedCapture:
@@ -179,9 +200,12 @@ class SharedCapture:
         self._bands, self._views = [], []
         self._watermark = None
         self._writing = None
+        self._optional_burst = 0
         self._next = self._completed = self._incomplete = 0
+        self._optional_completed = self._optional_incomplete = 0
         self._closing = False
         self.failure = None
+        self.header_controller = None
         self._pending_report = None
         self._pending_notice = None
         self._non_admitted = 0
@@ -293,6 +317,7 @@ class SharedCapture:
                         return old.number
                 lease = self.budget.reserve('view_metadata', 4096 + 4096 * len(detections), slots=1)
                 metadata = dict(pre_hop_n=pre_hop_n, wb_n=wb_n, sample_pos=sample_pos,
+                                base_start=base_start,
                                 base_end=base_end, signature=signature, identity=identity)
                 view = SharedSave(self, self._next, [dict(d) for d in detections],
                                   int(base_start), int(end), int(target_factor),
@@ -361,6 +386,78 @@ class SharedCapture:
                   + self._band_overhead(band))
         band.credit.resize(max(wanted, band.credit.size))
 
+    def header_candidates(self):
+        """Small descriptors only; never read or copy samples on this boundary."""
+        with self._lock:
+            if self.failure or self._closing:
+                return []
+            return [(view, ref) for view in self._views
+                    if view.role == 'shared_full' and view.state == 'collecting'
+                    for ref in view.refs]
+
+    def hold_header_reference(self, view, ref):
+        with self._lock:
+            if self.failure or self._closing or view._released or ref not in view.refs:
+                raise SharedCaptureFailure('header source no longer available')
+            hold = _HeaderHold(self, ref, self.budget.reserve(
+                'header_hold', 4096 + 4096 * len(view.detections)))
+            ref.band.refs.append((hold, ref))
+            return hold
+
+    def header_token(self, view, ref, begin_raw, end_raw):
+        band = ref.band
+        return (id(self), view.number, ref.index, *band.identity, band.origin,
+                band.factor, band.center, view.target_factor, ref.center,
+                self.rate, int(view.detections[ref.index]['sf']),
+                float(view.detections[ref.index]['bw']), int(begin_raw), int(end_raw))
+
+    def header_source_valid(self, hold, token):
+        with self._lock:
+            band = hold.ref.band
+            return (not self.failure and not self._closing and hold.state != 'done'
+                    and band in self._bands and self._watermark is not None
+                    and self._identity(self._watermark) == band.identity
+                    and tuple(token[3:5]) == band.identity
+                    and (token[0], token[5], token[6], token[7], token[10])
+                        == (id(self), band.origin, band.factor, band.center, self.rate))
+
+    def add_slice_view(self, parent, ref, begin_raw, end_raw, *, role, request_id):
+        """Optional prefix/early sibling; original full retention never changes."""
+        if role not in ('header_prefix', 'early'):
+            raise ValueError('invalid internal slice role')
+        with self._lock:
+            band = ref.band
+            if self.failure or self._closing or band not in self._bands:
+                raise SharedCaptureFailure('slice source identity ended')
+            begin = -(-(int(begin_raw) - band.origin) // band.factor)
+            stop = -(-(int(end_raw) - band.origin) // band.factor)
+            if begin < ref.start or stop > ref.end or stop <= begin or begin < band.retired_before:
+                raise SharedCaptureFailure('slice lies outside retained full reference')
+            credit = self.budget.reserve('header_view_metadata', 8192, slots=1)
+            try:
+                actual_start = band.origin + begin * band.factor
+                detection = dict(parent.detections[ref.index])
+                detection['_nb_ix'] = 0
+                detection['_capture_start_offset_s'] = (
+                    actual_start - parent.metadata.get('base_start', parent.start)) / self.rate
+                metadata = dict(parent.metadata, header_request_id=request_id,
+                                header_parent_id=parent.number,
+                                signature=(tuple(sorted((k, repr(v)) for k, v in detection.items())),))
+                child = SharedSave(self, self._next, [detection], actual_start, int(end_raw),
+                                   parent.target_factor, parent.export_bw, metadata, credit, role)
+                factor = child.target_factor // band.factor
+                child_ref = _Reference(band, 0, begin, stop,
+                                       stop + (10 * factor if factor > 1 else 0), ref.center)
+                child.refs.append(child_ref)
+                band.refs.append((child, child_ref))
+                self._views.append(child)
+                self._next += 1
+            except Exception:
+                credit.release()
+                raise
+        self._wake.set()
+        return child
+
     def _band_overhead(self, band):
         # Retained FIR history backing owner plus taps/polyphase state and
         # bounded Python band/chunk bookkeeping. D1 has no FIR state.
@@ -377,7 +474,10 @@ class SharedCapture:
                 view._render_failed = True
                 continue  # the sink still owns its arrays/lease
             view.state = 'cancelled'; view.complete = False
-            self._incomplete += 1
+            if view.role in ('header_prefix', 'early'):
+                self._optional_incomplete += 1
+            else:
+                self._incomplete += 1
             view.credit.release()
         self._wake.set()
 
@@ -409,6 +509,14 @@ class SharedCapture:
 
     def step(self):
         """One bounded crop service turn plus a nonblocking save transfer."""
+        if self.header_controller is not None:
+            self.header_controller.step()
+            for event in self.header_controller.drain_events():
+                try:
+                    import json
+                    self.report('[HEADER-CHECKPOINT] ' + json.dumps(event, separators=(',', ':')))
+                except Exception:
+                    pass
         with self._lock:
             report, self._pending_report = self._pending_report, None
             notice, self._pending_notice = self._pending_notice, None
@@ -418,8 +526,7 @@ class SharedCapture:
                 self._last_status = self.clock()
                 state = self.stats()
                 budget = state['budget']
-                debt = max((max(0, self._watermark[0] - b.cursor)
-                            for b in self._bands), default=0) / self.rate
+                debt = state['crop_debt_s']
                 report = (f"[SHARED-CAPTURE] bands={state['bands']} "
                           f"views={state['active_views']} ready={state['ready_views']} "
                           f"done={self._completed} incomplete={self._incomplete} "
@@ -495,7 +602,14 @@ class SharedCapture:
                     view.state = 'ready'; view.complete = True
                     view.ready_at = self.clock()
             if self._writing is None:
-                transfer = next((v for v in self._views if v.state == 'ready'), None)
+                ready = [v for v in self._views if v.state == 'ready']
+                optional = sorted((v for v in ready if v.role in ('early', 'header_prefix')),
+                                  key=lambda v: (v.role != 'early', v.number))
+                full = [v for v in ready if v.role not in ('early', 'header_prefix')]
+                # At most two optional transfers ahead of a waiting full view.
+                # One existing writer is never preempted; acquisition stays free.
+                transfer = (optional[0] if optional and (not full or self._optional_burst < 2)
+                            else full[0] if full else None)
                 if transfer is not None:
                     self._writing = transfer; transfer.state = 'transferring'
         if transfer is not None:
@@ -506,6 +620,8 @@ class SharedCapture:
                 accepted = False
             with self._lock:
                 if accepted:
+                    self._optional_burst = (self._optional_burst + 1
+                        if transfer.role in ('early', 'header_prefix') else 0)
                     if transfer.state != 'done':
                         transfer.state = 'writing'
                 else:
@@ -576,9 +692,15 @@ class SharedCapture:
                 return
             view._released = True
             if view._render_failed or self.failure:
-                self._incomplete += 1
+                if view.role in ('header_prefix', 'early'):
+                    self._optional_incomplete += 1
+                else:
+                    self._incomplete += 1
             else:
-                self._completed += 1
+                if view.role in ('header_prefix', 'early'):
+                    self._optional_completed += 1
+                else:
+                    self._completed += 1
             view.state = 'done'; view.credit.release()
             if self._writing is view:
                 self._writing = None
@@ -604,6 +726,8 @@ class SharedCapture:
                 self._wake.wait(.02); self._wake.clear()
 
     def close(self, *, wait=True):
+        if self.header_controller is not None:
+            self.header_controller.close(wait=wait)
         with self._lock:
             self._closing = True
             self._retire(); self._release_idle_credits()
@@ -615,10 +739,18 @@ class SharedCapture:
 
     def stats(self):
         with self._lock:
+            available = int(self._watermark[0]) if self._watermark is not None else 0
+            debt = max((max(0, min(available, b.origin
+                + max((r.context_end for _, r in b.refs), default=0) * b.factor
+                + (10 * b.factor if b.factor > 1 else 0)) - b.cursor)
+                for b in self._bands if b.refs), default=0) / self.rate
             return {'bands': len(self._bands),
+                    'crop_debt_s': debt,
                     'active_views': sum(v.state not in ('done','cancelled') for v in self._views),
                     'ready_views': sum(v.state == 'ready' for v in self._views),
                     'completed_views': self._completed, 'incomplete_views': self._incomplete,
+                    'optional_completed_views': self._optional_completed,
+                    'optional_incomplete_views': self._optional_incomplete,
                     'non_admitted': self._non_admitted,
                     'failure': self.failure, 'budget': self.budget.stats(),
                     'band_details': [{'center': b.center, 'factor': b.factor,
