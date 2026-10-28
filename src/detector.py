@@ -10553,21 +10553,30 @@ def main():
         if _fire and _SLOW_MIN_TICKS and len(_slow_halves) == 8:
             if _slow_tick - _slow_last_fire < _SLOW_MIN_TICKS:
                 _slow_rate_ok = False
+                _slow_defer_reason = 'spacing'
             elif (is_live
                   and reader.available() / float(_ring_n_total) > 0.3):
                 _slow_rate_ok = False
-            elif is_live and _bgt['cap_last'] <= _BUDGET_CAP_FLOOR:
-                # Budget clamp at its floor: the workers are already the
-                # deficit, and this scan (concat + detect_preamble over a
-                # 4 s assembly, 45 % of the gate process's CPU on a Pi 5
-                # under a spur comb) runs in the SAME process.  Triggers
-                # stay pending and fire once the cap recovers.
+                _slow_defer_reason = 'ring'
+            elif is_live and _cap_eff <= _BUDGET_CAP_FLOOR:
+                # Use THIS window's effective cap. cap_last is hysteretic
+                # history: it can remain at floor after the current budget
+                # returns to HI on a calm ring/pool. Treating that old value
+                # as pressure can permanently starve scans after recovery.
+                # An active floor/emergency budget still vetoes the scan.
                 _slow_rate_ok = False
+                _slow_defer_reason = 'budget'
             if not _slow_rate_ok and os.environ.get('LORA_SLOW_DEBUG'):
                 print(f"[SLOW] rate-bound defer tick={_slow_tick} "
-                      f"(last={_slow_last_fire})", file=sys.stderr)
+                      f"(last={_slow_last_fire}) reason={_slow_defer_reason} "
+                      f"cap_eff={_cap_eff} cap_last={_bgt['cap_last']}",
+                      file=sys.stderr)
         if (_fire and len(_slow_halves) == 8 and not _slow_busy[0]
                 and _slow_rate_ok):
+            if os.environ.get('LORA_SLOW_DEBUG'):
+                print(f"[SLOW-ADMIT] tick={_slow_tick} seeds={len(_fire)} "
+                      f"cap_eff={_cap_eff} cap_last={_bgt['cap_last']}",
+                      file=sys.stderr)
             _slow_last_fire = _slow_tick
             _slow_pending.clear()
             # parts refs only — the 640 MB concat happens IN THE THREAD
