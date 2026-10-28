@@ -7452,11 +7452,19 @@ while True:
                 # fine standalone.  Scale the wall deadline off the same budget
                 # with headroom; floor at 90 s so low-SF behaviour is unchanged.
                 import re as _re_t
-                _bud = float(os.environ.get('LORA_DECODE_BUDGET_S', '12.0') or 0)
+                # Match the exact token sent above, including its rounding.
+                # Slow-tier and pressure-floor overrides otherwise received a
+                # larger CPU allowance but were killed at the default wall limit.
+                _bud = (float(_bud_tok) if _bud_tok else
+                        float(os.environ.get('LORA_DECODE_BUDGET_S', '12.0') or 0))
                 _sfm = _re_t.search(r'SF(\d+)_', fname)
                 _sf_t = int(_sfm.group(1)) if _sfm else 7
                 _scaled_bud = _bud * (2.0 ** ((_sf_t - 7) * 0.5)) if _bud > 0 else 60.0
                 _wall = max(90.0, _scaled_bud * 1.5 + 30.0)
+                _cpu_budget_log = f'{_scaled_bud:.1f}' if _bud > 0 else 'unlimited'
+                self._rawlog('START', f"{fname} pid={worker.pid} "
+                                      f"base_budget={_bud} cpu_budget={_cpu_budget_log} "
+                                      f"wall_budget={_wall:.1f}")
                 output_lines = []
                 deadline = time.time() + _wall
                 timed_out = True
