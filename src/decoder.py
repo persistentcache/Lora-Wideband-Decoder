@@ -6949,10 +6949,76 @@ def _decoded_span_samples(preamble_start, data_start, N, ppm, ppm_pay,
     return int(data_start - preamble_start + (data_symbols + 1) * N)
 
 
+def probe_frame_header(iq_nb, sf, bw, nb_fs, name='', *, budget_s=2.0,
+                       identity_token=None):
+    """Read frame readiness from one immutable, bounded narrowband prefix.
+
+    Run in a decoder worker, outside acquisition. The CPU deadline is formed
+    here: parent process_time clocks cannot be sent across processes. A caller
+    must also bound prefix size and supervise worker wall time.
+
+    Return metadata, never a verified packet. Coordinates are relative to this
+    prefix at BW rate. The caller owns the opaque stream/generation/drop/origin
+    token and must validate it before mapping the endpoint or using an early
+    view. Neither success nor failure authorizes discarding the full fallback.
+
+    The known 41.67k display/detector labels map to physical 125000/3 Hz;
+    use the returned canonical BW for coordinate conversion. Other genuinely
+    noninteger nb_fs/BW clocks abstain, retaining the maximum-capture fallback.
+    The normal payload decoder has no general fractional-rate resampler to
+    reuse, so this API does not silently round an arbitrary sample clock.
+    """
+    from collections import Counter
+    started = time.process_time()
+    try:
+        if int(sf) != sf or not 7 <= sf <= 12:
+            return None
+        sf, bw, nb_fs, budget_s = int(sf), float(bw), float(nb_fs), float(budget_s)
+        if not all(np.isfinite(v) and v > 0 for v in (bw, nb_fs, budget_s)):
+            return None
+        if bw in (41667.0, 41670.0):
+            bw = 125000.0 / 3.0
+        dec = int(round(nb_fs / bw))
+        if dec < 1 or not np.isclose(nb_fs, bw * dec, rtol=1e-8, atol=1e-6):
+            return None
+        iq = np.asarray(iq_nb)
+        if iq.ndim != 1 or not len(iq) or not np.iscomplexobj(iq) or not np.isfinite(iq).all():
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    deadline = started + budget_s
+    if time.process_time() >= deadline:
+        return None
+    # Same DC cleanup and exact-clock centered extraction as process_file;
+    # leave the supplied prefix untouched and do not create a recenter ladder.
+    try:
+        dc = iq.mean()
+        if abs(dc) ** 2 > 1e-3 * float(np.mean(np.abs(iq) ** 2)):
+            iq = (iq - dc).astype(np.complex64)
+        bw_samples = (len(iq) + dec - 1) // dec
+        fft_len = dec * _next_fast_len(bw_samples)
+        spectrum = np.fft.fftshift(_fft(iq, n=fft_len))
+        keep = fft_len // dec
+        start = fft_len // 2 - keep // 2
+        baseband = (_ifft(np.fft.ifftshift(spectrum[start:start + keep]))
+                    * (keep / fft_len))[:bw_samples].astype(np.complex64)
+        if time.process_time() >= deadline:
+            return None
+        result = _decode_attempt(baseband, sf, bw, 2 ** sf, sf - 2, nb_fs,
+                                 dec, name, Counter, deadline=deadline,
+                                 header_only=True)
+    except Exception:
+        # A failed checkpoint leaves the original full capture available.
+        return None
+    if not isinstance(result, dict) or time.process_time() > deadline:
+        return None
+    return dict(result, identity_token=identity_token)
+
+
 def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     grid_sweep=False, force_td=None,
                     sweep_budget=2.0, diag_out=None, deadline=None,
-                    preamble_fit=True):
+                    preamble_fit=True, header_only=False):
     # deadline (process_time seconds, or None): the header-variant sweep below
     # is otherwise UNBOUNDED within one attempt — up to 128 grid_sweep offsets
     # x 8 symbols of FFT — so a phantom preamble can blow the whole per-file
@@ -6962,9 +7028,10 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # gets its base attempt (UC audit m).
     if skip_bins is None:
         skip_bins = []
-    _LAST_EMIT_VERIFIED[0] = False
+    if not header_only:
+        _LAST_EMIT_VERIFIED[0] = False
 
-    if _HARNESS_OUT:
+    if _HARNESS_OUT and not header_only:
         _HARNESS_ATTEMPT[0] += 1
         _harness_emit('attempt_start',
                       capture=(name.rsplit('/', 1)[-1] if name else ''),
@@ -7924,7 +7991,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # at SF7); KEEP that and only ADD UMOP-specific features that envelope+Welch
     # doesn't compute.  Dechirp-based precise_carrier_hz is alias-prone at the
     # ±BW/2 boundary (SHORT_FAST), so never overwrite the working measurement.
-    if _CURRENT_HW_FP[0] is None or _CURRENT_HW_FP[0].get('cfo_per_sym_std') is None:
+    if not header_only and (_CURRENT_HW_FP[0] is None
+                            or _CURRENT_HW_FP[0].get('cfo_per_sym_std') is None):
         _txfp = _extract_tx_fingerprint(iq1, preamble_start, sf, bw)
         if _txfp is not None:
             if _CURRENT_HW_FP[0] is None:
@@ -8049,7 +8117,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     #   +1 sync1, +2 sync2, +3..+5.25 SFD (2.25 downchirps) → data
     data_start = preamble_start + int((pre_last_i + 5.25) * N)
 
-    if _HARNESS_OUT:
+    if _HARNESS_OUT and not header_only:
         _harness_emit('preamble', preamble_start=int(preamble_start),
                       pre_last_i=int(pre_last_i), preamble_bin=int(preamble_bin),
                       data_start=int(data_start))
@@ -8458,7 +8526,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # margin / median header-symbol peak power).  Cheap: 8 N-point FFTs,
     # and only on the already-inconsistent (junk-suspect) path.
     _fluke_mnorm = None
-    if _sweep_gate_enabled() and hdr_ok:
+    if not header_only and _sweep_gate_enabled() and hdr_ok:
         _GATE_HDR_TUPLES.add((int(payload_len), int(cr),
                               int(bool(crc_present))))
         if crc_present:
@@ -8482,7 +8550,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             except Exception:
                 _fluke_mnorm = None   # no evidence -> gate cannot fire
 
-    if _HARNESS_OUT:
+    if _HARNESS_OUT and not header_only:
         _harness_emit('header', chosen_td=int(chosen_td),
                       hdr_bins=[int(b) for b in hdr_bins],
                       payload_len=int(payload_len), cr=int(cr),
@@ -8588,6 +8656,31 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
     if payload_len < 4 or payload_len > 237:
         print("  *** INVALID PAYLOAD LENGTH ***"); return ('FAIL', preamble_start, 20 * N, preamble_bin)
+
+    if header_only:
+        # Readiness is deliberately stricter than the payload recovery ladder.
+        # Conflicting checksum-valid tuples or an incomplete SFD keep the
+        # caller's original full-length fallback; no CRC has been checked here.
+        tuples = {(int(payload_len), int(cr), bool(crc_present))}
+        for _, _, variant in valid_variants:
+            parsed = variant[3]
+            if parsed is not None and parsed[3]:
+                tuples.add((int(parsed[0]), int(parsed[1]), bool(parsed[2])))
+        if (not 1 <= cr <= 4 or sfd_ok != 2 or len(tuples) != 1
+                or not np.isfinite(_hdr_minm) or _hdr_minm <= 0
+                or preamble_start < 0 or data_start <= preamble_start):
+            return None
+        needed = payload_len + (2 if crc_present else 0)
+        symbols = max(_frame_data_symbols(ppm, width, cr, needed)
+                      for width in (sf, sf - 2))
+        return {'preamble_start_bw': int(preamble_start),
+                'data_start_bw': int(data_start),
+                'header_end_bw': int(data_start + 8 * N),
+                'ready_end_bw': int(data_start + (symbols + 1) * N),
+                'sf': int(sf), 'bw': float(bw), 'payload_len': int(payload_len),
+                'cr': int(cr), 'crc_present': bool(crc_present),
+                'data_symbols': int(symbols), 'sfd_ok': int(sfd_ok),
+                'header_min_margin': float(_hdr_minm), 'chosen_td': int(chosen_td)}
 
     # ---- SOFT PAYLOAD DECODE ----
     rdd = cr + 4
