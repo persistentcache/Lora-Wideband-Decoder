@@ -135,6 +135,9 @@ class SharedSave:
         self._released = False
         self._render_failed = False
         self.ready_at = None
+        self._transfer_at = None
+        self._full_deferred_at = None
+        self._full_defer_s = 0.0
 
     @property
     def nb_fs(self):
@@ -201,6 +204,7 @@ class SharedCapture:
         self._watermark = None
         self._writing = None
         self._optional_burst = 0
+        self._full_write_s = 0.0
         self._next = self._completed = self._incomplete = 0
         self._optional_completed = self._optional_incomplete = 0
         self._closing = False
@@ -507,6 +511,40 @@ class SharedCapture:
             band.credit.resize(max(0, wanted))
         self._views = [v for v in self._views if v.state not in ('done', 'cancelled')]
 
+    def _defer_full_for_early(self, view, available):
+        """Leave the idle writer free briefly for an almost-collected early view.
+
+        Only measured successful full-save service time justifies this wait.
+        The first wait deadline belongs to the full view, never to later arrivals.
+        Caller holds the metadata lock; no sample work or sleeping occurs here.
+        """
+        cost = self._full_write_s
+        if self._closing or self.failure or self._optional_burst >= 2 or cost <= 0:
+            return False
+        now = self.clock()
+        wait = min(cost, 5.0, self.writer_stall_s / 4)
+        if view._full_deferred_at is not None:
+            wait = view._full_defer_s - (now - view._full_deferred_at)
+        if wait <= 0:
+            return False
+        # Do not voluntarily consume time needed to finish this already-aged
+        # full view before the existing writer-stall deadline.
+        if now - view.ready_at + wait + cost >= self.writer_stall_s:
+            return False
+        imminent = any(
+            early.role == 'early' and early.state == 'collecting'
+            and max((max(0, ref.band.origin + ref.context_end * ref.band.factor
+                         + (10 * ref.band.factor if ref.band.factor > 1 else 0)
+                         - available) for ref in early.refs), default=math.inf)
+                / self.rate <= cost
+            for early in self._views)
+        if not imminent:
+            return False
+        if view._full_deferred_at is None:
+            view._full_deferred_at = now
+            view._full_defer_s = wait
+        return True
+
     def step(self):
         """One bounded crop service turn plus a nonblocking save transfer."""
         if self.header_controller is not None:
@@ -608,10 +646,17 @@ class SharedCapture:
                 full = [v for v in ready if v.role not in ('early', 'header_prefix')]
                 # At most two optional transfers ahead of a waiting full view.
                 # One existing writer is never preempted; acquisition stays free.
-                transfer = (optional[0] if optional and (not full or self._optional_burst < 2)
-                            else full[0] if full else None)
+                expired = (full and full[0]._full_deferred_at is not None
+                    and self.clock() - full[0]._full_deferred_at >= full[0]._full_defer_s)
+                if full and (expired or self._optional_burst >= 2):
+                    transfer = full[0]
+                elif optional:
+                    transfer = optional[0]
+                elif full and not self._defer_full_for_early(full[0], available):
+                    transfer = full[0]
                 if transfer is not None:
                     self._writing = transfer; transfer.state = 'transferring'
+                    transfer._transfer_at = self.clock()
         if transfer is not None:
             try:
                 accepted = self.submit(transfer)  # never under producer/ledger lock
@@ -626,6 +671,7 @@ class SharedCapture:
                         transfer.state = 'writing'
                 else:
                     self._writing = None
+                    transfer._transfer_at = None
                     transfer.state = 'ready' if not self.failure else 'cancelled'
                     if self.failure:
                         self._release_view(transfer)
@@ -701,6 +747,10 @@ class SharedCapture:
                     self._optional_completed += 1
                 else:
                     self._completed += 1
+                    if view._transfer_at is not None:
+                        elapsed = self.clock() - view._transfer_at
+                        if math.isfinite(elapsed) and elapsed > 0:
+                            self._full_write_s = elapsed
             view.state = 'done'; view.credit.release()
             if self._writing is view:
                 self._writing = None
