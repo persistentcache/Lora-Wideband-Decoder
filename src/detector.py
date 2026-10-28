@@ -2440,8 +2440,9 @@ def _dechirp_scan(nb, sf, bw, nbfs):
     """Dechirp matched-filter preamble detection for a single channel.
 
     Scans sub-symbol offsets; at each, dechirps the channel into symbols and finds the
-    best 8-symbol window — the preamble's identical upchirps all dechirp to the SAME
-    FFT bin, so they sum to a sharp peak.  The detection metric is that despread
+    best 8-symbol window — the preamble's upchirps concentrate near the SAME
+    FFT bin, so their power accumulates there. Allow one adjacent bin for
+    fractional-bin jitter and modest clock drift. The detection metric is that despread
     peak-to-mean ratio (full SF processing gain), which detects well BELOW where
     Schmidl-Cox and the energy gate go deaf.  Mirrors dechirp_peak_quality's dechirp
     exactly, but also returns the preamble TIMING so a capture can be cut.
@@ -2468,11 +2469,25 @@ def _dechirp_scan(nb, sf, bw, nbfs):
                  if osf == 2 else _r.mean(axis=2))
         spec = np.abs(_fft_rows(d)) ** 2
         mn = spec.mean(axis=1)
-        ratios = np.where(mn > 0, spec.max(axis=1) / mn, 0.0)
-        cs = np.cumsum(ratios)
-        sums = cs[7:] - np.concatenate(([0.0], cs[:-8]))
-        bs = int(np.argmax(sums))
-        q = 10.0 * np.log10(sums[bs] / 8.0 + 1e-15)
+        # Normalize each symbol as before, but accumulate at a COMMON bin.
+        # Averaging unrelated per-symbol maxima let fresh DC/comb artifacts
+        # clear the learned-channel threshold and repeatedly queue captures.
+        # Bin-major layout makes each bin's symbol accumulation contiguous;
+        # retain the original symbol summation order. A zero mean implies a
+        # zero spectrum, so masked columns already contain zeros.
+        ratios = np.ascontiguousarray(spec.T)
+        np.divide(ratios, mn[None, :], out=ratios, where=mn[None, :] > 0)
+        near = np.empty_like(ratios)
+        np.maximum(ratios[:-2], ratios[2:], out=near[1:-1])
+        np.maximum(near[1:-1], ratios[1:-1], out=near[1:-1])
+        near[0] = np.maximum(ratios[0], np.maximum(ratios[-1], ratios[1]))
+        near[-1] = np.maximum(ratios[-1], np.maximum(ratios[-2], ratios[0]))
+        cs = np.cumsum(near, axis=1, out=near)
+        sums = cs[:, 7:].copy()
+        sums[:, 1:] -= cs[:, :-8]
+        peaks = sums.max(axis=0)
+        bs = int(np.argmax(peaks))
+        q = 10.0 * np.log10(peaks[bs] / 8.0 + 1e-15)
         if best is None or q > best[0]:
             pbin = int(np.argmax(spec[bs:bs + 8].mean(axis=0)))
             best = (q, (off + bs * sym) / float(nbfs), pbin)
