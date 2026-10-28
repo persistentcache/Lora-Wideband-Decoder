@@ -10652,32 +10652,58 @@ def main():
         # scan was < _SLOW_MIN_TICKS ago or the ring says the gate is behind.
         # Deferrals keep _slow_pending intact so the trigger refires.
         _slow_rate_ok = True
+        _slow_admit_reason = 'unbounded'
+        _slow_unfinished = _slow_free = -1
+        _slow_backlog_s = -1.0
         if _fire and _SLOW_MIN_TICKS and len(_slow_halves) == 8:
+            # Refresh AFTER this window's dispatch/commits. The main peak cap
+            # also counts completed slots retained for capture tails, which
+            # are not unfinished detector work. At its ordinary floor, allow
+            # one bounded scan only when a worker AND a slot are available
+            # and unread IQ is below one hop. Keep the peak throttle intact.
+            if _pool is not None:
+                _slow_unfinished = sum(
+                    1 for _it in _inflight if not _pool.ready(_it['seq']))
+                _slow_free = _pool.n_free()
+            _slow_avail = reader.available() if is_live else 0
+            _slow_backlog_s = _slow_avail / float(a.rate)
+            _slow_admit_reason = 'normal'
             if _slow_tick - _slow_last_fire < _SLOW_MIN_TICKS:
                 _slow_rate_ok = False
                 _slow_defer_reason = 'spacing'
-            elif (is_live
-                  and reader.available() / float(_ring_n_total) > 0.3):
+            elif is_live and _slow_avail / float(_ring_n_total) > 0.3:
                 _slow_rate_ok = False
                 _slow_defer_reason = 'ring'
             elif is_live and _cap_eff <= _BUDGET_CAP_FLOOR:
-                # Use THIS window's effective cap. cap_last is hysteretic
-                # history: it can remain at floor after the current budget
-                # returns to HI on a calm ring/pool. Treating that old value
-                # as pressure can permanently starve scans after recovery.
-                # An active floor/emergency budget still vetoes the scan.
+                if (_cap_eff == _BUDGET_CAP_FLOOR and _cap_eff >= 2
+                        and _bgt.get('emergency', 0) == 0
+                        and _pool is not None
+                        and _slow_unfinished < a.detect_workers
+                        and _slow_free > 0 and _slow_avail < hop_n):
+                    _slow_admit_reason = 'floor-spare'
+                else:
+                    _slow_rate_ok = False
+                    _slow_defer_reason = 'budget'
+            if _slow_rate_ok and _slow_busy[0]:
                 _slow_rate_ok = False
-                _slow_defer_reason = 'budget'
+                _slow_defer_reason = 'busy'
             if not _slow_rate_ok and os.environ.get('LORA_SLOW_DEBUG'):
                 print(f"[SLOW] rate-bound defer tick={_slow_tick} "
                       f"(last={_slow_last_fire}) reason={_slow_defer_reason} "
-                      f"cap_eff={_cap_eff} cap_last={_bgt['cap_last']}",
+                      f"cap_eff={_cap_eff} cap_last={_bgt['cap_last']} "
+                      f"unfinished={_slow_unfinished} free_slots={_slow_free} "
+                      f"backlog_s={_slow_backlog_s:.3f} "
+                      f"emergency={_bgt.get('emergency', 0)}",
                       file=sys.stderr)
         if (_fire and len(_slow_halves) == 8 and not _slow_busy[0]
                 and _slow_rate_ok):
             if os.environ.get('LORA_SLOW_DEBUG'):
                 print(f"[SLOW-ADMIT] tick={_slow_tick} seeds={len(_fire)} "
-                      f"cap_eff={_cap_eff} cap_last={_bgt['cap_last']}",
+                      f"reason={_slow_admit_reason} "
+                      f"cap_eff={_cap_eff} cap_last={_bgt['cap_last']} "
+                      f"unfinished={_slow_unfinished} free_slots={_slow_free} "
+                      f"backlog_s={_slow_backlog_s:.3f} "
+                      f"emergency={_bgt.get('emergency', 0)}",
                       file=sys.stderr)
             _slow_last_fire = _slow_tick
             _slow_pending.clear()
