@@ -163,7 +163,8 @@ def test_lost_history_is_fatal_and_never_splices_future_samples(failure):
 
 
 def test_retention_capacity_failure_is_explicit_main_loop_state():
-    e, r, _ = engine(budget_bytes=100000)
+    # Enough for the fixed mixer workspace, insufficient for this large view.
+    e, r, _ = engine(budget_bytes=500000)
     r._rp = r._wp = 4000
     register(e, 4000, tail=1_000_000)
     with pytest.raises(SharedCaptureFailure): e.raise_if_failed()
@@ -386,6 +387,101 @@ def test_prime_target_factor_retains_exact_rate_without_expanding_to_full_wideba
     expected=dec.feed(raw)[:1200]
     np.testing.assert_array_equal(actual,expected)
     view.release();e.close(wait=False)
+
+
+def test_three_overlapping_sf12_250_captures_fit_header_budget_without_shortening():
+    # Exact geometry behind the live failure: three nearby D5 centers, a
+    # four-second slow assembly and the supported237-byte CR4/8 tail. No sample
+    # arrays are needed to exercise the real production admission boundary.
+    budget = CaptureBudget(3 * 1024**3, 64)
+    header = budget.reserve('header_worker_workspace', 671088640)
+    e = SharedCapture(rate=10_000_000, center=915e6, hop_n=5_000_000,
+        reader=None, decimator_factory=detector._StreamDecimator,
+        submit=lambda view: False, budget=budget, threaded=False)
+    try:
+        for offset in (0., 100., 200.):
+            d = dict(detection(), sf=12, bw=250000, freq_hz=915e6 + offset)
+            result = e.register([d], base_start=0, base_end=40_000_000,
+                end=110_164_480, anchor=(40_000_000, 0, 0), target_factor=5,
+                export_bw=1_000_000, pre_hop_n=0, wb_n=40_000_000,
+                sample_pos=40_000_000)
+            assert result is not None, e.failure
+        assert not e.failure
+        assert len(e._views) == len(e._bands) == 3
+        assert all(v.start == 0 and v.end == 110_164_480 for v in e._views)
+        assert all(v.nb_fs == 2_000_000 for v in e._views)
+        assert budget.stats()['used_bytes'] <= 3 * 1024**3
+    finally:
+        e._fail('test teardown'); e.close(wait=False); header.release()
+    assert budget.stats()['used_bytes'] == 0
+
+
+def test_three_prime_center_views_preserve_every_sample_and_frequency():
+    submitted = []
+    e, r, _ = engine(submit=lambda view: submitted.append(view) or True)
+    r._rp = r._wp = 4000
+    for offset in (0., 1., -2.):
+        d = dict(detection(), freq_hz=915e6 + offset)
+        e.register([d], base_start=0, base_end=4000, end=6000,
+            anchor=(4000, 0, 0), target_factor=5, export_bw=100,
+            pre_hop_n=0, wb_n=4000, sample_pos=4000)
+    advance(e, r, 7000)
+    raw = np.arange(7000, dtype=np.float32)
+    raw = (raw - 1j * raw).astype(np.complex64)
+    seen = []
+    for _ in range(20):
+        e.step()
+        if submitted:
+            view = submitted.pop(0)
+            offset = view.detections[0]['freq_hz'] - 915e6
+            expected = detector._StreamDecimator(offset, 1000, 5).feed(raw)[:1200]
+            np.testing.assert_array_equal(view.stream(0), expected)
+            seen.append(offset)
+            view.release()
+    assert seen == [0., 1., -2.]
+    assert e.stats()['completed_views'] == 3
+    assert not e.failure
+    e.close(wait=False)
+
+
+def test_small_hop_writer_reservation_covers_real_two_output_render_peak():
+    import tracemalloc
+    submitted = []
+    e, r, _ = engine(capacity=100000, submit=lambda view: submitted.append(view) or True)
+    r._rp = r._wp = 4000
+    register(e, 4000, tail=76000)
+    advance(e, r, 80120)
+    view = submitted.pop()
+    # The second-stage FIR has an8192-sample mixer block even when each input
+    # chunk has125samples. A purely hop-scaled allowance undercounts its real
+    # arrays; also retain the prior output as the real save loop does.
+    try:
+        tracemalloc.start()
+        first = view.stream(0)
+        second = view.stream(0)
+        _, peak = tracemalloc.get_traced_memory()
+        assert len(first) == len(second) == 10000
+        assert peak <= e.budget.stats()['by_kind']['save_workspace']
+    finally:
+        tracemalloc.stop()
+        view.release(); e.close(wait=False)
+
+
+def test_small_hop_crop_reservation_covers_real_fixed_mixer_block():
+    import tracemalloc
+    e, r, _ = engine()
+    r._rp = r._wp = 4000
+    register(e, 4000, tail=2000)
+    e.step()  # warm imports/initial filter state outside the allocation probe
+    try:
+        tracemalloc.start()
+        e.step()
+        _, peak = tracemalloc.get_traced_memory()
+        kinds = e.budget.stats()['by_kind']
+        assert peak <= kinds['crop_workspace'] + kinds['band_retention']
+    finally:
+        tracemalloc.stop()
+        e._fail('test teardown'); e.close(wait=False)
 
 
 def test_same_span_different_preamble_hint_is_not_an_exact_duplicate():
