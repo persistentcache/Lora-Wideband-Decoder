@@ -144,7 +144,8 @@ def test_slow_registration_defers_history_copy_to_service(rec):
     assert not rec._pending
 
 
-def test_shared_writer_releases_mix_backing_before_lease_and_propagates_role(rec):
+@pytest.mark.parametrize('correction', [10000.125, -10000.125])
+def test_shared_writer_releases_mix_backing_before_lease_and_propagates_role(rec, correction):
     import ast
     import gc
     import threading
@@ -153,13 +154,18 @@ def test_shared_writer_releases_mix_backing_before_lease_and_propagates_role(rec
     tree=ast.parse(Path(detector.__file__).read_text())
     cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='SignalRecorder')
     node=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='_save_worker')
-    owners=[]
+    owners=[]; sizes=[]
     class Numpy:
         def __getattr__(self,name):return getattr(np,name)
         def arange(self,*args,**kw):
-            a=np.arange(*args,**kw);owners.append(weakref.ref(a));return a
+            a=np.arange(*args,**kw);owners.append(weakref.ref(a));sizes.append(a.size);return a
     scope=dict(vars(detector),np=Numpy(),_CROP_CENTER_FIX=True,
-               _nb_plateau_offset=lambda *a,**k:10000.)
+               _nb_plateau_offset=lambda *a,**k:correction)
+    # Run the production helper under the same allocation observer as its
+    # caller, so the weak-reference check still sees the real mix arrays.
+    helper=next(n for n in tree.body if isinstance(n,ast.FunctionDef)
+                and n.name=='_mix_capture_inplace')
+    exec(compile(ast.Module([helper],type_ignores=[]),detector.__file__,'exec'),scope)
     exec(compile(ast.Module([node],type_ignores=[]),detector.__file__,'exec'),scope)
     calls=[]
     class Decoder:
@@ -173,6 +179,14 @@ def test_shared_writer_releases_mix_backing_before_lease_and_propagates_role(rec
     rec.update_deferred([d],np.zeros(4000,np.complex64),sample_pos=4000,
         need_tail_n=2000,history_anchor=history.history_anchor(4000))
     history._rp=history._wp=7000;rec.feed_tail(np.zeros(500,np.complex64),sample_pos=7000)
+    end=time.monotonic()+2
+    while rec._save_queue.empty() and time.monotonic()<end:time.sleep(.005)
+    view=rec._shared._writing
+    assert view is not None
+    original=view.stream(0)
+    expected=(original*np.exp((-2j*np.pi*correction/view.nb_fs)
+                             *np.arange(len(original),dtype=np.float64))).astype(np.complex64)
+    retained=[(a,a.copy()) for b in rec._shared._bands for _,a in b.chunks]
     worker=threading.Thread(target=scope['_save_worker'],args=(rec,));worker.start()
     try:
         end=time.monotonic()+2
@@ -180,6 +194,14 @@ def test_shared_writer_releases_mix_backing_before_lease_and_propagates_role(rec
         assert rec._shared.stats()['completed_views']==1
         gc.collect()
         assert owners and all(ref() is None for ref in owners)
+        assert max(sizes)<=min(65536,rec.hop_n)
+        files=list(Path(rec.export_dir).glob('*.cf32'))
+        assert len(files)==1
+        actual=np.fromfile(files[0],np.complex64)
+        np.testing.assert_array_equal(actual.view(np.uint64),expected.view(np.uint64))
+        for data,before in retained:
+            np.testing.assert_array_equal(data,before)
+            assert not data.flags.writeable
         assert len(calls)==2  # full primary plus existing time-isolated derivative
         assert all(k.get('role')=='shared_full' for _,k in calls)
         assert all('_shared_full_' in args[1] for args,_ in calls)

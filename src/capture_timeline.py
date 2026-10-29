@@ -220,7 +220,10 @@ class SharedCapture:
         self._last_status = self.clock()
         # Includes input conversion, mix/concat/FIR temporaries. Each band's
         # previous full-hop _hist backing owner is charged separately below.
-        self._crop_credit = budget.reserve('crop_workspace', 48 * self.hop_n + 65536)
+        # _StreamDecimator's mixer builds an8192-sample phasor even for a
+        # smaller feed. Charge that fixed block in both processing stages.
+        self._workspace_hop_n = max(self.hop_n, 8192)
+        self._crop_credit = budget.reserve('crop_workspace', 48 * self._workspace_hop_n + 65536)
         self._writer_credit = budget.reserve('save_workspace', 0)
         self._thread = None
         if threaded:
@@ -359,10 +362,12 @@ class SharedCapture:
                 # Covers original/corrected arrays and existing save recenter
                 # temporaries, plus a bounded chunk-wise second-stage FIR.
                 out_bytes = math.ceil((end - base_start) / target_factor) * 8
-                # The save mixer uses float64 phase and complex128 exponent/
-                # product temporaries before its final complex64 cast. Charge
-                # those simultaneous owners, not just the final NB array.
-                needed_workspace = 8 * out_bytes + 64 * self.hop_n + 65536
+                # Shared saves mix their private output in <=min(65536, hop_n)
+                # tiles. Retain two complete outputs for the prior preamble
+                # during the next render, or the same-dtype file-write copy.
+                # The fixed allowance covers second-stage FIR and tile phase/
+                # complex128 mix temporaries, even for small input hops.
+                needed_workspace = 2 * out_bytes + 64 * self._workspace_hop_n + 65536
                 if needed_workspace > self._writer_credit.size:
                     self._writer_credit.resize(needed_workspace)
                 for index, det in enumerate(view.detections):

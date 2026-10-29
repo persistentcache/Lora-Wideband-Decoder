@@ -36,16 +36,44 @@ def correct_export():
                  and ast.unparse(n.test) == '_CROP_CENTER_FIX and len(nb)')
     code = compile(ast.Module(body=[block], type_ignores=[]), detector.__file__, 'exec')
 
-    def run(iq, *, preamble_sample=0, fs=500000, bw=62500):
+    def run(iq, *, preamble_sample=0, fs=500000, bw=62500,
+            shared=False, hop_n=50000):
         namespace = dict(vars(detector), nb=iq, nb_fs=fs,
                          d={'sf': 12, 'bw': bw, 'freq_hz': 915019500.},
-                         _nb_job={}, _crop_corr=0., _CROP_CENTER_FIX=True,
+                         _nb_job={}, _shared_save=object() if shared else None,
+                         _crop_corr=0., _CROP_CENTER_FIX=True,
                          _preamble_sample=preamble_sample,
-                         self=SimpleNamespace(debug=0))
+                         self=SimpleNamespace(debug=0, hop_n=hop_n))
         exec(code, namespace)
         return namespace['nb'], namespace['_crop_corr']
 
     return run
+
+
+@pytest.mark.parametrize('offset', [5000.125, -63000.375, 124999.999])
+@pytest.mark.parametrize('hop_n', [257, 200000])
+def test_shared_correction_keeps_exact_sample_bits_with_bounded_temporaries(
+        correct_export, monkeypatch, offset, hop_n):
+    # A full-array phase/mix would violate the admitted workspace. Resetting
+    # phase per tile or rounding the exponent to complex64 corrupts these bits.
+    rng = np.random.default_rng(20261029)
+    iq = (rng.standard_normal(131089) + 1j * rng.standard_normal(131089)).astype(np.complex64)
+    expected = (iq * np.exp((-2j * np.pi * offset / 500000)
+                           * np.arange(len(iq), dtype=np.float64))).astype(np.complex64)
+    sizes = []
+    class Numpy:
+        def __getattr__(self, name):
+            return getattr(np, name)
+        def exp(self, values):
+            sizes.append(values.size)
+            return np.exp(values)
+    monkeypatch.setattr(detector, 'np', Numpy())
+    monkeypatch.setattr(detector, '_nb_plateau_offset', lambda *args: offset)
+    actual, correction = correct_export(iq, shared=True, hop_n=hop_n)
+    np.testing.assert_array_equal(actual.view(np.uint64), expected.view(np.uint64))
+    assert correction == offset
+    assert sizes and max(sizes) <= min(65536, hop_n)
+    assert actual is iq  # only the renderer's private output is modified
 
 
 def test_stronger_broad_region_prevents_weak_band_from_moving_export(correct_export):

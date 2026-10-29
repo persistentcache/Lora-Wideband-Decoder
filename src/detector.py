@@ -1954,6 +1954,20 @@ def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
     return result, float(target_fs)
 
 
+def _mix_capture_inplace(iq, offset_hz, fs, chunk_n):
+    """Recenter a private shared-save output with bounded temporary arrays.
+
+    Absolute float64 indices and the original complex128 expression preserve
+    the full-array mix's sample bits, including across tile boundaries.
+    """
+    coefficient = -2j * np.pi * offset_hz / fs
+    block_n = min(65536, chunk_n)
+    for start in range(0, len(iq), block_n):
+        stop = min(start + block_n, len(iq))
+        phase = np.arange(start, stop, dtype=np.float64)
+        iq[start:stop] = (iq[start:stop] * np.exp(coefficient * phase)).astype(np.complex64)
+
+
 def _nb_plateau_offset(iq, fs, bw):
     """CROP-CENTER FIX: max-hold plateau mis-centering meter.
 
@@ -6204,10 +6218,17 @@ class SignalRecorder:
                                 # except in the empty brick-wall band edges
                                 # (the packet spans ±bw/2+corr, well inside
                                 # the ±bw slice).  Detection unchanged.
-                                _ph = np.arange(len(nb), dtype=np.float64)
-                                nb = (nb * np.exp(
-                                    (-2j * np.pi * _po / nb_fs) * _ph)
-                                      ).astype(np.complex64)
+                                if _shared_save is not None:
+                                    # stream() returns a private output, never
+                                    # a view into retained band chunks. Keep
+                                    # mixer temporaries within the charged hop
+                                    # workspace, including tiny-hop callers.
+                                    _mix_capture_inplace(nb, _po, nb_fs, self.hop_n)
+                                else:
+                                    _ph = np.arange(len(nb), dtype=np.float64)
+                                    nb = (nb * np.exp(
+                                        (-2j * np.pi * _po / nb_fs) * _ph)
+                                          ).astype(np.complex64)
                                 _crop_corr = float(_po)
                             if self.debug >= 1 and _crop_corr != 0.0:
                                 print(f"         [CROP-CENTER] "
