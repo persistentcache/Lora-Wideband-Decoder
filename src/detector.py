@@ -4553,27 +4553,24 @@ class _StreamDecimator:
 
     _MIX_BS = 8192   # mixer block size (see _mix)
 
-    def __init__(self, f_off_hz, wb_fs, D):
+    def __init__(self, f_off_hz, wb_fs, D, *, use_gemm=False):
         from scipy.signal import firwin, upfirdn as _ufd
         global _upfirdn
         _upfirdn = _ufd
         self.D = int(D)
         self.fs = float(wb_fs)
         self.f = float(f_off_hz)
+        self._use_gemm = bool(use_gemm)
         self.h = firwin(20 * self.D + 1, 1.0 / self.D,
                         window=('kaiser', 5.0)).astype(np.float32)
         self.L = len(self.h)
         self.H = (self.L - 1) // 2          # = 10*D, divisible by D
-        # Polyphase-as-GEMM decomposition (the naive per-output dot and
-        # scipy's upfirdn both ran ~0.5 s per 10 M-sample hop — too slow
-        # for the cropper to keep up with the hop cadence).  With h
+        # Polyphase decomposition used by the optional tiled FIR. With h
         # zero-padded to K*D taps and hp2[j, p] = h_pad[(j+1)*D - 1 - p],
         #     y[m] = sum_j ( seg[c_m - (j+1)D + 1 : c_m - jD + 1] . hp2[j] )
         # and the inner windows for consecutive m are consecutive D-sample
-        # rows of seg — so ONE contiguous reshape view of seg matmul'd
-        # against hp2.T computes every (m, j) partial in a single BLAS
-        # call, and y falls out as K diagonal slice-sums.  Exactly the
-        # same arithmetic, ~10x faster.
+        # rows of seg. Each bounded output tile computes real I/Q matrix
+        # products with hp2.T, then combines K diagonal slice-sums.
         self._K = (self.L + self.D - 1) // self.D    # = 21
         _hpad = np.zeros(self._K * self.D, np.float32)
         _hpad[:self.L] = self.h
@@ -4614,6 +4611,33 @@ class _StreamDecimator:
             xm[full:] = x[full:] * base[:n - full] * Rb[n // BS]
         return xm
 
+    def _fir_tiles(self, seg, c_min, n_y):
+        """Same real FIR coefficients, with bounded polyphase matrix products.
+
+        Each row of input holds D successive samples. Multiplying by the
+        reversed tap phases computes the partial sums; diagonal row offsets
+        align those sums on the original output grid. Tile the output so the
+        temporary matrix of 21 phases never grows with the complete capture.
+        """
+        D, K = self.D, self._K
+        taps = np.ascontiguousarray(self._hp2T.real.T)
+        y = np.zeros(n_y, np.complex64)
+        for begin in range(0, n_y, 65536):
+            count = min(65536, n_y - begin)
+            first = c_min // D + begin - K
+            rows = count + K - 1
+            source = seg[1 + first * D:1 + (first + rows) * D].reshape(rows, D)
+            matrix = np.empty((D, rows), np.float32, order='F')
+            partial = np.empty((K, rows), np.float32)
+            for part, target in ((source.real, y.real[begin:begin + count]),
+                                 (source.imag, y.imag[begin:begin + count])):
+                np.copyto(matrix, part.T)
+                np.matmul(taps, matrix, out=partial)
+                for j in range(K):
+                    start = K - j - 1
+                    target += partial[j, start:start + count]
+        return y
+
     def feed(self, x):
         """Feed the next contiguous chunk; returns 0+ output samples."""
         if len(x) == 0:
@@ -4643,10 +4667,15 @@ class _StreamDecimator:
         # The taps are real: filter I/Q separately instead of paying scipy's
         # complex-convolution cost. This preserves the FIR/grid arithmetic
         # while letting several pending streams keep up with live input.
-        take = slice(c_min // D, c_min // D + n_y)
-        y = np.empty(n_y, dtype=np.complex64)
-        y.real = _upfirdn(self.h, seg.real, up=1, down=D)[take]
-        y.imag = _upfirdn(self.h, seg.imag, up=1, down=D)[take]
+        if self._use_gemm and D >= 5 and n_y >= 1024:
+            # Measured faster for the shared D5/D10/D20 capture bands. D2
+            # and small feeds retain upfirdn; their matrix overhead is larger.
+            y = self._fir_tiles(seg, c_min, n_y)
+        else:
+            take = slice(c_min // D, c_min // D + n_y)
+            y = np.empty(n_y, dtype=np.complex64)
+            y.real = _upfirdn(self.h, seg.real, up=1, down=D)[take]
+            y.imag = _upfirdn(self.h, seg.imag, up=1, down=D)[take]
         self._m_next = m_hi + 1
         # keep L-1 (+ one extra D so the next GEMM's earliest row exists)
         keep_abs = self._m_next * D + H - (L - 1) - D
@@ -5010,7 +5039,9 @@ class SignalRecorder:
         self._history_reader = reader
         self._shared = SharedCapture(
             rate=self.wb_fs, center=self.center_hz, hop_n=self.hop_n,
-            reader=reader, decimator_factory=_StreamDecimator,
+            reader=reader,
+            decimator_factory=lambda offset, rate, factor: _StreamDecimator(
+                offset, rate, factor, use_gemm=True),
             submit=self._queue_shared_save, budget=budget,
             writer_stall_s=float(os.environ.get('LORA_SHARED_WRITER_TIMEOUT', '30')),
             report=lambda message: print(message, file=sys.stderr, flush=True))

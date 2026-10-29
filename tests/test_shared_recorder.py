@@ -63,6 +63,12 @@ def test_shared_flag_is_explicit_and_does_not_change_default_recorder(rec,monkey
     assert rec._shared is None
 
 
+def test_only_shared_recorder_selects_tiled_capture_fir(rec):
+    rec.set_history_reader(reader())
+    assert rec._shared.factory(35000, 10e6, 5)._use_gemm
+    assert not detector._StreamDecimator(35000, 10e6, 5)._use_gemm
+
+
 def test_actual_save_worker_handles_shared_view_and_releases_after_write(rec,monkeypatch):
     # Constructor save threads are disabled; execute the real worker below.
     import ast

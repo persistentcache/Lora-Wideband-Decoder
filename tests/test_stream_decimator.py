@@ -81,3 +81,33 @@ def test_multiple_detection_streams_keep_independent_phase_and_fir_state():
         actual = np.concatenate(nb['parts'][i] + [dec.finish()])
         np.testing.assert_allclose(actual, reference(x, offsets[i], 10e6, 20),
                                    rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize('factor', [2, 5, 10, 20])
+@pytest.mark.parametrize('offset', [35000, -200000])
+def test_shared_fir_tiles_preserve_samples_across_large_and_tiny_chunks(factor, offset):
+    # More than two output tiles, plus chunks shorter than the FIR and chunks
+    # off both the mixer and output grids. Compare to independent full-stream
+    # convolution, not to a second invocation of the optimized code.
+    x = iq((2 * 65536 + 31) * factor + 13)
+    dec = detector._StreamDecimator(offset, 10e6, factor, use_gemm=True)
+    chunks = np.split(x, [1, 9, 8201])
+    actual = np.concatenate([*(dec.feed(chunk) for chunk in chunks), dec.finish()])
+    assert len(actual) == (len(x) + factor - 1) // factor
+    np.testing.assert_allclose(actual, reference(x, offset, 10e6, factor),
+                               rtol=1e-5, atol=1e-6)
+
+
+def test_shared_fir_uses_bounded_real_matrix_workspace(monkeypatch):
+    # A large input must not allocate the old whole-hop (outputs ×21) matrix.
+    original = np.matmul
+    shapes = []
+    def multiply(a, b, **kwargs):
+        shapes.append((a.shape, b.shape, kwargs['out'].shape))
+        assert a.dtype == b.dtype == kwargs['out'].dtype == np.float32
+        assert b.shape[1] <= 65536 + 20
+        return original(a, b, **kwargs)
+    monkeypatch.setattr(np, 'matmul', multiply)
+    dec = detector._StreamDecimator(35000, 10e6, 5, use_gemm=True)
+    dec.feed(iq(5 * (2 * 65536 + 31)))
+    assert len(shapes) == 6  # I and Q for each of three bounded output tiles.
