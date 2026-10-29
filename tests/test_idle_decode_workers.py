@@ -70,7 +70,9 @@ def test_simultaneous_jobs_never_share_active_child(instance,tmp_path):
     assert len(instance._workers)==2
     first.with_suffix('.release').touch();second.with_suffix('.release').touch()
     wait_until(lambda:instance.pending()==0)
-    assert len(instance._idle_workers)==2
+    # The active-job count retires before final reference/bucket cleanup and
+    # child return. Wait for the state this test actually verifies.
+    wait_until(lambda:len(instance._idle_workers)==2)
 
 
 def test_dead_cached_worker_is_reaped_not_reused(instance,tmp_path):
