@@ -9166,7 +9166,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     crc_ok, crc_method = False, ""
     _clean_crc = False   # True only if the whole-packet CRC matched WITHOUT chase
     if crc_present and len(raw_bytes) >= payload_len + 2:
-        crc_ok, crc_method = check_crc(raw_bytes, payload_len)
+        crc_ok, crc_method = check_crc(raw_bytes, payload_len, strict=True)
         _clean_crc = crc_ok
         if diag_out is not None:
             diag_out['crc_ok'] = bool(crc_ok)
@@ -9188,7 +9188,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         _rb2, _pl2, _si2, _nb2 = soft_decode_payload(0, 0.0, frac_tau=tau_frac)
         _ok2 = False
         if len(_rb2) >= payload_len + 2:
-            _ok2, _m2 = check_crc(_rb2, payload_len)
+            _ok2, _m2 = check_crc(_rb2, payload_len, strict=True)
         if _ok2:
             raw_bytes, payload, pay_soft_info, decoded_nibs = _rb2, _pl2, _si2, _nb2
             crc_ok, crc_method, _clean_crc = True, _m2, True
@@ -9213,7 +9213,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         pay_bin_group = 1 if ppm_pay == sf else 4
         _lr, _lp, _ls, _ln = soft_decode_payload(0, 0.0, frac_tau=tau_frac)
         if len(_lr) >= payload_len + 2:
-            _lok, _lm = check_crc(_lr, payload_len)
+            _lok, _lm = check_crc(_lr, payload_len, strict=True)
             if _lok:
                 raw_bytes, payload, pay_soft_info, decoded_nibs = _lr, _lp, _ls, _ln
                 crc_ok, crc_method, _clean_crc = True, _lm, True
@@ -9292,7 +9292,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                                                          frac_tau=tau_frac + _dt)
                 _pok, _pm = False, ''
                 if len(_pr) >= payload_len + 2:
-                    _pok, _pm = check_crc(_pr, payload_len)
+                    _pok, _pm = check_crc(_pr, payload_len, strict=True)
                 if _pok:
                     raw_bytes, payload, pay_soft_info, decoded_nibs = _pr, _pp, _ps, _pn
                     crc_ok, crc_method, _clean_crc = True, _pm, True
@@ -9324,7 +9324,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     _nr, _npp, _nps, _npn = soft_decode_payload(
                         0, 0.0, frac_tau=_nt)
                     if len(_nr) >= payload_len + 2:
-                        _nok, _nm = check_crc(_nr, payload_len)
+                        _nok, _nm = check_crc(_nr, payload_len, strict=True)
                         if _nok:
                             raw_bytes, payload = _nr, _npp
                             pay_soft_info, decoded_nibs = _nps, _npn
