@@ -6940,6 +6940,13 @@ def _frame_data_symbols(ppm, ppm_pay, cr, need_bytes):
     return 8 + payload_blocks * (cr + 4)
 
 
+def _payload_fits_samples(sample_count, data_start, N, ppm, ppm_pay,
+                          cr, need_bytes, min_offset=0):
+    """Whether this FEC/LDRO mode fits at the earliest searched timing."""
+    available = max(0, (sample_count - data_start - int(min_offset)) // N)
+    return available >= _frame_data_symbols(ppm, ppm_pay, cr, need_bytes)
+
+
 def _decoded_span_samples(preamble_start, data_start, N, ppm, ppm_pay,
                           cr, need_bytes):
     """Span of a decoded frame at BW rate, including one symbol of margin."""
@@ -7388,6 +7395,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                 all_syms = syms
                 best_phase = refined
 
+    _origin_eligible = not all_runs and 0 not in coarse_positions
+
     # Fallback: also scan from offset 0 (catches preambles at file start
     # that autocorrelation misses due to resampling artifacts)
     runs0, syms0 = _scan_from(iq1, 0)
@@ -7449,6 +7458,31 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
     # Flatten: sort by length DESC, start time ASC on ties
     all_runs.sort(key=lambda x: (len(x[0]), -x[0][0][0]), reverse=True)
+    # Select the original candidate allowance before adding an optional grid.
+    # Otherwise a longer origin run can evict the sixth baseline candidate.
+    _candidate_runs = all_runs[:6]
+    _baseline_candidate_count = len(_candidate_runs)
+
+    # Padding can move a nearly tied origin window outside the coarse top
+    # three. When those searches failed, try its refined grid after the
+    # original unrefined/global admission, without suppressing either path
+    # or their candidates. Keep the optional allowance separately bounded.
+    if (_origin_eligible
+            and (deadline is None or time.process_time() < deadline)):
+        refined = _refine_start_xcorr(iq1, 0)
+        if (refined != 0
+                and (deadline is None or time.process_time() < deadline)):
+            runs, syms = _scan_from(iq1, refined)
+            if runs:
+                _origin_runs = sorted(((run, refined) for run in runs),
+                    key=lambda x: (len(x[0]), -x[0][0][0]), reverse=True)
+                _candidate_runs.extend(_origin_runs[:6])
+                all_runs.extend(_origin_runs)
+                all_runs.sort(key=lambda x: (len(x[0]), -x[0][0][0]), reverse=True)
+                if not all_syms:
+                    all_syms = syms
+                    best_phase = refined
+
     # Extract runs and phases
     run_phases = [phase for _, phase in all_runs]
     all_runs = [r for r, _ in all_runs]
@@ -7665,11 +7699,13 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # Adding the un-refined position as a second candidate lets the scoring
     # stage pick whichever gives the cleaner SC run + SFD.  SF/BW-agnostic:
     # all offsets are in `N` units which scales with sf and rate.
-    for run_idx, run in enumerate(all_runs[:min(6, len(all_runs))]):
+    for run_idx, (run, phase_for_run) in enumerate(_candidate_runs):
+        if (run_idx >= _baseline_candidate_count and deadline is not None
+                and time.process_time() >= deadline):
+            break
         run_len = len(run)
         run_mean_pmr = float(np.mean([p for _, _, p in run]))
         run_bin = circular_mean_bin([b for _, b, _ in run], N)
-        phase_for_run = run_phases[run_idx] if run_idx < len(run_phases) else best_phase
         pre_loc = phase_for_run + run[0][0] * N
         refined_start = refine_preamble_start(pre_loc, run_bin, min(max(run_len, 8), 12))
         candidate_starts = [refined_start]
@@ -9589,12 +9625,24 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         except Exception as _ge:
             print("  [GATE-DBG] failed: %r" % (_ge,), flush=True)
 
+    ds_offsets = ordered_unique_offsets(
+        [0] + list(range(-8, 9)) + [-(dec // 2), dec // 2, -dec, dec]
+    )
+    # Timing/drift recovery cannot add complete FEC blocks beyond the
+    # recorded samples. Primary and alternate-LDRO decoding already ran;
+    # this bounds only recovery in the current mode, leaving other header
+    # and carrier searches available. Include the earliest timing offset.
+    _payload_recovery_fits = _payload_fits_samples(
+        len(iq1), data_start, N, ppm, ppm_pay, cr, need_bytes,
+        min(ds_offsets))
+
     # One measured primary drift correction before the combinatorial sweep.
     # Long frames can drift outside every constant timing hypothesis. The
     # existing late DD path already recovers these; try its primary geometry
     # first, accepting only a direct received CRC with the same shape gate.
     # A failed trial adds no soft-combine vote and changes no fallback state.
     if (crc_present and not crc_ok and hdr_ok and not _fluke_junk
+            and _payload_recovery_fits
             and sym_time_ms > 16.0
             and (deadline is None or time.process_time() < deadline)):
         _primary_dd_curve = _dd_resid_curve(0, 0.0, tau_frac)
@@ -9679,13 +9727,10 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             print("  SWEEP MEMO: identical demod grid already swept to "
                   "CRC-FAIL this capture — skipping duplicate sweep")
     if (crc_present and not crc_ok and not _skip_sweep and not _fluke_junk
-            and not _c2_skip):
+            and not _c2_skip and _payload_recovery_fits):
         print("\n  === SWEEP (timing × chase) ===")
         # Limited sweep: ~20 timing offsets × decode-only + chase(1 flip)
         # More offsets × more flips = more false CRC-16 matches
-        ds_offsets = ordered_unique_offsets(
-            [0] + list(range(-8, 9)) + [-(dec // 2), dec // 2, -dec, dec]
-        )
 
         # CPU-time budget (2026-07-08; was wall-clock): the wall version
         # made the sweep's candidate count depend on host load and pool
@@ -9959,7 +10004,8 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # they pay the same per-symbol drift exposure.  Cost bounded: the
     # stage only runs when primary+chase+sweep all failed AND the
     # resid-curve span gate (>=0.12 bins) fires.
-    if crc_present and (not crc_ok) and (not _fluke_junk) and sym_time_ms > 16.0:
+    if (crc_present and not crc_ok and not _fluke_junk
+            and _payload_recovery_fits and sym_time_ms > 16.0):
         _retry_bases = [(0.0, 'primary', 0, 0.0, tau_frac, '')]
         if best_candidates:
             _retry_bases += sorted(best_candidates,

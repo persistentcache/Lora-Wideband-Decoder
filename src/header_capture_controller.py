@@ -250,6 +250,25 @@ class HeaderCaptureController:
                 self.counts['fallback'] += 1
                 self._event('header-write-fallback', request=identifier, reason=str(error)[:200])
 
+    def invalidate_sources(self):
+        """Cancel old generation descriptors while keeping the worker alive."""
+        with self._lock:
+            for identifier, entry in list(self._entries.items()):
+                if self.owner.header_source_valid(entry.hold, entry.token):
+                    continue
+                if entry.state == 'writing':
+                    # write_prefix checks the token again before submission,
+                    # and releases its file/hold in its own completion path.
+                    continue
+                if entry.state == 'requested':
+                    self.service.cancel(identifier)
+                else:
+                    entry.lease.release()
+                entry.hold.release()
+                self._entries.pop(identifier, None)
+                self.counts['fallback'] += 1
+                self._event('header-invalidated', request=identifier)
+
     def close(self, *, wait=True):
         with self._lock:
             self._closed = True
