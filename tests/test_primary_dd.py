@@ -39,6 +39,7 @@ def run_trial(*,crc_match=True,plausible=True,curve=(0.,.2),deadline=None,clock=
         deadline=deadline,time=SimpleNamespace(process_time=lambda:clock),tau_frac=.125,
         payload_len=97,_clean_crc=False,crc_method='',raw_bytes=original_raw,payload=original_payload,
         pay_soft_info=original_soft,_skip_sweep=False,_c2_skip=False,_sc_att=vote,
+        _payload_recovery_fits=True,
         _dd_resid_curve=track,soft_decode_payload=demod,check_crc=crc,
         _is_chase_acceptable_uni=shape,timing_sweep=lambda:calls.append(('sweep',)),
         late_drift=lambda:calls.append(('late',)),print=lambda *a,**kw:None)

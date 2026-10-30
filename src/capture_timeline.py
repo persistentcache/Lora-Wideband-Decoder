@@ -105,6 +105,8 @@ class _Band:
     started: bool = False
     busy: bool = False
     retired_before: int = 0
+    input_center: float = 0.0
+    sealed: bool = False
 
 
 @dataclass(eq=False)
@@ -115,6 +117,7 @@ class _Reference:
     end: int
     context_end: int
     center: float
+    received_end: object = None
 
 
 class SharedSave:
@@ -127,11 +130,13 @@ class SharedSave:
         self.start, self.end = start, end
         self.target_factor, self.export_bw = target_factor, export_bw
         self.metadata = metadata
+        self.input_center = owner.center
         self.credit = credit
         self.role = role
         self.refs = []
         self.state = 'collecting'
         self.complete = False
+        self.interrupted = False
         self._released = False
         self._render_failed = False
         self.ready_at = None
@@ -211,6 +216,9 @@ class SharedCapture:
         self._full_write_s = 0.0
         self._next = self._completed = self._incomplete = 0
         self._optional_completed = self._optional_incomplete = 0
+        self._interrupted = 0
+        self._generation_start = 0
+        self._retune_serial = 0
         self._closing = False
         self.failure = None
         self.header_controller = None
@@ -260,6 +268,7 @@ class SharedCapture:
         with self._lock:
             if self._closing or self.failure:
                 return
+            serial = self._retune_serial
         try:
             anchor = self.reader.received_history_anchor()
             identity = self._identity(anchor)
@@ -275,8 +284,73 @@ class SharedCapture:
             changed = (self._watermark is None
                 or identity != self._identity(self._watermark)
                 or received > int(self._watermark[0]))
-            if not self._closing and not self.failure and changed:
+            if (not self._closing and not self.failure and changed
+                    and serial == self._retune_serial):
                 self.advance(anchor)
+
+    def retune(self, center):
+        """Seal old emitted IQ and open an explicitly requested generation.
+
+        The cutoff is the last committed crop sample. A crop already running
+        keeps its workspace until it returns, but cannot append after sealing.
+        Only real, retained FIR support contributes to an interrupted save.
+        """
+        center = float(center)
+        if not math.isfinite(center):
+            raise ValueError('invalid retune center')
+        with self._lock:
+            self.raise_if_failed()
+            if self._closing:
+                raise SharedCaptureFailure('capture service is closing')
+            for band in self._bands:
+                band.sealed = True
+            for view in self._views:
+                if view.state != 'collecting':
+                    continue  # complete/writer-owned samples remain immutable
+                if view.role in ('header_prefix', 'early'):
+                    view.state = 'cancelled'
+                    view.credit.release()
+                    self._optional_incomplete += 1
+                    continue
+                view.interrupted = True
+                view.role = 'shared_partial'
+                view.metadata['interruption'] = 'retune'
+                view.metadata['requested_end'] = view.end
+                self._interrupted += 1
+                any_samples = False
+                for ref in view.refs:
+                    band = ref.band
+                    factor = view.target_factor // band.factor
+                    right = 10 * factor if factor > 1 else 0
+                    stop = min(ref.end, band.produced - right)
+                    stop = max(ref.start, stop)
+                    ref.end = stop
+                    ref.context_end = stop + right if stop > ref.start else stop
+                    ref.received_end = min(view.end, band.origin + stop * band.factor)
+                    any_samples |= stop > ref.start
+                view.metadata['received_ends'] = [r.received_end for r in view.refs]
+                if any_samples:
+                    view.state = 'ready'
+                    view.ready_at = self.clock()
+                else:
+                    view.state = 'cancelled'
+                    view.credit.release()
+                    self._incomplete += 1
+            self.reader.invalidate_history()
+            snapshot = (self.reader.received_history_anchor if self._published_history
+                        else self.reader.history_anchor)
+            self._watermark = tuple(snapshot())
+            self._generation_start = int(self._watermark[0])
+            self._retune_serial += 1
+            self.center = center
+            self._retire()
+            self._pending_notice = (f'[SHARED-CAPTURE RETUNE] center={center:g} '
+                f'raw_start={self._generation_start} interrupted={self._interrupted}')
+        # Controller -> owner is the normal lock order. Cancellation belongs
+        # outside the owner lock, and a writing prefix keeps its own lease.
+        if self.header_controller is not None:
+            self.header_controller.invalidate_sources()
+        self._wake.set()
 
     def _spec(self, target_factor, frequency):
         target_factor = int(target_factor)
@@ -285,7 +359,10 @@ class SharedCapture:
         shared = next((d for d in range(target_factor // 2, 0, -1)
                        if target_factor % d == 0), 1)
         wanted_half = self.rate / (2 * target_factor)
-        if target_factor == 1:
+        if target_factor in (1, 2):
+            # Nearby D2 estimates otherwise retain a separate half-rate band
+            # each. One unfiltered raw parent shares their samples; _render
+            # applies the original D2 FIR at every view's own center/origin.
             return 1, self.center
         if shared == 1 and target_factor > 1:
             # A prime D (e.g. D5 at10Msps) would otherwise expand a short
@@ -323,6 +400,12 @@ class SharedCapture:
                     return None
                 if self._watermark is not None and identity != self._identity(self._watermark):
                     raise SharedCaptureFailure('capture registration has stale raw identity')
+                if base_start < self._generation_start:
+                    self._non_admitted += len(detections)
+                    self._pending_notice = ('[SHARED-CAPTURE NON-ADMISSION] '
+                        'capture lookback crosses commanded retune boundary')
+                    self._wake.set()
+                    return None
                 if end <= base_start or base_end < base_start:
                     raise ValueError('invalid capture range')
                 useful = []
@@ -382,7 +465,7 @@ class SharedCapture:
                     if band is None:
                         credit = self.budget.reserve('band_retention', 0)
                         band = _Band(center, factor, target_factor, int(base_start), identity,
-                                     credit, cursor=int(base_start))
+                                     credit, cursor=int(base_start), input_center=self.center)
                         self._bands.append(band)
                     start = -(-(int(base_start) - band.origin) // factor)
                     stop = -(-(int(end) - band.origin) // factor)
@@ -464,7 +547,8 @@ class SharedCapture:
             raise ValueError('invalid internal slice role')
         with self._lock:
             band = ref.band
-            if self.failure or self._closing or band not in self._bands:
+            if (self.failure or self._closing or band not in self._bands
+                    or band.sealed):
                 raise SharedCaptureFailure('slice source identity ended')
             begin = -(-(int(begin_raw) - band.origin) // band.factor)
             stop = -(-(int(end_raw) - band.origin) // band.factor)
@@ -630,7 +714,7 @@ class SharedCapture:
             # fast band. Recover the oldest missing raw interval first so
             # insertion order cannot cause an avoidable ring lap.
             for band in sorted(self._bands, key=lambda b: b.cursor):
-                if not band.refs or band.busy:
+                if not band.refs or band.busy or band.sealed:
                     continue
                 through = band.origin + max(r.context_end for _, r in band.refs) * band.factor
                 through += 10 * band.factor if band.factor > 1 else 0
@@ -644,7 +728,8 @@ class SharedCapture:
             band, start, n = selected
             try:
                 if band.factor > 1 and band.decimator is None:
-                    band.decimator = self.factory(band.center - self.center, self.rate, band.factor)
+                    band.decimator = self.factory(band.center - band.input_center,
+                                                  self.rate, band.factor)
                 history_parts = (self.reader.received_history_parts if self._published_history
                                  else self.reader.history_parts)
                 data = next(history_parts((start, *band.identity), n, self.hop_n))
@@ -658,7 +743,7 @@ class SharedCapture:
                     output = output.copy()
                 output.flags.writeable = False
                 with self._lock:
-                    if not self.failure:
+                    if not self.failure and not band.sealed:
                         if len(output):
                             band.chunks.append((band.produced, output))
                             band.produced += len(output)
@@ -667,7 +752,9 @@ class SharedCapture:
             except Exception as exc:
                 with self._lock:
                     band.busy = False
-                    self._fail_locked(f'raw history/crop interval {start}:{start+n} failed: {exc}')
+                    if not band.sealed:
+                        self._fail_locked(f'raw history/crop interval {start}:{start+n} failed: {exc}')
+                    self._retire()
                 return False
         transfer = None
         with self._lock:
@@ -721,7 +808,8 @@ class SharedCapture:
 
     def _render(self, view, index):
         with self._lock:
-            if view is not self._writing or not view.complete or view._released:
+            if (view is not self._writing or not (view.complete or view.interrupted)
+                    or view._released):
                 raise SharedCaptureFailure('save view is not owned/stable')
             ref = next(r for r in view.refs if r.index == index)
             band = ref.band
@@ -737,9 +825,10 @@ class SharedCapture:
             if cursor != ref.context_end:
                 raise SharedCaptureFailure('view lacks emitted right context')
             raw_start = band.origin + ref.start * band.factor
-            size = math.ceil((view.end - raw_start) / view.target_factor)
+            end = view.end if ref.received_end is None else ref.received_end
+            size = max(0, math.ceil((end - raw_start) / view.target_factor))
             factor = view.target_factor // band.factor
-            phase = np.complex64(np.exp(2j * np.pi * (((band.center-self.center)
+            phase = np.complex64(np.exp(2j * np.pi * (((band.center-band.input_center)
                                  * (raw_start-band.origin) / self.rate) % 1)))
             offset = ref.center - band.center
         output = np.empty(size, np.complex64)
@@ -773,7 +862,7 @@ class SharedCapture:
             if view._released:
                 return
             view._released = True
-            if view._render_failed or self.failure:
+            if view._render_failed or self.failure or view.interrupted:
                 if view.role in ('header_prefix', 'early'):
                     self._optional_incomplete += 1
                 else:
@@ -842,6 +931,7 @@ class SharedCapture:
                     'active_views': sum(v.state not in ('done','cancelled') for v in self._views),
                     'ready_views': sum(v.state == 'ready' for v in self._views),
                     'completed_views': self._completed, 'incomplete_views': self._incomplete,
+                    'interrupted_views': self._interrupted,
                     'optional_completed_views': self._optional_completed,
                     'optional_incomplete_views': self._optional_incomplete,
                     'non_admitted': self._non_admitted,

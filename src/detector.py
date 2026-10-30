@@ -4102,8 +4102,13 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     _hw = max(2, int(round(bw / 8.0 / _fres_w)))
                     if 40 < _cbw < 4055:
                         _flw2 = float(np.median(_psw))
-                        _c1 = (_cbw - _hw
-                               + int(np.argmax(_psw[_cbw - _hw:_cbw + _hw + 1])))
+                        # Carrier-local searches can straddle the PSD edge.
+                        # A negative slice start wraps to the opposite edge,
+                        # leaving an empty interval and losing this whole window.
+                        _search_lo = max(0, _cbw - _hw)
+                        _search_hi = min(len(_psw), _cbw + _hw + 1)
+                        _c1 = (_search_lo
+                               + int(np.argmax(_psw[_search_lo:_search_hi])))
                         _pk2 = float(_psw[_c1])
                         if _pk2 > _flw2 * 63.0:
                             _thw2 = _pk2 / 15.85
@@ -5101,6 +5106,16 @@ class SignalRecorder:
         if getattr(self, '_shared', None) is not None:
             self._shared.raise_if_failed()
 
+    def retune(self, center_hz):
+        """Keep completed IQ at its original tuning and seal unfinished spans."""
+        if getattr(self, '_shared', None) is not None:
+            self._shared.retune(center_hz)
+        else:
+            self.break_pending('commanded retune')
+            if getattr(self, '_history_reader', None) is not None:
+                self._history_reader.invalidate_history()
+        self.center_hz = float(center_hz)
+
     def _register_shared(self, detections, wideband_n, sample_pos, pre_hop_n,
                          need_tail_n, history_anchor):
         shared = self._shared
@@ -5108,6 +5123,8 @@ class SignalRecorder:
         source = history_anchor
         if source is None:
             source = self._history_reader.history_anchor(sample_pos)
+        if source is not None and source[2] < current[2]:
+            return  # a bounded detector job completed after a commanded retune
         if (source is None or source[1:] != current[1:]
                 or source[0] - source[1] != sample_pos):
             shared._fail('stale/missing source identity for capture registration')
@@ -5562,11 +5579,13 @@ class SignalRecorder:
                 _nb_job = None
                 _capture_role = 'default'
                 _role_name = ''
+                _input_center = self.center_hz
                 if (isinstance(extended_full, tuple)
                         and extended_full[0] == 'NB_SHARED'):
                     _shared_save = extended_full[1]
+                    _input_center = _shared_save.input_center
                     if _shared_save.role == 'header_prefix':
-                        self._header.write_prefix(_shared_save)
+                        _shared_save._owner.header_controller.write_prefix(_shared_save)
                         continue  # finally releases only this optional source view
                     _capture_role = _shared_save.role
                     _role_name = f'_{_capture_role}_{_shared_save.number}'
@@ -5699,7 +5718,7 @@ class SignalRecorder:
                 # i.e. absolute 925.1 MHz, not the gate-reported 926.77).
                 # The gate's freq is already validated; trust it directly.
                 _ext_fft_cache = []
-                anchor_off = anchor['freq_hz'] - self.center_hz
+                anchor_off = anchor['freq_hz'] - _input_center
                 # nb_fs and sym_n needed for filename + decoder hint math.
                 # NB items carry the cropper's exact realized rate
                 # (wb_fs/D — equals export_bw*2 for standard presets at
@@ -6082,7 +6101,7 @@ class SignalRecorder:
                     # images whose source real signal was detected in a different
                     # (overlapping) window than this one — which the per-window
                     # check in detect_preamble misses (~2/3 of images leaked).
-                    _mirror_f = 2.0 * self.center_hz - _cand_freq
+                    _mirror_f = 2.0 * _input_center - _cand_freq
                     with self._img_lock:
                         _cand_pwr = max(
                             (c[1] for c in self._img_carriers
@@ -6139,7 +6158,7 @@ class SignalRecorder:
                     # (carrier_hz was measured relative to the anchor).
                     d = dict(_src)
                     d['freq_hz'] = anchor['freq_hz'] + carrier_hz
-                    off = d['freq_hz'] - self.center_hz
+                    off = d['freq_hz'] - _input_center
                     if _nb_job is not None:
                         # Already extracted by the cropper, centred on
                         # this detection's own carrier (preambles come
@@ -6253,7 +6272,7 @@ class SignalRecorder:
                     # one packet's adjacent-window duplicates through is one
                     # extra save_worker invocation per packet, which is
                     # absorbed by the 4-thread save_worker pool.
-                    corrected_abs = self.center_hz + off  # used in filename
+                    corrected_abs = _input_center + off  # used in filename
 
                     # Encode the true capture rate so the decoder reads it
                     # exactly instead of GUESSING from file size (the guess is
@@ -7408,10 +7427,10 @@ while True:
         relay_before_syms: blank from symbol N onward   → find hop BEFORE primary.
         bucket_key:        (cand_freq_hz, abs_t_s) for Phase-2 cross-worker
                            bucket dedup; None disables the dedup for this job.
-        role:              early/shared_full/continuation views must search all
+        role:              early/shared_full/shared_partial/continuation views search all
                            their frames; they never consume whole-window buckets.
         """
-        if role not in ('default', 'early', 'shared_full', 'continuation'):
+        if role not in ('default', 'early', 'shared_full', 'shared_partial', 'continuation'):
             raise ValueError('unknown capture role')
         if not self._decoder_script or self._aborting():
             return
@@ -9268,6 +9287,9 @@ def main():
     # _live_center_mhz is read by the closures/loop below; the integer-bin transition
     # blip during a manual change lasts < 1 window and self-corrects.
     _live_center_mhz = a.center
+    # Detector-clock lower bound for windows and lookback after a retune.
+    # Raw ring coordinates include drops; tot_s intentionally does not.
+    _history_floor = 0
     _ctl_path = os.environ.get('LORA_SDR_CTL') or None
     try:
         _ctl_mtime = os.stat(_ctl_path).st_mtime if _ctl_path else None
@@ -9400,6 +9422,10 @@ def main():
         _need = _capture_tail_n(recorder, dets, win_n, warn=False)
         return -(-_need // _tail_seg_n)   # ceil
 
+    def _source_before_retune(anchor):
+        return (is_live and anchor is not None
+                and anchor[2] < reader.history_anchor()[2])
+
     def _commit_oldest():
         """Pop the oldest in-flight window, wait for its detection, print and
         hand it to the recorder.  Tail = the next window's forward overlap."""
@@ -9407,6 +9433,13 @@ def main():
         it = _inflight.popleft()
         _t_res0 = time.time()
         dets0 = _pool.result(it['seq'])
+        if _source_before_retune(it.get('history_anchor')):
+            # The worker has finished with this slot. Releasing it at retune
+            # would let a new dispatch overwrite IQ still read by that worker.
+            _pool.release_slot(it['slot'])
+            print(f"[RETUNE] discarded old detector window {it['seq']}",
+                  file=sys.stderr, flush=True)
+            return
         _res_wait = time.time() - _t_res0
         if _res_wait > 0.2 and os.environ.get('LORA_SLOW_DEBUG'):
             print(f"[COMMIT-WAIT] {_res_wait:.2f}s on seq {it['seq']}",
@@ -9624,14 +9657,46 @@ def main():
                         if _nc != _live_center_mhz:
                             _live_center_mhz = _nc
                             if is_live:
-                                reader.invalidate_history()
-                            _slow_halves.clear()
-                            # The recorder reads center_hz live to compute each
-                            # capture's wideband crop offset (off = freq_hz -
-                            # center_hz).  It MUST track the retune or it crops the
-                            # wrong slice and every decode fails after a move.
+                                _retune_before = reader.history_anchor()
                             if recorder is not None:
-                                recorder.center_hz = _live_center_mhz * 1e6
+                                recorder.retune(_live_center_mhz * 1e6)
+                            if is_live:
+                                # Shared capture owns its generation rollover;
+                                # legacy/no-recorder paths still invalidate once.
+                                if reader.history_anchor()[2] == _retune_before[2]:
+                                    reader.invalidate_history()
+                                _retune_anchor = reader.received_history_anchor()
+                                _capture = getattr(recorder, '_shared', None)
+                                _retune_raw_start = (_capture._generation_start
+                                    if _capture is not None else _retune_anchor[0])
+                                _history_floor = _retune_raw_start - _retune_anchor[1]
+                                # This is the published receive boundary. The
+                                # radio polls control independently; it is not
+                                # an acquisition-side hardware-retune timestamp.
+                            buf_pos = 0
+                            if _lz is not None:
+                                _lz.reset()
+                                buf = None
+                            else:
+                                buf = np.zeros(win_n, dtype=np.complex64)
+                            pre_hop = None
+                            _carry_tail = None
+                            _prehop_hist.clear()
+                            _slice_cache.clear()
+                            _slow_halves.clear()
+                            if _slow_hold:
+                                print(f'[RETUNE] discarded {len(_slow_hold)} old held slow captures',
+                                      file=sys.stderr, flush=True)
+                            _slow_hold.clear()
+                            _slow_pending.clear()
+                            _slow_seeds.clear()
+                            _slow_exact.clear()
+                            _slow_backoff.clear()
+                            _slow_fruitless.clear()
+                            _slow_last_fire = -10**9
+                            # Keep _inflight slots and the old _slow_busy owner
+                            # until their workers finish; consume stale results
+                            # below without publishing or repopulating bins.
                             sys.stderr.write('detector: live center -> %.4f MHz\n'
                                              % _live_center_mhz); sys.stderr.flush()
                             # Patience accumulator is indexed by ABSOLUTE PSD
@@ -9769,7 +9834,9 @@ def main():
             # window and is contiguous with it.  Used as recording lookback so
             # the decoder always sees the full preamble even when it started
             # before the detection window.
-            if recorder:
+            _ph1 = tot_s - _n_iq - win_n + hop_n
+            _ph0 = _ph1 - _max_pre_hop_n
+            if recorder and _ph0 >= _history_floor:
                 # Save the most recent _max_pre_hop_n samples from the portion
                 # about to leave the window.  These are contiguous with the new
                 # window: buf[hop_n-_max_pre_hop_n:hop_n] = [T-0.4s, T-0.1s).
@@ -9779,8 +9846,6 @@ def main():
                 #
                 # The OLD (pre-slide) buf spans abs [tot_s-len(iq)-win_n,
                 # tot_s-len(iq)); pre_hop's abs range is [_ph0, _ph1).
-                _ph1 = tot_s - _n_iq - win_n + hop_n
-                _ph0 = _ph1 - _max_pre_hop_n
                 _ph_ref = None
                 if _prehop_ref_on:
                     # Reuse an earlier _hop_own if one FULLY CONTAINS the
@@ -9808,6 +9873,8 @@ def main():
                                _lz.seg_owned(hop_n - _max_pre_hop_n,
                                              _max_pre_hop_n))
                     _prehop_copies += 1
+            else:
+                pre_hop = None  # no real lookback before the new generation
             if _lz is not None:
                 _lz.slide(iq)      # 40 MB raw slide vs 320 MB c64 traffic
                 buf = None         # nothing may touch buf until materialized
@@ -9815,7 +9882,7 @@ def main():
                 buf[:sh] = buf[len(iq):]
                 buf[sh:] = iq
         buf_pos += _n_iq
-        if buf_pos < win_n:
+        if buf_pos < win_n or tot_s - win_n < _history_floor:
             continue
         _prof['read'] += time.time() - _t_step
         _t_step = time.time()
@@ -10798,9 +10865,7 @@ def main():
                 _inflight.append({'seq': _seq, 'slot': _slot,
                                   'pre_hop': pre_hop, 'tot_s': tot_s,
                                   'history_anchor': (reader.history_anchor(tot_s)
-                                      if is_live and recorder is not None
-                                      and getattr(recorder, '_shared', None) is not None
-                                      else None)})
+                                      if is_live else None)})
                 _seq += 1
                 # Tail-aware commit: once depth exceeds the base lag, commit the
                 # oldest ONLY when its detection is ready AND enough trailing windows
@@ -11240,6 +11305,10 @@ def main():
             _due = [h for h in _slow_hold if h[0] <= _slow_tick]
             _slow_hold = [h for h in _slow_hold if h[0] > _slow_tick]
             for _dl, _dets_h, _iql_h, _rts_h, _ha_h in _due:
+                if _source_before_retune(_ha_h):
+                    print('[RETUNE] discarded old held slow capture',
+                          file=sys.stderr, flush=True)
+                    continue
                 _keep_h = []
                 for d in _dets_h:
                     _da = (_rts_h - len(_iql_h)) / a.rate + d.get('preamble_t_s', 0.0)
@@ -11259,6 +11328,10 @@ def main():
         # consume finished background scans (bookkeeping on main thread)
         while not _slow_results.empty():
             dets_slow, _iq_long, _reg_tot_s, _trig_done, _history_done = _slow_results.get()
+            if _source_before_retune(_history_done):
+                print('[RETUNE] discarded old slow result',
+                      file=sys.stderr, flush=True)
+                continue
             _hit_bins = set()
             _hit_cool = {}       # hit bin -> post-hit cooldown (ticks)
             for d in dets_slow:

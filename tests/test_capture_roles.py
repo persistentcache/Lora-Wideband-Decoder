@@ -24,7 +24,7 @@ def mesh(identifier):
             f'PacketID: {identifier} Flags: 0x00 (hop_limit=0 hop_start=0 hops_taken=0)\n\n')
 
 
-@pytest.mark.parametrize('role',['early','shared_full','continuation'])
+@pytest.mark.parametrize('role',['early','shared_full','shared_partial','continuation'])
 def test_role_never_registers_waits_or_marks_whole_window(dec,tmp_path,role):
     bucket=(915e6,100.,12,62500)
     legacy=tmp_path/'legacy.cf32'; legacy.write_bytes(b'iq')
@@ -92,7 +92,7 @@ for line in sys.stdin:
     monkeypatch.setattr(dec,'_rawlog',lambda *args:raw.append(args))
     bucket=(915e6,100.,12,62500)
     paths=[]
-    for role in ('early','shared_full','continuation'):
+    for role in ('early','shared_full','shared_partial','continuation'):
         path=tmp_path/f'{role}.cf32';path.write_bytes(b'iq');paths.append(path)
         dec.submit(str(path),path.name,bucket_key=bucket,role=role)
     original_get=dec._queue.get
