@@ -208,16 +208,18 @@ def test_slow_result_checks_generation_before_trigger_state_or_publication(
     results = queue.Queue()
     results.put(([detection()], np.zeros(4000, np.complex64), 4000,
                  [2048], (4500, 500, generation)))
-    observed = []
+    observed, admitted = [], []
     state.update(_slow_results=results, _slow_hold=[], _slow_seeds={},
                  _slow_backoff={}, _slow_fruitless={}, _LAG=4,
                  a=SimpleNamespace(rate=1000), t_start=0,
+                 _record_slow_capture=lambda *args, **kwargs: admitted.append((args, kwargs)),
                  _pat_note_detection=lambda frequency: observed.append(('pat', frequency)),
                  _jk_note_detection=lambda frequency: observed.append(('junk', frequency)))
     exec(production['functions'], state)
     exec(production['slow'], state)
     assert results.empty()
-    assert bool(state['_slow_seeds']) == bool(state['_slow_hold']) == accepted
+    assert bool(state['_slow_seeds']) == bool(admitted) == accepted
+    assert not state['_slow_hold']
     assert bool(observed) == accepted
     assert state['tot_d'] == 2 + int(accepted)
     assert ('DETECTED' in capsys.readouterr().out) == accepted
