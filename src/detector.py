@@ -21,7 +21,7 @@ Usage:
   | python detector.py -r 40000000 -b 28000000 -c 915 -t sc16 -d 1
 """
 
-import sys, os
+import sys, os, math
 # Pin BLAS/FFT pools to ONE thread — MUST precede the numpy import.
 # Two reasons:
 # 1. DEADLOCK (found live 2026-07-09, py-spy): scipy-OpenBLAS registers a
@@ -428,9 +428,66 @@ def patience_cap_params(d):
     _sf, _bw = int(d['sf']), float(d['bw'])
     if not d.get('patience_trial'):
         return _bw, float(1 << _sf) / _bw
-    _fam = patience_trial_family(_sf, _bw)
+    _fam = patience_detection_family(d)
     return (max(b for _, b in _fam),
             max(float(1 << s) / b for s, b in _fam))
+
+
+def patience_detection_family(detection):
+    """Use the supported trial family, or the unchanged historical default."""
+    family = detection.get('_patience_covered_family')
+    return (family if family is not None else
+            patience_trial_family(detection['sf'], detection['bw']))
+
+
+def _rf_footprint_covered(frequency, bandwidth, center, rate):
+    """Match the recorder's useful RF check, independently of export width."""
+    half = float(bandwidth) / 2
+    return (math.isfinite(float(frequency)) and half > 0
+            and abs(frequency - center) + half <= rate / 2 + 1e-6)
+
+
+def _covered_dechirp_channels(channels, center, rate):
+    """Keep supported forced hypotheses in order; preserve ordinary peaks."""
+    covered, rejected = [], []
+    for channel in channels or ():
+        offset, sf, bandwidth = channel[:3]
+        frequency = center + offset  # same expression as the emitted detection
+        trial = bool(len(channel) > 3 and channel[3])
+        if not _rf_footprint_covered(frequency, bandwidth, center, rate):
+            rejected.append(dict(source='patience' if trial else 'configured',
+                sf=sf, bw=bandwidth, frequency_hz=frequency,
+                rf_low_hz=frequency-bandwidth/2, rf_high_hz=frequency+bandwidth/2,
+                input_low_hz=center-rate/2, input_high_hz=center+rate/2))
+            continue
+        if trial:
+            # A direct caller may reuse hypotheses after changing rate/center.
+            # Recompute coverage instead of retaining an obsolete restriction.
+            channel = tuple(channel[:4])
+            original = patience_trial_family(sf, bandwidth)
+            family = tuple((s,b) for s,b in original
+                           if _rf_footprint_covered(frequency,b,center,rate))
+            # An external direct caller can use a rung outside the built-in
+            # ladder. Its own fully covered hypothesis remains usable even
+            # when every in-ladder alias lies outside the input.
+            if not family:
+                family = ((int(sf),float(bandwidth)),)
+            if family != tuple(original):
+                channel = tuple(channel[:4]) + (family,)
+        covered.append(channel)
+    return covered, rejected
+
+
+def _report_dechirp_coverage(representative, total, counts, where):
+    """One summary per reporting interval, retaining explicit coverage loss."""
+    item = representative
+    print(f'[DECHIRP-COVERAGE] total={total} patience={counts["patience"]} '
+          f'configured={counts["configured"]} where={where} '
+          f'source={item["source"]} SF{item["sf"]} bw={item["bw"]:g} '
+          f'rf=[{item["rf_low_hz"]:.6f},{item["rf_high_hz"]:.6f}] '
+          f'input=[{item["input_low_hz"]:.6f},{item["input_high_hz"]:.6f}] '
+          'forced hypothesis outside received RF coverage',
+          file=sys.stderr, flush=True)
 
 # PRESCREEN — outcome-learned persistent-junk suppression (2026-07-14,
 # measured low-core ceiling item 3).  On a junk-heavy host (Pi at 20 Msps,
@@ -3093,6 +3150,15 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
     if os.environ.get('LORA_STUB_DETECT'):
         return []   # diagnostic: measure producer-only throughput
     center_hz = center_mhz * 1e6
+    dechirp_chans, _uncovered_chans = _covered_dechirp_channels(
+        dechirp_chans, center_hz, wb_fs)
+    if _uncovered_chans:
+        # Main-loop callers already partition before scheduling. This covers
+        # direct callers too, without removing their real energy/SC peaks.
+        _counts = {name: sum(item['source'] == name for item in _uncovered_chans)
+                   for name in ('patience','configured')}
+        _report_dechirp_coverage(_uncovered_chans[0], len(_uncovered_chans),
+                                _counts, 'direct')
     nfft_c = 4096
     fres = wb_fs / nfft_c
 
@@ -3385,6 +3451,8 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                         'forced_dechirp': True,   # Fix #2: collapse repeats via wide cooldown dedup
                         'patience_trial': _ltrial,  # acquisition-internal: never published/counted
                     })
+                    if len(_dech) > 4:
+                        _ld[-1]['_patience_covered_family'] = _dech[4]
                     return _ld
             except Exception:
                 pass
@@ -4735,7 +4803,7 @@ def _capture_duration_s(detection):
         # Preserve the explicit override's historical symbol semantics.
         return (16 + 4.25 + 8 + int(override)) * patience_cap_params(detection)[1]
     sf, bw = int(detection['sf']), float(detection['bw'])
-    family = (patience_trial_family(sf, bw)
+    family = (patience_detection_family(detection)
               if detection.get('patience_trial') else [(sf, bw)])
     durations = []
     for sf, bw in family:
@@ -6371,8 +6439,7 @@ class SignalRecorder:
                         # decode-confirm is unchanged.
                         _fam_links = []
                         if _lbl_blind:
-                            for _fsf, _fbw in patience_trial_family(
-                                    _src['sf'], _src['bw']):
+                            for _fsf, _fbw in patience_detection_family(_src):
                                 if (_fsf == _src['sf']
                                         and abs(_fbw - _src['bw']) < 1.0):
                                     continue          # primary label itself
@@ -8902,6 +8969,10 @@ def main():
     _pat_futile = {}      # promoted bin -> futile energy-present window count
     _pat_confirmed = set()  # promoted bins with >=1 decode confirm
     _pat_cooldown = {}    # bin -> wc when re-promotion is allowed again
+    _coverage_counts = {'patience': 0, 'configured': 0}
+    _coverage_total = _coverage_reported = 0
+    _coverage_report_at = 0.0
+    _coverage_representative = None
     def _pat_note_detection(_freq_hz):
         """A REAL detection published at _freq_hz: zero accumulated hits and
         expire any promotion within ±1 MHz — patience only pursues carriers
@@ -10553,10 +10624,15 @@ def main():
         # weak/far signals that would despread fine), giving dedicated-narrowband-
         # receiver sensitivity.  No false-positive risk: dechirp + CRC reject empty
         # windows; cost bounded by the cap.  ADDITIVE — non-channel peaks untouched.
-        if _dechirp_src and not _win_backlogged:
+        _configured_chans, _coverage_rejected = _covered_dechirp_channels(
+            [(_c-_live_center_mhz*1e6, _s, _b) for _c,_b,_s in _dechirp_src],
+            _live_center_mhz*1e6, a.rate)
+        _covered_dechirp_src = [(_live_center_mhz*1e6+_o, _b, _s)
+                                for _o,_s,_b in _configured_chans]
+        if _covered_dechirp_src and not _win_backlogged:
             _fres_gate = a.rate / 4096.0
             _cen_hz = _live_center_mhz * 1e6
-            for _cc, _bw_hz, _csf in _dechirp_src:
+            for _cc, _bw_hz, _csf in _covered_dechirp_src:
                 _cbin = 2048 + int(round((_cc - _cen_hz) / _fres_gate))
                 if 0 <= _cbin < 4096 and not any(abs(_pk[0] - _cbin) < 15 for _pk in _gate_peaks):
                     _wbins = max(3, int(round(_bw_hz / _fres_gate)))
@@ -10568,7 +10644,7 @@ def main():
             # Keep only the peak NEAREST each channel centre (the carrier); drop the
             # in-channel sidelobes so the dechirp runs ONCE per channel.  Peaks OUTSIDE
             # the learned channels (wideband discovery) are untouched.
-            for _cc, _bw_hz, _csf in _dechirp_src:
+            for _cc, _bw_hz, _csf in _covered_dechirp_src:
                 _cbin = 2048 + int(round((_cc - _cen_hz) / _fres_gate))
                 _w = max(1, int(round(_bw_hz / _fres_gate)))
                 _in = [_pk for _pk in _gate_peaks if abs(_pk[0] - _cbin) < _w]
@@ -10626,7 +10702,7 @@ def main():
                         continue                    # CW/continuous — not a beacon
                     if any(abs((_cc0 - _cen_pat) / _fres_pat + 2048 - _cb)
                            < max(3.0, _bw0 / _fres_pat)
-                           for _cc0, _bw0, _sf0 in _dechirp_src):
+                           for _cc0, _bw0, _sf0 in _covered_dechirp_src):
                         continue                    # a channel already covers it
                     _lo = max(0, _cb - 4); _hi = min(4096, _cb + 5)
                     _wv = _pat_hits[_lo:_hi].astype(np.float64)
@@ -10641,6 +10717,22 @@ def main():
                           % (_phz / 1e6, float(_pat_hits[_cb]),
                              int(_duty * 100), len(_pat_promoted), PATIENCE_CAP),
                           file=sys.stderr, flush=True)
+        # Partition this window's rotating rungs before adding placeholders.
+        # A narrower covered rung survives even if its wider alias cannot be
+        # received; that same feasible family travels to capture and decode.
+        _patience_chans = []
+        if _pat_promoted and not _win_backlogged:
+            _cen_pat = _live_center_mhz * 1e6
+            for _pi, (_pb, (_pexp, _phz)) in enumerate(_pat_promoted.items()):
+                for _k in range(PATIENCE_TRIALS_PER_WIN):
+                    _tsf, _tbw = PATIENCE_TRIALS[
+                        (wc * PATIENCE_TRIALS_PER_WIN + _pi + _k)
+                        % len(PATIENCE_TRIALS)]
+                    _patience_chans.append((_phz - _cen_pat, _tsf, _tbw, True))
+        _patience_chans, _patience_uncovered = _covered_dechirp_channels(
+            _patience_chans, _live_center_mhz*1e6, a.rate)
+        _coverage_rejected.extend(_patience_uncovered)
+        _covered_patience_offsets = {_channel[0] for _channel in _patience_chans}
         # Forced peak per active promotion, every window (mirrors the
         # channelizer force above; 125 kHz width placeholder — the per-peak
         # pipeline measures the real width/preset itself).
@@ -10648,6 +10740,8 @@ def main():
             _fres_pat = a.rate / 4096.0
             _cen_pat = _live_center_mhz * 1e6
             for _pb, (_pexp, _phz) in _pat_promoted.items():
+                if _phz-_cen_pat not in _covered_patience_offsets:
+                    continue  # real energy peaks remain available to ordinary SC
                 _cbin = 2048 + int(round((_phz - _cen_pat) / _fres_pat))
                 if (0 <= _cbin < 4096
                         and not any(abs(_pk[0] - _cbin) < 15 for _pk in _gate_peaks)):
@@ -10663,16 +10757,18 @@ def main():
         # the plain SC chain and the promotion is pointless below ~+2 dB.
         # Rebuilt every window; handed to BOTH detect paths (pool dispatch
         # carries it per-task so live channel changes reach the workers too).
-        _win_chans = [(_c - _live_center_mhz * 1e6, _s, _b)
-                      for (_c, _b, _s) in _dechirp_src]
-        if _pat_promoted and not _win_backlogged:
-            _cen_pat = _live_center_mhz * 1e6
-            for _pi, (_pb, (_pexp, _phz)) in enumerate(_pat_promoted.items()):
-                for _k in range(PATIENCE_TRIALS_PER_WIN):
-                    _tsf, _tbw = PATIENCE_TRIALS[
-                        (wc * PATIENCE_TRIALS_PER_WIN + _pi + _k)
-                        % len(PATIENCE_TRIALS)]
-                    _win_chans.append((_phz - _cen_pat, _tsf, _tbw, True))
+        _win_chans = _configured_chans + _patience_chans
+        for _excluded in _coverage_rejected:
+            _coverage_counts[_excluded['source']] += 1
+        _coverage_total += len(_coverage_rejected)
+        if _coverage_rejected:
+            _coverage_representative = _coverage_rejected[0]
+        if (_coverage_total != _coverage_reported
+                and time.monotonic()-_coverage_report_at >= 5.0):
+            _report_dechirp_coverage(_coverage_representative, _coverage_total,
+                                    _coverage_counts, 'main')
+            _coverage_reported = _coverage_total
+            _coverage_report_at = time.monotonic()
 
         # Offer deferred work a turn every window, including under sustained
         # traffic. The scheduler limits it to one reservation, uses a fast-job
@@ -10861,7 +10957,7 @@ def main():
                 _pool.slot_array(_slot)[:len(buf)] = buf
                 _pool.dispatch(_slot, _seq, len(buf), _psd_gate, _gate_peaks,
                                spur_db=_spur_db, center=_live_center_mhz,
-                               dechirp_chans=(_win_chans or None))
+                               dechirp_chans=_win_chans)
                 _inflight.append({'seq': _seq, 'slot': _slot,
                                   'pre_hop': pre_hop, 'tot_s': tot_s,
                                   'history_anchor': (reader.history_anchor(tot_s)
