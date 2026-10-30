@@ -1472,9 +1472,13 @@ def _on_lorawan_grid(freq_mhz, sf, bw, region=None, tol_khz=None):
 
 def parse_lorawan_packet(payload, rf=None):
     """Parse a LoRaWAN frame: print human-readable fields AND return a normalized
-    record dict (proto='lorawan') for the [PKT] stream, or None."""
+    unknown/candidate record with hint='lorawan' for the [PKT] stream, or None."""
     if len(payload) < 1:
         return None
+    # Demodulation supplies byte lists; the field slices below need .hex().
+    # Restrict conversion so bytes(integer) cannot manufacture a valid frame.
+    if isinstance(payload, list):
+        payload = bytes(payload)
     mhdr   = payload[0]
     mtype  = (mhdr >> 5) & 0x07
     major  = mhdr & 0x03
@@ -1506,7 +1510,7 @@ def parse_lorawan_packet(payload, rf=None):
         # 18-byte frame no Rejoin variant can produce.)
         # RejoinType 0/2 are 19 bytes, type 1 is 24 (TS001 1.1 §6.2.4); an
         # unchecked type read MIC bytes as the DevEUI and doubled the FP window.
-        if payload[1] not in (0, 1, 2): return None
+        if n < 2 or payload[1] not in (0, 1, 2): return None
         if n != (24 if payload[1] == 1 else 19): return None
     else:                                           # 0b111 Proprietary — unvalidatable w/o keys
         return None
