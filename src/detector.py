@@ -11406,12 +11406,19 @@ def main():
                           f"abst={_abst:.2f}s [slow-pass]",
                           flush=True)
                 if recorder:
-                    # Admit shared spans now so header work can start when its
-                    # prefix is ready. Keep the full tail and later full-save dedup.
-                    # Legacy wider aliases still wait for the main pass to
-                    # claim the same label, avoiding expensive duplicate jobs.
-                    # Keep the original groups separate: each registration
-                    # resolves label conflicts and chooses its own export/tail.
+                    # The slow pass exists for the 31.25k/41.67k presets; its
+                    # alias-chain vote may still resolve a wider class and then
+                    # re-detect a burst the main pass records — at a centroid
+                    # ~bw/4 off (slow to decode) and usually FIRST, so the
+                    # recorder cannot know it is a copy yet.  Live: 17 of 96
+                    # detections, 23-25 SF12/125k decode jobs for 3 frames, the
+                    # off-centre copies 30-50 s each.  Slow-class hits record
+                    # now, including modes whose 16-symbol gate exceeds the
+                    # main window. Other classes are HELD commit-lag + 6 hops (the
+                    # main pass commits _LAG hops late and its tail assembly
+                    # adds a few more — measured 2-5 s behind the slow pass)
+                    # and recorded only if the main pass has not claimed the
+                    # same label within +-bw and 1.5 s by then.
                     _slow_now = [d for d in dets_slow
                                  if _slow_record_immediately(d, win_n / a.rate)]
                     _slow_later = [d for d in dets_slow
@@ -11424,17 +11431,9 @@ def main():
                             history_reader=reader if is_live else None,
                             history_anchor=_history_done)
                     if _slow_later:
-                        if getattr(recorder, '_shared', None) is not None:
-                            _record_slow_capture(
-                                recorder, _slow_later, _iq_long, _reg_tot_s,
-                                sample_pos=tot_s, hop_n=hop_n, win_n=win_n,
-                                recent_hops=_slow_halves,
-                                history_reader=reader if is_live else None,
-                                history_anchor=_history_done)
-                        else:
-                            _slow_hold.append((_slow_tick + min(_LAG + 6, _slow_halves.maxlen),
-                                               _slow_later, _iq_long, _reg_tot_s,
-                                               _history_done))
+                        _slow_hold.append((_slow_tick + min(_LAG + 6, _slow_halves.maxlen),
+                                           _slow_later, _iq_long, _reg_tot_s,
+                                           _history_done))
         _prof['slow'] += time.time() - _t_slowblk0
         _t_step = time.time()
 
