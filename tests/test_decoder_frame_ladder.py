@@ -322,10 +322,13 @@ def test_grid_aliases_of_one_preamble_merge_to_the_best_scored(production_merge)
                cand(246.3, 124800, 1956)]     # start +1920, bin +1920
     other_cfo = cand(240.0, 122880, 60)       # same time, 24 bins away
     far_same_cfo = cand(230.0, 122880 + 5 * N, 36)   # a later frame
+    # A lock on the same preamble 1.93 symbols later (the live SF11/500k
+    # crop that decodes only there) is its own candidate, not a grid alias.
+    later_lock = cand(228.0, 122880 + 3948, (36 + 3948) % N)
     _, downchirp = chirps(11, 250000)
-    kept = production_merge([best] + aliases + [other_cfo, far_same_cfo], N,
+    kept = production_merge([best] + aliases + [other_cfo, far_same_cfo, later_lock], N,
                             noise(200 * N), downchirp, 9)
-    assert kept == [best, other_cfo, far_same_cfo]   # noise: no header, score order
+    assert kept == [best, other_cfo, far_same_cfo, later_lock]   # noise: no header, score order
 
 
 def test_merge_tolerates_bin_jitter_and_wraps_the_cfo_difference(production_merge):
@@ -437,3 +440,24 @@ def test_runner_up_attempt_is_only_for_an_alias_that_read_at_least_as_well(produ
     for ratio in (1.0, 1.39, float('inf')):
         assert len(run_recenter(production_recenter, dict(base, runner_up_ratio=ratio))) == 2
     assert len(run_recenter(production_recenter, base)) == 1     # no ratio recorded
+
+
+def test_truncated_recenter_attempt_hands_its_span_back_for_masking(production_recenter):
+    diag = dict(header_decoded=True, truncated=True, no_rescue=True, n_candidates=4,
+                alt_candidates=1, chosen_bin=2687, runner_up_ratio=1.39)
+    calls = []
+
+    def attempt(iq, *args, skip_bins=None, diag_out=None, **kw):
+        calls.append(1)
+        diag_out.update(diag)
+        return ('FAIL', 8192, 500000 - 8192, 1500)      # mask runs to the crop end
+
+    namespace = dict(os=os, time=SimpleNamespace(process_time=lambda: 0.0),
+                     _BUDGET_S=0, _process_start=0.0, _ddl=None, skip_bins=[],
+                     recrop_centered=lambda sh: np.zeros(8, dtype=np.complex64),
+                     _decode_attempt=attempt, sf=12, bw=62500, N=32768, ppm=10,
+                     fs=500000, dec=8, name='synthetic.cf32', Counter=Counter)
+    exec(production_recenter, namespace)
+    out = namespace['_recenter_and_decode'](27420.0)
+    assert out == ('TRUNCATED', 8192, 500000 - 8192, 1500)
+    assert len(calls) == 1                       # no runner-up for a truncated frame
