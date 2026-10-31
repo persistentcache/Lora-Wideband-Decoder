@@ -76,6 +76,14 @@ Tried after a1dc44a and rejected with measurements:
 
 Next levers are pipeline policy, not decoder code, and need a decision on latency trade-offs: defer the relay-isolation twin job until the plain job of the same crop has verified a packet (saves all of its no-packet time, 314 s here, 16 s in the reference; delays relay-hop decodes by one job); skip the full crop of a detection whose early crop already verified the frame; and bound the number of crops per transmission once one has verified.
 
+## Decode pool: the time-isolated twin waits for the plain job (19a846c, 793418d)
+
+The first pipeline lever above, implemented in `BackgroundDecoder`: a PASS-2 time-isolated twin (fast SF only) is held until the plain job on its file has left the system; it is skipped when that job decoded a CRC-verified frame (admitted or a publication-level duplicate — the first version counted only admitted packets and released 36 of 40 twins), released to its original tier otherwise. Every plain exit path reports; a REQUEUE-SLOW retry keeps the hold; a 180 s stale valve and `drain()` release anything left; `pending()` counts holds. One-sided relay searches are unchanged. `tests/test_iso_hold.py` (8 tests).
+
+Live run 4 (19a846c): 13/13 verified, 40 twins held, 4 skipped, 36 released (the duplicate gap). Live run 5 (793418d): 13/13 verified, `live_metrics --require-complete` passes, publication latency median 2.88 s (reference 2.84 s), max 4.27 s; 65 twins held, 36 skipped, 29 released — 25 on junk files with no packet in either twin (the external SF9/500k source again, 616 s of its 1251 s) and 4 whose packet came from the released twin itself. Twin time on files with a packet: 52 s in run 3 → 24 s in run 5. Both runs' independent CRC audits pass for every Meshtastic output; the unverified records are again the structural `unknown`/LoRaWAN-shaped candidates on the external junk (4 in run 5).
+
+Acquisition outlier, recurring: run 4's message 3 published at 8.0 s because its first crop was *submitted* 7.9 s after RF end (decode 0.1 s) — the same acquisition-side delay Codex recorded (7.77 s) and left unresolved; it occurs in 2 of 5 runs, never in the decoder or the pool.
+
 ## Ledger
 
 2026-10-31: corpus passes A–G and the forced-offset probe are under the session scratchpad (`corpus_ab.py`, `impair_ab.py`, `gridprobe.sh`); per-case logs and `summary.json` in `corpusG/` and `impairG/`. Committed as the frame-ladder change (3501fb4) on `fix/no-performance-regressions`.
