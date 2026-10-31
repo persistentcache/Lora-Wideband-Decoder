@@ -6278,15 +6278,39 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
             # and finding the frame again through Pass 2 (1.4 s -> 2.8 s).
             # Bounded: once per rung, only when another candidate exists,
             # never for truncated or sweep-gated attempts.
+            #
+            # The ban must name the CHOSEN candidate's finder bin: the bin
+            # an attempt returns is refined by the SFD re-anchor and grid
+            # descent (a -2560-sample re-phase on an SF12/62.5k live crop
+            # moved it by far more than the 20-bin ban radius), and banning
+            # that refined value left the winner eligible — the runner-up
+            # attempt then repeated the winner's attempt verbatim, sweep and
+            # curved-drift retries included (+2.5 s per rung, three rungs
+            # per capture, on every long SF12/62.5k crop of the 2026-10-31
+            # live run).  The finder must also hold a candidate outside the
+            # ban radius, or the attempt would fall back to the same winner.
+            #
+            # And the alias must have read its header at least as well as
+            # the winner at the finder grid (runner_up_ratio >= 1: the
+            # merge's 1.5x bar left a near-tie in score order, which is the
+            # case this rung exists for — the SF10/250k capture decodes on
+            # its 1.39x alias).  Aliases that read worse, or no header, at
+            # the finder grid still pass HDR_CHK in a full attempt on the
+            # SF12/62.5k crops (the SFD re-anchor moves the grid 6-8%), then
+            # fail the payload exactly like the winner: 0 decodes in 12
+            # such attempts across the live crops, 2.5 s each.
             if (r is not None and r[0] == 'FAIL' and _dx.get('header_decoded')
                     and not _dx.get('truncated') and not _dx.get('no_rescue')
                     and _dx.get('n_candidates', 0) >= 2
+                    and _dx.get('alt_candidates', 0) >= 1
+                    and _dx.get('runner_up_ratio', 0.0) >= 1.0
+                    and _dx.get('chosen_bin') is not None
                     and (_rung_ddl is None or time.process_time() < _rung_ddl)
                     and not (_BUDGET_S > 0 and (time.process_time() - _process_start) > _BUDGET_S)):
                 print("  === %s recenter by %.0f Hz: runner-up candidate ===" % (label, sh))
                 _dx2 = {}
                 r2 = _decode_attempt(iqx.copy(), sf, bw, N, ppm, fs, dec, name,
-                                     Counter, skip_bins=list(skip_bins) + [r[3]],
+                                     Counter, skip_bins=list(skip_bins) + [r[3], _dx['chosen_bin']],
                                      sweep_budget=1.0, deadline=_rung_ddl,
                                      diag_out=_dx2, alias_skip=True)
                 if r2 is not None and r2[0] == 'OK':
@@ -7994,12 +8018,14 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         # Candidates still available before aliases collapse: the recenter
         # retry bans the winner and lets the merge pick among the rest.
         diag_out['n_candidates'] = len(cand_infos)
+    _all_cands = list(cand_infos)
     def _banned(ci):
         _b = ci[6] if ci[6] <= N // 2 else ci[6] - N
         return any(abs(_b - (sb if sb <= N // 2 else sb - N)) < 20 for sb in skip_bins)
 
     _merged = []
     _alias_margins = {}
+    _group_alts = []     # per group: (valid, margin) of the aliases it absorbed
     for ci in cand_infos:
         _cfo_c = (ci[6] - ci[5]) % N
         for _ki, kj in enumerate(_merged):
@@ -8023,15 +8049,18 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                           % (ci[6], ci[5], kj[6], kj[5], _m_c, _m_k))
                     _merged[_ki] = ci
                     _alias_margins[id(ci)] = (_ok_c, _m_c)
+                    _group_alts[_ki].append((_ok_k, _m_k))
                 else:
                     print("  ALIAS: bin=%d start=%d merged into bin=%d start=%d "
                           "(hdr margin %.0f%s vs %.0f%s)"
                           % (ci[6], ci[5], kj[6], kj[5], _m_c,
                              '' if _ok_c else ' invalid', _m_k,
                              '' if _ok_k else ' invalid'))
+                    _group_alts[_ki].append((_ok_c, _m_c))
                 break
         else:
             _merged.append(ci)
+            _group_alts.append([])
     cand_infos = _merged
 
     # Filter out candidates whose bin is too close to a previously-failed bin
@@ -8054,6 +8083,34 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
 
     best_score, best_pre_len, best_mean_pmr, best_sfd_ok, best_sfd_metric, \
         preamble_start, preamble_bin, pre_last_i, best_run, _, _ = cand_infos[0]
+
+    if diag_out is not None:
+        # The chosen candidate's bin as the finder reported it.  The bin
+        # this attempt returns is refined later (SFD re-anchor, grid
+        # descent: up to thousands of bins on SF12/62.5k crops), so a
+        # retry that wants to ban THIS candidate must use this value, and
+        # it needs another finder candidate outside the ban radius to try.
+        diag_out['chosen_bin'] = int(preamble_bin)
+        _cb = preamble_bin if preamble_bin <= N // 2 else preamble_bin - N
+        diag_out['alt_candidates'] = sum(
+            1 for _ci in _all_cands
+            if abs((_ci[6] if _ci[6] <= N // 2 else _ci[6] - N) - _cb) >= 20)
+        # Best same-preamble alias of the chosen candidate, as the header
+        # margin ratio alias/winner read at the finder grid (0 when the
+        # winner absorbed no alias with a checksum-valid header; inf when
+        # the winner's own finder-grid header did not check).  The recenter
+        # rung's runner-up attempt is for the near-tie the merge left in
+        # score order (ratio in [1, 1.5)), not for any alias at all.
+        _gi = next((_k for _k, _m in enumerate(_merged) if _m is cand_infos[0]), None)
+        _rep = _alias_margins.get(id(cand_infos[0]))
+        _ratio = 0.0
+        if _gi is not None and _rep is not None:
+            _ok_r, _m_r = _rep
+            for _ok_a, _m_a in _group_alts[_gi]:
+                if _ok_a:
+                    _ratio = max(_ratio, (_m_a / _m_r) if (_ok_r and _m_r > 0)
+                                 else float('inf'))
+        diag_out['runner_up_ratio'] = _ratio
 
     if len(cand_infos) > 1:
         for _ci in cand_infos[:4]:

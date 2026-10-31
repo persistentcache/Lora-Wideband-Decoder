@@ -1,5 +1,6 @@
 """Truncated frames, header grid phase and same-preamble aliases in one attempt."""
 import ast
+import os
 from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
@@ -368,3 +369,71 @@ def test_runner_up_attempt_hands_a_banned_group_to_its_next_alias(production_mer
     # Runner-up attempt: the group passes to the first unbanned alias.
     assert production_merge([winner, other], N, iq1, downchirp, sf - 2,
                             skip_bins=[12], alias_skip=True) == [other]
+
+
+# ------------------------------------------------------ runner-up rung ban
+@pytest.fixture(scope='module')
+def production_recenter():
+    tree = ast.parse(Path(decoder.__file__).read_text())
+    process = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                   and n.name == '_process_file_label')
+    fn = next(n for n in process.body if isinstance(n, ast.FunctionDef)
+              and n.name == '_recenter_and_decode')
+    module = ast.Module(body=[fn], type_ignores=[])
+    ast.fix_missing_locations(module)
+    return compile(module, '<production recenter rung>', 'exec')
+
+
+def run_recenter(code, first_diag, refined_bin=1500):
+    """One rung; the first attempt fails after reading a header and returns a
+    REFINED bin far from the finder's chosen bin (SFD re-anchor / descent)."""
+    calls = []
+
+    def attempt(iq, *args, skip_bins=None, diag_out=None, alias_skip=False, **kw):
+        calls.append(dict(skip_bins=list(skip_bins or []), alias_skip=alias_skip))
+        if len(calls) == 1:
+            diag_out.update(first_diag)
+            return ('FAIL', 8192, 20 * 4096, refined_bin)
+        return ('FAIL', 8192, 20 * 4096, 7)
+
+    namespace = dict(os=os, time=SimpleNamespace(process_time=lambda: 0.0),
+                     _BUDGET_S=0, _process_start=0.0, _ddl=None, skip_bins=[3],
+                     recrop_centered=lambda sh: np.zeros(8, dtype=np.complex64),
+                     _decode_attempt=attempt, sf=12, bw=62500, N=32768, ppm=10,
+                     fs=500000, dec=8, name='synthetic.cf32', Counter=Counter)
+    exec(code, namespace)
+    namespace['_recenter_and_decode'](27420.0)
+    return calls
+
+
+def test_runner_up_attempt_bans_the_chosen_finder_bin_not_the_refined_one(production_recenter):
+    diag = dict(header_decoded=True, n_candidates=4, alt_candidates=1, chosen_bin=2687,
+                runner_up_ratio=1.39)
+    calls = run_recenter(production_recenter, diag)
+    assert len(calls) == 2 and calls[1]['alias_skip']
+    assert 2687 in calls[1]['skip_bins'] and 1500 in calls[1]['skip_bins']
+    assert calls[0]['skip_bins'] == [3]
+
+
+def test_runner_up_attempt_needs_a_candidate_outside_the_ban_radius(production_recenter):
+    # Four finder candidates that all alias the chosen bin: the retry could
+    # only re-pick the winner (the all-filtered fallback), so it is skipped.
+    diag = dict(header_decoded=True, n_candidates=4, alt_candidates=0, chosen_bin=2687,
+                runner_up_ratio=1.39)
+    assert len(run_recenter(production_recenter, diag)) == 1
+    # Attempts that never recorded a chosen bin (header-only paths) skip too.
+    diag = dict(header_decoded=True, n_candidates=4, alt_candidates=1, runner_up_ratio=1.39)
+    assert len(run_recenter(production_recenter, diag)) == 1
+
+
+def test_runner_up_attempt_is_only_for_an_alias_that_read_at_least_as_well(production_recenter):
+    base = dict(header_decoded=True, n_candidates=4, alt_candidates=1, chosen_bin=2687)
+    # SF12/62.5k live crops: the absorbed alias read no header (0) or a
+    # weaker one (0.48) at the finder grid — no runner-up attempt.
+    for ratio in (0.0, 0.48, 0.99):
+        assert len(run_recenter(production_recenter, dict(base, runner_up_ratio=ratio))) == 1
+    # The near-tie the merge left in score order, and an alias that read a
+    # header where the winner's finder-grid header did not check.
+    for ratio in (1.0, 1.39, float('inf')):
+        assert len(run_recenter(production_recenter, dict(base, runner_up_ratio=ratio))) == 2
+    assert len(run_recenter(production_recenter, base)) == 1     # no ratio recorded
