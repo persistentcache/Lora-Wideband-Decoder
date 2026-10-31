@@ -115,3 +115,25 @@ for line in sys.stdin:
             if process.poll() is None:process.stdin.close()
             process.wait(timeout=3)
             process.stdout.close()
+
+
+def test_a_duplicate_of_a_published_frame_still_covers_its_own_bucket(dec, tmp_path):
+    """A retransmission of an already-published frame decodes as [DUP]; that
+    verified decode must still mark the retransmission's RF bucket so its own
+    KEEP-2 copy (same instant, carrier within tolerance) skips at dispatch
+    instead of spending a full decode on a frame the pool has twice over."""
+    first = tmp_path / 'first.cf32'; first.write_bytes(b'iq')
+    dec.submit(str(first), first.name, bucket_key=(915e6, 100.0, 60e3, 0.1, 10, 250e3))
+    dec._compact(mesh('0x12345678'), first.name)                    # published
+    retx = tmp_path / 'retx.cf32'; retx.write_bytes(b'iq')         # same frame, 6 s later
+    dec.submit(str(retx), retx.name, bucket_key=(915e6, 106.0, 60e3, 0.1, 10, 250e3))
+    copy = tmp_path / 'copy.cf32'; copy.write_bytes(b'iq')         # its second-window copy
+    dec.submit(str(copy), copy.name, bucket_key=(915.05e6, 106.02, 60e3, 0.1, 10, 250e3))
+    assert not dec._bucket_already_decoded(str(copy))
+    out = dec._compact(mesh('0x12345678'), retx.name)
+    assert '[DUP]' in out
+    assert dec._bucket_already_decoded(str(copy))
+    # An unrelated later transmission is not covered by either.
+    later = tmp_path / 'later.cf32'; later.write_bytes(b'iq')
+    dec.submit(str(later), later.name, bucket_key=(915e6, 112.0, 60e3, 0.1, 10, 250e3))
+    assert not dec._bucket_already_decoded(str(later))

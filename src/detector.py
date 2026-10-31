@@ -8664,8 +8664,14 @@ while True:
             # The capture decoded a CRC-verified frame whether or not the
             # publication dedup below admits it as new: a [DUP] of a frame
             # another crop already published is still proof that this
-            # file's twin has nothing left to rescue.
+            # file's twin has nothing left to rescue, and that this RF
+            # bucket (the same transmission, captured again by the KEEP-2
+            # second window or an alias peak) needs no further decode. A
+            # retransmission of the same frame seconds later is its own
+            # bucket and still decodes; only copies of this instant skip.
             self._note_verified(fname)
+            if admit_bucket:
+                self._mark_bucket_decoded(fname)
             with self._packet_dedup_lock:
                 stale = [k for k, t in self._packet_dedup.items()
                          if _now_pkt - t > 60.0]
@@ -8677,11 +8683,6 @@ while True:
                             f"[DUP] {_pkt_id} hop{_hops_taken} — "
                             f"same hop already decoded recently\n")
                 self._packet_dedup[_pkey] = _now_pkt
-                # Phase-2: tell the dispatch loop that this RF bucket is
-                # covered so sibling captures (KEEP-2 second save + PASS-2-iso
-                # resubmit) skip their decode at dispatch time.
-                if admit_bucket:
-                    self._mark_bucket_decoded(fname)
 
         # Payload fingerprint dedup: suppress same raw payload within 30s.
         # Targets non-Meshtastic frames (LoRaWAN, MeshCore, CRC-only) that have no
@@ -8723,6 +8724,10 @@ while True:
                     _FP_WINDOW = 30.0
                     _FP_THRESH = 14
                     self._note_verified(fname)
+                    # A verified frame covers its RF bucket whether or not the
+                    # payload dedup below publishes it (see the packet-ID path).
+                    if admit_bucket:
+                        self._mark_bucket_decoded(fname)
                     with self._fp_dedup_lock:
                         # Prune stale entries
                         for _k in [k for k, t in self._fp_dedup.items()
@@ -8737,11 +8742,6 @@ while True:
                                     f"[FP-DEDUP] duplicate payload suppressed\n")
                         if len(self._fp_dedup) < 512:
                             self._fp_dedup[_fp] = _now_fp
-                            # Phase-2: same as for _packet_dedup admit —
-                            # bucket is now covered; sibling captures
-                            # skip decode at dispatch.
-                            if admit_bucket:
-                                self._mark_bucket_decoded(fname)
             except Exception:
                 pass
 
