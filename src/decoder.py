@@ -1528,6 +1528,22 @@ def parse_lorawan_packet(payload, rf=None):
            'msg_type': msg_type, 'decrypted': False}
     if rf:
         _og = _on_lorawan_grid(rf.get('freq_mhz'), rf.get('sf'), rf.get('bw'))
+        if _og is False:
+            # OFF-GRID (2026-10-31): the shape gate alone passes 8/256 of
+            # random first bytes plus a loose length rule, so a CRC-absent
+            # fluke header on a weak junk crop decodes to garbage that
+            # "looks like" LoRaWAN about once per few hundred junk crops —
+            # six such records were published across two live runs, all
+            # from an external source at 916.6 and 912.6 MHz, SF9/500k and
+            # SF7/250k: no US915 plan has a channel there.  A LoRaWAN device
+            # transmits on its region's channel grid; a frame clearly off
+            # every grid point for its SF/BW is not a LoRaWAN candidate.
+            # Unknown region or missing RF context (None) keeps the hint.
+            print("  LoRaWAN-shaped frame off the %s channel grid "
+                  "(%.4f MHz SF%s BW%sk) — not a LoRaWAN candidate"
+                  % (_LORA_REGION, float(rf.get('freq_mhz') or 0.0),
+                     rf.get('sf'), int((rf.get('bw') or 0) / 1000)))
+            return None
         if _og is not None:
             rec['on_grid'] = _og
     print("\n  --- LoRaWAN Frame ---")

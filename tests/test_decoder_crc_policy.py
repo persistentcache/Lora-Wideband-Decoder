@@ -115,7 +115,10 @@ def route(blocks, env, monkeypatch, *, protocols, unknown=False, sync=0x2b):
     monkeypatch.delenv('LORA_UNKNOWN_REPORT', raising=False)
     env.update(_PROTO_ENABLED=set(protocols), _PROTO_UNKNOWN=unknown,
                _GATE_HDR_TUPLES=set(),
-               name='SF7_125k_915.0104MHz_1000ksps_pwr52_fixture.cf32',
+               # On the US915 125 kHz uplink grid (channel 63 = 914.9 MHz):
+               # off-grid LoRaWAN-shaped frames are no longer candidates, and
+               # these tests exercise dispatch policy, not the channel grid.
+               name='SF7_125k_914.9004MHz_1000ksps_pwr52_fixture.cf32',
                _hw_fp=None, bw=125000, cr=4, best_pre_len=16,
                _sync_word=sync, preamble_start=0, preamble_bin=0)
     exec(blocks[1], env)
