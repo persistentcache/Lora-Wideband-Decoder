@@ -6677,6 +6677,27 @@ class BackgroundDecoder:
         self._decoded_buckets = []       # list of bucket_key tuples (admitted)
         self._inflight_buckets = {}      # bucket_key -> dispatch_timestamp
         self._bucket_lock = threading.Lock()
+        # ISO-HOLD (2026-10-31).  The time-isolated twin of a fast-SF primary
+        # (PASS 2 iso: same preamble window, the later relay's energy
+        # blanked) is a RESCUE for that primary, not a search for another
+        # frame.  It used to start alongside the plain job on the same file,
+        # so every verified fast-SF frame paid a second full decode, and on
+        # junk both twins ground to the budget: a 13-message live run spent
+        # 52 s on iso jobs of files whose plain job had already published
+        # and 314 s on iso jobs of junk files (reference run: 30 s + 16 s).
+        # Hold the twin until the plain job on its file has left the system;
+        # skip it when that job published a verified packet (the twin can
+        # only re-decode the same frame — zero relayed packets ever came
+        # from it in four live runs), release it to its tier otherwise.
+        # Holds never strand a job: every plain exit path calls _plain_done,
+        # a stale valve releases holds older than _ISO_HOLD_MAX_S, and drain
+        # flushes them.  Only roles sharing one capture file hold (the
+        # bucket dedup already covers 'default'-role siblings).
+        self._iso_lock = threading.Lock()
+        self._iso_hold = {}              # fpath -> [(job, slow, prio), ...]
+        self._iso_hold_since = {}        # fpath -> monotonic of first hold
+        self._plain_open = {}            # fpath -> plain jobs queued/running
+        self._verified_fnames = {}       # capture basename -> admit time (ordered)
         # Host-adaptive sibling wait (Pi 5, 2026-10-26): the in-flight wait
         # was a fixed 2 s and the in-flight GC 5 s — right where a decode
         # takes 0.5-1.5 s, wrong where it takes 2-15 s: the mark expired
@@ -7542,15 +7563,96 @@ while True:
                                f"tier={'slow' if _slow_tier else 'fast'}"
                                + (f" role={role}" if role != 'default' else ''))
         _job = (fpath, fname, relay_after_syms, relay_before_syms, None)
+        _is_plain = relay_after_syms is None and relay_before_syms is None
+        _is_iso = relay_after_syms is not None and relay_before_syms is not None
+        if _is_plain:
+            self._plain_enqueued(fpath)
+        elif _is_iso:
+            _base = os.path.basename(fpath)
+            with self._iso_lock:
+                if _base in self._verified_fnames:
+                    _iso_action = 'skip'
+                elif self._plain_open.get(fpath, 0) > 0:
+                    self._iso_hold.setdefault(fpath, []).append((_job, bool(_slow_tier), float(prio)))
+                    self._iso_hold_since.setdefault(fpath, time.monotonic())
+                    _iso_action = 'hold'
+                else:
+                    _iso_action = 'run'
+            if _iso_action == 'skip':
+                self._rawlog('ISO-SKIP', f"{fname} plain job already verified")
+                self._ref_dec_and_maybe_unlink(fpath)
+                return
+            if _iso_action == 'hold':
+                self._rawlog('ISO-HOLD', fname)
+                return
         if _slow_tier:
             self._slow_queue.put(_job)
         else:
             self._queue.put((-float(prio), next(self._qseq), _job))
 
+    _ISO_HOLD_MAX_S = 180.0
+
+    def _plain_enqueued(self, fpath):
+        with self._iso_lock:
+            self._plain_open[fpath] = self._plain_open.get(fpath, 0) + 1
+
+    def _note_verified(self, fname):
+        """A packet from capture `fname` was admitted (any role)."""
+        _base = os.path.basename(str(fname).split('[')[0])
+        with self._iso_lock:
+            self._verified_fnames[_base] = time.monotonic()
+            if len(self._verified_fnames) > 4000:
+                for _k in list(self._verified_fnames)[:2000]:
+                    self._verified_fnames.pop(_k, None)
+
+    def _plain_done(self, fpath):
+        """A plain job on `fpath` left the system (finished, skipped, dropped):
+        when it was the last one, its held iso twins are skipped or released."""
+        with self._iso_lock:
+            n = self._plain_open.get(fpath, 0) - 1
+            if n > 0:
+                self._plain_open[fpath] = n
+                return
+            self._plain_open.pop(fpath, None)
+            held = self._iso_hold.pop(fpath, [])
+            self._iso_hold_since.pop(fpath, None)
+            verified = os.path.basename(fpath) in self._verified_fnames
+        self._dispose_held(held, verified)
+
+    def _dispose_held(self, held, verified):
+        for job, slow, prio in held:
+            if verified:
+                self._rawlog('ISO-SKIP', f"{job[1]} plain job verified")
+                self._ref_dec_and_maybe_unlink(job[0])
+                continue
+            self._rawlog('ISO-RELEASE', job[1])
+            if slow or self._defer_state:
+                self._slow_queue.put(job)
+            else:
+                self._queue.put((-float(prio), next(self._qseq), job))
+
+    def _flush_stale_iso_holds(self, max_age=None):
+        """Release holds whose plain job has not reported for too long (or
+        all of them at drain) so a lost plain exit can never strand a twin."""
+        max_age = self._ISO_HOLD_MAX_S if max_age is None else max_age
+        now = time.monotonic()
+        with self._iso_lock:
+            stale = [f for f, t0 in self._iso_hold_since.items() if now - t0 >= max_age]
+            batches = []
+            for f in stale:
+                batches.append((self._iso_hold.pop(f, []),
+                                os.path.basename(f) in self._verified_fnames))
+                self._iso_hold_since.pop(f, None)
+                self._plain_open.pop(f, None)
+        for held, verified in batches:
+            self._dispose_held(held, verified)
+
     def pending(self):
         with self._lock:
-            return (self._queue.qsize() + self._slow_queue.qsize()
-                    + self._active_count)
+            n = (self._queue.qsize() + self._slow_queue.qsize()
+                 + self._active_count)
+        with self._iso_lock:
+            return n + sum(len(v) for v in self._iso_hold.values())
 
     def decoded_counts(self):
         """(total_decode_events, distinct_packets) reaching the packet log.
@@ -7735,6 +7837,7 @@ while True:
         the drain itself (a backlogged fast job that bailed) are also recovered."""
         deadline = time.time() + timeout
         while self.pending() > 0 and time.time() < deadline:
+            self._flush_stale_iso_holds(max_age=0.0)
             self.drain_slow_into_fast()
             time.sleep(0.2)
         # Close every pool worker's stdin so it exits cleanly; kill stragglers.
@@ -7764,6 +7867,7 @@ while True:
         """Lease one child per job, sharing bounded turns between tiers."""
         worker = None
         while not self._aborting():
+            self._flush_stale_iso_holds()
             self._release_one_slow()
             # Plain blocking get on the fast queue — NO polling loop (10 threads
             # waking on a timeout competed with the gate's realtime thread and
@@ -7859,6 +7963,8 @@ while True:
                 # (n_sym, N) symbol matrices.
                 if self._bucket_already_decoded(fpath):
                     self._rawlog('SKIP-BUCKET', os.path.basename(fpath))
+                    if relay_after_syms is None and relay_before_syms is None:
+                        self._plain_done(fpath)
                     self._ref_dec_and_maybe_unlink(fpath)
                     if _slow_token is not None:
                         self._slow_retire(_slow_token)
@@ -7945,6 +8051,8 @@ while True:
                 if worker is None or worker.poll() is not None:
                     worker = self._lease_worker()
                     if worker is None:
+                        if relay_after_syms is None and relay_before_syms is None:
+                            self._plain_done(fpath)
                         if _slow_token is not None:
                             self._slow_retire(_slow_token)
                         self._queue.task_done()
@@ -8113,6 +8221,7 @@ while True:
                         and relay_after_syms is None
                         and relay_before_syms is None):
                     self._ref_inc(fpath)
+                    self._plain_enqueued(fpath)
                     self._rawlog('REQUEUE-SLOW', fname)
                     self._slow_queue.put((fpath, fname, None, None,
                                           self._slow_budget))
@@ -8191,6 +8300,8 @@ while True:
                             worker = None
                     except Exception:
                         pass
+                if relay_after_syms is None and relay_before_syms is None:
+                    self._plain_done(fpath)
                 with self._lock:
                     self._active_count -= 1
                 if _slow_token is not None:
@@ -8460,6 +8571,7 @@ while True:
                             f"[DUP] {_pkt_id} hop{_hops_taken} — "
                             f"same hop already decoded recently\n")
                 self._packet_dedup[_pkey] = _now_pkt
+                self._note_verified(fname)
                 # Phase-2: tell the dispatch loop that this RF bucket is
                 # covered so sibling captures (KEEP-2 second save + PASS-2-iso
                 # resubmit) skip their decode at dispatch time.
@@ -8519,6 +8631,7 @@ while True:
                                     f"[FP-DEDUP] duplicate payload suppressed\n")
                         if len(self._fp_dedup) < 512:
                             self._fp_dedup[_fp] = _now_fp
+                            self._note_verified(fname)
                             # Phase-2: same as for _packet_dedup admit —
                             # bucket is now covered; sibling captures
                             # skip decode at dispatch.
