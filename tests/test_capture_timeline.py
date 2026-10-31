@@ -142,7 +142,11 @@ def test_full_writer_queue_never_blocks_producer_or_discards_ready_spans():
 
 
 @pytest.mark.parametrize('failure', ['drop', 'retune', 'lap'])
-def test_lost_history_is_fatal_and_never_splices_future_samples(failure):
+def test_lost_history_never_splices_future_samples(failure):
+    """A lost stream identity (drop, retune) is fatal. A ring lap only loses
+    the capture whose raw interval was overwritten: the samples produced
+    before the lap are saved as a partial, nothing after the gap is spliced
+    on, and the service stays up."""
     submitted = []
     e, r, _ = engine(capacity=16000, submit=lambda item: submitted.append(item) or True)
     r._rp = r._wp = 4000
@@ -156,9 +160,26 @@ def test_lost_history_is_fatal_and_never_splices_future_samples(failure):
         r._rp = r._wp = 24000
     e.advance(r.history_anchor())
     e.step()
-    with pytest.raises(SharedCaptureFailure): e.raise_if_failed()
-    assert not submitted
-    assert e.stats()['incomplete_views'] == 1
+    if failure != 'lap':
+        with pytest.raises(SharedCaptureFailure): e.raise_if_failed()
+        assert not submitted
+        assert e.stats()['incomplete_views'] == 1
+        e.close(wait=False)
+        return
+    e.raise_if_failed()
+    for _ in range(5):
+        e.step()
+    assert len(submitted) == 1
+    partial = submitted.pop()
+    assert partial.interrupted and not partial.complete
+    assert partial.metadata['interruption'] == 'ring_lap'
+    # Only samples produced before the lap (raw 0..5000 at factor 8); nothing
+    # from after the gap is spliced on.
+    assert 0 < len(partial.stream(0)) <= 625
+    assert max(partial.metadata['received_ends']) <= 5000
+    partial.release()
+    assert e.stats()['incomplete_views'] == 1 and e.stats()['lapped_bands'] == 1
+    assert not e.failure
     e.close(wait=False)
 
 
@@ -551,3 +572,72 @@ def test_failed_service_thread_start_releases_constructor_reservations(monkeypat
             decimator_factory=detector._StreamDecimator,submit=lambda v:False,
             budget=budget)
     assert budget.stats()['used_bytes']==0
+
+
+def test_ring_lap_drops_only_the_lapped_capture_and_keeps_the_service_alive():
+    """A saturated small host can fall more than the ring's length behind while
+    a long frame is captured; the overwritten interval loses that capture (as a
+    partial save when samples were already produced), never the pipeline."""
+    notices, submitted = [], []
+    e, r, _ = engine(submit=lambda item: submitted.append(item) or True)
+    e.report = notices.append
+    r._rp = r._wp = 4000
+    register(e, 4000, tail=2000)
+    r._rp = r._wp = 4500
+    register(e, 4500, tail=2000)                   # a second view on the same band
+    advance(e, r, 5000)                            # part of both spans is produced
+    full = [v for v in e._views if v.state == 'collecting']
+    assert len(full) == 2 and full[0].refs[0].band.produced > 0
+    band = full[0].refs[0].band
+    original = r.history_parts
+
+    def lapped(*args):
+        raise detector.StreamHistoryUnavailable('ring history unavailable or overwritten')
+        yield                                      # pragma: no cover - generator shape
+
+    r.history_parts = lapped
+    advance(e, r, 8000)
+    assert not e.failure
+    assert band.sealed
+    assert all(v.interrupted and v.role == 'shared_partial'
+               and v.metadata['interruption'] == 'ring_lap' for v in full)
+    assert e.stats()['interrupted_views'] == 2 and e.stats()['lapped_bands'] == 1
+    e.step()                                       # the next turn reports the notice
+    assert any('raw history lapped' in n and '2 view(s) saved partial' in n for n in notices)
+    # Both partial captures reach the save sink (one transfer per turn) with
+    # only the samples produced before the lap.
+    partials = 0
+    for _ in range(10):
+        e.step()
+        while submitted:
+            item = submitted.pop()
+            assert item.interrupted and not item.complete and 0 < len(item.stream(0)) < 750
+            item.release(); partials += 1
+    assert partials == 2
+    # The service keeps admitting and completing captures on fresh history.
+    r.history_parts = original
+    r._rp = r._wp = 9000
+    register(e, 9000, tail=2000)
+    advance(e, r, 12000)
+    assert not e.failure and len(submitted) == 1 and submitted[0].complete
+    assert len(submitted[0].stream(0)) == 750     # (4 s base + 2 s tail) * 125 samples/s
+    submitted[0].release()
+    assert e.stats()['completed_views'] == 1
+    e.close(wait=False)
+
+
+def test_a_skipped_stream_during_a_crop_is_still_fatal():
+    e, r, _ = engine()
+    r._rp = r._wp = 4000
+    register(e, 4000, tail=2000)
+
+    def skipped(*args):
+        raise detector.StreamHistoryUnavailable('stream skipped or retuned')
+        yield                                      # pragma: no cover - generator shape
+
+    r.history_parts = skipped
+    r._rp = r._wp = 5000
+    e.advance(r.history_anchor(5000))
+    e.step()
+    assert e.failure and 'skipped' in e.failure
+    e.close(wait=False)

@@ -16,6 +16,13 @@ class CaptureCapacityError(RuntimeError):
     pass
 
 
+def _history_lapped(exc):
+    """The reader's ring overwrote a raw interval before the writer reached
+    it (StreamHistoryUnavailable 'ring history unavailable or overwritten').
+    A skipped or retuned stream raises a different message and stays fatal."""
+    return type(exc).__name__ == 'StreamHistoryUnavailable' and 'overwritten' in str(exc)
+
+
 class SharedCaptureFailure(RuntimeError):
     pass
 
@@ -217,6 +224,7 @@ class SharedCapture:
         self._next = self._completed = self._incomplete = 0
         self._optional_completed = self._optional_incomplete = 0
         self._interrupted = 0
+        self._lapped = 0
         self._generation_start = 0
         self._retune_serial = 0
         self._closing = False
@@ -307,35 +315,7 @@ class SharedCapture:
             for view in self._views:
                 if view.state != 'collecting':
                     continue  # complete/writer-owned samples remain immutable
-                if view.role in ('header_prefix', 'early'):
-                    view.state = 'cancelled'
-                    view.credit.release()
-                    self._optional_incomplete += 1
-                    continue
-                view.interrupted = True
-                view.role = 'shared_partial'
-                view.metadata['interruption'] = 'retune'
-                view.metadata['requested_end'] = view.end
-                self._interrupted += 1
-                any_samples = False
-                for ref in view.refs:
-                    band = ref.band
-                    factor = view.target_factor // band.factor
-                    right = 10 * factor if factor > 1 else 0
-                    stop = min(ref.end, band.produced - right)
-                    stop = max(ref.start, stop)
-                    ref.end = stop
-                    ref.context_end = stop + right if stop > ref.start else stop
-                    ref.received_end = min(view.end, band.origin + stop * band.factor)
-                    any_samples |= stop > ref.start
-                view.metadata['received_ends'] = [r.received_end for r in view.refs]
-                if any_samples:
-                    view.state = 'ready'
-                    view.ready_at = self.clock()
-                else:
-                    view.state = 'cancelled'
-                    view.credit.release()
-                    self._incomplete += 1
+                self._interrupt_view_locked(view, 'retune')
             self.reader.invalidate_history()
             snapshot = (self.reader.received_history_anchor if self._published_history
                         else self.reader.history_anchor)
@@ -458,7 +438,7 @@ class SharedCapture:
                     wanted_half = self.rate / (2 * target_factor)
                     band = next((b for b in self._bands
                                  if b.identity == identity and b.target_factor == target_factor
-                                 and b.factor == factor
+                                 and b.factor == factor and not b.sealed
                                  and base_start >= b.origin + b.retired_before * b.factor
                                  and (factor == 1 or abs(det['freq_hz'] - b.center) + wanted_half
                                       <= self._support(b) + 1e-6)), None)
@@ -610,6 +590,64 @@ class SharedCapture:
         if self.failure:
             raise SharedCaptureFailure(self.failure)
 
+    def _interrupt_view_locked(self, view, reason):
+        """End a collecting view early: an optional view is cancelled, a full
+        view keeps the samples its bands have already produced as a
+        `shared_partial` save, or is cancelled when there are none."""
+        if view.role in ('header_prefix', 'early'):
+            view.state = 'cancelled'
+            view.credit.release()
+            self._optional_incomplete += 1
+            return
+        view.interrupted = True
+        view.role = 'shared_partial'
+        view.metadata['interruption'] = reason
+        view.metadata['requested_end'] = view.end
+        self._interrupted += 1
+        any_samples = False
+        for ref in view.refs:
+            band = ref.band
+            factor = view.target_factor // band.factor
+            right = 10 * factor if factor > 1 else 0
+            stop = min(ref.end, band.produced - right)
+            stop = max(ref.start, stop)
+            ref.end = stop
+            ref.context_end = stop + right if stop > ref.start else stop
+            ref.received_end = min(view.end, band.origin + stop * band.factor)
+            any_samples |= stop > ref.start
+        view.metadata['received_ends'] = [r.received_end for r in view.refs]
+        if any_samples:
+            view.state = 'ready'
+            view.ready_at = self.clock()
+        else:
+            view.state = 'cancelled'
+            view.credit.release()
+            self._incomplete += 1
+
+    def _lap_band_locked(self, band, start, n, exc):
+        """The ring overwrote raw samples this band still had to crop: the
+        writer fell more than the ring's length behind (a saturated small host
+        during a long frame). That loses the captures still collecting from
+        this band, not the pipeline: the band is sealed, those views end as
+        partial saves or are cancelled, and every other band keeps running.
+        Identity changes (skip, retune) are a different message and stay
+        fatal."""
+        band.sealed = True
+        partial = cancelled = 0
+        for view in list(self._views):
+            if view.state != 'collecting' or not any(
+                    r.band is band and band.produced < r.context_end for r in view.refs):
+                continue
+            self._interrupt_view_locked(view, 'ring_lap')
+            if view.state == 'ready':
+                partial += 1
+            else:
+                cancelled += 1
+        self._lapped += 1
+        self._pending_notice = (f'[SHARED-CAPTURE] raw history lapped at {start}:{start + n} '
+                                f'({exc}); band {band.center / 1e6:.4f} MHz sealed, '
+                                f'{partial} view(s) saved partial, {cancelled} cancelled')
+
     def _retire(self):
         for band in list(self._bands):
             band.refs = [(v, r) for v, r in band.refs if v.state not in ('done', 'cancelled')]
@@ -753,7 +791,10 @@ class SharedCapture:
                 with self._lock:
                     band.busy = False
                     if not band.sealed:
-                        self._fail_locked(f'raw history/crop interval {start}:{start+n} failed: {exc}')
+                        if _history_lapped(exc):
+                            self._lap_band_locked(band, start, n, exc)
+                        else:
+                            self._fail_locked(f'raw history/crop interval {start}:{start+n} failed: {exc}')
                     self._retire()
                 return False
         transfer = None
@@ -932,6 +973,7 @@ class SharedCapture:
                     'ready_views': sum(v.state == 'ready' for v in self._views),
                     'completed_views': self._completed, 'incomplete_views': self._incomplete,
                     'interrupted_views': self._interrupted,
+                    'lapped_bands': self._lapped,
                     'optional_completed_views': self._optional_completed,
                     'optional_incomplete_views': self._optional_incomplete,
                     'non_admitted': self._non_admitted,
