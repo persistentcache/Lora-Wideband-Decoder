@@ -84,6 +84,14 @@ Live run 4 (19a846c): 13/13 verified, 40 twins held, 4 skipped, 36 released (the
 
 Acquisition outlier, recurring: run 4's message 3 published at 8.0 s because its first crop was *submitted* 7.9 s after RF end (decode 0.1 s) — the same acquisition-side delay Codex recorded (7.77 s) and left unresolved; it occurs in 2 of 5 runs, never in the decoder or the pool.
 
+## Missed first transmissions under interference, and the patience region rule
+
+Across the six live runs (78 messages) the acquisition latency from RF end to decode job is median 2.29 s, p90 2.83 s, with two outliers, both in run 4: messages 3 (7.9 s) and 4 (5.0 s). Header-checkpoint timestamps show the gate never planned a capture for the first transmission of message 3 and planned message 4's 4.84 s after RF end (normal 2.3-2.9 s); both were recovered through the Meshtastic retransmission 5.2 s later. At those moments the external SF9/500k source at 916.3-917.4 MHz had all four patience slots: a carrier was promoted, burned 12 futile windows, was retired with a per-bin cooldown (±29 kHz), and a neighbour 50-100 kHz away was promoted in its place — 155 promotions in that run — while the budget cap fell from 24 to 10 peaks per window with 10-30 peaks shed per window. Run 4 also had the highest skipped-main dechirp count. Codex's 7.77 s outlier (SF12/500k, prefix planned 5.0 s after RF end) is the same acquisition-side class.
+
+Rule added in the patience promotion scan: a candidate bin with two or more futility cooldowns within ±500 kHz (the neighbourhood the scan already uses for "being detected normally") is not promoted — a wandering junk source makes its region junk until those cooldowns lapse. Decode confirms still lift nearby cooldowns; main-path detection is untouched.
+
+Evidence: a fresh 187 s raw 10 Msps recording with the source present and one SF12/62.5k message (`Desktop/LoRa-Raw-Junk-20261031/raw.cs16`), replayed through the live profile (`run_replay.py`, shared capture + header checkpoints, 2+2 workers): HEAD and the rule both detect 10 frames and decode the same 2 packets in 19 events; promotions 28 → 25, futility retires 24 → 21, gate throttle events 38 → 15 (HEAD spent 30 of 38 windows at caps 8-10). The miss itself is not in this recording (one message, detected by both); the rule removes the load that accompanied it. The three earlier clean recordings (`raw-diagnostic`, `raw-sf10-20261029`, `raw-sf12-250-20261029`) replay to identical detections and identical distinct packets under both builds, with promotions 29 → 22, 16 → 14, 25 → 21 and throttle events 1 → 1, 246 → 245, 30 → 16 (`Desktop/LoRa-Raw-Junk-20261031/clean_replays/`).
+
 ## Ledger
 
 2026-10-31: corpus passes A–G and the forced-offset probe are under the session scratchpad (`corpus_ab.py`, `impair_ab.py`, `gridprobe.sh`); per-case logs and `summary.json` in `corpusG/` and `impairG/`. Committed as the frame-ladder change (3501fb4) on `fix/no-performance-regressions`.
