@@ -130,3 +130,17 @@ def test_stale_hold_valve_and_drain_never_strand_a_twin(dec, tmp_path):
     dec._flush_stale_iso_holds(max_age=0.0)
     assert dec._queue.get_nowait()[2][2:4] == (4, 170)
     assert not dec._iso_hold and not dec._plain_open
+
+
+def test_a_duplicate_of_an_already_published_frame_still_counts_as_verified(dec, tmp_path):
+    first = capture(tmp_path, 'first.cf32')
+    second = capture(tmp_path)
+    dec.submit(str(second), second.name, role='shared_full')
+    dec.submit(str(second), second.name, relay_after_syms=4, relay_before_syms=170,
+               role='shared_full')
+    dec._compact(mesh('0x12345678'), first.name, role='shared_full')
+    out = dec._compact(mesh('0x12345678'), second.name, role='shared_full')
+    assert '[DUP]' in out                              # publication dedup suppressed it ...
+    _, _, plain = dec._queue.get_nowait()
+    dec._plain_done(plain[0])                          # ... but the twin is still skipped
+    assert dec._queue.empty() and dec._slow_queue.empty()
