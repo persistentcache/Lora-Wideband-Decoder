@@ -123,3 +123,26 @@ def test_native_crc_capture_dispatch_preserves_raw_phy_and_structural_hint(
         'raw_hex': payload.hex(), 'sf': 7, 'bw': 125000, 'cr': 1,
         'sync': '0x34', 'freq_mhz': 912.8997, 'rssi': 15,
     }
+
+
+@pytest.mark.parametrize('rf', [
+    pytest.param({'freq_mhz': 916.6191, 'rssi': 6, 'sf': 9, 'bw': 500000}, id='sf9-500k-off-plan'),
+    pytest.param({'freq_mhz': 912.6128, 'rssi': 6, 'sf': 7, 'bw': 250000}, id='250k-no-us915-dr'),
+    pytest.param({'freq_mhz': 912.9997, 'rssi': 15, 'sf': 7, 'bw': 125000}, id='125k-100khz-off-channel'),
+])
+def test_off_grid_lorawan_shape_is_not_a_candidate(monkeypatch, capsys, rf):
+    payload = UNKNOWN_RECEIVED[:-2]
+    monkeypatch.setattr(decoder, '_LORA_REGION', 'US915')
+    monkeypatch.setattr(decoder, '_PROTO_ENABLED', {'lorawan', 'raw_lora'})
+    emitted = []
+    monkeypatch.setattr(decoder, '_emit_pkt', lambda rec: emitted.append(dict(rec)))
+    assert decoder.parse_lorawan_packet(payload, rf) is None
+    assert 'off the US915 channel grid' in capsys.readouterr().out
+    handled, winner, via = decoder._dispatch_nonmt_or_meshtastic(
+        list(payload), {'rf': rf, 'crc_present': False}, 0x34, rf, rf['sf'], rf['bw'], 1,
+        lambda *a: pytest.fail('reached Meshtastic handler'), False, True)
+    assert emitted == [] and winner is None
+    # Without RF context, or in an unknown region, the structural hint is kept.
+    assert decoder.parse_lorawan_packet(payload) is not None
+    monkeypatch.setattr(decoder, '_LORA_REGION', 'EU868')
+    assert decoder.parse_lorawan_packet(payload, rf) is not None

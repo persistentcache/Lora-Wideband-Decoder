@@ -5647,6 +5647,7 @@ class SignalRecorder:
                 _nb_job = None
                 _capture_role = 'default'
                 _role_name = ''
+                _frame_key = None
                 _input_center = self.center_hz
                 if (isinstance(extended_full, tuple)
                         and extended_full[0] == 'NB_SHARED'):
@@ -5657,6 +5658,14 @@ class SignalRecorder:
                         continue  # finally releases only this optional source view
                     _capture_role = _shared_save.role
                     _role_name = f'_{_capture_role}_{_shared_save.number}'
+                    # Frame key shared by a detection's early and full crops
+                    # (the early view records its parent full view).
+                    if _capture_role == 'early':
+                        _frame_key = _shared_save.metadata.get('header_parent_id')
+                    elif _capture_role == 'shared_full':
+                        _frame_key = _shared_save.number
+                    else:
+                        _frame_key = None
                     _nb_job = {'nb_fs': _shared_save.nb_fs,
                                'export_bw': _shared_save.export_bw}
                     extended_full = None
@@ -6475,7 +6484,7 @@ class SignalRecorder:
                                              slow=bool(d.get('patience_trial')),
                                              prio=(float('inf') if _capture_role == 'early'
                                                    else float(d.get('bw_quality_db', 0.0))),
-                                             role=_capture_role)
+                                             role=_capture_role, frame_key=_frame_key)
                         # Family-label decode jobs (trial captures only) —
                         # same bucket, slow tier: once any label in the
                         # bucket decodes, the phase-2 bucket dedup skips the
@@ -6519,7 +6528,7 @@ class SignalRecorder:
                                 slow=_iso_slow or bool(d.get('patience_trial')),
                                 # relay search runs after every primary
                                 prio=float(d.get('bw_quality_db', 0.0)) - 100.0,
-                                role=_capture_role)
+                                role=_capture_role, frame_key=_frame_key)
             except Exception as e:
                 if _shared_save is not None:
                     _shared_save._render_failed = True
@@ -6698,6 +6707,23 @@ class BackgroundDecoder:
         self._iso_hold_since = {}        # fpath -> monotonic of first hold
         self._plain_open = {}            # fpath -> plain jobs queued/running
         self._verified_fnames = {}       # capture basename -> admit time (ordered)
+        # FULL-HOLD (2026-10-31).  The header checkpoint exports an EARLY
+        # crop of a frame as soon as its header reads and the FULL crop of
+        # the same detection when the frame completes; both are decoded,
+        # and for the slow-SF frames that matter the full crop costs 1-9 s
+        # to re-decode a frame the early crop published seconds earlier
+        # (a 13-message live run spent 306 s re-decoding verified
+        # messages, ~half of it in full crops).  A full crop whose early
+        # sibling (same frame key: the early view's parent view number)
+        # is still open waits for it and is skipped once it verified;
+        # released otherwise.  A full crop with no early sibling known at
+        # submit time runs at once, so a header abstain or a fast-SF
+        # frame whose full crop lands first is unchanged.
+        self._fpath_frame = {}           # fpath -> (role, frame_key) for plain jobs
+        self._early_open = {}            # frame_key -> early plain jobs queued/running
+        self._early_verified = set()     # frame keys whose early crop verified
+        self._full_hold = {}             # frame_key -> [(job, slow, prio), ...]
+        self._full_hold_since = {}       # frame_key -> monotonic of first hold
         # Host-adaptive sibling wait (Pi 5, 2026-10-26): the in-flight wait
         # was a fixed 2 s and the in-flight GC 5 s — right where a decode
         # takes 0.5-1.5 s, wrong where it takes 2-15 s: the mark expired
@@ -7508,7 +7534,8 @@ while True:
         self._release_one_slow()
 
     def submit(self, fpath, fname, relay_after_syms=None, relay_before_syms=None,
-               bucket_key=None, slow=False, prio=0.0, *, role='default'):
+               bucket_key=None, slow=False, prio=0.0, *, role='default',
+               frame_key=None):
         """Queue a capture file for background decoding.
 
         relay_after_syms:  blank first N BW-rate symbols → find hop AFTER primary.
@@ -7566,7 +7593,27 @@ while True:
         _is_plain = relay_after_syms is None and relay_before_syms is None
         _is_iso = relay_after_syms is not None and relay_before_syms is not None
         if _is_plain:
+            if frame_key is not None and role in ('early', 'shared_full'):
+                with self._iso_lock:
+                    self._fpath_frame[fpath] = (role, frame_key)
             self._plain_enqueued(fpath)
+            if role == 'shared_full' and frame_key is not None:
+                with self._iso_lock:
+                    if frame_key in self._early_verified:
+                        _full_action = 'skip'
+                    elif self._early_open.get(frame_key, 0) > 0:
+                        self._full_hold.setdefault(frame_key, []).append((_job, bool(_slow_tier), float(prio)))
+                        self._full_hold_since.setdefault(frame_key, time.monotonic())
+                        _full_action = 'hold'
+                    else:
+                        _full_action = 'run'
+                if _full_action == 'skip':
+                    self._rawlog('FULL-SKIP', f"{fname} early crop already verified")
+                    self._skip_full(fpath)
+                    return
+                if _full_action == 'hold':
+                    self._rawlog('FULL-HOLD', fname)
+                    return
         elif _is_iso:
             _base = os.path.basename(fpath)
             with self._iso_lock:
@@ -7595,6 +7642,9 @@ while True:
     def _plain_enqueued(self, fpath):
         with self._iso_lock:
             self._plain_open[fpath] = self._plain_open.get(fpath, 0) + 1
+            _rf = self._fpath_frame.get(fpath)
+            if _rf is not None and _rf[0] == 'early':
+                self._early_open[_rf[1]] = self._early_open.get(_rf[1], 0) + 1
 
     def _note_verified(self, fname):
         """A packet from capture `fname` was admitted (any role)."""
@@ -7604,20 +7654,62 @@ while True:
             if len(self._verified_fnames) > 4000:
                 for _k in list(self._verified_fnames)[:2000]:
                     self._verified_fnames.pop(_k, None)
+            for _fp, (_role, _fk) in self._fpath_frame.items():
+                if _role == 'early' and os.path.basename(_fp) == _base:
+                    self._early_verified.add(_fk)
+                    if len(self._early_verified) > 4000:
+                        self._early_verified = set(list(self._early_verified)[-2000:])
+
+    def _skip_full(self, fpath):
+        """A full crop skipped for its verified early sibling: the file counts
+        as verified (its iso twin skips too) and its plain job leaves."""
+        with self._iso_lock:
+            self._verified_fnames[os.path.basename(fpath)] = time.monotonic()
+        self._plain_done(fpath)
+        self._ref_dec_and_maybe_unlink(fpath)
 
     def _plain_done(self, fpath):
         """A plain job on `fpath` left the system (finished, skipped, dropped):
-        when it was the last one, its held iso twins are skipped or released."""
+        when it was the last one, its held iso twins are skipped or released,
+        and when it was an early crop, its held full siblings likewise."""
+        full_batches = []
         with self._iso_lock:
             n = self._plain_open.get(fpath, 0) - 1
+            _rf = self._fpath_frame.get(fpath)
+            if _rf is not None and _rf[0] == 'early':
+                m = self._early_open.get(_rf[1], 0) - 1
+                if m > 0:
+                    self._early_open[_rf[1]] = m
+                else:
+                    self._early_open.pop(_rf[1], None)
+                    held_full = self._full_hold.pop(_rf[1], [])
+                    self._full_hold_since.pop(_rf[1], None)
+                    if held_full:
+                        full_batches.append((held_full, _rf[1] in self._early_verified))
             if n > 0:
                 self._plain_open[fpath] = n
-                return
-            self._plain_open.pop(fpath, None)
-            held = self._iso_hold.pop(fpath, [])
-            self._iso_hold_since.pop(fpath, None)
-            verified = os.path.basename(fpath) in self._verified_fnames
+                held, verified = [], False
+            else:
+                self._plain_open.pop(fpath, None)
+                self._fpath_frame.pop(fpath, None)
+                held = self._iso_hold.pop(fpath, [])
+                self._iso_hold_since.pop(fpath, None)
+                verified = os.path.basename(fpath) in self._verified_fnames
         self._dispose_held(held, verified)
+        for held_full, early_verified in full_batches:
+            self._dispose_held_full(held_full, early_verified)
+
+    def _dispose_held_full(self, held, early_verified):
+        for job, slow, prio in held:
+            if early_verified:
+                self._rawlog('FULL-SKIP', f"{job[1]} early crop verified")
+                self._skip_full(job[0])
+                continue
+            self._rawlog('FULL-RELEASE', job[1])
+            if slow or self._defer_state:
+                self._slow_queue.put(job)
+            else:
+                self._queue.put((-float(prio), next(self._qseq), job))
 
     def _dispose_held(self, held, verified):
         for job, slow, prio in held:
@@ -7644,15 +7736,24 @@ while True:
                                 os.path.basename(f) in self._verified_fnames))
                 self._iso_hold_since.pop(f, None)
                 self._plain_open.pop(f, None)
+            stale_full = [k for k, t0 in self._full_hold_since.items() if now - t0 >= max_age]
+            full_batches = []
+            for k in stale_full:
+                full_batches.append((self._full_hold.pop(k, []), k in self._early_verified))
+                self._full_hold_since.pop(k, None)
+                self._early_open.pop(k, None)
         for held, verified in batches:
             self._dispose_held(held, verified)
+        for held, early_verified in full_batches:
+            self._dispose_held_full(held, early_verified)
 
     def pending(self):
         with self._lock:
             n = (self._queue.qsize() + self._slow_queue.qsize()
                  + self._active_count)
         with self._iso_lock:
-            return n + sum(len(v) for v in self._iso_hold.values())
+            return (n + sum(len(v) for v in self._iso_hold.values())
+                    + sum(len(v) for v in self._full_hold.values()))
 
     def decoded_counts(self):
         """(total_decode_events, distinct_packets) reaching the packet log.
