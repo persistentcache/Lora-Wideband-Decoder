@@ -185,9 +185,13 @@ def test_optional_origin_retains_sixth_baseline_sfd_candidate(
         refined.append(pre_loc)
         return pre_loc
 
-    result.ns.update(iq1=iq, sf=7, bw=125000, upchirp=upchirp,
+    result.ns.update(iq1=iq, sf=7, bw=125000, ppm=5, diag_out=None, upchirp=upchirp,
                      downchirp=np.conj(upchirp), skip_bins=[], Counter=Counter,
                      refine_preamble_start=refine,
+                     soft_fft_demod=decoder.soft_fft_demod,
+                     soft_deinterleave=decoder.soft_deinterleave,
+                     soft_hamming_decode_batch=decoder.soft_hamming_decode_batch,
+                     parse_header=decoder.parse_header,
                      deadline=1. if expire_before_optional else None,
                      time=SimpleNamespace(process_time=lambda: 2.),
                      print=lambda *a, **kw: None)
@@ -213,9 +217,14 @@ def test_successful_coarse_path_keeps_its_six_run_evaluation_limit(
         return pre_loc
 
     result.ns.update(iq1=np.zeros(448 * n, np.complex64), sf=7, bw=125000,
+                     ppm=5, diag_out=None,
                      upchirp=upchirp, downchirp=np.conj(upchirp),
                      skip_bins=[], Counter=Counter,
-                     refine_preamble_start=refine, print=lambda *a, **kw: None)
+                     refine_preamble_start=refine, print=lambda *a, **kw: None,
+                     soft_fft_demod=decoder.soft_fft_demod,
+                     soft_deinterleave=decoder.soft_deinterleave,
+                     soft_hamming_decode_batch=decoder.soft_hamming_decode_batch,
+                     parse_header=decoder.parse_header)
     exec(production_candidate_selection, result.ns)
     result.ns['select_candidate']()
     assert refined == [135 + run[0][0] * n for run in runs[:6]]
