@@ -44,7 +44,20 @@ Same 13-message USRP/Heltec matrix as the d3eb682 reference run (`Desktop/LoRa-L
 
 The alias merge's finder-grid header read is unreliable on these crops (margins marked invalid for grids whose full-attempt header checks) — it is used only as a relative discriminator, never to drop a candidate.
 
-Re-run: see the ledger.
+## Live run 2 (2b7d58f, Codex's launcher) and the two fixes it drove
+
+Same matrix through `prepare_live.py` + `launch.py` (`live_validation/ladder_live_2b7d58f`, metrics in `live_metrics_ladder_live_2b7d58f.json`): 13/13 recovered, `all_messages_verified`, zero unverified records, independent CRC audit 20/20, harness receipts valid; the only `live_metrics` acceptance reason left is one message whose firmware log shows two completions for one start (an attribution limit of the harness, not a decode result). Publication latency median 3.01 s (reference 2.84 s), max 5.50 s on the SF11/500k message. That message's first crop (pwr17, `early_214`) replays in 3.1 s on old and took 8.1 s with three duplicate emissions on 2b7d58f:
+
+3. **Alias-merge window was too wide.** The crop's finder reported the same preamble at starts 0, +0.95, +1.93 and +4.5 symbols. The old code tried each as its own candidate and decoded on the +1.93-symbol lock's first sweep; with the merge window at two symbols that lock was absorbed into the winner, whose attempt and recenter both read a valid header and never CRC'd — the pre-existing "confident demod, skip sweep" rule fired there (the fractional timing estimate rounded to −0.44 bins instead of old's −0.50, so the frac-park check that disarms the skip did not run), and without the redundant alias the frame surfaced only through Pass 2. Fix: aliases merge within ONE symbol (the padding's grid aliases); a lock a symbol or more later stays a candidate. 128: 8.1 → 2.3 s, one emission. Tried and rejected: handing a banned group to its next alias in the main ladder (made 052 and 172 slower than old and did not fix 128 — the second alias hits the same skip), and lifting the runner-up ratio gate (no decode).
+4. **Truncated recenter attempts left their span unmasked.** A CRC-absent fluke header (PL=203 on a 149-symbol junk SF12/250k capture, corpus 075) decoded to garbage in the old code's recenter rung, returned OK and masked its span; the truncated FAIL returned nothing to the caller, so the junk preamble survived for two more attempts and their recenters (10.6 → 14.1 s). The rung now hands the truncated span back and the caller masks it exactly as the main ladder does (075: 9.9 s).
+
+## Results (final build, 2026-10-31, serial, same machine, old main 921afce vs candidate)
+
+- Corpus 197: nothing lost; 101, 125, 127, 140, 147 gained (188 vs 183 recordings with a packet); total wall 471.1 → 280.3 s (−40.5 %); median per-recording ratio 0.84; p95 10.45 → 2.21 s; max 34.3 → 13.3 s; 25 recordings faster by more than 2 s; no recording slower by both >1.25x and >0.5 s (095, a junk capture, +0.4 s); duplicate-emission recordings 4 → 1.
+- 80 impairments: 79/80 vs 78/80 targets, nothing lost, wall −14 %.
+- 72 SF12/62.5k live crops (both live runs, `sf12_62_list.txt`): 54 → 68 crops decode a packet, nothing lost, wall 1049.6 → 384.9 s (−63 %), no crop slower by the bar; the one unverified record is the same CRC-16 collision old emits.
+- The five junk SF12/500k early crops of live run 2: both versions decode nothing; wall 25.2 → 12.9 s; one crop +0.85 s (2.1 → 3.0 s: the cheap truncated exits let more Pass-2 rungs run before the budget ends).
+- Unit tests: 914 passed + 16 subtests.
 
 ## Ledger
 

@@ -6268,6 +6268,16 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
                 return r          # ('OK', preamble_start, pkt_len, bin) — the
                                   # DECODED packet's span, same time axis as
                                   # iq1_work (recrop keeps rate and origin)
+            if r is not None and r[0] == 'FAIL' and _dx.get('truncated'):
+                # A header whose frame provably runs past the capture end:
+                # hand its span back so the caller masks it exactly as the
+                # main ladder masks a truncated attempt.  The old code
+                # "decoded" such a CRC-absent fluke header (PL=203 on a
+                # 149-symbol junk SF12/250k capture) to garbage, returned OK
+                # and masked the span; failing it here without the mask left
+                # the preamble in the residual for two more attempts and
+                # their recenters (10.6 s -> 14.1 s on corpus 075).
+                return ('TRUNCATED', r[1], r[2], r[3])
             # RUNNER-UP ALIAS: the recentered crop usually shows the same
             # preamble on several symbol grids and the score/margin pick
             # between them is a coin flip on marginal frames (one SF10/250k
@@ -7976,13 +7986,23 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     # preamble as several candidates on different symbol grids.  Delaying the grid by g chips lifts the
     # dechirped tone g bins, so (bin - start) mod N is the grid-invariant
     # CFO of the signal: candidates sharing it (within 3 bins) and starting
-    # within two symbols of each other are the same preamble.  Measured
-    # SF11/250k: four aliases (bins 36/1893/1559/1956, starts within 0.94
-    # symbol) each re-read the same PL=97 header and re-ran the same
-    # failing payload sweep — 15.2 s against 9.8 s for old code that saw
-    # fewer aliases.  Two frames from one transmitter are a frame apart;
-    # two transmitters within 3 bins starting within two symbols collide
-    # and neither decodes either way.
+    # within ONE symbol of each other are the padding's grid aliases of one
+    # preamble.  Measured SF11/250k: four aliases (bins 36/1893/1559/1956,
+    # starts within 0.94 symbol) each re-read the same PL=97 header and
+    # re-ran the same failing payload sweep — 15.2 s against 9.8 s for old
+    # code that saw fewer aliases.  A candidate a symbol or more later with
+    # the same invariant is a later lock on the same preamble that the old
+    # finder also reported as its own candidate, and it stays one: its
+    # attempt anchors on a different SFD and lands a different alignment.
+    # A live SF11/500k crop (first crop of the message) read a valid header
+    # on the winner and on its recenter and never CRC'd on either — the
+    # confident-demod sweep skip fired where the old code's alignment ran
+    # the sweep — while the lock 1.93 symbols later decoded on its first
+    # sweep: with it merged away the frame surfaced only through Pass 2,
+    # 8.1 s and three duplicate emissions against 3.1 s old; kept, 2.3 s.
+    # Two frames from one transmitter are a frame apart; two transmitters
+    # within 3 bins starting within a symbol collide and neither decodes
+    # either way.
     #
     # Which alias to keep: the score prefers late grids (the SFD metric
     # cannot see a grid up to a quarter symbol late), and the FFT padding
@@ -8030,7 +8050,7 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         _cfo_c = (ci[6] - ci[5]) % N
         for _ki, kj in enumerate(_merged):
             _dcfo = ((_cfo_c - (kj[6] - kj[5])) % N + N // 2) % N - N // 2
-            if abs(_dcfo) <= 3 and abs(ci[5] - kj[5]) < 2 * N:
+            if abs(_dcfo) <= 3 and abs(ci[5] - kj[5]) < N:
                 if alias_skip and _banned(kj) and not _banned(ci):
                     # Runner-up attempt: the banned winner hands its group
                     # to the next alias instead of being resurrected by the
