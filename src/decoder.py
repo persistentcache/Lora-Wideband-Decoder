@@ -6258,14 +6258,39 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
                 _rung_cap = None
             print("\n  === %s recenter by %.0f Hz ===" % (label, sh))
             iqx = recrop_centered(sh)
+            _rung_ddl = (_ddl if _rung_cap is None else
+                         (min(_ddl, _rung_cap) if _ddl else _rung_cap))
+            _dx = {}
             r = _decode_attempt(iqx.copy(), sf, bw, N, ppm, fs, dec, name,
                                 Counter, skip_bins=skip_bins, sweep_budget=1.0,
-                                deadline=(_ddl if _rung_cap is None else
-                                          (min(_ddl, _rung_cap) if _ddl else _rung_cap)))
+                                deadline=_rung_ddl, diag_out=_dx)
             if r is not None and r[0] == 'OK':
                 return r          # ('OK', preamble_start, pkt_len, bin) — the
                                   # DECODED packet's span, same time axis as
                                   # iq1_work (recrop keeps rate and origin)
+            # RUNNER-UP ALIAS: the recentered crop usually shows the same
+            # preamble on several symbol grids and the score/margin pick
+            # between them is a coin flip on marginal frames (one SF10/250k
+            # capture decodes only on its 6%-early grid, another SF11 only
+            # on its score winner).  When the winner read a valid header but
+            # its payload failed, give the next candidate of this crop one
+            # attempt with the winner banned, instead of leaving the crop
+            # and finding the frame again through Pass 2 (1.4 s -> 2.8 s).
+            # Bounded: once per rung, only when another candidate exists,
+            # never for truncated or sweep-gated attempts.
+            if (r is not None and r[0] == 'FAIL' and _dx.get('header_decoded')
+                    and not _dx.get('truncated') and not _dx.get('no_rescue')
+                    and _dx.get('n_candidates', 0) >= 2
+                    and (_rung_ddl is None or time.process_time() < _rung_ddl)
+                    and not (_BUDGET_S > 0 and (time.process_time() - _process_start) > _BUDGET_S)):
+                print("  === %s recenter by %.0f Hz: runner-up candidate ===" % (label, sh))
+                _dx2 = {}
+                r2 = _decode_attempt(iqx.copy(), sf, bw, N, ppm, fs, dec, name,
+                                     Counter, skip_bins=list(skip_bins) + [r[3]],
+                                     sweep_budget=1.0, deadline=_rung_ddl,
+                                     diag_out=_dx2, alias_skip=True)
+                if r2 is not None and r2[0] == 'OK':
+                    return r2
         return None
 
 
@@ -6373,12 +6398,15 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
         # `header_decoded` flag so ALL protocols (Meshtastic, MeshCore,
         # LoRaWAN, Unknown, etc.) reset the counter — not just Meshtastic-PL
         # frames (which would be what the narrower `hdr_ok` flag covers).
-        if _d.get('fluke_gated'):
+        if _d.get('fluke_gated') or _d.get('truncated'):
             # Fluke-gated attempt: the sweep gate proved this attempt's
             # header is a checksum fluke (>=2 mutually inconsistent
             # passing tuples + weak margin) — count it AS a no-header so
             # the cascade BAIL below ends the job instead of letting it
             # grind its full budget on further fluke variants.
+            # A truncated frame (valid header, capture ends before its
+            # payload) is equally terminal: nothing later in this ladder
+            # can complete it, so it must not keep the ladder alive.
             _consec_no_header += 1
         elif _d.get('header_decoded'):
             _consec_no_header = 0
@@ -6457,7 +6485,9 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
             # their bins burns the retry budget re-choosing them —
             # measured: gsf12_500k 2/2 -> 1/2, g500_sf11 4/5 -> 3/5
             # with unconditional retention.
-            if not (_d.get('hdr_ok') and bw <= 62500):
+            # A truncated frame's bin is always banned: re-choosing it can
+            # only re-read the same header and re-prove the same shortfall.
+            if _d.get('truncated') or not (_d.get('hdr_ok') and bw <= 62500):
                 skip_bins.append(preamble_bin)
             # Recrop to baseband now instead of after exhausting the retry
             # budget.  Fires when the signal is well off-centre (SC peak can
@@ -6474,9 +6504,12 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
             # could not read: the recenter only re-decoded the same frame
             # (SF12/125k: 2 s per duplicate).  A header-OK candidate still
             # earns its recenter — that is a real second frame.
-            if attempt <= 2 and (_d.get('hdr_ok')
-                                 or (abs(cfo_hz_raw) > bw / 8
-                                     and _EMIT_COUNT == 0)):
+            # A truncated frame earns no recenter either: the recentered
+            # crop holds the same samples and ends at the same place.
+            if (attempt <= 2 and not _d.get('truncated')
+                    and (_d.get('hdr_ok')
+                         or (abs(cfo_hz_raw) > bw / 8
+                             and _EMIT_COUNT == 0))):
                 _rr = _recenter_and_decode(cfo_hz_raw)
             if _rr is not None:
                 if _LAST_EMIT_VERIFIED[0]:
@@ -6526,8 +6559,10 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
             skip_bins[:] = _attempt_skip_bins
             print("  [PREAMBLE-FIT RETRY] later frame: mean CFO without regression")
             continue
-        # Also mask for the last couple attempts as fallback
-        if attempt >= 2:
+        # Also mask for the last couple attempts as fallback.  A truncated
+        # frame is masked at once — its span (preamble start to capture
+        # end) is known exactly and holds nothing this ladder can decode.
+        if attempt >= 2 or _d.get('truncated'):
             mask_end = min(len(iq1_work), mask_start + mask_len)
             iq1_work[mask_start:mask_end] = 0.0
 
@@ -7029,7 +7064,7 @@ def probe_frame_header(iq_nb, sf, bw, nb_fs, name='', *, budget_s=2.0,
 def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                     grid_sweep=False, force_td=None,
                     sweep_budget=2.0, diag_out=None, deadline=None,
-                    preamble_fit=True, header_only=False):
+                    preamble_fit=True, header_only=False, alias_skip=False):
     # deadline (process_time seconds, or None): the header-variant sweep below
     # is otherwise UNBOUNDED within one attempt — up to 128 grid_sweep offsets
     # x 8 symbols of FFT — so a phantom preamble can blow the whole per-file
@@ -7900,13 +7935,104 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
                           12.0 * _late_sym)
             cand_infos.append((cand_score, pre_len_cand, run_mean_pmr, sfd_ok_cand,
                                sfd_metric, preamble_start_cand, preamble_bin_cand,
-                               pre_last_i_cand, run))
+                               pre_last_i_cand, run, _sfd_cfo_cand_mean,
+                               sfd_i_cand))
 
     if not cand_infos:
         print("  NO PREAMBLE")
         return None
 
     cand_infos.sort(key=lambda x: x[0], reverse=True)
+
+    # SAME-PREAMBLE ALIAS MERGE (before the skip-bin filter: a frame keeps
+    # one candidate per attempt, as the old finder effectively had, so the
+    # retry ladder does not spend a full attempt per grid alias of a frame
+    # that will not decode; the recenter's runner-up attempt is where the
+    # next alias of a frame gets its turn).  The scan phases, refined/unrefined starts and origin runs surface one
+    # preamble as several candidates on different symbol grids.  Delaying the grid by g chips lifts the
+    # dechirped tone g bins, so (bin - start) mod N is the grid-invariant
+    # CFO of the signal: candidates sharing it (within 3 bins) and starting
+    # within two symbols of each other are the same preamble.  Measured
+    # SF11/250k: four aliases (bins 36/1893/1559/1956, starts within 0.94
+    # symbol) each re-read the same PL=97 header and re-ran the same
+    # failing payload sweep — 15.2 s against 9.8 s for old code that saw
+    # fewer aliases.  Two frames from one transmitter are a frame apart;
+    # two transmitters within 3 bins starting within two symbols collide
+    # and neither decodes either way.
+    #
+    # Which alias to keep: the score prefers late grids (the SFD metric
+    # cannot see a grid up to a quarter symbol late), and the FFT padding
+    # surfaces aliases the old finder never saw.  Measured SF10/250k: the
+    # same preamble at bin 0 (grid 6% early, decodes) and bin 312 (grid 24%
+    # late, header still passes HDR_CHK, payload never CRCs) — the late one
+    # scored 5 points higher and cost a Pass-2 recovery (1.4 s -> 2.8 s).
+    # The header symbols discriminate: read them on each alias's grid and
+    # keep the higher all-codeword min margin, but only when it beats the
+    # score winner by 1.5x — on marginal frames the CRC outcome flips
+    # erratically with small grid moves (forced-offset probe), so a
+    # near-tie must keep the score order the old code used.  Reduced-rate
+    # header symbols are forgiving and the margin ratio is not a sharp
+    # discriminator near the bar: the 24%-late grid above read 1.39x below
+    # the 6%-early one, while on another recording a 1.37x-better alias
+    # failed where the score winner decoded.  The recenter retry below
+    # gives the runner-up alias its turn when the winner's payload fails.
+    def _alias_header_margin(ci):
+        # Header windows start 2.25 symbols after the SFD the scoring stage
+        # located (the run-based preamble end can be a symbol short).
+        _h0 = ci[5] + int((ci[10] + 2.25) * N)
+        if _h0 < 0 or _h0 + 8 * N > len(iq1):
+            return False, 0.0
+        _llrs = [soft_fft_demod(iq1[_h0 + _j * N:_h0 + (_j + 1) * N], downchirp,
+                                N, N // 4, ppm, 4, cfo_shift=int(ci[6]) % N)
+                 for _j in range(8)]
+        _hb, _, _hm = soft_hamming_decode_batch(soft_deinterleave(_llrs, 8, ppm), 8)
+        _r = parse_header([int(_hb[_k]) for _k in range(ppm)])
+        _ok = bool(_r is not None and _r[3] and 4 <= _r[0] <= 237 and 1 <= _r[1] <= 4)
+        return _ok, (float(np.min(_hm)) if len(_hm) else 0.0)
+
+    if diag_out is not None:
+        # Candidates still available before aliases collapse: the recenter
+        # retry bans the winner and lets the merge pick among the rest.
+        diag_out['n_candidates'] = len(cand_infos)
+    def _banned(ci):
+        _b = ci[6] if ci[6] <= N // 2 else ci[6] - N
+        return any(abs(_b - (sb if sb <= N // 2 else sb - N)) < 20 for sb in skip_bins)
+
+    _merged = []
+    _alias_margins = {}
+    for ci in cand_infos:
+        _cfo_c = (ci[6] - ci[5]) % N
+        for _ki, kj in enumerate(_merged):
+            _dcfo = ((_cfo_c - (kj[6] - kj[5])) % N + N // 2) % N - N // 2
+            if abs(_dcfo) <= 3 and abs(ci[5] - kj[5]) < 2 * N:
+                if alias_skip and _banned(kj) and not _banned(ci):
+                    # Runner-up attempt: the banned winner hands its group
+                    # to the next alias instead of being resurrected by the
+                    # all-filtered fallback below.
+                    print("  ALIAS: bin=%d start=%d takes over from banned bin=%d"
+                          % (ci[6], ci[5], kj[6]))
+                    _merged[_ki] = ci
+                    break
+                if id(kj) not in _alias_margins:
+                    _alias_margins[id(kj)] = _alias_header_margin(kj)
+                _ok_k, _m_k = _alias_margins[id(kj)]
+                _ok_c, _m_c = _alias_header_margin(ci)
+                if _ok_c and _m_c >= 1.5 * _m_k:
+                    print("  ALIAS: bin=%d start=%d replaces bin=%d start=%d "
+                          "(hdr margin %.0f vs %.0f)"
+                          % (ci[6], ci[5], kj[6], kj[5], _m_c, _m_k))
+                    _merged[_ki] = ci
+                    _alias_margins[id(ci)] = (_ok_c, _m_c)
+                else:
+                    print("  ALIAS: bin=%d start=%d merged into bin=%d start=%d "
+                          "(hdr margin %.0f%s vs %.0f%s)"
+                          % (ci[6], ci[5], kj[6], kj[5], _m_c,
+                             '' if _ok_c else ' invalid', _m_k,
+                             '' if _ok_k else ' invalid'))
+                break
+        else:
+            _merged.append(ci)
+    cand_infos = _merged
 
     # Filter out candidates whose bin is too close to a previously-failed bin
     if skip_bins:
@@ -7925,10 +8051,16 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
         if filtered:
             cand_infos = filtered
         # If all filtered out, use originals (better than nothing)
+
     best_score, best_pre_len, best_mean_pmr, best_sfd_ok, best_sfd_metric, \
-        preamble_start, preamble_bin, pre_last_i, best_run = cand_infos[0]
+        preamble_start, preamble_bin, pre_last_i, best_run, _, _ = cand_infos[0]
 
     if len(cand_infos) > 1:
+        for _ci in cand_infos[:4]:
+            print("    cand: score=%.1f bin=%d start=%d len=%d pmr=%.1fdB "
+                  "SFD=%d/2 sfd_db=%.1f sfd_cfo=%+.1f"
+                  % (_ci[0], _ci[6], _ci[5], _ci[1], _ci[2], _ci[3], _ci[4],
+                     _ci[9]))
         print("  Chosen: bin=%d len=%d pmr=%.1fdB SFD=%d/2 score=%.1f start_sym=%d" % (
             preamble_bin, best_pre_len, best_mean_pmr, best_sfd_ok, best_score,
             preamble_start // N))
@@ -8151,6 +8283,79 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
             if _ci - 3 >= 0:
                 pre_last_i = _ci - 3
             break
+
+    # ---- HEADER GRID DESCENT (rescue of a grid that reads no header) ----
+    # The preamble cannot fix the symbol grid (identical symbols: a window
+    # offset by g chips dechirps to the same clean tone, g bins higher) and
+    # the SFD barely can (2.25 downchirps: a grid up to a quarter symbol LATE
+    # still sees two pure downchirp windows, so the SFD metric even favours
+    # late grids).  The eight HEADER symbols differ from their neighbours,
+    # so a misaligned window splits each dechirped peak between two symbols
+    # and the peak-to-mean drops with |g|: a binary descent on the summed
+    # header sharpness converges on the true boundary from up to ~0.48
+    # symbol away.  A >= 10% gain is only the prefilter; acceptance is
+    # decided below on the header itself.  Delaying the grid by g moves
+    # every dechirped tone UP g bins; the preamble reference already sits
+    # at bin 0, so rotate the crop by -g bins to keep it there (bin shifts
+    # are cyclic at BW-rate sampling).
+    _hdr0 = preamble_start + int((pre_last_i + 5.25) * N)
+    if _hdr0 - N // 2 >= 0 and _hdr0 + N // 2 + 8 * N <= len(iq1):
+        def _hdrq(_g):
+            _X = np.abs(_fft(iq1[_hdr0 + _g:_hdr0 + _g + 8 * N].reshape(8, N)
+                             * downchirp, axis=1))
+            return float(np.sum(_X.max(axis=1) / (_X.mean(axis=1) + 1e-30)))
+        _hg, _hq = 0, _hdrq(0)
+        _hq0 = _hq
+        for _step in (N // 4, N // 8, N // 16, N // 32, N // 64):
+            if _step < 1:
+                break
+            _qp = _hdrq(_hg + _step)
+            _qm = _hdrq(_hg - _step)
+            if _qp > _hq and _qp >= _qm:
+                _hg += _step; _hq = _qp
+            elif _qm > _hq:
+                _hg -= _step; _hq = _qm
+        if _hg != 0 and _hq > _hq0 * 1.10:
+            # RESCUE ONLY.  A forced-offset probe on marginal SF11 frames
+            # showed the payload CRC flipping erratically with the integer
+            # grid (one frame passed at -512..+256 chips except -256, another
+            # failed at +64..+256 but passed at 0), so moving a grid whose
+            # header already checks is a coin flip against the result the
+            # unmoved grid gives — and lost it on three corpus recordings.
+            # Re-phase only when the original grid reads NO valid header and
+            # the proposed grid does: that attempt had nothing to lose.  A
+            # genuine rescue is a badly misphased frame whose correction
+            # gains far more sharpness than the ~30% a fluke header on noise
+            # can show (junk accepts measured at +25..45% with margins of
+            # 1-25), so require 1.5x.  Decode the header on both grids (eight
+            # small FFTs each); the tones sit g bins up on the proposed grid,
+            # so read them with that CFO shift.
+            def _hdr_read(_g):
+                _llrs = [soft_fft_demod(iq1[_hdr0 + _g + _j * N:_hdr0 + _g + (_j + 1) * N],
+                                        downchirp, N, N // 4, ppm, 4,
+                                        cfo_shift=(_g % N)) for _j in range(8)]
+                _hb, _, _hm = soft_hamming_decode_batch(
+                    soft_deinterleave(_llrs, 8, ppm), 8)
+                _r = parse_header([int(_hb[_k]) for _k in range(ppm)])
+                _ok = bool(_r is not None and _r[3] and 4 <= _r[0] <= 237
+                           and 1 <= _r[1] <= 4)
+                return _ok, (float(np.min(_hm)) if len(_hm) else 0.0)
+            _ok0, _m0 = _hdr_read(0)
+            _ok1, _m1 = (False, 0.0) if _ok0 else _hdr_read(_hg)
+            if _ok1 and not _ok0 and _hq >= 1.5 * _hq0:
+                preamble_start += _hg
+                _t_g = np.arange(len(iq1), dtype=np.float64) / N
+                iq1 = (iq1 * np.exp(-1j * 2.0 * np.pi * _hg * _t_g)).astype(np.complex64)
+                print("  HDR GRID DESCENT: shift %+d samp (hdr q %.0f -> %.0f, "
+                      "hdr margin %.0f -> %.0f) — grid re-phased"
+                      % (_hg, _hq0, _hq, _m0, _m1))
+            elif _ok0:
+                print("  HDR GRID DESCENT: shift %+d samp not taken (hdr q %.0f -> "
+                      "%.0f) — original grid reads a valid header" % (_hg, _hq0, _hq))
+            else:
+                print("  HDR GRID DESCENT: shift %+d samp rejected (hdr q %.0f -> "
+                      "%.0f, proposed header valid=%s, margin %.0f)"
+                      % (_hg, _hq0, _hq, _ok1, _m1))
 
     # ---- Deterministic data_start (matching analysis script) ----
     # LoRa packet structure after last preamble symbol:
@@ -8729,6 +8934,72 @@ def _decode_attempt(iq1, sf, bw, N, ppm, fs, dec, name, Counter, skip_bins=None,
     ppm_pay = (sf - 2) if sym_time_ms > 16.0 else sf
     pay_levels = N if ppm_pay == sf else (N // 4)
     pay_bin_group = 1 if ppm_pay == sf else 4
+
+    # TRUNCATED FRAME: the header is valid but the capture ends before the
+    # payload's last FEC block in EITHER LDRO mode, even at the earliest
+    # timing offset the recovery sweep would try.  No payload decode, timing
+    # sweep, recenter or carrier rescue can supply the missing symbols, so
+    # the attempt is terminal here.  Measured on relay-tail captures (a
+    # second burst with the same PHY header starting ~100 symbols after the
+    # decoded frame, cut off by the capture end): treating it as a normal
+    # header-OK/CRC-fail re-armed the recenter + carrier rescue + Pass-2
+    # ladder and re-decoded the already-verified frame 6 times (SF12/125k:
+    # 9.4 s vs 1.9 s for the old oversized mask that erased the tail).
+    # The returned mask runs to the capture end: the frame provably
+    # extends past it.  The live header checkpoint (header_only above)
+    # still reports ready_end so the capture controller can extend.
+    _trunc_min_offset = -max(8, dec)
+    _alt_ppm_pay = (sf - 2) if ppm_pay == sf else sf
+    _fits_cur = _payload_fits_samples(len(iq1), data_start, N, ppm, ppm_pay,
+                                      cr, need_bytes, _trunc_min_offset)
+    _fits_alt = _payload_fits_samples(len(iq1), data_start, N, ppm,
+                                      _alt_ppm_pay, cr, need_bytes,
+                                      _trunc_min_offset)
+    _avail_syms = (len(iq1) - data_start - _trunc_min_offset) // N
+    _need_syms = _frame_data_symbols(ppm, ppm_pay, cr, need_bytes)
+    _truncated = not _fits_cur and not _fits_alt
+    _trunc_why = "no LDRO mode fits"
+    if not _fits_cur and _fits_alt:
+        # Only the opposite-LDRO frame fits, and that frame would END
+        # before the capture does.  Dechirp the symbols past its end on
+        # this grid: a frame that really ended leaves noise there (PMR at
+        # the floor); the current-mode frame running past the capture end
+        # leaves LoRa symbols with header-like PMR.  Measured: SF12/250k
+        # PL=56 — LDRO-on needs 68 symbols of 66 present, LDRO-off 58 —
+        # the 8 symbols after the LDRO-off end carried the burst at full
+        # strength, and the LDRO-off decode never CRC'd.
+        _alt_syms = _frame_data_symbols(ppm, _alt_ppm_pay, cr, need_bytes)
+        _alt_end = data_start + _alt_syms * N
+        _n_tail = (len(iq1) - _alt_end) // N
+        _n_hdr = min(8, (len(iq1) - data_start) // N)
+        if _n_tail >= 1 and _n_hdr >= 4:
+            def _grid_pmr_db(_start, _n):
+                _X = np.abs(_fft(iq1[_start:_start + _n * N].reshape(_n, N)
+                                 * downchirp, axis=1))
+                return float(np.median(10.0 * np.log10(
+                    _X.max(axis=1) / (_X.mean(axis=1) + 1e-30) + 1e-15)))
+            _hdr_pmr_db = _grid_pmr_db(data_start, _n_hdr)
+            _tail_pmr_db = _grid_pmr_db(_alt_end, _n_tail)
+            if _tail_pmr_db > 8.0 and _tail_pmr_db > _hdr_pmr_db - 4.0:
+                _truncated = True
+                _trunc_why = ("LoRa symbols continue past the %d-symbol "
+                              "LDRO-%s frame end (tail pmr %.1f dB, header "
+                              "%.1f dB)" % (_alt_syms,
+                                            "off" if _alt_ppm_pay == sf else "on",
+                                            _tail_pmr_db, _hdr_pmr_db))
+    if _truncated:
+        print("  TRUNCATED: PL=%d CR=4/%d needs %d data symbols, capture holds "
+              "%d after the header start — %s"
+              % (payload_len, cr + 4, _need_syms, _avail_syms, _trunc_why))
+        if diag_out is not None:
+            diag_out['truncated'] = True
+            diag_out['no_rescue'] = True
+        if _HARNESS_OUT:
+            _harness_emit('attempt_end', status='FAIL', via='truncated',
+                          payload_len=int(payload_len), cr=int(cr),
+                          need_symbols=int(_need_syms),
+                          available_symbols=int(_avail_syms))
+        return ('FAIL', preamble_start, len(iq1) - preamble_start, preamble_bin)
 
     print("\n  === SOFT PAYLOAD DECODE ===")
     print("  PL=%d CR=4/%d need=%d bytes, ppm_pay=%d, LDRO=%s" % (
