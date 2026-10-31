@@ -8560,6 +8560,11 @@ while True:
         if _pkt_id is not None and _hops_taken is not None and 'FAIL' not in (crc_line or ''):
             _pkey = (_pkt_id, _hops_taken)
             _now_pkt = time.time()
+            # The capture decoded a CRC-verified frame whether or not the
+            # publication dedup below admits it as new: a [DUP] of a frame
+            # another crop already published is still proof that this
+            # file's twin has nothing left to rescue.
+            self._note_verified(fname)
             with self._packet_dedup_lock:
                 stale = [k for k, t in self._packet_dedup.items()
                          if _now_pkt - t > 60.0]
@@ -8571,7 +8576,6 @@ while True:
                             f"[DUP] {_pkt_id} hop{_hops_taken} — "
                             f"same hop already decoded recently\n")
                 self._packet_dedup[_pkey] = _now_pkt
-                self._note_verified(fname)
                 # Phase-2: tell the dispatch loop that this RF bucket is
                 # covered so sibling captures (KEEP-2 second save + PASS-2-iso
                 # resubmit) skip their decode at dispatch time.
@@ -8617,6 +8621,7 @@ while True:
                     _now_fp = time.time()
                     _FP_WINDOW = 30.0
                     _FP_THRESH = 14
+                    self._note_verified(fname)
                     with self._fp_dedup_lock:
                         # Prune stale entries
                         for _k in [k for k, t in self._fp_dedup.items()
@@ -8631,7 +8636,6 @@ while True:
                                     f"[FP-DEDUP] duplicate payload suppressed\n")
                         if len(self._fp_dedup) < 512:
                             self._fp_dedup[_fp] = _now_fp
-                            self._note_verified(fname)
                             # Phase-2: same as for _packet_dedup admit —
                             # bucket is now covered; sibling captures
                             # skip decode at dispatch.
