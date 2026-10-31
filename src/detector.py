@@ -10807,6 +10807,25 @@ def main():
                         continue                    # futility cooldown: this
                                                     # bin burned a full futile
                                                     # cycle with zero confirms
+                    if sum(1 for _qb0 in _pat_cooldown
+                           if abs(_cb - _qb0) <= 205) >= 2:
+                        # REGION FUTILITY (2026-10-31): a wandering junk
+                        # source re-earns promotion at a new bin every
+                        # cycle — the per-bin cooldown (±29 kHz) never
+                        # catches it.  Live: carriers at 916.3-917.4 MHz
+                        # were promoted, burned 12 futile windows, retired
+                        # and replaced by a neighbour 20-40 times per run,
+                        # holding all 4 slots; the forced dechirps drove the
+                        # budget cap from 24 to 10 peaks per window and the
+                        # gate shed 10-30 peaks per window — one first
+                        # transmission was detected 2.5 s late and one not
+                        # at all (its retransmission was).  Two futile
+                        # carriers within ±500 kHz (the "detected normally"
+                        # neighbourhood) make the region junk until their
+                        # cooldowns lapse.  Real traffic there still decodes
+                        # through the main path, and a decode confirm lifts
+                        # nearby cooldowns as before.
+                        continue
                     if any(abs(_cb - _db0) <= 205 and wc - _dwc0 <= 600
                            for _db0, _dwc0 in _pat_det_bins.items()):
                         continue                    # being detected normally
