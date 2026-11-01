@@ -187,9 +187,10 @@ def test_retention_capacity_failure_is_explicit_main_loop_state():
     # Enough for the fixed mixer workspace, insufficient for this large view.
     e, r, _ = engine(budget_bytes=500000)
     r._rp = r._wp = 4000
-    register(e, 4000, tail=1_000_000)
-    with pytest.raises(SharedCaptureFailure): e.raise_if_failed()
-    assert e.stats()['incomplete_views'] == 1
+    assert register(e, 4000, tail=1_000_000) is None     # does not fit: not admitted
+    e.raise_if_failed()
+    assert e.stats()['non_admitted'] == 1 and e.stats()['active_views'] == 0
+    assert e.budget.stats()['used_bytes'] == e._crop_credit.size   # nothing leaked
     e.close(wait=False)
 
 
@@ -283,13 +284,24 @@ def test_producer_does_not_wait_while_worker_copies_history():
 
 
 def test_full_outbox_slot_limit_is_reserved_before_capture_completion():
-    e,r,_=engine(max_views=1)
+    """The outbox slot is reserved at admission; a capture that finds no slot
+    is not admitted (counted and reported) while the service and the
+    admitted capture carry on."""
+    notices=[]
+    submitted=[]
+    e,r,_=engine(max_views=1,submit=lambda item: submitted.append(item) or True)
+    e.report=notices.append
     r._rp=r._wp=4000
-    register(e,4000,tail=28000)
+    register(e,4000,tail=2000)
     assert e.stats()['budget']['outbox_slots']==1
-    register(e,6500,tail=28000)
-    with pytest.raises(SharedCaptureFailure):e.raise_if_failed()
-    assert 'slots' in e.failure
+    assert register(e,6500,tail=2000) is None
+    e.raise_if_failed()
+    assert e.stats()['non_admitted']==1 and e.stats()['active_views']==1
+    e.step()
+    assert any('NON-ADMISSION' in n and 'slots' in n for n in notices)
+    advance(e,r,9000)
+    assert len(submitted)==1 and submitted[0].complete
+    submitted[0].release()
     e.close(wait=False)
 
 

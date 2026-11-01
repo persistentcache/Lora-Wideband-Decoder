@@ -463,6 +463,24 @@ class SharedCapture:
                     self._watermark = tuple(anchor)
             self._wake.set()
             return view.number
+        except CaptureCapacityError as exc:
+            # The byte/outbox budget is a resource limit, not an invariant:
+            # a burst of simultaneous captures on a small-RAM host used to
+            # fail the whole service (and restart the receiver) over the one
+            # capture that did not fit.  That capture is not admitted; every
+            # other view, band and the live stream are untouched.
+            with self._lock:
+                if view is not None:
+                    for ref in view.refs:
+                        ref.band.refs = [(v, r) for v, r in ref.band.refs if v is not view]
+                if lease is not None:
+                    lease.release()
+                self._retire()
+                self._non_admitted += len(detections)
+                self._pending_notice = ('[SHARED-CAPTURE NON-ADMISSION] capture budget '
+                                        f'exhausted: {exc}; count={self._non_admitted}')
+                self._wake.set()
+            return None
         except Exception as exc:
             with self._lock:
                 if view is not None:

@@ -6776,7 +6776,14 @@ class BackgroundDecoder:
         self._job_dur_ewma = 0.0         # measured decode wall time, EWMA
         self._ok_dur_ewma = 0.0          # wall time of SUCCESSFUL full-budget
                                          # fast-tier jobs: this host's speed
-        self._wait_since = {}            # fpath -> first time it waited on a sibling
+        # Sibling park: a capture whose RF bucket is already decoding waits
+        # here, OFF the worker, until that job clears the bucket (skipped if
+        # the bucket verified, released otherwise) or its own deadline passes
+        # (then it runs regardless, as the old wait did).  The old wait held a
+        # worker in a 2 s sleep loop and requeued the job every turn: on a
+        # three-worker host one worker was busy waiting while its twin decoded.
+        self._sib_park = {}              # inflight bucket key -> [(job, slow, prio, deadline)]
+        self._park_expired = set()       # fpaths released by deadline: run, do not park again
         # stale in-flight GC: only a crashed/hung worker leaves an entry
         # behind (completion clears it), so bound it by the longest legal
         # fast-tier decode (SF12 scale 2^2.5) with 2x slack
@@ -7504,28 +7511,93 @@ while True:
     # 5.0 s covers SF12 LONG_SLOW decodes (the slowest standard preset) with
     # margin.  If a worker has been holding a bucket longer than this it's
     # presumed crashed/wedged and sibling dispatches proceed normally.
-    def _is_bucket_inflight(self, fpath):
-        """True if another worker is currently processing a sibling capture
-        in the same RF bucket (or a same-slope alias bucket) as `fpath`.
+    def _inflight_bucket_key(self, fpath):
+        """The in-flight bucket key another worker is decoding that covers
+        `fpath`'s RF bucket (same bucket or a same-slope alias), or None.
         Auto-GCs entries older than _inflight_max_age_s so a crashed worker
         can't deadlock siblings."""
         with self._bucket_lock:
             bkey = self._fname_bucket.get(fpath)
             if bkey is None:
-                return False
+                return None
             now = time.time()
             stale = []
-            hit = False
+            hit = None
             for key, dispatch_ts in self._inflight_buckets.items():
                 if now - dispatch_ts > self._inflight_max_age_s:
                     stale.append(key)
                     continue
-                if self._bucket_hit(bkey, key):
-                    hit = True
-                    break
+                if hit is None and self._bucket_hit(bkey, key):
+                    hit = key
             for k in stale:
                 self._inflight_buckets.pop(k, None)
             return hit
+
+    def _is_bucket_inflight(self, fpath):
+        """True if another worker is currently processing a sibling capture
+        in the same RF bucket (or a same-slope alias bucket) as `fpath`."""
+        return self._inflight_bucket_key(fpath) is not None
+
+    def _park_sibling(self, job, prio, slow_token):
+        """Park `job` behind the in-flight sibling covering its bucket instead
+        of holding a worker.  Returns True when parked (the caller moves on).
+        Not parked: no sibling in flight, or this job already waited out its
+        deadline once (it then runs concurrently, as the old wait did)."""
+        fpath = job[0]
+        with self._bucket_lock:
+            if fpath in self._park_expired:
+                self._park_expired.discard(fpath)
+                return False
+        key = self._inflight_bucket_key(fpath)
+        if key is None:
+            return False
+        bk = self._fname_bucket.get(fpath)
+        sf = bk[4] if (bk is not None and len(bk) >= 6) else 12
+        deadline = time.time() + max(
+            2.0,
+            1.5 * self._fast_budget_s * 2.0 ** ((sf - 7) * 0.5),
+            2.0 * self._job_dur_ewma)
+        self._slow_retire(slow_token)
+        with self._bucket_lock:
+            self._sib_park.setdefault(key, []).append(
+                (job, slow_token is not None, prio, deadline))
+        self._rawlog('PARK-SIBLING', os.path.basename(fpath))
+        return True
+
+    def _dispose_parked(self, parked, expired=False):
+        for job, slow, prio, _deadline in parked:
+            fpath, fname, relay_after, relay_before, _budget = job
+            if self._bucket_already_decoded(fpath):
+                self._rawlog('SKIP-PARKED', f"{fname} sibling verified")
+                if relay_after is None and relay_before is None:
+                    self._plain_done(fpath)
+                self._ref_dec_and_maybe_unlink(fpath)
+                continue
+            if expired:
+                with self._bucket_lock:
+                    self._park_expired.add(fpath)
+            self._rawlog('RELEASE-PARKED', fname)
+            if slow or self._defer_state:
+                self._slow_queue.put(job)
+            else:
+                self._queue.put((prio, next(self._qseq), job))
+
+    def _flush_stale_parks(self, force=False):
+        """Release parked siblings past their deadline (all of them at drain)
+        so a lost in-flight exit can never strand a capture."""
+        now = time.time()
+        with self._bucket_lock:
+            batch = []
+            for key in list(self._sib_park):
+                entries = self._sib_park[key]
+                keep = [e for e in entries if not force and e[3] > now]
+                batch.extend(e for e in entries if force or e[3] <= now)
+                if keep:
+                    self._sib_park[key] = keep
+                else:
+                    self._sib_park.pop(key, None)
+        if batch:
+            self._dispose_parked(batch, expired=not force)
 
     def _mark_bucket_inflight(self, fpath):
         """Mark this fpath's bucket as in-flight (a worker is about to start
@@ -7545,6 +7617,9 @@ while True:
             if bkey is None:
                 return
             self._inflight_buckets.pop(bkey, None)
+            parked = self._sib_park.pop(bkey, [])
+        if parked:
+            self._dispose_parked(parked)
 
     def set_pressure(self, frac):
         self._pressure = float(frac)
@@ -7787,8 +7862,10 @@ while True:
             n = (self._queue.qsize() + self._slow_queue.qsize()
                  + self._active_count)
         with self._iso_lock:
-            return (n + sum(len(v) for v in self._iso_hold.values())
-                    + sum(len(v) for v in self._full_hold.values()))
+            n += (sum(len(v) for v in self._iso_hold.values())
+                  + sum(len(v) for v in self._full_hold.values()))
+        with self._bucket_lock:
+            return n + sum(len(v) for v in self._sib_park.values())
 
     def decoded_counts(self):
         """(total_decode_events, distinct_packets) reaching the packet log.
@@ -7974,6 +8051,7 @@ while True:
         deadline = time.time() + timeout
         while self.pending() > 0 and time.time() < deadline:
             self._flush_stale_iso_holds(max_age=0.0)
+            self._flush_stale_parks(force=True)
             self.drain_slow_into_fast()
             time.sleep(0.2)
         # Close every pool worker's stdin so it exits cleanly; kill stragglers.
@@ -8004,6 +8082,7 @@ while True:
         worker = None
         while not self._aborting():
             self._flush_stale_iso_holds()
+            self._flush_stale_parks()
             self._release_one_slow()
             # Plain blocking get on the fast queue — NO polling loop (10 threads
             # waking on a timeout competed with the gate's realtime thread and
@@ -8011,7 +8090,7 @@ while True:
             # its items INTO this fast queue at shutdown (drain_slow_into_fast),
             # so these same blocking workers process the stragglers then, with
             # the big per-job budget carried in the job tuple.
-            _, _, job = self._queue.get()
+            _prio, _, job = self._queue.get()
             if job is None or self._aborting():
                 self._queue.task_done()
                 break
@@ -8124,59 +8203,15 @@ while True:
                 # above typical decode time (SF7-SF11 finish in 0.5-1.5 s); the
                 # in-flight entry also has a 5 s GC timeout so a crashed worker
                 # can never deadlock siblings indefinitely.
-                if self._is_bucket_inflight(fpath):
-                    # Wait as long as the sibling can legitimately take: the
-                    # fast-tier budget, or twice the measured job duration if
-                    # that is longer.  The loop exits the moment the sibling
-                    # admits or finishes, so this costs nothing where decodes
-                    # are quick; where they take 2-15 s (Pi 5) the old fixed
-                    # 2 s let every sibling run a full duplicate decode.
-                    # the fast-tier budget scales 2^((sf-7)/2) like the
-                    # decoder's own (SF11 = 4x), so size the wait by the
-                    # capture's SF when the bucket key carries it
-                    _bk = self._fname_bucket.get(fpath)
-                    _sfw = _bk[4] if (_bk is not None and len(_bk) >= 6) else 12
-                    _wait_deadline = time.time() + max(
-                        2.0,
-                        1.5 * self._fast_budget_s * 2.0 ** ((_sfw - 7) * 0.5),
-                        2.0 * self._job_dur_ewma)
-                    _skipped = False
-                    # A worker used to SLEEP here for the whole deadline (up to
-                    # 85 s at SF12) while its sibling decoded: with a cluster of
-                    # SF12 copies that serialised the whole pool — 5 worker
-                    # processes, active=1, queue 19 (Pi 5 live).  Wait briefly,
-                    # then put the job BACK on the queue and take the next one;
-                    # it returns once the sibling has admitted (skip) or finished
-                    # (decode).  The original deadline still bounds the total
-                    # time a job can be deferred this way.
-                    _first_wait = self._wait_since.setdefault(fpath, time.time())
-                    _short_deadline = min(_wait_deadline, time.time() + 2.0)
-                    while time.time() < _short_deadline and not self._aborting():
-                        time.sleep(0.1)
-                        if self._bucket_already_decoded(fpath):
-                            self._rawlog('SKIP-INFLIGHT-ADMIT', os.path.basename(fpath))
-                            self._ref_dec_and_maybe_unlink(fpath)
-                            self._wait_since.pop(fpath, None)
-                            if _slow_token is not None:
-                                self._slow_retire(_slow_token)
-                            self._queue.task_done()
-                            if self._verbose:
-                                print(f"         [BUCKET-DEDUP] skip {os.path.basename(fpath)} "
-                                      f"— sibling admitted during wait",
-                                      file=sys.stderr, flush=True)
-                            _skipped = True
-                            break
-                        if not self._is_bucket_inflight(fpath):
-                            break
-                    if _skipped:
-                        continue
-                    if (self._is_bucket_inflight(fpath) and _slow_token is None
-                            and time.time() - _first_wait < _wait_deadline - (_short_deadline - 2.0)):
-                        self._rawlog('REQUEUE-SIBLING', os.path.basename(fpath))
-                        self._queue.put((-0.0, next(self._qseq), job))
-                        self._queue.task_done()
-                        continue
-                    self._wait_since.pop(fpath, None)
+                # A sibling of a capture that is decoding right now waits in
+                # the park, off the worker, until that job clears its bucket
+                # (skipped if the bucket verified, released otherwise) or its
+                # own deadline passes.  The former sleep-and-requeue loop held
+                # a worker for 2 s per turn: on a three-worker host one worker
+                # idled while its twin decoded (emulated Pi, 2026-10-31).
+                if self._park_sibling(job, _prio, _slow_token):
+                    self._queue.task_done()
+                    continue
 
                 # Mark this bucket in-flight BEFORE writing to the worker stdin
                 # so siblings see the in-flight state immediately.
