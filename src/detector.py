@@ -306,6 +306,37 @@ DECHIRP_MF_MIN_DB = 12.0
 # gaps (e.g. a 15 s beacon), so distinct transmissions are preserved.
 DECHIRP_DEDUP_WIN_S = 1.5
 
+# A strong gate peak (this many dB over the window's PSD floor) that the
+# preamble detector cannot confirm is logged, once per 20 kHz carrier bucket
+# per _UNCONFIRMED_EVERY_S, with the best Schmidl-Cox score it reached.  Live
+# run 2026-10-31: two 52 dB SF7/125k transmissions in a clean band produced no
+# log line at all, so a missed first transmission could not be told apart from
+# RF that never arrived.  This keeps that failure visible without touching any
+# decision.  30 dB sits above the band's ambient spurs (measured 20-25 dB over
+# the floor on the 2026-10-31 recordings) and well below a nearby node's burst.
+GATE_UNCONFIRMED_DB = 30.0
+_UNCONFIRMED_EVERY_S = 30.0
+_unconfirmed_last = {}
+
+
+def _note_unconfirmed(freq_hz, over_db, width_bins, sc, thr):
+    bucket = int(round(freq_hz / 20e3))
+    now = time.monotonic()
+    last = _unconfirmed_last.get(bucket)
+    if last is not None and now - last < _UNCONFIRMED_EVERY_S:
+        return
+    _unconfirmed_last[bucket] = now
+    if len(_unconfirmed_last) > 256:
+        for key in [k for k, t in _unconfirmed_last.items() if now - t >= _UNCONFIRMED_EVERY_S]:
+            del _unconfirmed_last[key]
+    if sc:
+        best = max(sc, key=lambda lag: sc[lag][0])
+        why = f'SC best lag={best} score={sc[best][0]:.2f} < {thr:.2f}'
+    else:
+        why = 'no bandwidth class reached the SC stage'
+    print(f'[GATE-UNCONFIRMED] peak {freq_hz / 1e6:.4f}MHz +{over_db:.0f}dB over floor, '
+          f'width {width_bins} bins: {why}', file=sys.stderr, flush=True)
+
 # Max channels to run the dechirp matched-filter on at once (the channelizer's learned
 # channels).  Each is a forced per-window dechirp scan (cheap after the per-channel-
 # compute fix, fix #3); the cap bounds worst-case work if the channelizer learns many
@@ -3681,6 +3712,10 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                   file=sys.stderr)
 
         if not hit_lags:
+            if (debug >= 1 and not _ld
+                    and (pwr - _psd_floor_db) >= GATE_UNCONFIRMED_DB):
+                _note_unconfirmed(center_mhz * 1e6 + off_hz, pwr - _psd_floor_db,
+                                  bw_bins, sc, _thr_m)
             return _ld
 
         if os.environ.get('LORA_SLOW_DEBUG'):
