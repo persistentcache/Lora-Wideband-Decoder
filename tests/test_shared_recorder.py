@@ -57,8 +57,8 @@ def test_actual_recorder_exposes_failed_capture_before_healthy_loop_can_continue
         rec.feed_tail(np.zeros(500,np.complex64),sample_pos=4000)
 
 
-def test_shared_flag_is_explicit_and_does_not_change_default_recorder(rec,monkeypatch):
-    monkeypatch.delenv('LORA_SHARED_CAPTURE')
+def test_plain_capture_on_request_keeps_the_default_recorder(rec,monkeypatch):
+    monkeypatch.setenv('LORA_SHARED_CAPTURE','0')
     rec.set_history_reader(reader())
     assert rec._shared is None
 

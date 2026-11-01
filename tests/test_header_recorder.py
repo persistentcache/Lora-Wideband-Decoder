@@ -24,7 +24,7 @@ def worker(rec):
 def test_header_flag_requires_shared_path(rec,monkeypatch):
     from test_capture_timeline import reader
     monkeypatch.setenv('LORA_HEADER_CHECKPOINT','1')
-    monkeypatch.delenv('LORA_SHARED_CAPTURE')
+    monkeypatch.setenv('LORA_SHARED_CAPTURE','0')          # plain capture requested
     with pytest.raises(RuntimeError,match='SHARED_CAPTURE'):rec.set_history_reader(reader())
     assert rec._shared is None
 

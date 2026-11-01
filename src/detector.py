@@ -4934,6 +4934,97 @@ def _record_slow_capture(recorder, detections, base, base_end, *, sample_pos,
                              gap_parts=gap_parts, tail_parts=tail_parts)
 
 
+def _mem_available_bytes():
+    """Linux MemAvailable (what a new allocation can actually use), else the
+    free-page count, else None when the host does not say."""
+    try:
+        with open('/proc/meminfo') as fh:
+            for line in fh:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf('SC_AVPHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+_MIB = 1024 * 1024
+SHARED_CAPTURE_PLAN_BYTES = 2048 * _MIB        # Codex's validated retention plan
+SHARED_CAPTURE_RAM_HEADROOM = 2048 * _MIB      # the rest of the pipeline, workers, web
+
+
+def shared_capture_plan(environ, mem_available):
+    """Decide how this host captures.
+
+    Frame-length-exact capture (the shared recorder with header checkpoints)
+    ends a capture when the frame's header says the frame ends, instead of
+    after the worst-case frame duration of its SF/BW; on every host measured
+    it halved slow-SF publication latency and removed most redundant decodes.
+    It is the default wherever the host can carry its memory budget:
+
+      LORA_SHARED_CAPTURE unset  -> on when MemAvailable >= 2 x budget + 2 GiB,
+                                    header checkpoints on (LORA_HEADER_CHECKPOINT=0 opts out),
+                                    budget = 2048 MiB plan + header workspace
+                                    (about 2.8 GiB; a 16 GB Pi 5 or any desktop
+                                    qualifies, an 8 GB Pi does not and keeps
+                                    plain capture)
+      LORA_SHARED_CAPTURE=0      -> plain capture
+      LORA_SHARED_CAPTURE=1      -> the explicit diagnostic form, unchanged:
+                                    LORA_SHARED_CAPTURE_MB sizes the budget
+                                    (default 2048), header checkpoints only
+                                    with LORA_HEADER_CHECKPOINT=1 and then an
+                                    explicit budget of at least the plan plus
+                                    the header workspace.
+
+    Returns a dict: enabled, explicit, header, budget_bytes, views,
+    prefix_bytes, header_workspace, reason.  Raises RuntimeError for
+    contradictory explicit settings, exactly as before."""
+    mode = environ.get('LORA_SHARED_CAPTURE')
+    header_env = environ.get('LORA_HEADER_CHECKPOINT')
+    views = int(environ.get('LORA_SHARED_CAPTURE_VIEWS', '64'))
+    prefix_bytes = int(environ.get('LORA_HEADER_PREFIX_MB', '64')) * _MIB
+    header_workspace = 8 * prefix_bytes + 128 * _MIB
+    header_extra = header_workspace + 2 * prefix_bytes + 65536
+    base = dict(views=views, prefix_bytes=prefix_bytes, header_workspace=header_workspace)
+    if mode == '0':
+        if header_env == '1':
+            raise RuntimeError('LORA_HEADER_CHECKPOINT requires LORA_SHARED_CAPTURE=1')
+        return dict(base, enabled=False, explicit=True, header=False, budget_bytes=0,
+                    reason='plain capture: LORA_SHARED_CAPTURE=0')
+    if mode == '1':
+        header = header_env == '1'
+        budget = int(environ.get('LORA_SHARED_CAPTURE_MB', '2048')) * _MIB
+        if header:
+            if prefix_bytes <= 0:
+                raise RuntimeError('header prefix memory budget must be positive')
+            if ('LORA_SHARED_CAPTURE_MB' not in environ
+                    or budget < SHARED_CAPTURE_PLAN_BYTES + header_extra):
+                raise RuntimeError('header checkpoint memory requires explicit aggregate '
+                                   'LORA_SHARED_CAPTURE_MB budget (3072 with default prefix)')
+        return dict(base, enabled=True, explicit=True, header=header, budget_bytes=budget,
+                    reason=f'LORA_SHARED_CAPTURE=1, budget {budget // _MIB} MiB, '
+                           f'header checkpoints {"on" if header else "off"}')
+    header = header_env != '0'
+    budget = SHARED_CAPTURE_PLAN_BYTES + (header_extra if header else 0)
+    need = 2 * budget + SHARED_CAPTURE_RAM_HEADROOM
+    if mem_available is None or mem_available < need:
+        have = 'unknown' if mem_available is None else f'{mem_available / _MIB:.0f} MiB'
+        if header_env == '1':
+            raise RuntimeError(f'LORA_HEADER_CHECKPOINT=1 but frame-exact capture does not fit: '
+                               f'{have} available, needs {need / _MIB:.0f} MiB; set '
+                               'LORA_SHARED_CAPTURE=1 and LORA_SHARED_CAPTURE_MB to force it')
+        return dict(base, enabled=False, explicit=False, header=False, budget_bytes=0,
+                    reason=f'plain capture: {have} available, frame-exact capture needs '
+                           f'{need / _MIB:.0f} MiB (set LORA_SHARED_CAPTURE=1 and '
+                           f'LORA_SHARED_CAPTURE_MB to force it)')
+    return dict(base, enabled=True, explicit=False, header=header, budget_bytes=budget,
+                reason=f'frame-exact capture: budget {budget // _MIB} MiB of '
+                       f'{mem_available / _MIB:.0f} MiB available, header checkpoints '
+                       f'{"on" if header else "off"}')
+
+
 class SignalRecorder:
     """One file per detection, saved in a background thread.
 
@@ -5133,31 +5224,31 @@ class SignalRecorder:
         self._decoder = decoder
 
     def set_history_reader(self, reader):
-        """Enable the independently gated shared live-capture experiment."""
-        header_enabled = os.environ.get('LORA_HEADER_CHECKPOINT') == '1'
-        if os.environ.get('LORA_SHARED_CAPTURE') != '1':
-            if header_enabled:
-                raise RuntimeError('LORA_HEADER_CHECKPOINT requires LORA_SHARED_CAPTURE=1')
+        """Attach the live ring reader and choose the capture mode for this
+        host (see shared_capture_plan): frame-length-exact capture by default
+        where the memory fits, plain capture otherwise or on request."""
+        plan = shared_capture_plan(os.environ, _mem_available_bytes())
+        if not plan['enabled']:
+            print(f"[CAPTURE] {plan['reason']}", file=sys.stderr, flush=True)
             return
         if not hasattr(reader, 'history_parts'):
-            raise RuntimeError('LORA_SHARED_CAPTURE requires validated live ring history')
+            if plan['explicit']:
+                raise RuntimeError('LORA_SHARED_CAPTURE requires validated live ring history')
+            print('[CAPTURE] plain capture: this source has no validated ring history',
+                  file=sys.stderr, flush=True)
+            return
         if os.environ.get('LORA_NO_DEFER') == '1':
-            raise RuntimeError('LORA_SHARED_CAPTURE cannot use blocking LORA_NO_DEFER')
+            if plan['explicit']:
+                raise RuntimeError('LORA_SHARED_CAPTURE cannot use blocking LORA_NO_DEFER')
+            print('[CAPTURE] plain capture: LORA_NO_DEFER=1 blocks the main loop',
+                  file=sys.stderr, flush=True)
+            return
         from capture_timeline import CaptureBudget, SharedCapture
-        budget = CaptureBudget(int(os.environ.get('LORA_SHARED_CAPTURE_MB', '2048')) * 1024 * 1024,
-                               int(os.environ.get('LORA_SHARED_CAPTURE_VIEWS', '64')))
-        if header_enabled:
-            prefix_bytes = int(os.environ.get('LORA_HEADER_PREFIX_MB', '64')) * 1024 * 1024
-            if prefix_bytes <= 0:
-                raise RuntimeError('header prefix memory budget must be positive')
-            header_workspace = 8 * prefix_bytes + 128 * 1024 * 1024
-            # Explicit diagnostic allocation, not a host-aware default. Keep
-            # the existing2GiB capture plan intact plus one persistent worker
-            # and two file-backed prefixes (3GiB total with default knobs).
-            minimum = 2048 * 1024 * 1024 + header_workspace + 2 * prefix_bytes + 65536
-            if ('LORA_SHARED_CAPTURE_MB' not in os.environ or budget.total_bytes < minimum):
-                raise RuntimeError('header checkpoint memory requires explicit aggregate '
-                                   'LORA_SHARED_CAPTURE_MB budget (3072 with default prefix)')
+        budget = CaptureBudget(plan['budget_bytes'], plan['views'])
+        header_enabled = plan['header']
+        prefix_bytes = plan['prefix_bytes']
+        header_workspace = plan['header_workspace']
+        print(f"[CAPTURE] {plan['reason']}", file=sys.stderr, flush=True)
         self._history_reader = reader
         self._shared = SharedCapture(
             rate=self.wb_fs, center=self.center_hz, hop_n=self.hop_n,
