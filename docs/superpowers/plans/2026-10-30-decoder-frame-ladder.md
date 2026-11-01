@@ -159,7 +159,23 @@ Offline reproduction attempt: `Desktop/LoRa-Raw-SF7x3-20261031/` records 231 s o
 
 **Shared-capture budget exhaustion → non-admission (capture_timeline.py).** A registration that did not fit the byte or outbox budget failed the whole service (Codex's logs show `capture admission failed: band_retention growth exceeds capture byte budget` twice, each a receiver restart). The limit is a resource bound, not an invariant, so that registration is now refused like the existing out-of-band and retune-boundary cases: counted in `non_admitted`, reported once, every other view and band untouched. The two tests that asserted the fatal (`test_full_outbox_slot_limit_is_reserved_before_capture_completion`, `test_retention_capacity_failure_is_explicit_main_loop_state`) now assert the refusal, that nothing leaked from the budget, and that the admitted capture still completes.
 
+## Frame-length-exact capture is the default (20ea5ff)
+
+Plain capture records a frame for the worst-case duration of its SF/BW and decode cost scales with the crop; the shared recorder with header checkpoints ends the capture where the header says the frame ends. It was env-only. On the emulated 4-core host it halved slow-SF publication latency (SF12/250k 49 → 16 s, SF12/62.5k 47 → 28 s) with fewer decode jobs, and its two fatal paths are degradations now. `shared_capture_plan()` (detector.py) decides the mode once at start and the recorder logs it as a `[CAPTURE]` line:
+
+| `LORA_SHARED_CAPTURE` | result |
+|---|---|
+| unset | exact capture when MemAvailable ≥ 2 × budget + 2 GiB, budget = the validated 2048 MiB plan + header workspace (about 2.8 GiB), header checkpoints on unless `LORA_HEADER_CHECKPOINT=0`; otherwise plain capture with the reason. A 16 GB Pi 5 or any desktop qualifies; an 8 GB Pi keeps plain capture unless forced. |
+| `0` | plain capture (`LORA_HEADER_CHECKPOINT=1` with it is still an error) |
+| `1` | the explicit diagnostic form, unchanged: `LORA_SHARED_CAPTURE_MB` sizes the budget, header checkpoints only with `LORA_HEADER_CHECKPOINT=1` and an explicit budget of at least plan + workspace |
+
+Why 2 × budget + 2 GiB: the budget is a cap on charged bytes (peaks in the emulation 1.5–2.2 GiB at 5 Msps, 1.6–3.0 GiB at 10 Msps) and the rest of the pipeline, its decode workers and the web app need their own several GiB; an 8 GB Pi 5 ran plain capture at 6 GB RSS before and froze once, so it is not enabled there by default. In auto mode a source without validated ring history or `LORA_NO_DEFER=1` falls back to plain capture with a `[CAPTURE]` line; the explicit form still refuses. Tests: `tests/test_capture_default.py`.
+
+Validation of the default path (no environment set, so the detector chose the mode itself: `[CAPTURE] frame-exact capture: budget 2816 MiB of 50107 MiB available, header checkpoints on`): emulated 4-core host at 5 Msps, same packets as the plain arm on the same cores, message published 23.5 s after transmission against 36.2 s plain on the junk recording and 4.8 s against 12.1 s on the SF12/250k recording, charged peaks 1.46 and 2.19 GiB under the 2.75 GiB budget, no non-admission, no lap; the three-message recording at full speed, 9 of 9 transmissions. Live run 9 (`ladder_live8_20ea5ff`, Codex's launcher, which sets the explicit form): 13/13 recovered, CRC audit 20/20, `all_messages_verified`, publication median 2.81 s (reference 2.84 s), max 4.17 s, nothing over 5 s, 135 decode jobs (reference 243), 61 full crops skipped for their verified early sibling. The acceptance gate's attribution item stayed open for message 6 only because the Heltec's serial log carried one "Started Tx" and two "Completed sending" lines for that packet; the message itself was published 2.18 s after transmission.
+
 ## Ledger
+
+2026-10-31 (night, 20ea5ff): frame-length-exact capture is the default where MemAvailable allows (`shared_capture_plan`, `tests/test_capture_default.py`); default-mode emulation replays `Desktop/LoRa-PiEmul-20261031/{junk,sf12_250}_new_default_5m`, full-speed `Desktop/LoRa-Raw-SF7x3-20261031/replay_default` (9/9), live run 9 `ladder_live8_20ea5ff` 13/13, CRC 20/20, median 2.81 s, max 4.17 s, 135 jobs; 951 tests.
 
 2026-10-31 (night, b020438): sibling wait rewritten as a park off the worker (`tests/test_sibling_park.py`), shared-capture budget exhaustion made a non-admission instead of a fatal; 942 tests; emulated and full-speed replays identical in packets (details in the section above); evidence under `Desktop/LoRa-PiEmul-20261031/*_park*` and `Desktop/LoRa-Raw-SF7x3-20261031/replay_plain_park/`.
 
