@@ -87,3 +87,18 @@ def test_auto_mode_degrades_to_plain_without_ring_history(rec, monkeypatch, caps
     monkeypatch.setenv('LORA_SHARED_CAPTURE', '1')
     with pytest.raises(RuntimeError, match='ring history'):
         rec.set_history_reader(object())                   # the explicit form still refuses
+
+
+def test_plan_scales_with_available_memory_between_floor_and_cap():
+    from detector import shared_capture_plan_bytes, SHARED_CAPTURE_PLAN_MAX_BYTES
+    assert shared_capture_plan_bytes(None) == SHARED_CAPTURE_PLAN_BYTES
+    assert shared_capture_plan_bytes(14 * GIB) == SHARED_CAPTURE_PLAN_BYTES      # 16 GB Pi 5: the floor
+    assert shared_capture_plan_bytes(16 * GIB) == SHARED_CAPTURE_PLAN_BYTES
+    assert shared_capture_plan_bytes(57 * GIB) == 57 * GIB // 8                  # this laptop: ~7.1 GiB
+    assert shared_capture_plan_bytes(57 * GIB) % _MIB == 0
+    assert shared_capture_plan_bytes(200 * GIB) == SHARED_CAPTURE_PLAN_MAX_BYTES
+    plan = shared_capture_plan({}, 57 * GIB)
+    assert plan['enabled'] and plan['budget_bytes'] == 57 * GIB // 8 + HEADER_EXTRA
+    assert f'budget {plan["budget_bytes"] // _MIB} MiB' in plan['reason']
+    # The explicit form never consults memory.
+    assert shared_capture_plan({'LORA_SHARED_CAPTURE': '1'}, 57 * GIB)['budget_bytes'] == 2048 * _MIB

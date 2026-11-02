@@ -62,7 +62,7 @@ def state(*, busy=False, low_core=False):
         _SLOW_MIN_TICKS=4 if low_core else 0, _BUDGET_CAP_FLOOR=2,
         _bgt={'emergency':0,'cap_last':24}, _pool=None, _inflight=[],
         reader=SimpleNamespace(available=lambda:0), is_live=True,
-        _ring_n_total=160_000_000, hop_n=5_000_000)
+        _ring_n_total=160_000_000, hop_n=5_000_000, _ledger=None, _lrec=None)
 
 
 def observe(blocks, env, peaks, psd, cap, *, forced=()):

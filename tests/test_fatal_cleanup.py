@@ -79,7 +79,7 @@ def test_main_real_failure_handler_aborts_without_new_work_and_reraises_original
         def raise_shared_failure(self):raise problem
         def flush_pending(self,**kwargs):calls.append('flush-new-work')
         _shared=None
-    env={**vars(detector),'_pool':Pool(),'decoder':Decoder(),'recorder':Recorder(),
+    env={**vars(detector),'_ledger':None,'_pool':Pool(),'decoder':Decoder(),'recorder':Recorder(),
          '_inflight':[1],'_commit_oldest':lambda:calls.append('commit-new-work')}
     with pytest.raises(RuntimeError) as error:exec(main_exception_path(),env)
     assert error.value is problem
@@ -99,7 +99,7 @@ def test_main_real_normal_eof_still_uses_normal_drain():
         def raise_shared_failure(self):pass
         def flush_pending(self,**kwargs):calls.append('capture-finalize')
         def flush(self):calls.append('capture-flush')
-    env={**vars(detector),'_pool':Pool(),'decoder':Decoder(),'recorder':Recorder(),
+    env={**vars(detector),'_ledger':None,'_pool':Pool(),'decoder':Decoder(),'recorder':Recorder(),
          '_inflight':[],'_commit_oldest':lambda:calls.append('commit')}
     exec(main_exception_path(),env)
     assert calls==['pool-close','capture-finalize','capture-flush','decode-drain']
@@ -187,7 +187,7 @@ def test_main_failure_during_eof_flush_also_aborts_and_preserves_original():
         def raise_shared_failure(self):pass
         def flush_pending(self,**kwargs):pass
         def flush(self):raise problem
-    env={**vars(detector),'_pool':Pool(),'decoder':Decoder(),'recorder':Recorder(),'_inflight':[]}
+    env={**vars(detector),'_ledger':None,'_pool':Pool(),'decoder':Decoder(),'recorder':Recorder(),'_inflight':[]}
     with pytest.raises(OSError) as error:exec(main_exception_path(),env)
     assert error.value is problem
     assert calls==['pool-close','decoder-abort','pool-abort']

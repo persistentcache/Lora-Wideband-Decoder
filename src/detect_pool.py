@@ -72,6 +72,7 @@ def _worker_main(shm_names, win_n, task_q, result_q, params, cap_override=None):
         # main thread until one drains.  Truncating here (strongest peaks
         # first — the same shed-weakest rule the gate applies) or skipping
         # (-1) lets that backlog drain in milliseconds instead.
+        _co = 0
         if cap_override is not None and peaks:
             _co = cap_override.value
             if _co < 0:
@@ -93,7 +94,8 @@ def _worker_main(shm_names, win_n, task_q, result_q, params, cap_override=None):
                 kw['spur_db'] = spur_db
             _c = task_center if task_center is not None else center
             _t0 = time.perf_counter()
-            dets = L.detect_preamble(iq, wb_fs, wb_bw, _c, **kw)
+            _out = []
+            dets = L.detect_preamble(iq, wb_fs, wb_bw, _c, outcomes=_out, **kw)
             # Measured detect cost rides along with the result: the gate's
             # proactive peak-budget clamp needs the WORKER's wall time per
             # peak, not the ~15 ms the main loop spends dispatching (which it
@@ -105,9 +107,12 @@ def _worker_main(shm_names, win_n, task_q, result_q, params, cap_override=None):
             break   # shutdown SIGINT mid-detect — exit quietly
         except Exception as e:
             dets = []
-            result_q.put((seq, dets, 'ERR:%s' % e, None))
+            result_q.put((seq, dets, 'ERR:%s' % e, None, None))
             continue
-        result_q.put((seq, dets, None, _cost))
+        # The detect stage's per-peak verdicts ride along for the gate
+        # ledger, with the emergency cap the worker applied (if any).
+        result_q.put((seq, dets, None, _cost,
+                      {'peaks': _out, 'cap_override': _co if (cap_override is not None and peaks) else 0}))
 
     for s in shms:
         s.close()
@@ -149,6 +154,7 @@ class DetectPool:
             p.start()
             self._workers.append(p)
         self._results = {}   # seq -> dets, filled as results arrive
+        self._outcomes = {}  # seq -> detect-stage verdicts (gate ledger)
         self._costs = []     # (detect_seconds, n_peaks) per finished window,
                              # drained by the gate's budget clamp
 
@@ -175,7 +181,7 @@ class DetectPool:
         self._task_q.put((slot, seq, n, psd, peaks, spur_db, center,
                           dechirp_chans))
 
-    def _absorb(self, rseq, dets, err, cost=None):
+    def _absorb(self, rseq, dets, err, cost=None, outcomes=None):
         if err is not None:
             # Worker-side detect exceptions used to vanish silently (the
             # third tuple field was read and dropped): a systematic failure
@@ -184,6 +190,7 @@ class DetectPool:
             print(f"[POOL] worker error on window {rseq}: {err}",
                   file=sys.stderr, flush=True)
         self._results[rseq] = dets
+        self._outcomes[rseq] = outcomes
         if cost is not None:
             self._costs.append(cost)
 
@@ -225,6 +232,11 @@ class DetectPool:
                 break
             self._absorb(*_item)
         return self._results.pop(seq)
+
+    def outcomes(self, seq):
+        """The detect stage's per-peak verdicts for a window whose result()
+        was taken: {'peaks': [...], 'cap_override': n} or None."""
+        return self._outcomes.pop(seq, None)
 
     def ready(self, seq):
         """Non-blocking: drain any arrived results, return True if `seq` is done.

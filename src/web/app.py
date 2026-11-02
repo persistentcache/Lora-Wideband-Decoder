@@ -2481,6 +2481,10 @@ def start_pipeline():
         pass
     env = dict(os.environ)
     env['LORA_PKT_LOG'] = dec['packet_log']
+    # Gate decisions as data (src/gate_ledger.py): one line per detector
+    # window, kept beside the sessions rather than in /tmp so a missed
+    # transmission can be explained after the fact.  Rotates at 20 MB.
+    env.setdefault('LORA_GATE_LEDGER', os.path.join(_DATA_DIR, 'gate_ledger.jsonl'))
     env['LORA_DECODE_BUDGET_S'] = str(dec['budget_s'])
     # Only forward a pinned positive worker count.  -1 / 0 → leave env unset so
     # the decoder auto-scales from cpu_count (multipurpose tool: must work on

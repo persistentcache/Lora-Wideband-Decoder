@@ -70,7 +70,7 @@ def _pin_mmap_threshold():
 
 _pin_mmap_threshold()
 import time, json, argparse, numpy as np
-import threading, queue, io, subprocess, fcntl, collections, itertools
+import threading, queue, io, subprocess, fcntl, collections, itertools, tempfile
 
 # Make the GIL hand off 5× more often.  Default 5ms means a Python-only
 # thread (MainThread doing numpy bookkeeping, _save_worker thread building
@@ -3193,8 +3193,14 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     ethresh=8.0, spur_db=SPUR_REJECT_DB,
                     dc_notch_mhz=0.0, spur_notch_hz=None, debug=0,
                     cached_psd=None, cached_peaks=None, dechirp_chans=None,
-                    only_bws=None):
+                    only_bws=None, outcomes=None):
     """Schmidl-Cox LoRa preamble detector.  Replaces the CNN detect() pipeline.
+
+    outcomes: optional list; when given, one dict per processed peak is
+    appended describing the detect stage's verdict on it (gate_ledger):
+    f (MHz), w (bins), e (dB over the window floor), r (reason: 'detected',
+    'slow-wide', 'no-crop', 'short', 'no-class', 'sc-below', 'unresolved'),
+    and for peaks that reached the SC stage sc/lag/thr, plus det [(sf, bw)].
 
     1. Welch PSD → find energy peaks
     2. Per peak: extract 1Msps IQ (covers all Meshtastic BWs ≤ 500kHz)
@@ -3333,6 +3339,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
     def _process_one_peak(peak):
         cb, bw_bins, pwr = peak[0], peak[1], peak[2]
         if only_bws is not None and bw_bins * fres > 100e3:
+            _DPQ_MEMO.why = 'slow-wide'
             return []        # slow pass: narrow signals only
         # the emitting pass's own noise floor (4th element when present) —
         # the ONLY correct reference for this peak's elevation; absolute
@@ -3359,6 +3366,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             iq, wb_fs, off_hz, _bw_targets,
             chunk=_NB_CHUNK, fft_cache=_nb_fft_cache)
         if not iq_1m_parts:
+            _DPQ_MEMO.why = 'no-crop'
             return _ld
         iq_1m, _rate1m = iq_1m_parts[0]
 
@@ -3425,6 +3433,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
 
         # Minimum length: 3 × worst-case symbol duration (SF12/125k at 1Msps = 32768)
         if len(iq_1m) < 32768 * 3:
+            _DPQ_MEMO.why = 'short'
             return _ld
 
         # One forward-FFT cache for EVERY narrowband re-extraction of iq_1m
@@ -3741,7 +3750,12 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                   f"hits={len(hit_lags)}",
                   file=sys.stderr)
 
+        if sc:
+            _best_lag = max(sc, key=lambda l: sc[l][0])
+            _DPQ_MEMO.sc = (int(_best_lag), round(float(sc[_best_lag][0]), 3),
+                            round(float(_thr_m), 3))
         if not hit_lags:
+            _DPQ_MEMO.why = 'sc-below' if sc else 'no-class'
             if (debug >= 1 and not _ld
                     and (pwr - _psd_floor_db) >= GATE_UNCONFIRMED_DB):
                 _note_unconfirmed(center_mhz * 1e6 + off_hz, pwr - _psd_floor_db,
@@ -4307,10 +4321,26 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         # Arm the per-peak dechirp memo for this peak's resolver work
         # (thread-local: safe under both the serial and threaded paths).
         _DPQ_MEMO.d = {}
+        _DPQ_MEMO.why = None
+        _DPQ_MEMO.sc = None
         try:
-            return _process_one_peak_core(_pk)
+            _r = _process_one_peak_core(_pk)
         finally:
+            _why, _scb = getattr(_DPQ_MEMO, 'why', None), getattr(_DPQ_MEMO, 'sc', None)
             _DPQ_MEMO.d = None
+            _DPQ_MEMO.why = None
+            _DPQ_MEMO.sc = None
+        if outcomes is not None:
+            _flr = (_pk[3] if len(_pk) > 3 and _pk[3] is not None else _psd_floor_db)
+            _o = {'f': round((center_hz + (float(_pk[0]) - nfft_c / 2) * fres) / 1e6, 4),
+                  'w': int(_pk[1]), 'e': int(round(float(_pk[2]) - _flr)),
+                  'r': 'detected' if _r else (_why or 'unresolved')}
+            if _scb is not None:
+                _o['lag'], _o['sc'], _o['thr'] = _scb
+            if _r:
+                _o['det'] = sorted({(int(d['sf']), int(round(d['bw']))) for d in _r})
+            outcomes.append(_o)
+        return _r
 
     if (len(peaks) <= 1 or os.environ.get('LORA_DETECT_SERIAL')
             or (os.cpu_count() or 8) < 8):
@@ -4981,8 +5011,25 @@ def _mem_available_bytes():
 
 
 _MIB = 1024 * 1024
-SHARED_CAPTURE_PLAN_BYTES = 2048 * _MIB        # Codex's validated retention plan
+SHARED_CAPTURE_PLAN_BYTES = 2048 * _MIB        # Codex's validated retention plan: the floor
+SHARED_CAPTURE_PLAN_MAX_BYTES = 8192 * _MIB    # no host needs more retention than this
+SHARED_CAPTURE_PLAN_FRACTION = 8               # the plan takes 1/8 of MemAvailable
 SHARED_CAPTURE_RAM_HEADROOM = 2048 * _MIB      # the rest of the pipeline, workers, web
+
+
+def shared_capture_plan_bytes(mem_available):
+    """Retention plan for the auto mode: an eighth of what the host can
+    allocate, never below the validated 2048 MiB, never above 8 GiB.  A 16 GB
+    Pi 5 lands exactly on the floor; a 64 GB desktop gets about 7 GiB.  Live
+    run 2026-11-02 (10 Msps, three bands, SF12/62.5k long frames) charged
+    2.90 GB against the fixed 2.95 GB budget and refused four captures on a
+    host with 57 GB free; retention scales with sample rate and concurrent
+    frames, so the plan scales with the memory that is actually there."""
+    if mem_available is None:
+        return SHARED_CAPTURE_PLAN_BYTES
+    plan = int(mem_available) // SHARED_CAPTURE_PLAN_FRACTION
+    plan -= plan % _MIB
+    return max(SHARED_CAPTURE_PLAN_BYTES, min(SHARED_CAPTURE_PLAN_MAX_BYTES, plan))
 
 
 def shared_capture_plan(environ, mem_available):
@@ -4996,10 +5043,11 @@ def shared_capture_plan(environ, mem_available):
 
       LORA_SHARED_CAPTURE unset  -> on when MemAvailable >= 2 x budget + 2 GiB,
                                     header checkpoints on (LORA_HEADER_CHECKPOINT=0 opts out),
-                                    budget = 2048 MiB plan + header workspace
-                                    (about 2.8 GiB; a 16 GB Pi 5 or any desktop
-                                    qualifies, an 8 GB Pi does not and keeps
-                                    plain capture)
+                                    budget = plan + header workspace, plan =
+                                    MemAvailable / 8 clamped to [2048 MiB, 8 GiB]
+                                    (about 2.8 GiB on a 16 GB Pi 5, about 7.9 GiB
+                                    on a 64 GB desktop; an 8 GB Pi does not
+                                    qualify and keeps plain capture)
       LORA_SHARED_CAPTURE=0      -> plain capture
       LORA_SHARED_CAPTURE=1      -> the explicit diagnostic form, unchanged:
                                     LORA_SHARED_CAPTURE_MB sizes the budget
@@ -5037,7 +5085,7 @@ def shared_capture_plan(environ, mem_available):
                     reason=f'LORA_SHARED_CAPTURE=1, budget {budget // _MIB} MiB, '
                            f'header checkpoints {"on" if header else "off"}')
     header = header_env != '0'
-    budget = SHARED_CAPTURE_PLAN_BYTES + (header_extra if header else 0)
+    budget = shared_capture_plan_bytes(mem_available) + (header_extra if header else 0)
     need = 2 * budget + SHARED_CAPTURE_RAM_HEADROOM
     if mem_available is None or mem_available < need:
         have = 'unknown' if mem_available is None else f'{mem_available / _MIB:.0f} MiB'
@@ -9913,6 +9961,9 @@ def main():
         it = _inflight.popleft()
         _t_res0 = time.time()
         dets0 = _pool.result(it['seq'])
+        if it.get('ledger') is not None:
+            _ledger.outcomes(it['ledger'], _pool.outcomes(it['seq']))
+            _ledger.write(it['ledger'])
         if _source_before_retune(it.get('history_anchor')):
             # The worker has finished with this slot. Releasing it at retune
             # would let a new dispatch overwrite IQ still read by that worker.
@@ -10019,6 +10070,9 @@ def main():
       _peak_cap = _PEAK_CAP_HI
       _cap_calm = 0
       _gate_doomed = {'peaks': 0, 'windows': 0, 'reported': time.monotonic()}
+      from gate_ledger import ledger_from_environ as _ledger_from_environ
+      _ledger = _ledger_from_environ(os.environ, a.debug, tempfile.gettempdir())
+      _lrec = None
       _ring_n_total = max(1, int(a.rate * a.buf_seconds))
       # Proactive budget clamp state ([GATE-BUDGET] block in the loop; live
       # only).  EWMAs (alpha 0.3) of the MEASURED per-peak detect cost and the
@@ -10717,6 +10771,12 @@ def main():
                     del _pat_promoted[_pb]
                     del _pat_futile[_pb]
 
+        # ---- gate ledger: this window's record (gate_ledger.py) ----
+        if _ledger is not None:
+            _lrec = _ledger.begin(wc + 1, tot_s / a.rate, win_n / a.rate,
+                                  float(np.median(_psd_gate)),
+                                  a.rate / 4096.0, _live_center_mhz * 1e6)
+            _ledger.scanned(_lrec, _gate_peaks)
         # ---- [PRESCREEN] outcome-learned persistent-junk suppression ----
         # Sits AFTER patience accumulation (its masks see the untouched peak
         # list) and BEFORE the throttle + channelizer/patience forced-peak
@@ -10835,6 +10895,9 @@ def main():
                                and wc - _jk_verify_recent[0][0] > 40):
                             _jk_verify_recent.popleft()
                     else:
+                        if _lrec is not None:
+                            _ledger.removed(_lrec, 'prescreen',
+                                            [_pk for _pk in _gate_peaks if _pk not in _jk_kept])
                         _gate_peaks = _jk_kept
                         if not _gate_peaks:
                             _jk_sup_windows += 1
@@ -11032,6 +11095,9 @@ def main():
                            if not _gate_peak_doomed(_pk, _fres_gate0, _floor_gate)]
             _n_doomed = len(_gate_peaks) - len(_live_peaks)
             if _n_doomed:
+                if _lrec is not None:
+                    _ledger.removed(_lrec, 'doomed',
+                                    [_pk for _pk in _gate_peaks if _pk not in _live_peaks])
                 _gate_peaks = _live_peaks
                 _gate_doomed['peaks'] += _n_doomed
                 _gate_doomed['windows'] += 1
@@ -11045,6 +11111,8 @@ def main():
         if len(_gate_peaks) > _cap_eff:
             _gate_peaks.sort(key=lambda p: -p[2])
             _n_shed = len(_gate_peaks) - _cap_eff
+            if _lrec is not None:
+                _ledger.removed(_lrec, 'shed', _gate_peaks[_cap_eff:])
             _gate_peaks = _gate_peaks[:_cap_eff]
             print(f"[GATE-THROTTLE] shed {_n_shed} weakest candidate peak(s) "
                   f"(cap {_cap_eff})", file=sys.stderr, flush=True)
@@ -11070,6 +11138,8 @@ def main():
                     # carry the channel's REAL PSD value (not a placeholder) so the
                     # spur-reject / power ordering downstream treat it correctly
                     _gate_peaks.append((_cbin, _wbins, float(_psd_gate[_cbin]), float(np.median(_psd_gate))))   # forced; dechirp decides
+                    if _lrec is not None:
+                        _ledger.forced(_lrec, 1)
             # Fix #3 (per-channel compute): a strong signal's sidelobes each fall within
             # ±bw of a channel and would EACH fire the expensive forced dechirp + decode.
             # Keep only the peak NEAREST each channel centre (the carrier); drop the
@@ -11396,6 +11466,9 @@ def main():
             if _skip_win:
                 _hyb_skipped += 1
                 _seq += 1            # the gap the tail builder honours
+                if _lrec is not None:
+                    _ledger.dispatched(_lrec, _gate_peaks, 'skipped', _cap_eff)
+                    _ledger.write(_lrec)
             else:
                 _slot = _pool.acquire_slot()
                 if _lz is not None and buf is None:
@@ -11408,8 +11481,11 @@ def main():
                 _pool.dispatch(_slot, _seq, len(buf), _psd_gate, _gate_peaks,
                                spur_db=_spur_db, center=_live_center_mhz,
                                dechirp_chans=_win_chans)
+                if _lrec is not None:
+                    _ledger.dispatched(_lrec, _gate_peaks, 'pool', _cap_eff)
                 _inflight.append({'seq': _seq, 'slot': _slot,
                                   'pre_hop': pre_hop, 'tot_s': tot_s,
+                                  'ledger': _lrec,
                                   'history_anchor': (reader.history_anchor(tot_s)
                                       if is_live else None)})
                 _seq += 1
@@ -11450,10 +11526,14 @@ def main():
                 # and patience placeholders were all appended above, so any
                 # of them firing lands in _gate_peaks and takes the else.
                 dets = []
+                if _lrec is not None:
+                    _ledger.dispatched(_lrec, _gate_peaks, 'quiet', _cap_eff)
+                    _ledger.write(_lrec)
             else:
                 if _lz is not None and buf is None:
                     # MATERIALIZATION TRIGGER (inline detect): peaks exist
                     buf = _lz.materialize()
+                _l_out = [] if _lrec is not None else None
                 dets = detect_preamble(buf, a.rate, a.bandwidth,
                                        _live_center_mhz,
                                        sc_threshold=a.threshold,
@@ -11464,7 +11544,12 @@ def main():
                                        debug=a.debug,
                                        cached_psd=_psd_gate,
                                        cached_peaks=_gate_peaks,
-                                       dechirp_chans=(_win_chans or None))
+                                       dechirp_chans=(_win_chans or None),
+                                       outcomes=_l_out)
+                if _lrec is not None:
+                    _ledger.dispatched(_lrec, _gate_peaks, 'inline', _cap_eff)
+                    _ledger.outcomes(_lrec, _l_out)
+                    _ledger.write(_lrec)
             dt = time.time() - tw; elapsed = time.time() - t_start
             _prof['detect'] += dt
             if is_live and _bgt['margin'] > 0.0:
@@ -12159,6 +12244,8 @@ def main():
             while _inflight:
                 _commit_oldest()
             _pool.close()
+        if _ledger is not None:
+            _ledger.close()
 
         if recorder:
             try:

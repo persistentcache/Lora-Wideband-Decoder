@@ -57,7 +57,8 @@ def _run_cap(peaks, cap, *, debug=1, reported=-1e9):
                    detector.__file__, 'exec')
     env = dict(vars(detector), a=SimpleNamespace(rate=RATE, debug=debug),
                _gate_peaks=list(peaks), _psd_gate=np.full(4096, -80., np.float32),
-               _cap_eff=cap, _gate_doomed={'peaks': 0, 'windows': 0, 'reported': reported})
+               _cap_eff=cap, _gate_doomed={'peaks': 0, 'windows': 0, 'reported': reported},
+               _ledger=None, _lrec=None)
     exec(code, env)
     return env
 

@@ -88,6 +88,7 @@ def state(tmp_path):
                _slow_exact={1: 8}, _slow_backoff={1: 4}, _slow_fruitless={1: 3},
                _slow_last_fire=40, _slow_tick=42, _slow_busy=[True],
                _seq=7, tot_s=3500, tot_d=2, _inflight=deque([{'seq': 6, 'slot': 0}]),
+               _ledger=None, _lrec=None,
                _pat_hits=np.ones(4), _pat_seen=np.ones(4), _pat_promoted={1: 1},
                _pat_futile={1: 1}, _pat_confirmed={1: 1}, _pat_cooldown={1: 1},
                PRESCREEN_ON=True, _jk_hits=np.ones(4), _jk_elev=np.ones(4),
