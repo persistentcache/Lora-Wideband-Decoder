@@ -318,6 +318,36 @@ GATE_UNCONFIRMED_DB = 30.0
 _UNCONFIRMED_EVERY_S = 30.0
 _unconfirmed_last = {}
 
+# Width gate shared by the gate's peak cap and the SC stage.  A peak that
+# stands SC_WIDTH_ELEV_DB over its own pass's floor has a trustworthy width
+# (weak peaks' widths collapse, so they are never gated), and a LoRa chirp of
+# bandwidth B occupies at least B / SC_WIDTH_RATIO of the PSD; a strong peak
+# narrower than that reaches no bandwidth class and the SC stage returns
+# nothing for it.  The gate applies the same test before the per-window cap:
+# live run 2026-10-31 (ladder_live8) ran under a 50 kHz spur comb, ~90 teeth
+# at +40..+52 dB and 4-5 bins wide, which shed-weakest ranked above the
+# SF7/125k traffic at +48 dB because the sort looked only at power.  A tooth
+# can never become a detection, so it must never take a slot from a peak that
+# can.  The slow pass, patience and prescreen snapshots are taken before this
+# point and still see every peak.
+SC_WIDTH_ELEV_DB = 15.0
+SC_WIDTH_RATIO = 2.5
+MIN_LORA_BW_HZ = 31_250.0
+
+
+def _sc_width_admits(bw_hz, width_hz, elev_db):
+    """True when a peak of this measured width and elevation may carry a
+    LoRa signal of bandwidth bw_hz (the SC stage evaluates that class)."""
+    return not (elev_db >= SC_WIDTH_ELEV_DB and bw_hz > width_hz * SC_WIDTH_RATIO)
+
+
+def _gate_peak_doomed(peak, fres_hz, window_floor_db):
+    """True when no bandwidth class at or above MIN_LORA_BW_HZ admits this
+    gate peak, i.e. the SC stage would discard it unexamined."""
+    floor = peak[3] if len(peak) > 3 and peak[3] is not None else window_floor_db
+    return not _sc_width_admits(MIN_LORA_BW_HZ, float(peak[1]) * fres_hz,
+                                float(peak[2]) - floor)
+
 
 def _note_unconfirmed(freq_hz, over_db, width_bins, sc, thr):
     bucket = int(round(freq_hz / 20e3))
@@ -3635,7 +3665,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             # true per-provenance elevation: absolute peak power minus
             # the EMITTING pass's own floor. 15 dB is an honest bar:
             # floor-level battery signals never gate; splatter does.
-            if (pwr - _src_floor) >= 15.0 and _bwc > _wh_gate * 2.5:
+            if not _sc_width_admits(_bwc, _wh_gate, pwr - _src_floor):
                 continue
             _nbp = _matched_nb.get(_bwc)
             if _nbp is None:
@@ -9988,6 +10018,7 @@ def main():
       _PEAK_CAP_LO = 3
       _peak_cap = _PEAK_CAP_HI
       _cap_calm = 0
+      _gate_doomed = {'peaks': 0, 'windows': 0, 'reported': time.monotonic()}
       _ring_n_total = max(1, int(a.rate * a.buf_seconds))
       # Proactive budget clamp state ([GATE-BUDGET] block in the loop; live
       # only).  EWMAs (alpha 0.3) of the MEASURED per-peak detect cost and the
@@ -10990,6 +11021,27 @@ def main():
             _pool.set_cap_override(
                 -1 if _cap_eff == 0
                 else (_cap_eff if _cap_eff <= _BUDGET_CAP_FLOOR else 0))
+        # Peaks the SC stage is certain to refuse (strong and narrower than
+        # any LoRa bandwidth) leave before the cap: a spur comb tooth at
+        # +50 dB must not outrank a real preamble at +40 dB in the sort.
+        _n_doomed = 0
+        if _gate_peaks:
+            _floor_gate = float(np.median(_psd_gate))
+            _fres_gate0 = a.rate / 4096.0
+            _live_peaks = [_pk for _pk in _gate_peaks
+                           if not _gate_peak_doomed(_pk, _fres_gate0, _floor_gate)]
+            _n_doomed = len(_gate_peaks) - len(_live_peaks)
+            if _n_doomed:
+                _gate_peaks = _live_peaks
+                _gate_doomed['peaks'] += _n_doomed
+                _gate_doomed['windows'] += 1
+        if (_gate_doomed['peaks'] and a.debug >= 1
+                and time.monotonic() - _gate_doomed['reported'] >= 60.0):
+            print(f"[GATE] dropped {_gate_doomed['peaks']} spur-width peak(s) "
+                  f"over {_gate_doomed['windows']} window(s) before the cap "
+                  f"(strong, narrower than {MIN_LORA_BW_HZ / SC_WIDTH_RATIO / 1e3:.1f} kHz)",
+                  file=sys.stderr, flush=True)
+            _gate_doomed.update(peaks=0, windows=0, reported=time.monotonic())
         if len(_gate_peaks) > _cap_eff:
             _gate_peaks.sort(key=lambda p: -p[2])
             _n_shed = len(_gate_peaks) - _cap_eff
