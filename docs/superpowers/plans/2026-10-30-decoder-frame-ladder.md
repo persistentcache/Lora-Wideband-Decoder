@@ -209,7 +209,16 @@ Run 13 (`ladder_live15_30094f3`, the in-window copy rule): 13 of 13, CRC audit 2
 
 `OnAirFrames` (detector.py) remembers every detection at least 30 dB over the window floor for its worst-case duration (the same bound that sizes captures). Every detection path, the pooled commit, the inline detect and the slow pass, first drops a same-slope detection at another carrier that falls inside a remembered frame's span and is at least 20 dB weaker, then registers the strong survivors. A detection's elevation is the larger of its own power and the latest window's PSD at its carrier, so a frame the slow pass reported at 20 dB is remembered at its real strength. Tests in `tests/test_intermod_copy.py` (registry semantics, purge, alias copies, the frame's own carrier exempt, all three paths wired). Replays of the three-message and junk recordings: see the ledger entry.
 
+## Live run 14: the default mode holds (1a514d9)
+
+Run 14 (`ladder_live16_b24ac93`, the on-air registry): 13 of 13 recovered on their first transmission, CRC audit 20 of 20, evidence complete, median publication 2.78 s, mean 2.57 s (the lowest of any run), maximum 4.17 s. 152 decode jobs and 541 s of decoder time against 236 and 1393 s the run before (run 9's figures were 135 and 357 s); the on-air registry dropped 39 copies, all in the pooled commit path and all SF12/62.5k copies of the long frames at 911.99, 913.02, 916.67, 916.99, 917.02 and 917.99 MHz, 1 to 17 dB over the floor under frames at +61 to +63 dB; the in-window rule dropped 10 more. Junk full captures fell from 156 to 8 (three are the SF10/125k frame's own weak late captures at its carrier, 5.8 s each), slow-tier jobs from 84 to 8, and no decoder error occurred. The acceptance gate flagged only message 6's attribution, where the Heltec's serial log carried one "Started Tx" and two "Completed sending" lines, as in run 9. A few of the remaining copies had committed in the same batch as their frame but ahead of it; `OnAirFrames.filter()` (1a514d9) now registers a batch's strong detections before judging any of them.
+
+Where this leaves the day's open item: the acquisition miss of 2026-10-31 did not recur in five ladders today (15 SF7/125k first transmissions, all recovered on the first attempt); the gate ledger is in place for when it does.
+
 ## Ledger
+
+2026-11-02 (1a514d9): batch-ordered on-air filter; live run 14 `ladder_live16_b24ac93` 13/13, CRC 20/20, evidence complete, 541 s of decoder time, 8 junk captures; 982 tests.
+
 
 2026-11-02 (b24ac93): on-air frame registry for cross-window copies; live run 13 `ladder_live15_30094f3` (13/13, CRC 20/20, max 3.91 s, 65 junk captures remaining); replays `replay_onair` of the three-message (9/9, 38 publications) and junk (10 detections, 2 packets) recordings identical to the previous build with zero copy drops; 981 tests.
 
