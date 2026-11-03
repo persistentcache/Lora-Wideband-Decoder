@@ -8,11 +8,113 @@
 #   * the Python requirements (requirements.txt)
 #   * SDR device access (plugdev group)
 #
-# Usage:   ./install.sh
+# Usage:   ./install.sh [--install-service] [--uninstall-service]
 # (You'll be prompted for sudo to install system packages.)
+#
+#   --install-service   (aliases: --installservice, --install-autorun,
+#                        --installautorun)  Also install + enable a systemd
+#                        unit so the web UI AND the SDR pipeline start by
+#                        themselves at boot, with the settings saved in the
+#                        UI (lora_web/web_settings.json: SDR, radio, ...).
+#   --uninstall-service Disable and remove that unit; nothing else changes.
+#   --print-service     Print the unit that --install-service would write.
 # ============================================================================
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+
+SERVICE_NAME="lora-wideband-decoder"
+SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+INSTALL_SERVICE=0
+for arg in "$@"; do
+    case "$arg" in
+        --install-service|--installservice|--install-autorun|--installautorun)
+            INSTALL_SERVICE=1 ;;
+        --uninstall-service|--uninstallservice)
+            INSTALL_SERVICE=-1 ;;
+        --print-service)
+            INSTALL_SERVICE=2 ;;
+        -h|--help)
+            sed -n '3,/^# =====/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)
+            echo "install.sh: unknown option '$arg' (try --help)" >&2; exit 2 ;;
+    esac
+done
+
+# The unit runs as the installing user (pip --user puts the Python deps in
+# that HOME; the plugdev membership gives SDR access) from this checkout,
+# under the system python that the SoapySDR bindings are built against.
+# --autostart makes the server launch the pipeline with the saved settings
+# and keep retrying until it is healthy (USB SDRs often enumerate after the
+# service starts).  systemd restarts the server itself if it ever dies, and
+# stopping the unit stops the whole process tree (the SDR is released).
+# ExecStart arguments are quoted because a checkout path may contain spaces;
+# WorkingDirectory= takes the whole value as one path.
+render_service() {
+    local user="${SUDO_USER:-${USER:-$(whoami)}}"
+    local home; home="$(getent passwd "$user" | cut -d: -f6)"
+    cat <<UNIT
+[Unit]
+Description=LORA Wideband Decoder (web UI + SDR pipeline, autostart)
+After=network-online.target systemd-udev-settle.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${user}
+WorkingDirectory=${HERE}
+Environment=HOME=${home}
+Environment=LORA_AUTOSTART=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 "${HERE}/run/web.py" --autostart
+Restart=always
+RestartSec=5
+TimeoutStopSec=25
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+install_service() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "==> --install-service: systemd not found on this host; skipping the unit." >&2
+        return 1
+    fi
+    echo "==> Installing systemd service ${SERVICE_NAME} ..."
+    render_service | sudo tee "$SERVICE_PATH" >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl enable "$SERVICE_NAME" >/dev/null
+    sudo systemctl restart "$SERVICE_NAME"
+    sleep 2
+    sudo systemctl --no-pager --lines=5 status "$SERVICE_NAME" || true
+    cat <<MSG
+
+Service installed: the web UI and the configured SDR pipeline now start at boot.
+  status:   systemctl status ${SERVICE_NAME}
+  logs:     journalctl -u ${SERVICE_NAME} -f
+  stop:     sudo systemctl stop ${SERVICE_NAME}      (releases the SDR)
+  disable:  ./install.sh --uninstall-service
+Settings changed in the web UI (SDR, radio, protocols) are saved to
+${HERE}/lora_web/web_settings.json and used on the next boot.
+MSG
+}
+
+uninstall_service() {
+    if [ ! -f "$SERVICE_PATH" ]; then
+        echo "==> ${SERVICE_NAME} is not installed."; return 0
+    fi
+    echo "==> Removing systemd service ${SERVICE_NAME} ..."
+    sudo systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+    sudo rm -f "$SERVICE_PATH"
+    sudo systemctl daemon-reload
+    echo "   removed; start the receiver by hand with: python3 run/web.py"
+}
+
+case "$INSTALL_SERVICE" in
+    2)  render_service; exit 0 ;;
+    -1) uninstall_service; exit 0 ;;
+esac
 
 echo "==> LORA Wideband Decoder installer"
 
@@ -171,3 +273,9 @@ Done.
 If your SDR isn't found, re-plug it or log out/in once (so the 'plugdev' group
 membership takes effect).
 EOF
+
+if [ "$INSTALL_SERVICE" = 1 ]; then
+    install_service
+else
+    echo "  Start at boot:      ./install.sh --install-service   (web UI + SDR pipeline, saved settings)"
+fi
