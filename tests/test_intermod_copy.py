@@ -107,3 +107,18 @@ def test_main_loop_filters_every_detection_path():
     for where in ("'pool'", "'inline'", "'slow'"):
         assert f", {where})" in src and '_onair_filter(' in src, where
     assert src.count('_onair_filter(') == 4            # definition + three paths
+
+
+def test_batch_filter_registers_the_frame_before_judging_its_copy():
+    reg = OnAirFrames()
+    real = _det(915.0325, 10, 125000, pwr=55.0)
+    copy = _det(913.8375, 12, 250000, pwr=0.0)             # same slope, 1.2 MHz away
+    drops = []
+    kept = reg.filter([copy, real], 1082.0, lambda d: d['peak_power_db'], _capture_duration_s,
+                      lambda d, t, e, src: drops.append((round(d['freq_mhz'], 4), round(src['freq_hz'] / 1e6, 4))))
+    assert kept == [real] and drops == [(913.8375, 915.0325)]
+    # a trial detection is judged but never registered as a frame
+    trial = _det(911.0, 12, 62500, pwr=60.0, patience_trial=True)
+    assert reg.filter([trial], 1090.0, lambda d: d['peak_power_db'], _capture_duration_s) == [trial]
+    assert len(reg) == 1
+    assert reg.filter([], 0.0, None, None) == []

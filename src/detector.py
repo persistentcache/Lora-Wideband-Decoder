@@ -401,6 +401,26 @@ class OnAirFrames:
                 return {'freq_hz': f[3], 'bw': f[4], 'elev': f[5], 't0': f[0], 't1': f[1]}
         return None
 
+    def filter(self, dets, abst_base_s, elev_fn, duration_fn, on_drop=None):
+        """Register this batch's strong, non-trial detections first, then
+        drop the copies among the rest: a frame and its copy can commit in
+        one batch, in either order.  Returns the survivors in input order."""
+        if not dets:
+            return dets
+        times = {id(d): abst_base_s + float(d.get('preamble_t_s', 0.0)) for d in dets}
+        elevs = {id(d): float(elev_fn(d)) for d in dets}
+        for d in dets:
+            if not d.get('patience_trial'):
+                self.register(d, times[id(d)], elevs[id(d)], duration_fn(d))
+        kept = []
+        for d in dets:
+            src = self.copy_of(d, times[id(d)], elevs[id(d)])
+            if src is None:
+                kept.append(d)
+            elif on_drop is not None:
+                on_drop(d, times[id(d)], elevs[id(d)], src)
+        return kept
+
     def __len__(self):
         return len(self._frames)
 
@@ -10198,28 +10218,14 @@ def main():
           """Drop receiver copies of frames on air; register the strong
           survivors for their airtime.  Same rule as the in-window
           arbitration, across windows."""
-          if not dets:
-              return dets
-          kept = []
-          for d in dets:
-              abst = abst_base_s + float(d.get('preamble_t_s', 0.0))
-              elev = _onair_elev(d)
-              src = _onair.copy_of(d, abst, elev)
-              if src is not None:
-                  if a.debug >= 1:
-                      print(f"  [GATE] intermod copy dropped ({where}): "
-                            f"{d['freq_hz'] / 1e6:.4f}MHz SF{d['sf']}/{int(d['bw']) // 1000}k "
-                            f"+{elev:.0f}dB under on-air {src['freq_hz'] / 1e6:.4f}MHz "
-                            f"+{src['elev']:.0f}dB (t={abst:.2f}s, frame {src['t0']:.2f}-{src['t1']:.2f}s)",
-                            file=sys.stderr, flush=True)
-                  continue
-              kept.append(d)
-          for d in kept:
-              if d.get('patience_trial'):
-                  continue                 # a trial's label is a hypothesis
-              _onair.register(d, abst_base_s + float(d.get('preamble_t_s', 0.0)),
-                              _onair_elev(d), _capture_duration_s(d))
-          return kept
+          def _drop(d, abst, elev, src):
+              if a.debug >= 1:
+                  print(f"  [GATE] intermod copy dropped ({where}): "
+                        f"{d['freq_hz'] / 1e6:.4f}MHz SF{d['sf']}/{int(d['bw']) // 1000}k "
+                        f"+{elev:.0f}dB under on-air {src['freq_hz'] / 1e6:.4f}MHz "
+                        f"+{src['elev']:.0f}dB (t={abst:.2f}s, frame {src['t0']:.2f}-{src['t1']:.2f}s)",
+                        file=sys.stderr, flush=True)
+          return _onair.filter(dets, abst_base_s, _onair_elev, _capture_duration_s, _drop)
       _ring_n_total = max(1, int(a.rate * a.buf_seconds))
       # Proactive budget clamp state ([GATE-BUDGET] block in the loop; live
       # only).  EWMAs (alpha 0.3) of the MEASURED per-peak detect cost and the
