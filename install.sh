@@ -11,11 +11,10 @@
 # Usage:   ./install.sh [--install-service] [--uninstall-service]
 # (You'll be prompted for sudo to install system packages.)
 #
-#   --install-service   (aliases: --installservice, --install-autorun,
-#                        --installautorun)  Also install + enable a systemd
-#                        unit so the web UI AND the SDR pipeline start by
-#                        themselves at boot, with the settings saved in the
-#                        UI (lora_web/web_settings.json: SDR, radio, ...).
+#   --install-service   Also install + enable a systemd unit so the web UI
+#                        AND the SDR pipeline start by themselves at boot,
+#                        with the settings saved in the UI
+#                        (lora_web/web_settings.json: SDR, radio, ...).
 #   --uninstall-service Disable and remove that unit; nothing else changes.
 #   --print-service     Print the unit that --install-service would write.
 # ============================================================================
@@ -27,9 +26,9 @@ SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 INSTALL_SERVICE=0
 for arg in "$@"; do
     case "$arg" in
-        --install-service|--installservice|--install-autorun|--installautorun)
+        --install-service)
             INSTALL_SERVICE=1 ;;
-        --uninstall-service|--uninstallservice)
+        --uninstall-service)
             INSTALL_SERVICE=-1 ;;
         --print-service)
             INSTALL_SERVICE=2 ;;

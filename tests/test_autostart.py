@@ -126,4 +126,5 @@ def test_installer_rejects_unknown_options():
 
 def test_installer_help_lists_the_service_flags():
     out = _installer('--help').stdout
-    assert '--install-service' in out and '--installautorun' in out and '--uninstall-service' in out
+    assert '--install-service' in out and '--uninstall-service' in out
+    assert '--installautorun' not in out                # one spelling per command

@@ -40,7 +40,7 @@ is launched from the web UI based on `lora.toml`.
 ### Start at boot (optional)
 
 ```bash
-./install.sh --install-service      # also accepts --installservice / --installautorun
+./install.sh --install-service
 ```
 
 installs and enables a systemd unit (`lora-wideband-decoder`) that runs the
