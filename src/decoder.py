@@ -6349,7 +6349,12 @@ def _process_file_label(fpath, relay_after=None, relay_before=None,
             if abs(sh) < 5 * bw / N:
                 continue
             if _BUDGET_S > 0 and (time.process_time() - _process_start) > _BUDGET_S:
-                return False
+                # Budget gone: nothing decoded.  This returned False until
+                # 2026-11-02; the caller treats any non-None result as the
+                # ('OK'|'TRUNCATED', start, len, bin) tuple and indexed it
+                # ("'bool' object is not subscriptable"), which aborted the
+                # whole job on the live pool's small slow-tier budgets.
+                return None
             # Per-rung budget slice: the remaining CPU budget is split
             # across the remaining rungs so one wrong-alias hdr_ok grind
             # cannot consume the whole job (measured: 3x 102s watchdog
@@ -10701,4 +10706,10 @@ if __name__ == '__main__':
         except Exception as e:
             import traceback
             print("  ERROR: %s" % e)
+            # The live decode pool discards worker stderr; the raw job log
+            # keeps stdout, so the traceback goes there as well (live runs
+            # 2026-11-02 logged "'bool' object is not subscriptable" twice
+            # with no way to see where).
+            traceback.print_exc(file=sys.stdout)
+            sys.stdout.flush()
             traceback.print_exc()
