@@ -128,3 +128,36 @@ def test_drain_releases_every_parked_sibling(dec, tmp_path):
     dec._flush_stale_parks(force=True)
     assert dec._queue.get_nowait()[2] is job2
     assert not dec._sib_park
+
+
+def test_early_crop_sibling_parks_behind_its_twin_and_skips_once_it_verifies(dec, tmp_path):
+    """Two early crops of ONE frame (the gate labelled the burst at carriers a
+    few hundred Hz apart; two header checkpoints followed) decode once."""
+    first = capture(tmp_path, 'a_early_1.cf32', (915.0163e6, 100.0, 60e3, 0.1, 12, 62.5e3), dec,
+                    role='early', frame_key=1)
+    copy = capture(tmp_path, 'a_early_2.cf32', (915.0166e6, 100.01, 60e3, 0.1, 12, 62.5e3), dec,
+                   role='early', frame_key=2)
+    _, job1 = take(dec)
+    dec._mark_bucket_inflight(job1[0])
+    prio2, job2 = take(dec)
+    assert dec._park_sibling(job2, prio2, None)
+    assert dec._queue.empty() and dec.pending() == 1 and copy.exists()
+    dec._compact(mesh('0x12345678'), first.name, role='early')
+    dec._clear_bucket_inflight(job1[0])
+    assert dec._queue.empty() and dec._slow_queue.empty()
+    assert not copy.exists() and dec.pending() == 0
+
+
+def test_early_crop_sibling_is_released_when_its_twin_fails(dec, tmp_path):
+    first = capture(tmp_path, 'b_early_1.cf32', (915.0163e6, 100.0, 60e3, 0.1, 12, 62.5e3), dec,
+                    role='early', frame_key=1)
+    copy = capture(tmp_path, 'b_early_2.cf32', (915.0166e6, 100.01, 60e3, 0.1, 12, 62.5e3), dec,
+                   role='early', frame_key=2)
+    _, job1 = take(dec)
+    dec._mark_bucket_inflight(job1[0])
+    prio2, job2 = take(dec)
+    assert dec._park_sibling(job2, prio2, None)
+    dec._clear_bucket_inflight(job1[0])                # nothing verified: the copy gets its turn
+    _, _, released = dec._queue.get_nowait()
+    assert released is job2 and copy.exists()
+

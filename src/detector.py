@@ -7968,8 +7968,15 @@ while True:
         relay_before_syms: blank from symbol N onward   → find hop BEFORE primary.
         bucket_key:        (cand_freq_hz, abs_t_s) for Phase-2 cross-worker
                            bucket dedup; None disables the dedup for this job.
-        role:              early/shared_full/shared_partial/continuation views search all
+        role:              shared_full/shared_partial/continuation views search all
                            their frames; they never consume whole-window buckets.
+                           An early crop is ONE frame planned from its decoded
+                           header, so it keeps its bucket like a default capture:
+                           a same-frame sibling (the gate labels one burst at
+                           carriers a few hundred Hz apart, two header checkpoints
+                           follow) parks behind the one in flight and skips once
+                           it verifies, instead of decoding the same frame twice
+                           (live 2026-11-03: 78 such early jobs, 93 s, none new).
         """
         if role not in ('default', 'early', 'shared_full', 'shared_partial', 'continuation'):
             raise ValueError('unknown capture role')
@@ -7982,7 +7989,7 @@ while True:
             self._capture_roles[fpath] = role
             self._refs[fpath] = self._refs.get(fpath, 0) + 1
 
-        if role != 'default':
+        if role not in ('default', 'early'):
             bucket_key = None
             with self._bucket_lock:
                 self._fname_bucket.pop(fpath, None)
@@ -8916,14 +8923,14 @@ while True:
                 if sec.strip():
                     r = self._compact_single(sec, fname, elapsed,
                                               _is_relay, _is_pre, _is_secondary,
-                                              admit_bucket=role == 'default')
+                                              admit_bucket=role in ('default', 'early'))
                     if r:
                         results.append(r)
             return ''.join(results)
 
         return self._compact_single(output, fname, elapsed,
                                      _is_relay, _is_pre, _is_secondary,
-                                     admit_bucket=role == 'default')
+                                     admit_bucket=role in ('default', 'early'))
 
     def _compact_single(self, output, fname, elapsed,
                          _is_relay, _is_pre, _is_secondary, *, admit_bucket=True):
