@@ -2683,12 +2683,15 @@ def _autostart_tick(start=None):
             and PIPELINE.get('restart_attempts', 0) < _SUP_MAX_ATTEMPTS):
         return 'supervised'      # the crash watcher is still inside its own budget
     # Never launched, or the supervisor gave up: fresh budget, try again.
-    PIPELINE['restart_attempts'] = 0
-    AUTOSTART['attempts'] += 1
-    try:
-        r = start(); ok = bool(r.get('ok')); err = r.get('error')
-    except Exception as e:          # keep retrying at boot whatever failed
-        ok, err = False, str(e)
+    # Under the supervisor's lock so the crash watcher can never launch a
+    # second detector while this one is inside start_pipeline's settle sleep.
+    with _SUPERVISOR_LOCK:
+        PIPELINE['restart_attempts'] = 0
+        AUTOSTART['attempts'] += 1
+        try:
+            r = start(); ok = bool(r.get('ok')); err = r.get('error')
+        except Exception as e:          # keep retrying at boot whatever failed
+            ok, err = False, str(e)
     print('[AUTOSTART] attempt %d: %s' % (AUTOSTART['attempts'],
           'started' if ok else 'failed: %s' % err), file=sys.stderr, flush=True)
     return 'started' if ok else 'failed'

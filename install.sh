@@ -55,8 +55,9 @@ render_service() {
     cat <<UNIT
 [Unit]
 Description=LORA Wideband Decoder (web UI + SDR pipeline, autostart)
-After=network-online.target systemd-udev-settle.service
-Wants=network-online.target
+# The UI binds 127.0.0.1 by default and the SDR is found by retrying, so
+# nothing here waits for the network or for udev to settle.
+After=local-fs.target network.target
 
 [Service]
 Type=simple
@@ -82,6 +83,8 @@ install_service() {
         return 1
     fi
     echo "==> Installing systemd service ${SERVICE_NAME} ..."
+    echo "    (if a 'python3 run/web.py' you started by hand is still running, stop it:"
+    echo "     the service needs the same port and the SDR)"
     render_service | sudo tee "$SERVICE_PATH" >/dev/null
     sudo systemctl daemon-reload
     sudo systemctl enable "$SERVICE_NAME" >/dev/null
