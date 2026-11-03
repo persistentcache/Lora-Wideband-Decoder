@@ -203,7 +203,16 @@ Run 12 (`ladder_live14_076e1ac`) with those two fixes: 13 of 13, CRC audit 20 of
 
 Open from run 12: one decode job logged `ERROR: 'bool' object is not subscriptable` on a junk capture (`SF12_62.50k_918.0012MHz..._089`); the same file decodes cleanly offline, so the path is load- or budget-dependent and is not yet located.
 
+## Live run 13 and the on-air registry (b24ac93)
+
+Run 13 (`ladder_live15_30094f3`, the in-window copy rule): 13 of 13, CRC audit 20 of 20, evidence complete, median publication 2.75 s and a maximum of 3.91 s, the lowest maximum of any run. The copy rule fired 15 times, all on copies starting in the same window as their frame, and the run still produced 65 junk full captures and 84 slow-tier jobs (1393 s of decoder time). Read against the detector's own output, 22 of the 65 coincided with a strong same-slope detection and only 18 of those in the same window; 43 had no strong detection anywhere near them in time, because the frame they copied, an SF12/62.5k long frame, had been detected once at its preamble, by the slow pass at its nominal 20 dB, and then kept leaving copies on the spur carriers for the next 30 s of its body.
+
+`OnAirFrames` (detector.py) remembers every detection at least 30 dB over the window floor for its worst-case duration (the same bound that sizes captures). Every detection path, the pooled commit, the inline detect and the slow pass, first drops a same-slope detection at another carrier that falls inside a remembered frame's span and is at least 20 dB weaker, then registers the strong survivors. A detection's elevation is the larger of its own power and the latest window's PSD at its carrier, so a frame the slow pass reported at 20 dB is remembered at its real strength. Tests in `tests/test_intermod_copy.py` (registry semantics, purge, alias copies, the frame's own carrier exempt, all three paths wired). Replays of the three-message and junk recordings: see the ledger entry.
+
 ## Ledger
+
+2026-11-02 (b24ac93): on-air frame registry for cross-window copies; live run 13 `ladder_live15_30094f3` (13/13, CRC 20/20, max 3.91 s, 65 junk captures remaining); replays `replay_onair` of the three-message (9/9, 38 publications) and junk (10 detections, 2 packets) recordings identical to the previous build with zero copy drops; 981 tests.
+
 
 2026-11-02 (076e1ac, 30094f3): placeholders off dropped spur bins, strict Data-message validity, intermod-copy arbitration; live runs 11 `ladder_live13_67d565e` (13/13, four defects' evidence) and 12 `ladder_live14_076e1ac` (13/13, CRC 20/20, evidence complete); 978 tests.
 
