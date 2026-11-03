@@ -224,3 +224,61 @@ def test_stale_full_hold_is_released_by_the_valve(dec, tmp_path):
     dec._flush_stale_iso_holds(max_age=0.0)
     assert dec._queue.get_nowait()[2][0] == str(full)
     assert not dec._full_hold and not dec._early_open
+
+
+def test_full_crop_waits_for_an_early_that_is_planned_but_not_yet_submitted(dec, tmp_path):
+    """4-core host: the full crop of a short frame reaches the queue a second
+    before its early crop; it must wait for the planned early like it waits
+    for an open one, and be skipped once that early verifies."""
+    early, full = early_full(tmp_path)
+    dec.expect_early(39)
+    dec.submit(str(full), full.name, role='shared_full', frame_key=39)
+    assert queued_names(dec) == [] and 39 in dec._full_hold
+    dec.submit(str(early), early.name, role='early', frame_key=39, prio=float('inf'))
+    assert queued_names(dec) == [early.name] and 39 not in dec._early_expected
+    _, _, job = dec._queue.get_nowait()
+    dec._compact(mesh('0x12345678'), early.name, role='early')
+    dec._plain_done(job[0])
+    dec._ref_dec_and_maybe_unlink(job[0])
+    assert dec._queue.empty() and not full.exists() and not dec._full_hold
+
+
+def test_expected_early_that_never_arrives_releases_the_full_crop(dec, tmp_path, monkeypatch):
+    import detector
+    early, full = early_full(tmp_path)
+    now = [1000.0]
+    monkeypatch.setattr(detector.time, 'monotonic', lambda: now[0])
+    dec.expect_early(39)
+    dec.submit(str(full), full.name, role='shared_full', frame_key=39)
+    assert 39 in dec._full_hold
+    now[0] += dec._EARLY_EXPECT_S - 1
+    dec._flush_stale_iso_holds()
+    assert 39 in dec._full_hold                        # still inside the expectation window
+    now[0] += 2
+    dec._flush_stale_iso_holds()
+    _, _, released = dec._queue.get_nowait()
+    assert released[0] == str(full) and not dec._full_hold and not dec._early_expected
+
+
+def test_expectation_after_the_early_already_verified_does_nothing(dec, tmp_path):
+    early, full = early_full(tmp_path)
+    dec.submit(str(early), early.name, role='early', frame_key=39)
+    _, _, job = dec._queue.get_nowait()
+    dec._compact(mesh('0x12345678'), early.name, role='early')
+    dec._plain_done(job[0])
+    dec._ref_dec_and_maybe_unlink(job[0])
+    dec.expect_early(39)
+    assert 39 not in dec._early_expected
+    dec.submit(str(full), full.name, role='shared_full', frame_key=39)
+    assert dec._queue.empty() and not full.exists()    # skipped at once, as before
+
+
+def test_recorder_forwards_the_planned_early_to_its_decoder():
+    import detector
+    calls = []
+    rec = detector.SignalRecorder.__new__(detector.SignalRecorder)
+    rec._decoder = None
+    rec._expect_early(5)                               # no decoder yet: nothing happens
+    rec._decoder = type('D', (), {'expect_early': lambda self, k: calls.append(k)})()
+    rec._expect_early(7)
+    assert calls == [7]

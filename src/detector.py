@@ -5422,6 +5422,13 @@ class SignalRecorder:
     def set_decoder(self, decoder):
         self._decoder = decoder
 
+    def _expect_early(self, frame_key):
+        """The header checkpoint planned an early crop: tell the decoder so
+        the frame's full crop waits for it (see BackgroundDecoder.expect_early)."""
+        dec = self._decoder
+        if dec is not None and hasattr(dec, 'expect_early'):
+            dec.expect_early(frame_key)
+
     def set_history_reader(self, reader):
         """Attach the live ring reader and choose the capture mode for this
         host (see shared_capture_plan): frame-length-exact capture by default
@@ -5466,7 +5473,8 @@ class SignalRecorder:
                 service = HeaderCheckpointService(workspace_lease=workspace,
                     max_pending=2, max_prefix_bytes=prefix_bytes)
                 self._header = HeaderCaptureController(self._shared, service,
-                    directory=self.export_dir, max_prefix_bytes=prefix_bytes)
+                    directory=self.export_dir, max_prefix_bytes=prefix_bytes,
+                    on_early_planned=self._expect_early)
                 self._shared.header_controller = self._header
             except Exception:
                 if service is not None:
@@ -7046,6 +7054,16 @@ class BackgroundDecoder:
         # frame whose full crop lands first is unchanged.
         self._fpath_frame = {}           # fpath -> (role, frame_key) for plain jobs
         self._early_open = {}            # frame_key -> early plain jobs queued/running
+        # frame_key -> monotonic when the header checkpoint PLANNED an early
+        # crop that has not been submitted yet.  On a 4-core host the full
+        # crop of a short frame (SF10/250k, 3.6 s) reaches the queue about a
+        # second before its early crop (header 1 s, export, save worker),
+        # found no early open and ran at once; both then decoded together
+        # and the early took 17 s instead of 2 (emulated Pi, 2026-11-02),
+        # publishing 24 s after the frame against old main's 14 s.  A full
+        # crop whose early is planned waits like one whose early is open;
+        # an early that never arrives releases it after _EARLY_EXPECT_S.
+        self._early_expected = {}
         self._early_verified = set()     # frame keys whose early crop verified
         self._full_hold = {}             # frame_key -> [(job, slow, prio), ...]
         self._full_hold_since = {}       # frame_key -> monotonic of first hold
@@ -8001,7 +8019,10 @@ while True:
                 with self._iso_lock:
                     if frame_key in self._early_verified:
                         _full_action = 'skip'
-                    elif self._early_open.get(frame_key, 0) > 0:
+                    elif (self._early_open.get(frame_key, 0) > 0
+                          or (frame_key in self._early_expected
+                              and time.monotonic() - self._early_expected[frame_key]
+                              < self._EARLY_EXPECT_S)):
                         self._full_hold.setdefault(frame_key, []).append((_job, bool(_slow_tier), float(prio)))
                         self._full_hold_since.setdefault(frame_key, time.monotonic())
                         _full_action = 'hold'
@@ -8038,6 +8059,16 @@ while True:
             self._queue.put((-float(prio), next(self._qseq), _job))
 
     _ISO_HOLD_MAX_S = 180.0
+    _EARLY_EXPECT_S = 10.0
+
+    def expect_early(self, frame_key):
+        """The header checkpoint planned an early crop for this frame; its
+        full crop, if it arrives first, waits for it."""
+        if frame_key is None:
+            return
+        with self._iso_lock:
+            if frame_key not in self._early_verified and self._early_open.get(frame_key, 0) == 0:
+                self._early_expected[frame_key] = time.monotonic()
 
     def _plain_enqueued(self, fpath):
         with self._iso_lock:
@@ -8045,6 +8076,7 @@ while True:
             _rf = self._fpath_frame.get(fpath)
             if _rf is not None and _rf[0] == 'early':
                 self._early_open[_rf[1]] = self._early_open.get(_rf[1], 0) + 1
+                self._early_expected.pop(_rf[1], None)     # the expected early is here
 
     def _note_verified(self, fname):
         """A packet from capture `fname` was admitted (any role)."""
@@ -8136,7 +8168,16 @@ while True:
                                 os.path.basename(f) in self._verified_fnames))
                 self._iso_hold_since.pop(f, None)
                 self._plain_open.pop(f, None)
-            stale_full = [k for k, t0 in self._full_hold_since.items() if now - t0 >= max_age]
+            # A full crop held for an early that was planned but never
+            # submitted (export failed, header view lost) waits only
+            # _EARLY_EXPECT_S; one held for an open early waits max_age.
+            stale_full = [k for k, t0 in self._full_hold_since.items()
+                          if now - t0 >= max_age
+                          or (self._early_open.get(k, 0) == 0 and now - t0 >= self._EARLY_EXPECT_S)]
+            for k in stale_full:
+                self._early_expected.pop(k, None)
+            for k in [k for k, t0 in self._early_expected.items() if now - t0 >= max_age]:
+                self._early_expected.pop(k, None)
             full_batches = []
             for k in stale_full:
                 full_batches.append((self._full_hold.pop(k, []), k in self._early_verified))

@@ -49,8 +49,9 @@ class _Entry:
 class HeaderCaptureController:
     """Bound optional checkpoint work; a header never shortens a full view."""
     def __init__(self, owner, service, *, directory, max_prefix_bytes,
-                 max_pending=2, cpu_budget_s=2., wall_timeout_s=10.):
+                 max_pending=2, cpu_budget_s=2., wall_timeout_s=10., on_early_planned=None):
         self.owner, self.service = owner, service
+        self.on_early_planned = on_early_planned     # called with the parent view number
         self.directory = os.fspath(directory)
         self.max_prefix_bytes = int(max_prefix_bytes)
         self.max_pending = int(max_pending)
@@ -162,6 +163,11 @@ class HeaderCaptureController:
                             self.counts['early'] += 1
                             self._event('early-planned', request=entry.identifier,
                                         view=child.number, start=child.start, end=child.end)
+                            if self.on_early_planned is not None:
+                                try:
+                                    self.on_early_planned(entry.parent.number)
+                                except Exception:
+                                    pass
                         else:
                             self.counts['fallback'] += 1
                     else:
