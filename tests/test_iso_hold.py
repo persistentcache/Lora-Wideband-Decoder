@@ -282,3 +282,66 @@ def test_recorder_forwards_the_planned_early_to_its_decoder():
     rec._decoder = type('D', (), {'expect_early': lambda self, k: calls.append(k)})()
     rec._expect_early(7)
     assert calls == [7]
+
+
+# ---- an early crop that read the header and failed every retry retires its full
+
+DUD = ('Found 4 preamble candidates:\n  Header: PL=97 CR=4/8 CRC=yes HDR_CHK=OK  nibs=[6, 1]\n'
+       '  CRC: FAIL\n  [CRC GATE] AES decrypt suppressed — payload CRC failed after all retries\n')
+
+
+def test_exhausted_early_outcome_classifier():
+    cls = BackgroundDecoder._early_exhausted_outcome
+    assert cls(DUD, False)
+    assert not cls(DUD, True)                                   # wall timeout: the full may finish it
+    assert not cls(DUD + '[BUDGET] bail\n', False)              # ran out of budget: not exhausted
+    assert not cls(DUD + '[PKT] {"x":1}\n', False)             # something came out: let verification decide
+    assert not cls(DUD + '  ERROR: boom\n', False)
+    assert not cls('NO PREAMBLE\n', False)                      # no header: the crop may not span the frame
+    assert not cls('', False) and not cls(None, False)
+
+
+def test_full_crop_is_skipped_when_its_early_read_the_header_but_failed_every_retry(dec, tmp_path):
+    early, full = early_full(tmp_path)
+    dec.submit(str(early), early.name, role='early', frame_key=39)
+    dec.submit(str(full), full.name, role='shared_full', frame_key=39)
+    dec.submit(str(full), full.name, relay_after_syms=4, relay_before_syms=170,
+               role='shared_full', frame_key=39)
+    _, _, job = dec._queue.get_nowait()
+    dec._plain_done(job[0], early_exhausted=dec._early_exhausted_outcome(DUD, False))
+    dec._ref_dec_and_maybe_unlink(job[0])
+    assert dec._queue.empty() and dec._slow_queue.empty() and dec.pending() == 0
+    assert not full.exists() and not early.exists()
+    assert 39 in dec._early_exhausted and 39 not in dec._early_verified
+
+
+def test_full_crop_submitted_after_an_exhausted_early_is_skipped_at_once(dec, tmp_path):
+    early, full = early_full(tmp_path)
+    dec.submit(str(early), early.name, role='early', frame_key=39)
+    _, _, job = dec._queue.get_nowait()
+    dec._plain_done(job[0], early_exhausted=True)
+    dec._ref_dec_and_maybe_unlink(job[0])
+    dec.submit(str(full), full.name, role='shared_full', frame_key=39)
+    assert dec._queue.empty() and dec.pending() == 0 and not full.exists()
+
+
+def test_full_crop_is_still_released_when_the_early_ran_out_of_budget(dec, tmp_path):
+    early, full = early_full(tmp_path)
+    dec.submit(str(early), early.name, role='early', frame_key=39)
+    dec.submit(str(full), full.name, role='shared_full', frame_key=39)
+    _, _, job = dec._queue.get_nowait()
+    dec._plain_done(job[0], early_exhausted=dec._early_exhausted_outcome(DUD + '[BUDGET] bail\n', False))
+    dec._ref_dec_and_maybe_unlink(job[0])
+    _, _, released = dec._queue.get_nowait()
+    assert released[0] == str(full) and full.exists()
+    assert 39 not in dec._early_exhausted
+
+
+def test_a_verified_early_is_never_marked_exhausted(dec, tmp_path):
+    early, full = early_full(tmp_path)
+    dec.submit(str(early), early.name, role='early', frame_key=39)
+    _, _, job = dec._queue.get_nowait()
+    dec._compact(mesh('0x12345678'), early.name, role='early')
+    dec._plain_done(job[0], early_exhausted=True)          # a stale flag cannot demote a verified frame
+    assert 39 in dec._early_verified and 39 not in dec._early_exhausted
+

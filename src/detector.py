@@ -7065,6 +7065,14 @@ class BackgroundDecoder:
         # an early that never arrives releases it after _EARLY_EXPECT_S.
         self._early_expected = {}
         self._early_verified = set()     # frame keys whose early crop verified
+        # Frame keys whose early crop read the header and then failed the
+        # payload after every retry WITHOUT running out of budget.  The early
+        # crop is planned from that very header to end at the frame's end
+        # (header_capture_controller abstains rather than clip), so its full
+        # sibling holds the same frame samples: decoding them again cannot
+        # succeed.  Live runs 2026-10-31..11-03: 21 full crops released after
+        # such an early crop, 0 recovered a packet, 686 s of decode spent.
+        self._early_exhausted = set()
         self._full_hold = {}             # frame_key -> [(job, slow, prio), ...]
         self._full_hold_since = {}       # frame_key -> monotonic of first hold
         # Host-adaptive sibling wait (Pi 5, 2026-10-26): the in-flight wait
@@ -8019,6 +8027,8 @@ while True:
                 with self._iso_lock:
                     if frame_key in self._early_verified:
                         _full_action = 'skip'
+                    elif frame_key in self._early_exhausted:
+                        _full_action = 'skip-dud'
                     elif (self._early_open.get(frame_key, 0) > 0
                           or (frame_key in self._early_expected
                               and time.monotonic() - self._early_expected[frame_key]
@@ -8030,6 +8040,10 @@ while True:
                         _full_action = 'run'
                 if _full_action == 'skip':
                     self._rawlog('FULL-SKIP', f"{fname} early crop already verified")
+                    self._skip_full(fpath)
+                    return
+                if _full_action == 'skip-dud':
+                    self._rawlog('FULL-SKIP', f"{fname} {self._EXHAUSTED_WHY}")
                     self._skip_full(fpath)
                     return
                 if _full_action == 'hold':
@@ -8100,15 +8114,36 @@ while True:
         self._plain_done(fpath)
         self._ref_dec_and_maybe_unlink(fpath)
 
-    def _plain_done(self, fpath):
+    _EXHAUSTED_WHY = ('early crop covered the frame: header read, payload failed '
+                      'after every retry')
+
+    @staticmethod
+    def _early_exhausted_outcome(output, timed_out):
+        """True when a finished early-crop job proves its full sibling futile:
+        the explicit header was read (so the crop spans the whole frame), no
+        packet came out, and the decoder stopped on its own rather than on
+        the budget, a wall timeout or an error."""
+        if not output or timed_out:
+            return False
+        if '[PKT]' in output or '[BUDGET]' in output or 'ERROR' in output:
+            return False
+        return 'HDR_CHK=OK' in output
+
+    def _plain_done(self, fpath, early_exhausted=False):
         """A plain job on `fpath` left the system (finished, skipped, dropped):
         when it was the last one, its held iso twins are skipped or released,
-        and when it was an early crop, its held full siblings likewise."""
+        and when it was an early crop, its held full siblings likewise.
+        `early_exhausted` (see _early_exhausted_outcome) lets a failed early
+        crop retire its full sibling instead of releasing it."""
         full_batches = []
         with self._iso_lock:
             n = self._plain_open.get(fpath, 0) - 1
             _rf = self._fpath_frame.get(fpath)
             if _rf is not None and _rf[0] == 'early':
+                if early_exhausted and _rf[1] not in self._early_verified:
+                    self._early_exhausted.add(_rf[1])
+                    if len(self._early_exhausted) > 4000:
+                        self._early_exhausted = set(list(self._early_exhausted)[-2000:])
                 m = self._early_open.get(_rf[1], 0) - 1
                 if m > 0:
                     self._early_open[_rf[1]] = m
@@ -8117,7 +8152,8 @@ while True:
                     held_full = self._full_hold.pop(_rf[1], [])
                     self._full_hold_since.pop(_rf[1], None)
                     if held_full:
-                        full_batches.append((held_full, _rf[1] in self._early_verified))
+                        full_batches.append((held_full, _rf[1] in self._early_verified,
+                                             _rf[1] in self._early_exhausted))
             if n > 0:
                 self._plain_open[fpath] = n
                 held, verified = [], False
@@ -8128,13 +8164,17 @@ while True:
                 self._iso_hold_since.pop(fpath, None)
                 verified = os.path.basename(fpath) in self._verified_fnames
         self._dispose_held(held, verified)
-        for held_full, early_verified in full_batches:
-            self._dispose_held_full(held_full, early_verified)
+        for held_full, early_verified, early_exhausted in full_batches:
+            self._dispose_held_full(held_full, early_verified, early_exhausted)
 
-    def _dispose_held_full(self, held, early_verified):
+    def _dispose_held_full(self, held, early_verified, early_exhausted=False):
         for job, slow, prio in held:
             if early_verified:
                 self._rawlog('FULL-SKIP', f"{job[1]} early crop verified")
+                self._skip_full(job[0])
+                continue
+            if early_exhausted:
+                self._rawlog('FULL-SKIP', f"{job[1]} {self._EXHAUSTED_WHY}")
                 self._skip_full(job[0])
                 continue
             self._rawlog('FULL-RELEASE', job[1])
@@ -8180,13 +8220,14 @@ while True:
                 self._early_expected.pop(k, None)
             full_batches = []
             for k in stale_full:
-                full_batches.append((self._full_hold.pop(k, []), k in self._early_verified))
+                full_batches.append((self._full_hold.pop(k, []), k in self._early_verified,
+                                     k in self._early_exhausted))
                 self._full_hold_since.pop(k, None)
                 self._early_open.pop(k, None)
         for held, verified in batches:
             self._dispose_held(held, verified)
-        for held, early_verified in full_batches:
-            self._dispose_held_full(held, early_verified)
+        for held, early_verified, early_exhausted in full_batches:
+            self._dispose_held_full(held, early_verified, early_exhausted)
 
     def pending(self):
         with self._lock:
@@ -8571,6 +8612,7 @@ while True:
                 # so it can never leak and permanently disable the drain.
                 self._slow_retire(_slow_token)
                 raise
+            output, timed_out = '', False   # defined even when the protocol fails before a result
             try:
                 # Send file path, search mode, and per-job budget to worker.
                 # Format: "<fpath>\t<mode>\t<budget>\n"
@@ -8803,7 +8845,8 @@ while True:
                     except Exception:
                         pass
                 if relay_after_syms is None and relay_before_syms is None:
-                    self._plain_done(fpath)
+                    self._plain_done(fpath, early_exhausted=self._early_exhausted_outcome(
+                        output, timed_out))
                 with self._lock:
                     self._active_count -= 1
                 if _slow_token is not None:
