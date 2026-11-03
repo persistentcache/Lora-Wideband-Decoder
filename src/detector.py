@@ -347,6 +347,64 @@ def _same_slope(a, b):
     return abs(a['bw'] ** 2 / 2.0 ** a['sf'] - b['bw'] ** 2 / 2.0 ** b['sf']) < 1.0
 
 
+# A frame this far over the window floor is strong enough to leave receiver
+# copies on the spur carriers (measured copies: 25-40 dB under frames at
+# +50 dB); the registry below remembers such frames for their airtime.
+ONAIR_STRONG_DB = 30.0
+
+
+class OnAirFrames:
+    """Frames currently on air, so a copy can be recognised in a later
+    window than its source.  The in-window arbitration catches a copy that
+    starts with its frame; a long frame (SF12/62.5k: 30 s) keeps leaving
+    copies on the receiver's spur carriers for its whole body, in windows
+    where the frame itself is no longer detected (live run 2026-11-02:
+    43 of 65 junk captures had no same-window source).  register() keeps a
+    strong detection for its worst-case duration; copy_of() finds the
+    frame a weaker same-slope detection at another carrier is a copy of.
+    Elevations are the detections' power over the window floor."""
+
+    def __init__(self, strong_db=ONAIR_STRONG_DB, copy_db=INTERMOD_COPY_DB):
+        self.strong_db = float(strong_db)
+        self.copy_db = float(copy_db)
+        self._frames = []           # [t0, t1, slope, freq_hz, bw, elev]
+
+    def _purge(self, now_s):
+        self._frames = [f for f in self._frames if f[1] >= now_s - 1.0]
+
+    def register(self, det, abst_s, elev_db, duration_s):
+        self._purge(abst_s)
+        if elev_db < self.strong_db:
+            return False
+        slope = det['bw'] ** 2 / 2.0 ** det['sf']
+        for f in self._frames:
+            if (abs(f[2] - slope) < 1.0 and abs(f[3] - det['freq_hz']) < max(f[4], det['bw'])
+                    and f[0] <= abst_s <= f[1]):
+                f[1] = max(f[1], abst_s + duration_s)      # same frame seen again
+                f[5] = max(f[5], elev_db)
+                return True
+        self._frames.append([abst_s, abst_s + duration_s, slope, float(det['freq_hz']),
+                             float(det['bw']), float(elev_db)])
+        return True
+
+    def copy_of(self, det, abst_s, elev_db):
+        """The on-air frame this detection copies, or None: same slope
+        family, another carrier, within the frame's span (a preamble span
+        of slack before it), and at least copy_db weaker."""
+        slope = det['bw'] ** 2 / 2.0 ** det['sf']
+        span = 8.0 * (2.0 ** det['sf']) / det['bw']
+        for f in self._frames:
+            if (abs(f[2] - slope) < 1.0
+                    and abs(f[3] - det['freq_hz']) >= max(f[4], det['bw'], 60_000.0)
+                    and f[0] - span <= abst_s <= f[1]
+                    and f[5] - elev_db >= self.copy_db):
+                return {'freq_hz': f[3], 'bw': f[4], 'elev': f[5], 't0': f[0], 't1': f[1]}
+        return None
+
+    def __len__(self):
+        return len(self._frames)
+
+
 def _sc_width_admits(bw_hz, width_hz, elev_db):
     """True when a peak of this measured width and elevation may carry a
     LoRa signal of bandwidth bw_hz (the SC stage evaluates that class)."""
@@ -10018,6 +10076,7 @@ def main():
         if _res_wait > 0.2 and os.environ.get('LORA_SLOW_DEBUG'):
             print(f"[COMMIT-WAIT] {_res_wait:.2f}s on seq {it['seq']}",
                   file=sys.stderr, flush=True)
+        dets0 = _onair_filter(dets0, it['tot_s'] / a.rate, 'pool')
         _elapsed = time.time() - t_start
         for d in dets0:
             if d.get('patience_trial'):
@@ -10116,6 +10175,51 @@ def main():
       from gate_ledger import ledger_from_environ as _ledger_from_environ
       _ledger = _ledger_from_environ(os.environ, a.debug, tempfile.gettempdir())
       _lrec = None
+      _onair = OnAirFrames()
+      _onair_floor = [0.0]          # the latest window's PSD floor (dB)
+
+      def _onair_elev(d):
+          # Power over the floor.  The detection's own figure is the gate
+          # peak's PSD power, except for the slow pass, which reports a
+          # nominal 20 dB; the latest window's PSD at the carrier is read
+          # too and the larger wins, so a long frame still on air is seen
+          # at its true strength whichever path detected it.
+          _e = float(d['peak_power_db']) - _onair_floor[0]
+          try:
+              _b = 2048 + int(round((float(d['freq_hz']) - _live_center_mhz * 1e6)
+                                    / (a.rate / 4096.0)))
+              if 3 <= _b < 4093 and _psd_gate is not None:
+                  _e = max(_e, float(np.max(_psd_gate[_b - 3:_b + 4])) - _onair_floor[0])
+          except (NameError, TypeError, ValueError):
+              pass
+          return _e
+
+      def _onair_filter(dets, abst_base_s, where):
+          """Drop receiver copies of frames on air; register the strong
+          survivors for their airtime.  Same rule as the in-window
+          arbitration, across windows."""
+          if not dets:
+              return dets
+          kept = []
+          for d in dets:
+              abst = abst_base_s + float(d.get('preamble_t_s', 0.0))
+              elev = _onair_elev(d)
+              src = _onair.copy_of(d, abst, elev)
+              if src is not None:
+                  if a.debug >= 1:
+                      print(f"  [GATE] intermod copy dropped ({where}): "
+                            f"{d['freq_hz'] / 1e6:.4f}MHz SF{d['sf']}/{int(d['bw']) // 1000}k "
+                            f"+{elev:.0f}dB under on-air {src['freq_hz'] / 1e6:.4f}MHz "
+                            f"+{src['elev']:.0f}dB (t={abst:.2f}s, frame {src['t0']:.2f}-{src['t1']:.2f}s)",
+                            file=sys.stderr, flush=True)
+                  continue
+              kept.append(d)
+          for d in kept:
+              if d.get('patience_trial'):
+                  continue                 # a trial's label is a hypothesis
+              _onair.register(d, abst_base_s + float(d.get('preamble_t_s', 0.0)),
+                              _onair_elev(d), _capture_duration_s(d))
+          return kept
       _ring_n_total = max(1, int(a.rate * a.buf_seconds))
       # Proactive budget clamp state ([GATE-BUDGET] block in the loop; live
       # only).  EWMAs (alpha 0.3) of the MEASURED per-peak detect cost and the
@@ -10814,6 +10918,7 @@ def main():
                     del _pat_promoted[_pb]
                     del _pat_futile[_pb]
 
+        _onair_floor[0] = float(np.median(_psd_gate))
         # ---- gate ledger: this window's record (gate_ledger.py) ----
         if _ledger is not None:
             _lrec = _ledger.begin(wc + 1, tot_s / a.rate, win_n / a.rate,
@@ -11604,6 +11709,7 @@ def main():
                     _ledger.dispatched(_lrec, _gate_peaks, 'inline', _cap_eff)
                     _ledger.outcomes(_lrec, _l_out)
                     _ledger.write(_lrec)
+                dets = _onair_filter(dets, tot_s / a.rate, 'inline')
             dt = time.time() - tw; elapsed = time.time() - t_start
             _prof['detect'] += dt
             if is_live and _bgt['margin'] > 0.0:
@@ -12077,6 +12183,8 @@ def main():
                         _bo = min(256, _slow_backoff.get(_bk, 4) * 2)
                         _slow_backoff[_bk] = _bo
                         _slow_seeds[_bk] = -_bo
+            if dets_slow:
+                dets_slow = _onair_filter(dets_slow, (_reg_tot_s - len(_iq_long)) / a.rate, 'slow')
             if dets_slow:
                 for d in dets_slow:
                     _pat_note_detection(d['freq_hz'])

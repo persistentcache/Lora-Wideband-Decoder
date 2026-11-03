@@ -61,3 +61,49 @@ def test_a_weak_frame_of_another_slope_survives(monkeypatch):
                                     cached_psd=psd,
                                     cached_peaks=[_peak(0.85e6, 125e3, -30.), _peak(-3.03e6, 250e3, -55.)])
     assert sorted(round(d['freq_mhz'], 2) for d in dets) == [911.97, 915.85]
+
+
+from detector import OnAirFrames, ONAIR_STRONG_DB, _capture_duration_s
+
+
+def _det(f_mhz, sf, bw, pwr=0.0, **kw):
+    d = {'freq_hz': f_mhz * 1e6, 'freq_mhz': f_mhz, 'sf': sf, 'bw': bw, 'peak_power_db': pwr,
+         'preamble_t_s': 0.0}
+    d.update(kw)
+    return d
+
+
+def test_on_air_registry_recognises_copies_for_the_frame_duration():
+    reg = OnAirFrames()
+    long_frame = _det(915.0166, 12, 62500)
+    assert reg.register(long_frame, 100.0, 52.0, _capture_duration_s(long_frame))
+    dur = _capture_duration_s(long_frame)
+    assert dur > 25.0
+    copy = _det(918.0012, 12, 62500)
+    assert reg.copy_of(copy, 100.3, 3.0)                       # preamble window
+    assert reg.copy_of(copy, 100.0 + dur - 0.5, -1.0)          # last window of the body
+    assert reg.copy_of(copy, 99.9, 2.0)                        # a preamble span of slack before
+    assert reg.copy_of(copy, 100.0 + dur + 2.0, 2.0) is None   # frame over
+    assert reg.copy_of(_det(911.0, 12, 62500), 110.0, 40.0) is None   # not 20 dB weaker
+    assert reg.copy_of(_det(911.0, 10, 125000), 110.0, 2.0) is None   # another slope
+    assert reg.copy_of(_det(915.03, 12, 62500), 110.0, 2.0) is None   # the frame's own carrier
+    assert reg.copy_of(_det(911.1226, 10, 31250), 110.0, 2.0)         # same-slope alias copies too
+
+
+def test_weak_frames_are_not_registered_and_old_ones_are_purged():
+    reg = OnAirFrames()
+    assert not reg.register(_det(911.0, 12, 62500), 10.0, ONAIR_STRONG_DB - 1, 30.0)
+    assert len(reg) == 0
+    assert reg.register(_det(915.0, 7, 125000), 10.0, 50.0, 2.3)
+    reg.register(_det(915.0, 7, 125000), 11.0, 51.0, 2.3)      # the same frame, seen again
+    assert len(reg) == 1
+    reg.register(_det(915.0, 10, 250000), 60.0, 50.0, 6.0)       # a minute later: the SF7 is gone
+    assert len(reg) == 1
+
+
+def test_main_loop_filters_every_detection_path():
+    from pathlib import Path
+    src = Path(detector.__file__).read_text()
+    for where in ("'pool'", "'inline'", "'slow'"):
+        assert f", {where})" in src and '_onair_filter(' in src, where
+    assert src.count('_onair_filter(') == 4            # definition + three paths
