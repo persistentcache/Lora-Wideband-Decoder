@@ -134,3 +134,62 @@ def test_sc_stage_refuses_exactly_the_peaks_the_gate_drops(monkeypatch):
     assert not _gate_peak_doomed(wide, FRES, -80.0)
     detector.detect_preamble(iq, RATE, RATE, 915., cached_psd=psd, cached_peaks=[wide], debug=0)
     assert seen                                          # at least one class evaluated
+
+
+def _forced_blocks():
+    """The channelizer and patience forced-placeholder statements from main()."""
+    tree = ast.parse(Path(detector.__file__).read_text())
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'main')
+    def assigns(node, name):
+        return isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets)
+    body = next(n.body for n in ast.walk(main) if hasattr(n, 'body')
+                and isinstance(n.body, list) and any(assigns(c, '_cap_eff') for c in n.body))
+    def test_is(node, *names):
+        if not isinstance(node, ast.If):
+            return False
+        text = ast.unparse(node.test).replace('(', '').replace(')', '')
+        return text == ' and not '.join(names)
+    chan = next(n for n in body if test_is(n, '_covered_dechirp_src', '_win_backlogged'))
+    pat = [n for n in body if test_is(n, '_pat_promoted', '_win_backlogged')
+           and '_gate_peaks.append' in ast.unparse(n)]
+    assert len(pat) == 1
+    code = lambda nodes: compile(ast.fix_missing_locations(ast.Module(nodes, type_ignores=[])),
+                                 detector.__file__, 'exec')
+    return code([chan]), code(pat)
+
+
+def _forced_env(**kw):
+    env = dict(vars(detector), a=SimpleNamespace(rate=RATE, debug=0), _live_center_mhz=915.,
+               _win_backlogged=False, _psd_gate=np.full(4096, -80., np.float32),
+               _ledger=None, _lrec=None, _gate_peaks=[], _doomed_bins=[],
+               _covered_dechirp_src=[], _pat_promoted={}, _covered_patience_offsets=set())
+    env.update(kw)
+    return env
+
+
+def test_channelizer_placeholder_is_not_planted_on_a_dropped_spur():
+    chan, _ = _forced_blocks()
+    carrier = 915e6 + 400 * FRES                       # a learned channel at bin 2448
+    env = _forced_env(_covered_dechirp_src=[(carrier, 125e3, 7)])
+    exec(chan, env)
+    assert len(env['_gate_peaks']) == 1                # quiet channel: placeholder as before
+    env = _forced_env(_covered_dechirp_src=[(carrier, 125e3, 7)], _doomed_bins=[2448.0])
+    exec(chan, env)
+    assert env['_gate_peaks'] == []                    # its energy this window is a spur tooth
+    env = _forced_env(_covered_dechirp_src=[(carrier, 125e3, 7)], _doomed_bins=[2448.0 + 40])
+    exec(chan, env)
+    assert len(env['_gate_peaks']) == 1                # a tooth 100 kHz away does not block it
+
+
+def test_patience_placeholder_is_not_planted_on_a_dropped_spur():
+    _, pat = _forced_blocks()
+    phz = 915e6 + 400 * FRES
+    promoted = {2448: (10_000, phz)}
+    env = _forced_env(_pat_promoted=promoted, _covered_patience_offsets={phz - 915e6})
+    exec(pat, env)
+    assert len(env['_gate_peaks']) == 1 and env['_gate_peaks'][0][1] == round(125e3 / FRES)
+    env = _forced_env(_pat_promoted=promoted, _covered_patience_offsets={phz - 915e6},
+                      _doomed_bins=[2448.0])
+    exec(pat, env)
+    assert env['_gate_peaks'] == []

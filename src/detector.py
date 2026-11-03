@@ -11088,6 +11088,14 @@ def main():
         # any LoRa bandwidth) leave before the cap: a spur comb tooth at
         # +50 dB must not outrank a real preamble at +40 dB in the sort.
         _n_doomed = 0
+        # Bins of this window's dropped spur peaks.  A forced placeholder
+        # (channelizer or patience) must not be planted on one: the
+        # placeholder's nominal 125 kHz width would send the dechirp trial a
+        # carrier the gate just measured at 10 kHz, and the trial fires on a
+        # CW spur (live run 2026-11-02: 100 junk SF12/62.5k full captures of
+        # 29.6 s each, 1219 s of slow-tier decode, after the spur peak that
+        # used to block the placeholder started leaving before the cap).
+        _doomed_bins = []
         if _gate_peaks:
             _floor_gate = float(np.median(_psd_gate))
             _fres_gate0 = a.rate / 4096.0
@@ -11095,9 +11103,10 @@ def main():
                            if not _gate_peak_doomed(_pk, _fres_gate0, _floor_gate)]
             _n_doomed = len(_gate_peaks) - len(_live_peaks)
             if _n_doomed:
+                _dropped = [_pk for _pk in _gate_peaks if _pk not in _live_peaks]
+                _doomed_bins = [float(_pk[0]) for _pk in _dropped]
                 if _lrec is not None:
-                    _ledger.removed(_lrec, 'doomed',
-                                    [_pk for _pk in _gate_peaks if _pk not in _live_peaks])
+                    _ledger.removed(_lrec, 'doomed', _dropped)
                 _gate_peaks = _live_peaks
                 _gate_doomed['peaks'] += _n_doomed
                 _gate_doomed['windows'] += 1
@@ -11133,7 +11142,8 @@ def main():
             _cen_hz = _live_center_mhz * 1e6
             for _cc, _bw_hz, _csf in _covered_dechirp_src:
                 _cbin = 2048 + int(round((_cc - _cen_hz) / _fres_gate))
-                if 0 <= _cbin < 4096 and not any(abs(_pk[0] - _cbin) < 15 for _pk in _gate_peaks):
+                if (0 <= _cbin < 4096 and not any(abs(_pk[0] - _cbin) < 15 for _pk in _gate_peaks)
+                        and not any(abs(_db - _cbin) < 15 for _db in _doomed_bins)):
                     _wbins = max(3, int(round(_bw_hz / _fres_gate)))
                     # carry the channel's REAL PSD value (not a placeholder) so the
                     # spur-reject / power ordering downstream treat it correctly
@@ -11264,7 +11274,8 @@ def main():
                     continue  # real energy peaks remain available to ordinary SC
                 _cbin = 2048 + int(round((_phz - _cen_pat) / _fres_pat))
                 if (0 <= _cbin < 4096
-                        and not any(abs(_pk[0] - _cbin) < 15 for _pk in _gate_peaks)):
+                        and not any(abs(_pk[0] - _cbin) < 15 for _pk in _gate_peaks)
+                        and not any(abs(_db - _cbin) < 15 for _db in _doomed_bins)):
                     _gate_peaks.append((_cbin,
                                         max(3, int(round(125e3 / _fres_pat))),
                                         float(_psd_gate[_cbin]),

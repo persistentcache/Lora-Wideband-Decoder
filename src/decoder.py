@@ -968,6 +968,106 @@ def parse_protobuf(data):
     return fields
 
 
+# Meshtastic Data message (mesh.proto): portnum(1) varint, payload(2) bytes,
+# want_response(3) varint, dest(4) source(5) request_id(6) reply_id(7)
+# emoji(8) fixed32 (older firmware wrote some as varints), bitfield(9) varint.
+_DATA_FIELD_WIRE = {1: (0,), 2: (2,), 3: (0,), 4: (0, 5), 5: (0, 5), 6: (0, 5),
+                    7: (0, 5), 8: (0, 5), 9: (0,)}
+
+
+def parse_protobuf_strict(data):
+    """parse_protobuf, plus whether the whole buffer was consumed as
+    well-formed fields (no truncated length, no unknown wire type)."""
+    fields = []
+    pos = 0
+    length = len(data)
+    while pos < length:
+        tag = 0; shift = 0
+        while pos < length:
+            b = data[pos]; pos += 1
+            tag |= (b & 0x7f) << shift
+            shift += 7
+            if not (b & 0x80): break
+        else:
+            return fields, False
+        field_num, wire_type = tag >> 3, tag & 7
+        if wire_type == 0:
+            val = 0; shift = 0
+            done = False
+            while pos < length:
+                b = data[pos]; pos += 1
+                val |= (b & 0x7f) << shift
+                shift += 7
+                if not (b & 0x80):
+                    done = True
+                    break
+            if not done:
+                return fields, False
+            fields.append((field_num, wire_type, val))
+        elif wire_type == 2:
+            flen = 0; shift = 0
+            done = False
+            while pos < length:
+                b = data[pos]; pos += 1
+                flen |= (b & 0x7f) << shift
+                shift += 7
+                if not (b & 0x80):
+                    done = True
+                    break
+            if not done or pos + flen > length:
+                return fields, False
+            fields.append((field_num, wire_type, bytes(data[pos:pos + flen])))
+            pos += flen
+        elif wire_type == 5:
+            if pos + 4 > length:
+                return fields, False
+            fields.append((field_num, wire_type, int.from_bytes(data[pos:pos + 4], 'little')))
+            pos += 4
+        elif wire_type == 1:
+            if pos + 8 > length:
+                return fields, False
+            fields.append((field_num, wire_type, int.from_bytes(data[pos:pos + 8], 'little')))
+            pos += 8
+        else:
+            return fields, False
+    return fields, True
+
+
+def data_message_valid(decrypted):
+    """Is this decrypted buffer a Meshtastic Data message a real node would
+    have sent?  AES-CTR has no integrity check, so this parse IS the
+    integrity check: the buffer must consist entirely of well-formed Data
+    fields, carry a known portnum, and a text portnum must carry a non-empty
+    UTF-8 payload.  Returns (fields, valid).
+
+    Live run 2026-11-02: a CRC-16 coincidence on a frame with three flipped
+    bits decrypted to portnum 1 with a damaged payload length; the old rule
+    (known portnum, UTF-8 check only when a payload exists) called it
+    verified and published a TEXT_MESSAGE with no text beside the real one."""
+    fields, whole = parse_protobuf_strict(decrypted)
+    if not whole or not fields:
+        return fields, False
+    portnum, payload = -1, None
+    for fn, wt, val in fields:
+        allowed = _DATA_FIELD_WIRE.get(fn)
+        if allowed is None or wt not in allowed:
+            return fields, False
+        if fn == 1:
+            portnum = int(val)
+        elif fn == 2:
+            payload = val
+    if portnum not in KNOWN_PORTNUMS:
+        return fields, False
+    if portnum in _TEXT_PORTNUMS:
+        if not payload:
+            return fields, False
+        try:
+            payload.decode('utf-8')
+        except UnicodeDecodeError:
+            return fields, False
+    return fields, True
+
+
 # ============================================================================
 # Portnum names (from meshtastic protobuf)
 # ============================================================================
@@ -4892,22 +4992,16 @@ def parse_meshtastic_packet(payload, aes_key=None, no_key=False, _clean_crc=Fals
             decrypted = bytes(enc_data)
         else:
             decrypted = aes_ctr_decrypt(_kb, bytes(nonce), bytes(enc_data))
-        fields = parse_protobuf(decrypted)
+        fields, _v = data_message_valid(decrypted)
         portnum, inner_payload = -1, None
         want_response = request_id = reply_id = emoji = None
         for fn, wt, val in fields:
             if fn == 1 and wt == 0: portnum = int(val)
             if fn == 2 and wt == 2: inner_payload = val
             if fn == 3 and wt == 0: want_response = bool(val)
-            if fn == 6 and wt == 0: request_id = int(val)
-            if fn == 7 and wt == 0: reply_id = int(val)
-            if fn == 8 and wt == 0: emoji = int(val)
-        _v = (portnum >= 0) and (portnum in KNOWN_PORTNUMS)
-        if _v and portnum in _TEXT_PORTNUMS and inner_payload:
-            try:
-                inner_payload.decode('utf-8')
-            except UnicodeDecodeError:
-                _v = False
+            if fn == 6: request_id = int(val)
+            if fn == 7: reply_id = int(val)
+            if fn == 8: emoji = int(val)
         if _v:
             _valid, _key_label = True, _klabel
             break
@@ -4921,22 +5015,16 @@ def parse_meshtastic_packet(payload, aes_key=None, no_key=False, _clean_crc=Fals
             _pki = _decrypt_mt_pki_dm(p, enc_data, pkt_id)
             if _pki is not None:
                 decrypted, _key_label = _pki['plaintext'], _pki['label']
-                fields = parse_protobuf(decrypted)
+                fields, _v2 = data_message_valid(decrypted)
                 portnum, inner_payload = -1, None
                 want_response = request_id = reply_id = emoji = None
                 for fn, wt, val in fields:
                     if fn == 1 and wt == 0: portnum = int(val)
                     if fn == 2 and wt == 2: inner_payload = val
                     if fn == 3 and wt == 0: want_response = bool(val)
-                    if fn == 6 and wt == 0: request_id = int(val)
-                    if fn == 7 and wt == 0: reply_id = int(val)
-                    if fn == 8 and wt == 0: emoji = int(val)
-                _v2 = (portnum >= 0) and (portnum in KNOWN_PORTNUMS)
-                if _v2 and portnum in _TEXT_PORTNUMS and inner_payload:
-                    try:
-                        inner_payload.decode('utf-8')
-                    except UnicodeDecodeError:
-                        _v2 = False
+                    if fn == 6: request_id = int(val)
+                    if fn == 7: reply_id = int(val)
+                    if fn == 8: emoji = int(val)
                 if _v2:
                     _valid = True
                     _rec['pki'] = True
