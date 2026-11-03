@@ -215,7 +215,16 @@ Run 14 (`ladder_live16_b24ac93`, the on-air registry): 13 of 13 recovered on the
 
 Where this leaves the day's open item: the acquisition miss of 2026-10-31 did not recur in five ladders today (15 SF7/125k first transmissions, all recovered on the first attempt); the gate ledger is in place for when it does.
 
+## SF7 acquisition stress and the decoder's budget bool (49867ab)
+
+Twenty SF7/125k CR4/8 first transmissions through the live pipeline in the default mode (`Desktop/LoRa-SF7-Stress-20261102/sf7_stress.py`, the ladder arm's frozen app and logged Heltec shim, 52 s cadence, Heltec restored afterwards): 20 of 20 published from their first transmission, firmware TX start to publication 2.58 to 3.38 s, 251 decode jobs for 165 s of decoder time, 8 slow-tier jobs, 17 copies dropped by the on-air rule, no non-admission, no decoder error. With the day's five ladders that is 35 SF7 first transmissions recovered first-time; the 2026-10-31 miss has not recurred since the gate changes, and the ledger (2347 windows recorded in this run) is in place if it does. `analyze_stress.py RUNDIR` prints the per-transmission table and, for a miss, the ledger windows around its firmware timestamp.
+
+The decoder error seen once each in runs 12 and 13 is located and fixed: `_recenter_and_decode` returned `False` when the CPU budget ran out between recenter rungs, and its caller indexed the result as a span tuple. Under the pool's small slow-tier budgets that aborted the job; in run 12 the job was message 7's early capture, which is why that message waited 24 s for its full capture. It returns None now, and decoder tracebacks also go to stdout so the raw job log keeps them (the pool discards worker stderr).
+
 ## Ledger
+
+2026-11-02 (49867ab): recenter budget returns None (`tests/test_decoder_recenter_budget.py`); SF7 stress run `Desktop/LoRa-SF7-Stress-20261102/run_20261102_212142` 20/20 first-attempt, 2.58-3.38 s; 984 tests.
+
 
 2026-11-02 (1a514d9): batch-ordered on-air filter; live run 14 `ladder_live16_b24ac93` 13/13, CRC 20/20, evidence complete, 541 s of decoder time, 8 junk captures; 982 tests.
 
