@@ -21,7 +21,7 @@ Usage:
   | python detector.py -r 40000000 -b 28000000 -c 915 -t sc16 -d 1
 """
 
-import sys, os
+import sys, os, math
 # Pin BLAS/FFT pools to ONE thread — MUST precede the numpy import.
 # Two reasons:
 # 1. DEADLOCK (found live 2026-07-09, py-spy): scipy-OpenBLAS registers a
@@ -70,7 +70,7 @@ def _pin_mmap_threshold():
 
 _pin_mmap_threshold()
 import time, json, argparse, numpy as np
-import threading, queue, io, subprocess, fcntl, collections, itertools
+import threading, queue, io, subprocess, fcntl, collections, itertools, tempfile
 
 # Make the GIL hand off 5× more often.  Default 5ms means a Python-only
 # thread (MainThread doing numpy bookkeeping, _save_worker thread building
@@ -306,6 +306,157 @@ DECHIRP_MF_MIN_DB = 12.0
 # gaps (e.g. a 15 s beacon), so distinct transmissions are preserved.
 DECHIRP_DEDUP_WIN_S = 1.5
 
+# A strong gate peak (this many dB over the window's PSD floor) that the
+# preamble detector cannot confirm is logged, once per 20 kHz carrier bucket
+# per _UNCONFIRMED_EVERY_S, with the best Schmidl-Cox score it reached.  Live
+# run 2026-10-31: two 52 dB SF7/125k transmissions in a clean band produced no
+# log line at all, so a missed first transmission could not be told apart from
+# RF that never arrived.  This keeps that failure visible without touching any
+# decision.  30 dB sits above the band's ambient spurs (measured 20-25 dB over
+# the floor on the 2026-10-31 recordings) and well below a nearby node's burst.
+GATE_UNCONFIRMED_DB = 30.0
+_UNCONFIRMED_EVERY_S = 30.0
+_unconfirmed_last = {}
+
+# Width gate shared by the gate's peak cap and the SC stage.  A peak that
+# stands SC_WIDTH_ELEV_DB over its own pass's floor has a trustworthy width
+# (weak peaks' widths collapse, so they are never gated), and a LoRa chirp of
+# bandwidth B occupies at least B / SC_WIDTH_RATIO of the PSD; a strong peak
+# narrower than that reaches no bandwidth class and the SC stage returns
+# nothing for it.  The gate applies the same test before the per-window cap:
+# live run 2026-10-31 (ladder_live8) ran under a 50 kHz spur comb, ~90 teeth
+# at +40..+52 dB and 4-5 bins wide, which shed-weakest ranked above the
+# SF7/125k traffic at +48 dB because the sort looked only at power.  A tooth
+# can never become a detection, so it must never take a slot from a peak that
+# can.  The slow pass, patience and prescreen snapshots are taken before this
+# point and still see every peak.
+SC_WIDTH_ELEV_DB = 15.0
+SC_WIDTH_RATIO = 2.5
+MIN_LORA_BW_HZ = 31_250.0
+
+# A same-slope detection this many dB weaker than a time-coincident kept one
+# is a receiver copy of it (intermod, spur mixing), not a second transmitter.
+# Measured copies sit 25-40 dB down; two real nodes on different channels
+# within one preamble span of each other and 20 dB apart are the cost.
+INTERMOD_COPY_DB = 20.0
+
+
+def _same_slope(a, b):
+    """Same chirp slope family: bw^2 / 2^sf equal (a preset and its
+    same-slope aliases, e.g. SF7/125k ~ SF9/250k ~ SF11/500k)."""
+    return abs(a['bw'] ** 2 / 2.0 ** a['sf'] - b['bw'] ** 2 / 2.0 ** b['sf']) < 1.0
+
+
+# A frame this far over the window floor is strong enough to leave receiver
+# copies on the spur carriers (measured copies: 25-40 dB under frames at
+# +50 dB); the registry below remembers such frames for their airtime.
+ONAIR_STRONG_DB = 30.0
+
+
+class OnAirFrames:
+    """Frames currently on air, so a copy can be recognised in a later
+    window than its source.  The in-window arbitration catches a copy that
+    starts with its frame; a long frame (SF12/62.5k: 30 s) keeps leaving
+    copies on the receiver's spur carriers for its whole body, in windows
+    where the frame itself is no longer detected (live run 2026-11-02:
+    43 of 65 junk captures had no same-window source).  register() keeps a
+    strong detection for its worst-case duration; copy_of() finds the
+    frame a weaker same-slope detection at another carrier is a copy of.
+    Elevations are the detections' power over the window floor."""
+
+    def __init__(self, strong_db=ONAIR_STRONG_DB, copy_db=INTERMOD_COPY_DB):
+        self.strong_db = float(strong_db)
+        self.copy_db = float(copy_db)
+        self._frames = []           # [t0, t1, slope, freq_hz, bw, elev]
+
+    def _purge(self, now_s):
+        self._frames = [f for f in self._frames if f[1] >= now_s - 1.0]
+
+    def register(self, det, abst_s, elev_db, duration_s):
+        self._purge(abst_s)
+        if elev_db < self.strong_db:
+            return False
+        slope = det['bw'] ** 2 / 2.0 ** det['sf']
+        for f in self._frames:
+            if (abs(f[2] - slope) < 1.0 and abs(f[3] - det['freq_hz']) < max(f[4], det['bw'])
+                    and f[0] <= abst_s <= f[1]):
+                f[1] = max(f[1], abst_s + duration_s)      # same frame seen again
+                f[5] = max(f[5], elev_db)
+                return True
+        self._frames.append([abst_s, abst_s + duration_s, slope, float(det['freq_hz']),
+                             float(det['bw']), float(elev_db)])
+        return True
+
+    def copy_of(self, det, abst_s, elev_db):
+        """The on-air frame this detection copies, or None: same slope
+        family, another carrier, within the frame's span (a preamble span
+        of slack before it), and at least copy_db weaker."""
+        slope = det['bw'] ** 2 / 2.0 ** det['sf']
+        span = 8.0 * (2.0 ** det['sf']) / det['bw']
+        for f in self._frames:
+            if (abs(f[2] - slope) < 1.0
+                    and abs(f[3] - det['freq_hz']) >= max(f[4], det['bw'], 60_000.0)
+                    and f[0] - span <= abst_s <= f[1]
+                    and f[5] - elev_db >= self.copy_db):
+                return {'freq_hz': f[3], 'bw': f[4], 'elev': f[5], 't0': f[0], 't1': f[1]}
+        return None
+
+    def filter(self, dets, abst_base_s, elev_fn, duration_fn, on_drop=None):
+        """Register this batch's strong, non-trial detections first, then
+        drop the copies among the rest: a frame and its copy can commit in
+        one batch, in either order.  Returns the survivors in input order."""
+        if not dets:
+            return dets
+        times = {id(d): abst_base_s + float(d.get('preamble_t_s', 0.0)) for d in dets}
+        elevs = {id(d): float(elev_fn(d)) for d in dets}
+        for d in dets:
+            if not d.get('patience_trial'):
+                self.register(d, times[id(d)], elevs[id(d)], duration_fn(d))
+        kept = []
+        for d in dets:
+            src = self.copy_of(d, times[id(d)], elevs[id(d)])
+            if src is None:
+                kept.append(d)
+            elif on_drop is not None:
+                on_drop(d, times[id(d)], elevs[id(d)], src)
+        return kept
+
+    def __len__(self):
+        return len(self._frames)
+
+
+def _sc_width_admits(bw_hz, width_hz, elev_db):
+    """True when a peak of this measured width and elevation may carry a
+    LoRa signal of bandwidth bw_hz (the SC stage evaluates that class)."""
+    return not (elev_db >= SC_WIDTH_ELEV_DB and bw_hz > width_hz * SC_WIDTH_RATIO)
+
+
+def _gate_peak_doomed(peak, fres_hz, window_floor_db):
+    """True when no bandwidth class at or above MIN_LORA_BW_HZ admits this
+    gate peak, i.e. the SC stage would discard it unexamined."""
+    floor = peak[3] if len(peak) > 3 and peak[3] is not None else window_floor_db
+    return not _sc_width_admits(MIN_LORA_BW_HZ, float(peak[1]) * fres_hz,
+                                float(peak[2]) - floor)
+
+
+def _note_unconfirmed(freq_hz, over_db, width_bins, sc, thr):
+    bucket = int(round(freq_hz / 20e3))
+    now = time.monotonic()
+    last = _unconfirmed_last.get(bucket)
+    if last is not None and now - last < _UNCONFIRMED_EVERY_S:
+        return
+    _unconfirmed_last[bucket] = now
+    if len(_unconfirmed_last) > 256:
+        for key in [k for k, t in _unconfirmed_last.items() if now - t >= _UNCONFIRMED_EVERY_S]:
+            del _unconfirmed_last[key]
+    if sc:
+        best = max(sc, key=lambda lag: sc[lag][0])
+        why = f'SC best lag={best} score={sc[best][0]:.2f} < {thr:.2f}'
+    else:
+        why = 'no bandwidth class reached the SC stage'
+    print(f'[GATE-UNCONFIRMED] peak {freq_hz / 1e6:.4f}MHz +{over_db:.0f}dB over floor, '
+          f'width {width_bins} bins: {why}', file=sys.stderr, flush=True)
+
 # Max channels to run the dechirp matched-filter on at once (the channelizer's learned
 # channels).  Each is a forced per-window dechirp scan (cheap after the per-channel-
 # compute fix, fix #3); the cap bounds worst-case work if the channelizer learns many
@@ -428,9 +579,66 @@ def patience_cap_params(d):
     _sf, _bw = int(d['sf']), float(d['bw'])
     if not d.get('patience_trial'):
         return _bw, float(1 << _sf) / _bw
-    _fam = patience_trial_family(_sf, _bw)
+    _fam = patience_detection_family(d)
     return (max(b for _, b in _fam),
             max(float(1 << s) / b for s, b in _fam))
+
+
+def patience_detection_family(detection):
+    """Use the supported trial family, or the unchanged historical default."""
+    family = detection.get('_patience_covered_family')
+    return (family if family is not None else
+            patience_trial_family(detection['sf'], detection['bw']))
+
+
+def _rf_footprint_covered(frequency, bandwidth, center, rate):
+    """Match the recorder's useful RF check, independently of export width."""
+    half = float(bandwidth) / 2
+    return (math.isfinite(float(frequency)) and half > 0
+            and abs(frequency - center) + half <= rate / 2 + 1e-6)
+
+
+def _covered_dechirp_channels(channels, center, rate):
+    """Keep supported forced hypotheses in order; preserve ordinary peaks."""
+    covered, rejected = [], []
+    for channel in channels or ():
+        offset, sf, bandwidth = channel[:3]
+        frequency = center + offset  # same expression as the emitted detection
+        trial = bool(len(channel) > 3 and channel[3])
+        if not _rf_footprint_covered(frequency, bandwidth, center, rate):
+            rejected.append(dict(source='patience' if trial else 'configured',
+                sf=sf, bw=bandwidth, frequency_hz=frequency,
+                rf_low_hz=frequency-bandwidth/2, rf_high_hz=frequency+bandwidth/2,
+                input_low_hz=center-rate/2, input_high_hz=center+rate/2))
+            continue
+        if trial:
+            # A direct caller may reuse hypotheses after changing rate/center.
+            # Recompute coverage instead of retaining an obsolete restriction.
+            channel = tuple(channel[:4])
+            original = patience_trial_family(sf, bandwidth)
+            family = tuple((s,b) for s,b in original
+                           if _rf_footprint_covered(frequency,b,center,rate))
+            # An external direct caller can use a rung outside the built-in
+            # ladder. Its own fully covered hypothesis remains usable even
+            # when every in-ladder alias lies outside the input.
+            if not family:
+                family = ((int(sf),float(bandwidth)),)
+            if family != tuple(original):
+                channel = tuple(channel[:4]) + (family,)
+        covered.append(channel)
+    return covered, rejected
+
+
+def _report_dechirp_coverage(representative, total, counts, where):
+    """One summary per reporting interval, retaining explicit coverage loss."""
+    item = representative
+    print(f'[DECHIRP-COVERAGE] total={total} patience={counts["patience"]} '
+          f'configured={counts["configured"]} where={where} '
+          f'source={item["source"]} SF{item["sf"]} bw={item["bw"]:g} '
+          f'rf=[{item["rf_low_hz"]:.6f},{item["rf_high_hz"]:.6f}] '
+          f'input=[{item["input_low_hz"]:.6f},{item["input_high_hz"]:.6f}] '
+          'forced hypothesis outside received RF coverage',
+          file=sys.stderr, flush=True)
 
 # PRESCREEN — outcome-learned persistent-junk suppression (2026-07-14,
 # measured low-core ceiling item 3).  On a junk-heavy host (Pi at 20 Msps,
@@ -624,6 +832,10 @@ class IQReader:
         return np.frombuffer(raw, dtype=np.int16 if self.sc16 else np.int8)
 
 
+class StreamHistoryUnavailable(RuntimeError):
+    """The requested past samples no longer form a validated contiguous span."""
+
+
 class StreamBuffer:
     """Background-threaded IQ reader with ring buffer.
 
@@ -686,6 +898,7 @@ class StreamBuffer:
         self._lock = threading.Lock()
         self._eof = False
         self._total_drops = 0
+        self._history_generation = 0
         # CONVERT-AHEAD (2026-07-05): live reads are 100% uniform hop-sized
         # since the deferred-tail work, so a dedicated thread converts the
         # NEXT hop while the main loop processes the current one — read()
@@ -1044,6 +1257,69 @@ class StreamBuffer:
             return (self._wp, self._rp - self._total_drops,
                     max(0, self._wp - self._rp), self._total_drops)
 
+    def history_anchor(self, consumed_pos=None):
+        """Map a detector position to raw ring coordinates without consuming.
+
+        Drops advance the raw read pointer but not the detector's sample clock.
+        Reject a mismatched clock (e.g. outstanding carry) instead of guessing.
+        """
+        with self._lock:
+            if (consumed_pos is not None
+                    and consumed_pos != self._rp - self._total_drops):
+                return None
+            return (self._rp, self._total_drops, self._history_generation)
+
+    def received_history_anchor(self):
+        """Snapshot fully published raw samples without advancing detection.
+
+        _reader_loop copies both wrap segments and only then advances _wp
+        under this same lock. The snapshot never exposes an unfinished write.
+        """
+        with self._lock:
+            return (self._wp, self._total_drops, self._history_generation)
+
+    def invalidate_history(self):
+        """Separate samples on either side of a radio retune."""
+        with self._lock:
+            self._history_generation += 1
+
+    def received_history_parts(self, anchor, count, chunk_n):
+        """Copy published samples, including those not yet consumed by read()."""
+        yield from self.history_parts(anchor, count, chunk_n, True)
+
+    def history_parts(self, anchor, count, chunk_n, _received=False):
+        """Yield owned, hop-bounded past samples; never move the read pointer.
+
+        The writer may run during conversion. Validate both sides of every
+        copy, using the same lap rule as read(), plus skip/retune identity.
+        A failure is terminal: callers may retain the contiguous prefix only.
+        The received-history wrapper selects _wp as the upper bound; ordinary
+        callers retain the consumed _rp bound and detector-clock semantics.
+        """
+        if anchor is None or count < 0 or chunk_n <= 0:
+            raise StreamHistoryUnavailable('invalid history range/anchor')
+        start, drops, generation = anchor
+        end = start + count
+        pos = start
+        while pos < end:
+            n = min(chunk_n, end - pos)
+            def validate():
+                if (self._total_drops != drops
+                        or self._history_generation != generation):
+                    raise StreamHistoryUnavailable('stream skipped or retuned')
+                if (pos < 0 or end > (self._wp if _received else self._rp)
+                        or self._wp - pos > self._ring_n):
+                    raise StreamHistoryUnavailable('ring history unavailable or overwritten')
+            with self._lock:
+                validate()
+            part = self._convert_span(pos, n)
+            with self._lock:
+                validate()
+                if part is None or len(part) != n:
+                    raise StreamHistoryUnavailable('ring history lost during copy')
+            yield part
+            pos += n
+
     def skip_to_latest(self, keep_n):
         """Skip ahead so only keep_n samples remain to be read."""
         with self._lock:
@@ -1337,6 +1613,24 @@ def _emit_psd_frame(path, psd_db, out_bins=512, span_db=55.0):
         os.replace(tmp, path)
     except Exception:
         pass
+
+
+def _slow_seed_is_narrow(psd_db, peak_bin, sample_rate, floor_db):
+    """Measure a slow seed at peak-minus-12 dB, above the floor-plus-6 bar."""
+    peak_db = float(psd_db[peak_bin - 2:peak_bin + 3].max())
+    threshold = max(peak_db - 12.0, floor_db + 6.0)
+    lo = hi = peak_bin
+    while lo > 0 and psd_db[lo - 1] > threshold:
+        lo -= 1
+    while hi < len(psd_db) - 1 and psd_db[hi + 1] > threshold:
+        hi += 1
+    # Sixteen 4096-point bins at the original 20 Msps rate span 78.125 kHz.
+    # Keep that physical allowance at lower rates (32 bins at 10 Msps),
+    # where a fixed 16-bin gate excluded SF12/62.5k from its required slow pass.
+    # Do not tighten established >=20 Msps behavior; coarse-bin width and
+    # other high-rate slow-pass limits need separate validation.
+    max_bins = max(16.0, 16.0 * 20_000_000.0 / sample_rate)
+    return hi - lo + 1 <= max_bins
 
 
 def find_peaks(psd_db, thresh_db=8.0, min_bins=3, max_peaks=MAX_ENERGY_PEAKS,
@@ -1868,6 +2162,20 @@ def extract_narrowband_fft(iq, wb_fs, offset_hz, target_bw, fft_cache=None):
     return result, float(target_fs)
 
 
+def _mix_capture_inplace(iq, offset_hz, fs, chunk_n):
+    """Recenter a private shared-save output with bounded temporary arrays.
+
+    Absolute float64 indices and the original complex128 expression preserve
+    the full-array mix's sample bits, including across tile boundaries.
+    """
+    coefficient = -2j * np.pi * offset_hz / fs
+    block_n = min(65536, chunk_n)
+    for start in range(0, len(iq), block_n):
+        stop = min(start + block_n, len(iq))
+        phase = np.arange(start, stop, dtype=np.float64)
+        iq[start:stop] = (iq[start:stop] * np.exp(coefficient * phase)).astype(np.complex64)
+
+
 def _nb_plateau_offset(iq, fs, bw):
     """CROP-CENTER FIX: max-hold plateau mis-centering meter.
 
@@ -1881,9 +2189,9 @@ def _nb_plateau_offset(iq, fs, bw):
     median: at fs = 2*bw the plateau itself spans ~half the bins.
 
     Returns the plateau edge-midpoint offset from DC (Hz) — i.e. how far
-    off-center the crop is — or None to ABSTAIN (slice too short, or no
-    contiguous floor+6dB run of width 0.6-1.4x bw).  Callers MUST treat
-    None as "keep the original center" (fail-safe contract: a correction
+    off-center the crop is — or None to ABSTAIN (slice too short, or the
+    dominant sufficiently wide floor+6dB run is not 0.6-1.4x bw). Callers MUST
+    treat None as "keep the original center" (fail-safe contract: a correction
     is only ever applied on a positive, bw-wide plateau identification).
     """
     n = 2048
@@ -1910,11 +2218,15 @@ def _nb_plateau_offset(iq, fs, bw):
     best, be = None, -1.0
     for s, e in zip(st, en):
         wd = (e - s + 1) * (fs / n)
-        if 0.6 * bw <= wd <= 1.4 * bw:
+        # Ignore narrow CW, but rank broad regions BEFORE the upper-width
+        # check. Strong signal skirts can exceed 1.4*bw; dropping them here
+        # would promote a weak, unrelated bw-wide feature and move a good
+        # gate center far away from the packet. In that case abstain.
+        if wd >= 0.6 * bw:
             es = float(mh[s:e + 1].sum())
             if es > be:
-                be, best = es, (s, e)
-    if best is None:
+                be, best = es, (s, e, wd)
+    if best is None or best[2] > 1.4 * bw:
         return None
     return 0.5 * (frq[best[0]] + frq[best[1]])
 
@@ -2365,8 +2677,9 @@ def _dechirp_scan(nb, sf, bw, nbfs):
     """Dechirp matched-filter preamble detection for a single channel.
 
     Scans sub-symbol offsets; at each, dechirps the channel into symbols and finds the
-    best 8-symbol window — the preamble's identical upchirps all dechirp to the SAME
-    FFT bin, so they sum to a sharp peak.  The detection metric is that despread
+    best 8-symbol window — the preamble's upchirps concentrate near the SAME
+    FFT bin, so their power accumulates there. Allow one adjacent bin for
+    fractional-bin jitter and modest clock drift. The detection metric is that despread
     peak-to-mean ratio (full SF processing gain), which detects well BELOW where
     Schmidl-Cox and the energy gate go deaf.  Mirrors dechirp_peak_quality's dechirp
     exactly, but also returns the preamble TIMING so a capture can be cut.
@@ -2393,11 +2706,25 @@ def _dechirp_scan(nb, sf, bw, nbfs):
                  if osf == 2 else _r.mean(axis=2))
         spec = np.abs(_fft_rows(d)) ** 2
         mn = spec.mean(axis=1)
-        ratios = np.where(mn > 0, spec.max(axis=1) / mn, 0.0)
-        cs = np.cumsum(ratios)
-        sums = cs[7:] - np.concatenate(([0.0], cs[:-8]))
-        bs = int(np.argmax(sums))
-        q = 10.0 * np.log10(sums[bs] / 8.0 + 1e-15)
+        # Normalize each symbol as before, but accumulate at a COMMON bin.
+        # Averaging unrelated per-symbol maxima let fresh DC/comb artifacts
+        # clear the learned-channel threshold and repeatedly queue captures.
+        # Bin-major layout makes each bin's symbol accumulation contiguous;
+        # retain the original symbol summation order. A zero mean implies a
+        # zero spectrum, so masked columns already contain zeros.
+        ratios = np.ascontiguousarray(spec.T)
+        np.divide(ratios, mn[None, :], out=ratios, where=mn[None, :] > 0)
+        near = np.empty_like(ratios)
+        np.maximum(ratios[:-2], ratios[2:], out=near[1:-1])
+        np.maximum(near[1:-1], ratios[1:-1], out=near[1:-1])
+        near[0] = np.maximum(ratios[0], np.maximum(ratios[-1], ratios[1]))
+        near[-1] = np.maximum(ratios[-1], np.maximum(ratios[-2], ratios[0]))
+        cs = np.cumsum(near, axis=1, out=near)
+        sums = cs[:, 7:].copy()
+        sums[:, 1:] -= cs[:, :-8]
+        peaks = sums.max(axis=0)
+        bs = int(np.argmax(peaks))
+        q = 10.0 * np.log10(peaks[bs] / 8.0 + 1e-15)
         if best is None or q > best[0]:
             pbin = int(np.argmax(spec[bs:bs + 8].mean(axis=0)))
             best = (q, (off + bs * sym) / float(nbfs), pbin)
@@ -2956,8 +3283,14 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     ethresh=8.0, spur_db=SPUR_REJECT_DB,
                     dc_notch_mhz=0.0, spur_notch_hz=None, debug=0,
                     cached_psd=None, cached_peaks=None, dechirp_chans=None,
-                    only_bws=None):
+                    only_bws=None, outcomes=None):
     """Schmidl-Cox LoRa preamble detector.  Replaces the CNN detect() pipeline.
+
+    outcomes: optional list; when given, one dict per processed peak is
+    appended describing the detect stage's verdict on it (gate_ledger):
+    f (MHz), w (bins), e (dB over the window floor), r (reason: 'detected',
+    'slow-wide', 'no-crop', 'short', 'no-class', 'sc-below', 'unresolved'),
+    and for peaks that reached the SC stage sc/lag/thr, plus det [(sf, bw)].
 
     1. Welch PSD → find energy peaks
     2. Per peak: extract 1Msps IQ (covers all Meshtastic BWs ≤ 500kHz)
@@ -2974,6 +3307,15 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
     if os.environ.get('LORA_STUB_DETECT'):
         return []   # diagnostic: measure producer-only throughput
     center_hz = center_mhz * 1e6
+    dechirp_chans, _uncovered_chans = _covered_dechirp_channels(
+        dechirp_chans, center_hz, wb_fs)
+    if _uncovered_chans:
+        # Main-loop callers already partition before scheduling. This covers
+        # direct callers too, without removing their real energy/SC peaks.
+        _counts = {name: sum(item['source'] == name for item in _uncovered_chans)
+                   for name in ('patience','configured')}
+        _report_dechirp_coverage(_uncovered_chans[0], len(_uncovered_chans),
+                                _counts, 'direct')
     nfft_c = 4096
     fres = wb_fs / nfft_c
 
@@ -3087,6 +3429,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
     def _process_one_peak(peak):
         cb, bw_bins, pwr = peak[0], peak[1], peak[2]
         if only_bws is not None and bw_bins * fres > 100e3:
+            _DPQ_MEMO.why = 'slow-wide'
             return []        # slow pass: narrow signals only
         # the emitting pass's own noise floor (4th element when present) —
         # the ONLY correct reference for this peak's elevation; absolute
@@ -3113,6 +3456,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             iq, wb_fs, off_hz, _bw_targets,
             chunk=_NB_CHUNK, fft_cache=_nb_fft_cache)
         if not iq_1m_parts:
+            _DPQ_MEMO.why = 'no-crop'
             return _ld
         iq_1m, _rate1m = iq_1m_parts[0]
 
@@ -3179,6 +3523,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
 
         # Minimum length: 3 × worst-case symbol duration (SF12/125k at 1Msps = 32768)
         if len(iq_1m) < 32768 * 3:
+            _DPQ_MEMO.why = 'short'
             return _ld
 
         # One forward-FFT cache for EVERY narrowband re-extraction of iq_1m
@@ -3266,6 +3611,8 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                         'forced_dechirp': True,   # Fix #2: collapse repeats via wide cooldown dedup
                         'patience_trial': _ltrial,  # acquisition-internal: never published/counted
                     })
+                    if len(_dech) > 4:
+                        _ld[-1]['_patience_covered_family'] = _dech[4]
                     return _ld
             except Exception:
                 pass
@@ -3417,7 +3764,7 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
             # true per-provenance elevation: absolute peak power minus
             # the EMITTING pass's own floor. 15 dB is an honest bar:
             # floor-level battery signals never gate; splatter does.
-            if (pwr - _src_floor) >= 15.0 and _bwc > _wh_gate * 2.5:
+            if not _sc_width_admits(_bwc, _wh_gate, pwr - _src_floor):
                 continue
             _nbp = _matched_nb.get(_bwc)
             if _nbp is None:
@@ -3493,7 +3840,16 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                   f"hits={len(hit_lags)}",
                   file=sys.stderr)
 
+        if sc:
+            _best_lag = max(sc, key=lambda l: sc[l][0])
+            _DPQ_MEMO.sc = (int(_best_lag), round(float(sc[_best_lag][0]), 3),
+                            round(float(_thr_m), 3))
         if not hit_lags:
+            _DPQ_MEMO.why = 'sc-below' if sc else 'no-class'
+            if (debug >= 1 and not _ld
+                    and (pwr - _psd_floor_db) >= GATE_UNCONFIRMED_DB):
+                _note_unconfirmed(center_mhz * 1e6 + off_hz, pwr - _psd_floor_db,
+                                  bw_bins, sc, _thr_m)
             return _ld
 
         if os.environ.get('LORA_SLOW_DEBUG'):
@@ -3983,8 +4339,13 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                     _hw = max(2, int(round(bw / 8.0 / _fres_w)))
                     if 40 < _cbw < 4055:
                         _flw2 = float(np.median(_psw))
-                        _c1 = (_cbw - _hw
-                               + int(np.argmax(_psw[_cbw - _hw:_cbw + _hw + 1])))
+                        # Carrier-local searches can straddle the PSD edge.
+                        # A negative slice start wraps to the opposite edge,
+                        # leaving an empty interval and losing this whole window.
+                        _search_lo = max(0, _cbw - _hw)
+                        _search_hi = min(len(_psw), _cbw + _hw + 1)
+                        _c1 = (_search_lo
+                               + int(np.argmax(_psw[_search_lo:_search_hi])))
                         _pk2 = float(_psw[_c1])
                         if _pk2 > _flw2 * 63.0:
                             _thw2 = _pk2 / 15.85
@@ -4050,10 +4411,26 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
         # Arm the per-peak dechirp memo for this peak's resolver work
         # (thread-local: safe under both the serial and threaded paths).
         _DPQ_MEMO.d = {}
+        _DPQ_MEMO.why = None
+        _DPQ_MEMO.sc = None
         try:
-            return _process_one_peak_core(_pk)
+            _r = _process_one_peak_core(_pk)
         finally:
+            _why, _scb = getattr(_DPQ_MEMO, 'why', None), getattr(_DPQ_MEMO, 'sc', None)
             _DPQ_MEMO.d = None
+            _DPQ_MEMO.why = None
+            _DPQ_MEMO.sc = None
+        if outcomes is not None:
+            _flr = (_pk[3] if len(_pk) > 3 and _pk[3] is not None else _psd_floor_db)
+            _o = {'f': round((center_hz + (float(_pk[0]) - nfft_c / 2) * fres) / 1e6, 4),
+                  'w': int(_pk[1]), 'e': int(round(float(_pk[2]) - _flr)),
+                  'r': 'detected' if _r else (_why or 'unresolved')}
+            if _scb is not None:
+                _o['lag'], _o['sc'], _o['thr'] = _scb
+            if _r:
+                _o['det'] = sorted({(int(d['sf']), int(round(d['bw']))) for d in _r})
+            outcomes.append(_o)
+        return _r
 
     if (len(peaks) <= 1 or os.environ.get('LORA_DETECT_SERIAL')
             or (os.cpu_count() or 8) < 8):
@@ -4173,6 +4550,37 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                         and abs(_d['preamble_t_s'] - _k['preamble_t_s']) < 2.0
                         and abs((_d['freq_hz'] - _center_hz_arb)
                                 + (_k['freq_hz'] - _center_hz_arb)) < 30e3):
+                    _dup = True
+                    break
+                # INTERMOD / SPUR-MIXED COPY: a strong frame reappears at the
+                # receiver's spur carriers (live 2026-11-02: a +51 dB
+                # SF7/125k at 915.002 left a time-aligned chirp 25 dB down at
+                # 911.123, 3.88 MHz away on the 1 MHz spur grid; the junk
+                # capture's own IQ holds it).  The copy keeps the chirp
+                # slope, so a same-slope dechirp or SC at that carrier
+                # confirms it; the patience gate then had 100 such 29.6 s
+                # captures decoded on noise in one run.  A detection that
+                # starts when a kept one starts, shares its slope family
+                # (bw^2 / 2^sf: same preset or its aliases) and is at least
+                # INTERMOD_COPY_DB weaker is that copy, whatever its carrier.
+                _pdiff = _d.get('peak_power_db', 0.0) - _k.get('peak_power_db', 0.0)
+                if (abs(_d['preamble_t_s'] - _k['preamble_t_s'])
+                        < max(_span, _kspan)
+                        and _same_slope(_d, _k)
+                        and abs(_pdiff) >= INTERMOD_COPY_DB):
+                    # The order is by dechirp quality, and a clean copy can
+                    # outscore the frame it copies, so the weaker of the
+                    # pair goes whichever came first.
+                    _copy, _real = (_d, _k) if _pdiff < 0 else (_k, _d)
+                    if debug >= 1:
+                        print("  [GATE] intermod copy dropped: %.4fMHz SF%d/%dk %+.0fdB under "
+                              "%.4fMHz SF%d/%dk at t=%.0fms"
+                              % (_copy['freq_hz'] / 1e6, _copy['sf'], _copy['bw'] // 1000,
+                                 -abs(_pdiff), _real['freq_hz'] / 1e6, _real['sf'],
+                                 _real['bw'] // 1000, _copy['preamble_t_s'] * 1000),
+                              file=sys.stderr, flush=True)
+                    if _real is _d:
+                        _kept[_ki] = _d
                     _dup = True
                     break
             if not _dup:
@@ -4448,27 +4856,24 @@ class _StreamDecimator:
 
     _MIX_BS = 8192   # mixer block size (see _mix)
 
-    def __init__(self, f_off_hz, wb_fs, D):
+    def __init__(self, f_off_hz, wb_fs, D, *, use_gemm=False):
         from scipy.signal import firwin, upfirdn as _ufd
         global _upfirdn
         _upfirdn = _ufd
         self.D = int(D)
         self.fs = float(wb_fs)
         self.f = float(f_off_hz)
+        self._use_gemm = bool(use_gemm)
         self.h = firwin(20 * self.D + 1, 1.0 / self.D,
                         window=('kaiser', 5.0)).astype(np.float32)
         self.L = len(self.h)
         self.H = (self.L - 1) // 2          # = 10*D, divisible by D
-        # Polyphase-as-GEMM decomposition (the naive per-output dot and
-        # scipy's upfirdn both ran ~0.5 s per 10 M-sample hop — too slow
-        # for the cropper to keep up with the hop cadence).  With h
+        # Polyphase decomposition used by the optional tiled FIR. With h
         # zero-padded to K*D taps and hp2[j, p] = h_pad[(j+1)*D - 1 - p],
         #     y[m] = sum_j ( seg[c_m - (j+1)D + 1 : c_m - jD + 1] . hp2[j] )
         # and the inner windows for consecutive m are consecutive D-sample
-        # rows of seg — so ONE contiguous reshape view of seg matmul'd
-        # against hp2.T computes every (m, j) partial in a single BLAS
-        # call, and y falls out as K diagonal slice-sums.  Exactly the
-        # same arithmetic, ~10x faster.
+        # rows of seg. Each bounded output tile computes real I/Q matrix
+        # products with hp2.T, then combines K diagonal slice-sums.
         self._K = (self.L + self.D - 1) // self.D    # = 21
         _hpad = np.zeros(self._K * self.D, np.float32)
         _hpad[:self.L] = self.h
@@ -4509,6 +4914,33 @@ class _StreamDecimator:
             xm[full:] = x[full:] * base[:n - full] * Rb[n // BS]
         return xm
 
+    def _fir_tiles(self, seg, c_min, n_y):
+        """Same real FIR coefficients, with bounded polyphase matrix products.
+
+        Each row of input holds D successive samples. Multiplying by the
+        reversed tap phases computes the partial sums; diagonal row offsets
+        align those sums on the original output grid. Tile the output so the
+        temporary matrix of 21 phases never grows with the complete capture.
+        """
+        D, K = self.D, self._K
+        taps = np.ascontiguousarray(self._hp2T.real.T)
+        y = np.zeros(n_y, np.complex64)
+        for begin in range(0, n_y, 65536):
+            count = min(65536, n_y - begin)
+            first = c_min // D + begin - K
+            rows = count + K - 1
+            source = seg[1 + first * D:1 + (first + rows) * D].reshape(rows, D)
+            matrix = np.empty((D, rows), np.float32, order='F')
+            partial = np.empty((K, rows), np.float32)
+            for part, target in ((source.real, y.real[begin:begin + count]),
+                                 (source.imag, y.imag[begin:begin + count])):
+                np.copyto(matrix, part.T)
+                np.matmul(taps, matrix, out=partial)
+                for j in range(K):
+                    start = K - j - 1
+                    target += partial[j, start:start + count]
+        return y
+
     def feed(self, x):
         """Feed the next contiguous chunk; returns 0+ output samples."""
         if len(x) == 0:
@@ -4535,8 +4967,18 @@ class _StreamDecimator:
         # the single crop thread fell behind and captures were finalized
         # 25-100 s after detection (median row latency 79 s, 21/21 decoded
         # but a minute late).
-        zd = _upfirdn(self.h, seg, up=1, down=D)
-        y = np.ascontiguousarray(zd[c_min // D:c_min // D + n_y], dtype=np.complex64)
+        # The taps are real: filter I/Q separately instead of paying scipy's
+        # complex-convolution cost. This preserves the FIR/grid arithmetic
+        # while letting several pending streams keep up with live input.
+        if self._use_gemm and D >= 5 and n_y >= 1024:
+            # Measured faster for the shared D5/D10/D20 capture bands. D2
+            # and small feeds retain upfirdn; their matrix overhead is larger.
+            y = self._fir_tiles(seg, c_min, n_y)
+        else:
+            take = slice(c_min // D, c_min // D + n_y)
+            y = np.empty(n_y, dtype=np.complex64)
+            y.real = _upfirdn(self.h, seg.real, up=1, down=D)[take]
+            y.imag = _upfirdn(self.h, seg.imag, up=1, down=D)[take]
         self._m_next = m_hi + 1
         # keep L-1 (+ one extra D so the next GEMM's earliest row exists)
         keep_abs = self._m_next * D + H - (L - 1) - D
@@ -4562,6 +5004,226 @@ def _slope(sf, bw):
     return round(bw * bw / (2.0 ** sf) / 1e3)
 
 
+def _capture_duration_s(detection):
+    """Bound supported frames, without needing an already-decoded header.
+
+    Semtech SX1276 datasheet section 4.1.1.7: explicit header, payload CRC,
+    CR4/8 and the longer LDRO=1 form. decoder.py's LDRO fallback supports
+    either setting even below 16 ms/symbol. Its universal payload guard
+    is 4..237 bytes (including Unknown/MeshCore/LoRaWAN), not the PHY's 255.
+    Allow the known 32-symbol MeshCore preamble as well as Meshtastic's 16.
+    https://cdn.sparkfun.com/assets/a/a/0/b/5/DS_SX1276-7-8-9_W_APP_V5.pdf
+    """
+    override = os.environ.get('LORA_PAYLOAD_SYM_BUDGET')
+    if override is not None:
+        # Preserve the explicit override's historical symbol semantics.
+        return (16 + 4.25 + 8 + int(override)) * patience_cap_params(detection)[1]
+    sf, bw = int(detection['sf']), float(detection['bw'])
+    family = (patience_detection_family(detection)
+              if detection.get('patience_trial') else [(sf, bw)])
+    durations = []
+    for sf, bw in family:
+        symbol_s = (2 ** sf) / bw
+        denominator = 4 * (sf - 2)  # DE=1 bounds both supported LDRO settings
+        numerator = 8 * 237 - 4 * sf + 28 + 16
+        blocks = max(0, -(-numerator // denominator))
+        payload_symbols = 8 + blocks * 8  # CR4/8
+        durations.append((32 + 4.25 + payload_symbols) * symbol_s)
+    return max(durations)
+
+
+def _legacy_tail_limit_n(detections, rate, window_n):
+    """Keep the pre-existing wideband retention ceiling on fallback paths."""
+    return min(int(max(148.25 * patience_cap_params(d)[1]
+                       for d in detections) * rate), 24 * window_n)
+
+
+def _capture_tail_n(recorder, detections, window_n, *, allow_nb=True, warn=True):
+    if not detections:
+        return 0
+    requested = int(np.ceil(max(_capture_duration_s(d) for d in detections)
+                            * recorder.wb_fs))
+    if recorder._nb_mode and allow_nb:
+        return requested
+    limit = _legacy_tail_limit_n(detections, recorder.wb_fs, window_n)
+    if requested > limit and warn:
+        print(f'[CAPTURE-LIMIT] wideband tail limited to '
+              f'{limit / recorder.wb_fs:.3f}s of '
+              f'{requested / recorder.wb_fs:.3f}s requested; long frames '
+              'may be truncated', file=sys.stderr, flush=True)
+    return min(requested, limit)
+
+
+def _slow_record_immediately(detection, window_s):
+    """No main-pass dedup hold for modes that cannot fit its 16-symbol gate."""
+    return (int(detection['bw']) in (31250, 41667)
+            or 16 * (2 ** detection['sf']) / detection['bw'] > window_s)
+
+
+def _record_slow_capture(recorder, detections, base, base_end, *, sample_pos,
+                         hop_n, win_n, recent_hops, history_reader=None,
+                         history_anchor=None):
+    """Register a contiguous slow assembly, recovering delayed tails in hops."""
+    tail_n = _capture_tail_n(recorder, detections, win_n)
+    if getattr(recorder, '_shared', None) is not None:
+        # Shared crop service recovers the whole validated raw range in its
+        # own worker. Do not enumerate/copy a delayed tail in acquisition.
+        recorder.update_deferred(detections, base, base_end, pre_hop=None,
+                                 need_tail_n=tail_n, owned_buf=True,
+                                 history_anchor=history_anchor)
+        return
+    gap_n = sample_pos - base_end
+    gap_parts = tail_parts = None
+    reg_pos = base_end
+    continuous = True
+    if history_reader is not None:
+        identity = history_reader.history_anchor()
+        current = history_reader.history_anchor(sample_pos)
+        # Check retune identity independently of the sample-clock check: a
+        # clock mismatch must not hide an old-center assembly.
+        if (history_anchor is not None
+                and identity[2] != history_anchor[2]):
+            print('[SLOW-GAP] discarded slow result across retune',
+                  file=sys.stderr, flush=True)
+            return
+        continuous = (history_anchor is not None and current is not None
+                      and current[1:] == history_anchor[1:]
+                      and history_anchor[0] - history_anchor[1] == base_end
+                      and current[0] - history_anchor[0] == gap_n)
+    if gap_n < 0 or not continuous:
+        print('[SLOW-GAP] stream position changed — truncated base capture',
+              file=sys.stderr, flush=True)
+        tail_n = 0
+    elif gap_n > 0:
+        k = gap_n // hop_n if hop_n > 0 else 0
+        if hop_n > 0 and k * hop_n == gap_n and 0 < k <= len(recent_hops):
+            gap_parts = list(recent_hops)[-k:]
+            reg_pos = sample_pos
+            tail_n = max(0, tail_n - gap_n)
+        elif history_reader is not None and hop_n > 0:
+            # Keep the 8-hop fast path and existing ring size. Feed older
+            # history through the recorder's NB cropper one owned hop at a
+            # time; no second multi-second wideband assembly is allocated.
+            tail_parts = history_reader.history_parts(
+                history_anchor, min(gap_n, tail_n), hop_n)
+        else:
+            print(f'[SLOW-GAP] unfillable gap {gap_n} samples '
+                  '— truncated base capture', file=sys.stderr, flush=True)
+            tail_n = 0
+    recorder.update_deferred(detections, base, reg_pos, pre_hop=None,
+                             need_tail_n=tail_n, owned_buf=True,
+                             gap_parts=gap_parts, tail_parts=tail_parts)
+
+
+def _mem_available_bytes():
+    """Linux MemAvailable (what a new allocation can actually use), else the
+    free-page count, else None when the host does not say."""
+    try:
+        with open('/proc/meminfo') as fh:
+            for line in fh:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf('SC_AVPHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+_MIB = 1024 * 1024
+SHARED_CAPTURE_PLAN_BYTES = 2048 * _MIB        # Codex's validated retention plan: the floor
+SHARED_CAPTURE_PLAN_MAX_BYTES = 8192 * _MIB    # no host needs more retention than this
+SHARED_CAPTURE_PLAN_FRACTION = 8               # the plan takes 1/8 of MemAvailable
+SHARED_CAPTURE_RAM_HEADROOM = 2048 * _MIB      # the rest of the pipeline, workers, web
+
+
+def shared_capture_plan_bytes(mem_available):
+    """Retention plan for the auto mode: an eighth of what the host can
+    allocate, never below the validated 2048 MiB, never above 8 GiB.  A 16 GB
+    Pi 5 lands exactly on the floor; a 64 GB desktop gets about 7 GiB.  Live
+    run 2026-11-02 (10 Msps, three bands, SF12/62.5k long frames) charged
+    2.90 GB against the fixed 2.95 GB budget and refused four captures on a
+    host with 57 GB free; retention scales with sample rate and concurrent
+    frames, so the plan scales with the memory that is actually there."""
+    if mem_available is None:
+        return SHARED_CAPTURE_PLAN_BYTES
+    plan = int(mem_available) // SHARED_CAPTURE_PLAN_FRACTION
+    plan -= plan % _MIB
+    return max(SHARED_CAPTURE_PLAN_BYTES, min(SHARED_CAPTURE_PLAN_MAX_BYTES, plan))
+
+
+def shared_capture_plan(environ, mem_available):
+    """Decide how this host captures.
+
+    Frame-length-exact capture (the shared recorder with header checkpoints)
+    ends a capture when the frame's header says the frame ends, instead of
+    after the worst-case frame duration of its SF/BW; on every host measured
+    it halved slow-SF publication latency and removed most redundant decodes.
+    It is the default wherever the host can carry its memory budget:
+
+      LORA_SHARED_CAPTURE unset  -> on when MemAvailable >= 2 x budget + 2 GiB,
+                                    header checkpoints on (LORA_HEADER_CHECKPOINT=0 opts out),
+                                    budget = plan + header workspace, plan =
+                                    MemAvailable / 8 clamped to [2048 MiB, 8 GiB]
+                                    (about 2.8 GiB on a 16 GB Pi 5, about 7.9 GiB
+                                    on a 64 GB desktop; an 8 GB Pi does not
+                                    qualify and keeps plain capture)
+      LORA_SHARED_CAPTURE=0      -> plain capture
+      LORA_SHARED_CAPTURE=1      -> the explicit diagnostic form, unchanged:
+                                    LORA_SHARED_CAPTURE_MB sizes the budget
+                                    (default 2048), header checkpoints only
+                                    with LORA_HEADER_CHECKPOINT=1 and then an
+                                    explicit budget of at least the plan plus
+                                    the header workspace.
+
+    Returns a dict: enabled, explicit, header, budget_bytes, views,
+    prefix_bytes, header_workspace, reason.  Raises RuntimeError for
+    contradictory explicit settings, exactly as before."""
+    mode = environ.get('LORA_SHARED_CAPTURE')
+    header_env = environ.get('LORA_HEADER_CHECKPOINT')
+    views = int(environ.get('LORA_SHARED_CAPTURE_VIEWS', '64'))
+    prefix_bytes = int(environ.get('LORA_HEADER_PREFIX_MB', '64')) * _MIB
+    header_workspace = 8 * prefix_bytes + 128 * _MIB
+    header_extra = header_workspace + 2 * prefix_bytes + 65536
+    base = dict(views=views, prefix_bytes=prefix_bytes, header_workspace=header_workspace)
+    if mode == '0':
+        if header_env == '1':
+            raise RuntimeError('LORA_HEADER_CHECKPOINT requires LORA_SHARED_CAPTURE=1')
+        return dict(base, enabled=False, explicit=True, header=False, budget_bytes=0,
+                    reason='plain capture: LORA_SHARED_CAPTURE=0')
+    if mode == '1':
+        header = header_env == '1'
+        budget = int(environ.get('LORA_SHARED_CAPTURE_MB', '2048')) * _MIB
+        if header:
+            if prefix_bytes <= 0:
+                raise RuntimeError('header prefix memory budget must be positive')
+            if ('LORA_SHARED_CAPTURE_MB' not in environ
+                    or budget < SHARED_CAPTURE_PLAN_BYTES + header_extra):
+                raise RuntimeError('header checkpoint memory requires explicit aggregate '
+                                   'LORA_SHARED_CAPTURE_MB budget (3072 with default prefix)')
+        return dict(base, enabled=True, explicit=True, header=header, budget_bytes=budget,
+                    reason=f'LORA_SHARED_CAPTURE=1, budget {budget // _MIB} MiB, '
+                           f'header checkpoints {"on" if header else "off"}')
+    header = header_env != '0'
+    budget = shared_capture_plan_bytes(mem_available) + (header_extra if header else 0)
+    need = 2 * budget + SHARED_CAPTURE_RAM_HEADROOM
+    if mem_available is None or mem_available < need:
+        have = 'unknown' if mem_available is None else f'{mem_available / _MIB:.0f} MiB'
+        if header_env == '1':
+            raise RuntimeError(f'LORA_HEADER_CHECKPOINT=1 but frame-exact capture does not fit: '
+                               f'{have} available, needs {need / _MIB:.0f} MiB; set '
+                               'LORA_SHARED_CAPTURE=1 and LORA_SHARED_CAPTURE_MB to force it')
+        return dict(base, enabled=False, explicit=False, header=False, budget_bytes=0,
+                    reason=f'plain capture: {have} available, frame-exact capture needs '
+                           f'{need / _MIB:.0f} MiB (set LORA_SHARED_CAPTURE=1 and '
+                           f'LORA_SHARED_CAPTURE_MB to force it)')
+    return dict(base, enabled=True, explicit=False, header=header, budget_bytes=budget,
+                reason=f'frame-exact capture: budget {budget // _MIB} MiB of '
+                       f'{mem_available / _MIB:.0f} MiB available, header checkpoints '
+                       f'{"on" if header else "off"}')
+
+
 class SignalRecorder:
     """One file per detection, saved in a background thread.
 
@@ -4574,11 +5236,13 @@ class SignalRecorder:
     Recording = wideband_buf + tail, trimmed per SF/BW.
     """
 
-    def __init__(self, export_dir, wb_fs, center_hz, hop_n, debug=0):
+    def __init__(self, export_dir, wb_fs, center_hz, hop_n, debug=0,
+                 window_n=None):
         self.export_dir = export_dir
         self.wb_fs = wb_fs
         self.center_hz = center_hz
         self.hop_n = hop_n
+        self.window_n = int(window_n if window_n is not None else 2 * hop_n)
         self.debug = debug
         os.makedirs(export_dir, exist_ok=True)
         # Reap orphan captures from a previous crashed run.  The pipeline holds
@@ -4595,6 +5259,7 @@ class SignalRecorder:
             for _f in os.listdir(export_dir):
                 if not ((_f.startswith('SF') and _f.endswith('.cf32'))
                         or _f.endswith('.spool')
+                        or (_f.startswith('.header-') and _f.endswith('.prefix'))
                         or _f == '.lora_write_test'):
                     continue
                 _p = os.path.join(export_dir, _f)
@@ -4607,6 +5272,9 @@ class SignalRecorder:
             pass
 
         self._decoder = None
+        self._shared = None
+        self._header = None
+        self._history_reader = None
         # RAM-PROPORTIONAL SPOOL (UC audit (s) re-exam 2026-07-12): the class
         # default (600 MB) is the threshold above which a save job spills its
         # wideband concat to a disk-backed memmap instead of holding it in RAM.
@@ -4754,9 +5422,132 @@ class SignalRecorder:
     def set_decoder(self, decoder):
         self._decoder = decoder
 
+    def _expect_early(self, frame_key):
+        """The header checkpoint planned an early crop: tell the decoder so
+        the frame's full crop waits for it (see BackgroundDecoder.expect_early)."""
+        dec = self._decoder
+        if dec is not None and hasattr(dec, 'expect_early'):
+            dec.expect_early(frame_key)
+
+    def set_history_reader(self, reader):
+        """Attach the live ring reader and choose the capture mode for this
+        host (see shared_capture_plan): frame-length-exact capture by default
+        where the memory fits, plain capture otherwise or on request."""
+        plan = shared_capture_plan(os.environ, _mem_available_bytes())
+        if not plan['enabled']:
+            print(f"[CAPTURE] {plan['reason']}", file=sys.stderr, flush=True)
+            return
+        if not hasattr(reader, 'history_parts'):
+            if plan['explicit']:
+                raise RuntimeError('LORA_SHARED_CAPTURE requires validated live ring history')
+            print('[CAPTURE] plain capture: this source has no validated ring history',
+                  file=sys.stderr, flush=True)
+            return
+        if os.environ.get('LORA_NO_DEFER') == '1':
+            if plan['explicit']:
+                raise RuntimeError('LORA_SHARED_CAPTURE cannot use blocking LORA_NO_DEFER')
+            print('[CAPTURE] plain capture: LORA_NO_DEFER=1 blocks the main loop',
+                  file=sys.stderr, flush=True)
+            return
+        from capture_timeline import CaptureBudget, SharedCapture
+        budget = CaptureBudget(plan['budget_bytes'], plan['views'])
+        header_enabled = plan['header']
+        prefix_bytes = plan['prefix_bytes']
+        header_workspace = plan['header_workspace']
+        print(f"[CAPTURE] {plan['reason']}", file=sys.stderr, flush=True)
+        self._history_reader = reader
+        self._shared = SharedCapture(
+            rate=self.wb_fs, center=self.center_hz, hop_n=self.hop_n,
+            reader=reader,
+            decimator_factory=lambda offset, rate, factor: _StreamDecimator(
+                offset, rate, factor, use_gemm=True),
+            submit=self._queue_shared_save, budget=budget,
+            writer_stall_s=float(os.environ.get('LORA_SHARED_WRITER_TIMEOUT', '30')),
+            report=lambda message: print(message, file=sys.stderr, flush=True))
+        if header_enabled:
+            from header_checkpoint_service import HeaderCheckpointService
+            from header_capture_controller import HeaderCaptureController
+            workspace = budget.reserve('header_worker_workspace', header_workspace)
+            service = None
+            try:
+                service = HeaderCheckpointService(workspace_lease=workspace,
+                    max_pending=2, max_prefix_bytes=prefix_bytes)
+                self._header = HeaderCaptureController(self._shared, service,
+                    directory=self.export_dir, max_prefix_bytes=prefix_bytes,
+                    on_early_planned=self._expect_early)
+                self._shared.header_controller = self._header
+            except Exception:
+                if service is not None:
+                    service.close(timeout_s=2)
+                else:
+                    workspace.release()
+                self._shared.close(wait=False)
+                raise
+            print(f'[HEADER-CHECKPOINT] enabled; permanent_workspace={header_workspace} '
+                  f'prefix_limit={prefix_bytes} pending=2 aggregate_limit={budget.total_bytes}',
+                  file=sys.stderr, flush=True)
+        self._nb_mode = True
+        self._shared.advance(reader.history_anchor())
+        print(f'[SHARED-CAPTURE] enabled; memory={budget.total_bytes} bytes '
+              f'outbox={budget.outbox_limit}', file=sys.stderr, flush=True)
+
+    def _queue_shared_save(self, view):
+        """Nonblocking transfer; save worker retains the lease until finally."""
+        dt_str = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+        meta = view.metadata
+        item = (('NB_SHARED', view), view.detections, dt_str,
+                meta['pre_hop_n'], meta['wb_n'], meta['sample_pos'])
+        try:
+            self._save_queue.put_nowait(item)
+            return True
+        except queue.Full:
+            return False
+
+    def raise_shared_failure(self):
+        if getattr(self, '_shared', None) is not None:
+            self._shared.raise_if_failed()
+
+    def retune(self, center_hz):
+        """Keep completed IQ at its original tuning and seal unfinished spans."""
+        if getattr(self, '_shared', None) is not None:
+            self._shared.retune(center_hz)
+        else:
+            self.break_pending('commanded retune')
+            if getattr(self, '_history_reader', None) is not None:
+                self._history_reader.invalidate_history()
+        self.center_hz = float(center_hz)
+
+    def _register_shared(self, detections, wideband_n, sample_pos, pre_hop_n,
+                         need_tail_n, history_anchor):
+        shared = self._shared
+        current = self._history_reader.history_anchor()
+        source = history_anchor
+        if source is None:
+            source = self._history_reader.history_anchor(sample_pos)
+        if source is not None and source[2] < current[2]:
+            return  # a bounded detector job completed after a commanded retune
+        if (source is None or source[1:] != current[1:]
+                or source[0] - source[1] != sample_pos):
+            shared._fail('stale/missing source identity for capture registration')
+            shared.raise_if_failed()
+        shared.advance(current)
+        anchor = max(detections, key=lambda d: d.get('peak_power_db', 0.0))
+        export_dec = int(os.environ.get('LORA_EXPORT_DEC', '2'))
+        export_bw = min(int(patience_cap_params(anchor)[0] * export_dec / 2),
+                        int(self.wb_fs) // 2)
+        factor = int(round(self.wb_fs / float(export_bw * 2)))
+        base_end = sample_pos + source[1]
+        capture_detections = [dict(d, _capture_signal_bw=patience_cap_params(d)[0])
+                              for d in detections]
+        shared.register(capture_detections, base_start=base_end-wideband_n-pre_hop_n,
+                        base_end=base_end, end=base_end+int(need_tail_n),
+                        anchor=source, target_factor=factor, export_bw=export_bw,
+                        pre_hop_n=pre_hop_n, wb_n=wideband_n, sample_pos=sample_pos)
+        shared.raise_if_failed()
+
     def update_deferred(self, detections, wideband_buf, sample_pos=0,
                         pre_hop=None, need_tail_n=0, owned_buf=False,
-                        gap_parts=None, tail_parts=None):
+                        gap_parts=None, tail_parts=None, history_anchor=None):
         """Register a save whose TAIL arrives later: instead of BLOCKING
         the main loop for an airtime-sized ring read (2.4 s per SF11/125k
         detection — measured as the dominant live-loop stall: CATCHUP
@@ -4798,6 +5589,11 @@ class SignalRecorder:
                     continue
                 _pre.append(_d)
             detections = _pre
+        if getattr(self, '_shared', None) is not None:
+            self._register_shared(detections, len(wideband_buf), sample_pos,
+                                  len(pre_hop) if pre_hop is not None else 0,
+                                  need_tail_n, history_anchor)
+            return []
         # ONE PENDING JOB PER PHYSICAL FRAME: overlapping windows re-detect
         # the same long frame every hop, and each registration held a full
         # wideband base (up to 640 MB for slow-pass assemblies) — the
@@ -4870,6 +5666,8 @@ class SignalRecorder:
         # in-flight window depth) it PENDS and feed_tail completes it from
         # future loop hops (UC audit p — was silently truncated to the
         # n_slots-hop ceiling).  Fallback to the seed length if no need given.
+        if tail_parts is not None and not need_tail_n:
+            tail_parts = list(tail_parts)
         _need = (int(need_tail_n) if need_tail_n
                  else (sum(len(t) for t in tail_parts)
                        if tail_parts is not None else 0))
@@ -4890,6 +5688,19 @@ class SignalRecorder:
                     # cropper drowning — degrade this job to the legacy
                     # wideband path rather than block the loop
                     del job['nb']
+        if 'nb' not in job:
+            # Decide after NB setup/BASE enqueue: missing scipy, degenerate
+            # decimation and a full crop queue all take the wideband fallback.
+            # Its pre-existing memory bound must not inherit the larger NB
+            # allowance. Gap parts already consume part of that allowance.
+            limit = max(0, _legacy_tail_limit_n(
+                job['dets'], self.wb_fs, self.window_n) - _gap_n)
+            if job['need'] > limit:
+                print(f'[CAPTURE-LIMIT] wideband fallback tail limited to '
+                      f'{limit / self.wb_fs:.3f}s of '
+                      f'{job["need"] / self.wb_fs:.3f}s requested; long '
+                      'frames may be truncated', file=sys.stderr, flush=True)
+                job['need'] = limit
         if os.environ.get('LORA_SLOW_DEBUG'):
             print(f"[UPDEF-JOB] created dets={[(d['sf'], d['bw'], round(d['freq_hz']/1e6,4)) for d in job['dets']]} need={job['need']}", flush=True)
         # POOL-MODE SEED (UC audit q + p): feed the fully-known in-flight tail
@@ -4902,23 +5713,29 @@ class SignalRecorder:
         # future loop hops (the seed + future hops are contiguous — the
         # in-flight forward-overlaps ARE the _hop_own's already emitted).
         if tail_parts is not None:
-            if 'nb' in job:
+            try:
                 for _h in tail_parts:
-                    try:
-                        self._crop_queue.put_nowait(('HOP', job, _h))
-                        job['got'] += len(_h)
-                    except queue.Full:
-                        # cropper full mid-tail: truncate here (same
-                        # degradation feed_tail takes) rather than stall the
-                        # realtime commit path.
+                    _room = job['need'] - job['got']
+                    if _room <= 0:
                         break
-            else:
-                job['tail'] = list(tail_parts)
-                job['got'] = sum(len(t) for t in tail_parts)
-            if job['got'] >= job['need']:
-                self._finalize(job)     # seed covers the airtime — done
+                    _h = _h[:_room]
+                    if 'nb' in job:
+                        self._crop_queue.put_nowait(('HOP', job, _h))
+                    else:
+                        job['tail'].append(_h)
+                    job['got'] += len(_h)
+            except (StreamHistoryUnavailable, queue.Full) as exc:
+                # Never pend across a missing history hop: future feed_tail
+                # would splice across the hole and masquerade as a full frame.
+                print(f'[SLOW-GAP] tail recovery stopped ({type(exc).__name__}: '
+                      f'{exc}) — finalizing contiguous prefix '
+                      f'({job["got"]}/{job["need"]} tail samples)',
+                      file=sys.stderr, flush=True)
+                self._finalize(job)
                 return []
-            # long frame — feed_tail finishes it (bounded by the 3-job cap)
+        if job['got'] >= job['need']:
+            self._finalize(job)
+            return []
         self._pending.append(job)
         if len(self._pending) > 3:
             if os.environ.get('LORA_SLOW_DEBUG'):
@@ -4926,20 +5743,44 @@ class SignalRecorder:
             self._finalize(self._pending.pop(0))
         return []
 
-    def feed_tail(self, hop):
-        """Give every pending deferred job the freshly-arrived hop; jobs
+    def feed_tail(self, hop, sample_pos=None):
+        """Give pending jobs the hop ending at consumed position sample_pos.
+
+        Positioned feeds skip data already in the base/pool seed and reject
+        missing intervals. Unpositioned callers retain the legacy append API.
+        Jobs
         finalize once their tail requirement is met. ZERO-COPY: the hop
         is an owned array (the caller's per-hop copy) — jobs hold
         REFERENCES; trimming and concatenation happen in the save
         worker. (Per-job copies here cost 46 ms median / 1.48 s max on
         the loop during long-frame phases — the top stall driver.)"""
+        if getattr(self, '_shared', None) is not None:
+            anchor = self._history_reader.history_anchor(sample_pos)
+            self._shared.advance(anchor)
+            self._shared.raise_if_failed()
+            return
         if not self._pending:
             return
         done = []
         for job in self._pending:
             if job['got'] < job['need']:
+                fresh = hop
+                if sample_pos is not None:
+                    expected = job['sample_pos'] + job['got']
+                    if sample_pos <= expected:
+                        continue  # current hop is already in the base/seed
+                    start = sample_pos - len(hop)
+                    if start > expected:
+                        print(f'[PENDING-BREAK] missing {start - expected} '
+                              'samples before tail hop; finalizing contiguous '
+                              'prefix', file=sys.stderr, flush=True)
+                        done.append(job)
+                        continue
+                    if start < expected:
+                        fresh = hop[expected - start:]
                 if job['got'] == 0 and os.environ.get('LORA_SEAM_DEBUG'):
-                    _ff = getattr(self, '_dbg_tot_s', 0) - len(hop)
+                    _ff = ((sample_pos if sample_pos is not None
+                            else getattr(self, '_dbg_tot_s', 0)) - len(fresh))
                     print(f"[SEAMDBG] first-feed: base_end={job['sample_pos']} "
                           f"feed_start={_ff} gap={_ff - job['sample_pos']} "
                           f"({(_ff - job['sample_pos'])/self.wb_fs*1000:.2f} ms)",
@@ -4949,7 +5790,7 @@ class SignalRecorder:
                     # the save worker; the cropper must never see samples
                     # past 'need' or the stream lengths diverge)
                     _room = job['need'] - job['got']
-                    _h = hop if len(hop) <= _room else hop[:_room]
+                    _h = fresh if len(fresh) <= _room else fresh[:_room]
                     try:
                         self._crop_queue.put_nowait(('HOP', job, _h))
                         job['got'] += len(_h)
@@ -4959,11 +5800,12 @@ class SignalRecorder:
                         # fixed) — finalize now with the contiguous data
                         # already cropped instead
                         print("         [NB-CROP] queue full — early "
-                              "finalize of a pending job", flush=True)
-                        job['got'] = job['need']
+                              "finalize of a pending job", file=sys.stderr, flush=True)
+                        done.append(job)
+                        continue
                 else:
-                    job['tail'].append(hop)
-                    job['got'] += len(hop)
+                    job['tail'].append(fresh)
+                    job['got'] += len(fresh)
             if job['got'] >= job['need']:
                 done.append(job)
         for job in done:
@@ -4971,6 +5813,10 @@ class SignalRecorder:
             self._finalize(job)
 
     def flush_pending(self, wait=False):
+        if getattr(self, '_shared', None) is not None:
+            self._shared.close(wait=wait)
+            self._shared.raise_if_failed()
+            return
         for job in self._pending:
             self._finalize(job)
         self._pending = []
@@ -4987,10 +5833,14 @@ class SignalRecorder:
         splice and decoded as structured garbage). Finalize everything
         with the contiguous data collected so far — a truncated real
         capture beats a spliced one."""
+        if getattr(self, '_shared', None) is not None:
+            self._shared._fail('raw stream discontinuity: ' + reason)
+            self._shared.raise_if_failed()
+            return
         if self._pending:
             print(f"         [PENDING-BREAK] finalizing "
                   f"{len(self._pending)} job(s) at discontinuity "
-                  f"{reason}", flush=True)
+                  f"{reason}", file=sys.stderr, flush=True)
         self.flush_pending()
 
     def _finalize(self, job):
@@ -5122,10 +5972,36 @@ class SignalRecorder:
             if item is None:
                 self._save_queue.task_done()
                 break
+            _shared_save = None
+            _spool_path = None
             try:
                 extended_full, detections, dt_str, pre_hop_n, wb_n, sample_pos = item
                 _spool_path = None
                 _nb_job = None
+                _capture_role = 'default'
+                _role_name = ''
+                _frame_key = None
+                _input_center = self.center_hz
+                if (isinstance(extended_full, tuple)
+                        and extended_full[0] == 'NB_SHARED'):
+                    _shared_save = extended_full[1]
+                    _input_center = _shared_save.input_center
+                    if _shared_save.role == 'header_prefix':
+                        _shared_save._owner.header_controller.write_prefix(_shared_save)
+                        continue  # finally releases only this optional source view
+                    _capture_role = _shared_save.role
+                    _role_name = f'_{_capture_role}_{_shared_save.number}'
+                    # Frame key shared by a detection's early and full crops
+                    # (the early view records its parent full view).
+                    if _capture_role == 'early':
+                        _frame_key = _shared_save.metadata.get('header_parent_id')
+                    elif _capture_role == 'shared_full':
+                        _frame_key = _shared_save.number
+                    else:
+                        _frame_key = None
+                    _nb_job = {'nb_fs': _shared_save.nb_fs,
+                               'export_bw': _shared_save.export_bw}
+                    extended_full = None
                 if (isinstance(extended_full, tuple)
                         and extended_full[0] == 'NB'):
                     # NARROWBAND PENDING: the cropper already extracted
@@ -5219,23 +6095,11 @@ class SignalRecorder:
                 # partner, which would truncate the true payload).  Non-trial
                 # anchors get exactly the historic (bw, (2**sf)/bw).
                 _cap_bw, sym_time = patience_cap_params(anchor)
-                # Capture extent past the preamble = preamble (16) + SFD (4.25)
-                # + sync (8) + payload-symbol budget.  Originally 120 syms covered
-                # the absolute Meshtastic max (PL=237 / CR4/5 / LDRO) — but that
-                # tail is mostly silence for the typical 20-90 byte Meshtastic
-                # packet.  Slow SFs especially suffer: at SF12 sym_time≈33 ms so
-                # the unused tail adds ~3 s per capture, which both raises
-                # send→decoded latency by that much AND inflates the decode
-                # workload proportionally.  100 syms covers Meshtastic up to
-                # ~80 bytes after FEC (>99 % of real traffic incl. all standard
-                # text, telemetry, position, nodeinfo, routing); larger packets
-                # are truncated and may fail CRC.  Live SF11 4-core: latency
-                # p50 18s → 11s with this trim, 20/20 hops preserved.
-                # Tunable via LORA_PAYLOAD_SYM_BUDGET for users who need to
-                # capture giant packets at the cost of latency.
-                _pay_syms = int(os.environ.get('LORA_PAYLOAD_SYM_BUDGET', '100'))
-                max_pkt_syms = 16 + 4.25 + 8 + _pay_syms
-                max_pkt_s = max_pkt_syms * sym_time
+                # Use the same supported-frame bound as live retention.
+                # A later save trim must not discard the tail we just kept.
+                max_pkt_s = max(_capture_duration_s(d) for d in detections)
+                if _nb_job is None:
+                    max_pkt_s = min(max_pkt_s, 148.25 * sym_time)
                 buf_dur_s = pre_hop_s + wb_n / self.wb_fs
                 max_record_n = int((buf_dur_s + max_pkt_s) * self.wb_fs)
                 extended = (extended_full[:max_record_n]
@@ -5264,7 +6128,7 @@ class SignalRecorder:
                 # i.e. absolute 925.1 MHz, not the gate-reported 926.77).
                 # The gate's freq is already validated; trust it directly.
                 _ext_fft_cache = []
-                anchor_off = anchor['freq_hz'] - self.center_hz
+                anchor_off = anchor['freq_hz'] - _input_center
                 # nb_fs and sym_n needed for filename + decoder hint math.
                 # NB items carry the cropper's exact realized rate
                 # (wb_fs/D — equals export_bw*2 for standard presets at
@@ -5393,7 +6257,8 @@ class SignalRecorder:
                         # hop0/hop1 same-capture recovery never ran (UC
                         # audit g).
                         'time_sample': int(max(
-                            0.0, pre_hop_s + float(d.get('preamble_t_s', 0.0)))
+                            0.0, pre_hop_s + float(d.get('preamble_t_s', 0.0))
+                            - float(d.get('_capture_start_offset_s', 0.0)))
                             * nb_fs),
                         'pmr_db':      float(d.get('bw_quality_db', 0.0)),
                         'peak_pwr_db': d_pwr,
@@ -5480,156 +6345,158 @@ class SignalRecorder:
                         _dt_win = DECHIRP_DEDUP_WIN_S
                     _match = 0
                     _skip = False
-                    with self._saved_abs_t_lock:
-                        # PER-LABEL keep-N (2026-07-08): the cluster key now
-                        # includes (sf, bw).  Same-label re-detections of one
-                        # frame across overlapping windows still collapse to
-                        # keep-N exactly as before — but a CONFLICTING-label
-                        # detection of the same frame gets its own slots.
-                        # Ground truth (matrix, SF12/62.5k = the only 0/5
-                        # combo): separate slow-scan assemblies emitted the
-                        # same burst as SF10/31.25k (partial-burst evidence,
-                        # sc 0.67) and SF12/62.5k (full evidence, sc 0.98);
-                        # first-arriving mislabels consumed both (freq, time)
-                        # slots and the correct-label save was REFUSED —
-                        # whichever label arrived first won regardless of
-                        # merit.  With per-label slots both are captured and
-                        # the decoder's CRC arbitrates (mislabeled captures
-                        # fail fast; the post-decode dedup absorbs the
-                        # duplicate emit).  Bounded cost: one extra capture
-                        # pair per label-conflict, which only slow-pass
-                        # straddle presets exhibit.
-                        # Patience-trial dets dedup by CARRIER ONLY: the
-                        # rotating (sf,bw) hypothesis must not hand each rung
-                        # its own keep-N slots (soundness review: one promoted
-                        # carrier fanned out into N differently-labeled
-                        # captures per packet).
-                        # _src label, not the stale loop variable `d` (the
-                        # WEAKEST det from the batch power-sort — UC audit a):
-                        # the registry must match/register under the label
-                        # the save actually carries.
-                        # Option A extends the cluster key: besides exact
-                        # (sf, bw), a same-SLOPE member collapses onto the
-                        # cluster too (bw^2/2^sf identical) — so a down-alias
-                        # (SF7/62.5k of a real SF9/125k, SF9/62.5k of SF11/125k)
-                        # no longer opens its own keep-2 slots and its own
-                        # never-CRCing decode jobs.  The registry tuple now
-                        # carries bw_quality_db as a 5th field for the quality-
-                        # ranked eviction below.  LORA_SLOPE_DEDUP=0 → exact
-                        # per-(sf,bw) HEAD behaviour.
-                        _lbl_blind = bool(_src.get('patience_trial'))
-                        _cand_slope = _slope(_src['sf'], _src['bw'])
-                        _cand_q = float(_src.get('bw_quality_db', 0.0))
-                        # Option B: effective keep collapses 2→1 under decode
-                        # backlog so a real beacon's 2nd fallback capture is not
-                        # queued while the single slow worker is saturated.
-                        _eff_keep = self._dedup_keep
-                        if (self._keep1_under_load and self._dedup_keep > 1
-                                and self._decoder is not None
-                                and self._decoder.pending()
-                                    > self._keep1_load_thresh):
-                            _eff_keep = 1
-                        _cluster_idx = []
-                        _best_diff_q = -1e30   # best q of a same-slope,
-                        #   DIFFERENT-(sf,bw) member already in this cluster
-                        # WIDTH FIT of a label: |log2(bw / measured occupied
-                        # width)|, <= 0.85 means the label's bandwidth is the
-                        # one the burst actually occupies.  Same-slope
-                        # siblings are dechirp-DEGENERATE, so their raw q
-                        # cannot rank them — the alias that a distant gate
-                        # peak's wider crop picked up often scores HIGHER
-                        # (live: SF9/500k at bwq 22.4 beat the true SF7/250k
-                        # at 19.6 and took the cluster slot; the decoder
-                        # then relabelled it by occupied width, seconds
-                        # later).  Width can: a different-label sibling
-                        # whose label fits its width beats one whose label
-                        # does not (or whose width was unmeasurable), in
-                        # either direction; only when neither side settles
-                        # it does the q margin below decide, as before.
-                        import math as _mw
-                        _cand_w = _src.get('width_hz')
-                        _cand_fits = bool(_cand_w) and abs(
-                            _mw.log2(_src['bw'] / float(_cand_w))) <= 0.85
-                        _sib_fits = False      # a different-label sibling fits
-                        _sib_misfit_idx = []   # different-label siblings that don't
-                        for _i, _e in enumerate(self._saved_abs_t):
-                            _sf_hz, _st, _ssf, _sbw = _e[0], _e[1], _e[2], _e[3]
-                            if (abs(_cand_freq - _sf_hz) < _ftol
-                                    and abs(_abs_t_s - _st) < _dt_win
-                                    and (_lbl_blind
-                                         or (_ssf == _src['sf']
-                                             and _sbw == _src['bw'])
-                                         or (self._slope_dedup
-                                             and _slope(_ssf, _sbw)
-                                                 == _cand_slope))):
-                                _match += 1
-                                _cluster_idx.append(_i)
-                                if (self._slope_dedup
-                                        and (_ssf != _src['sf']
-                                             or _sbw != _src['bw'])):
-                                    _best_diff_q = max(_best_diff_q, _e[4])
-                                    _ew = _e[5] if len(_e) > 5 else None
-                                    if _ew and abs(_mw.log2(
-                                            _sbw / float(_ew))) <= 0.85:
-                                        _sib_fits = True
-                                    else:
-                                        _sib_misfit_idx.append(_i)
-                        # RECORD-TIME same-slope alias gate (the eviction below
-                        # only rewrites the registry — it cannot un-create a
-                        # decode job for an alias that already filled a free
-                        # keep-N slot or beat the weakest one).  A same-slope
-                        # member whose raw dechirp quality is MARGIN dB below a
-                        # different-label sibling already in the cluster is the
-                        # 3-6 dB-weaker down-alias (SF7/62.5k of a real
-                        # SF9/125k) — skip RECORDING it entirely so it never
-                        # becomes a decode job, regardless of slot availability.
-                        # A genuinely-strongest same-slope member is never
-                        # gated (it clears the margin), preserving a real weak
-                        # SF7/62.5k that has no stronger sibling.
-                        if (self._slope_dedup and _sib_fits
-                                and not _cand_fits):
-                            _skip = True           # a sibling's label fits, this one's doesn't
-                        elif (self._slope_dedup and _cand_fits
-                                and not _sib_fits and _sib_misfit_idx):
-                            # This label fits the burst's width and the
-                            # recorded sibling's doesn't: take its slot.
-                            self._saved_abs_t[_sib_misfit_idx[0]] = (
-                                _cand_freq, _abs_t_s,
-                                _src['sf'], _src['bw'], _cand_q, _cand_w)
-                        elif (self._slope_dedup
-                                and _best_diff_q - _cand_q > self._slope_margin_db):
-                            _skip = True
-                        elif _match < _eff_keep:
-                            self._saved_abs_t.append(
-                                (_cand_freq, _abs_t_s,
-                                 _src['sf'], _src['bw'], _cand_q, _cand_w))
-                            if len(self._saved_abs_t) > 4000:
-                                _cut = _abs_t_s - 10.0
-                                self._saved_abs_t = [
-                                    e for e in self._saved_abs_t
-                                    if e[1] > _cut]
-                        elif self._slope_dedup and _cluster_idx:
-                            # Cluster full: quality-ranked eviction.  If this
-                            # det's bw_quality_db beats the weakest slot's, evict
-                            # + replace that slot so the true higher-q member
-                            # always wins; the 3-6 dB-weaker alias never
-                            # displaces the real parent.  Registry stays bounded
-                            # (replace, not add) — at most a few evictions until
-                            # the highest-q member holds the slot.  REGRESSION
-                            # GUARD: the SF12/62.5k-vs-SF10/31.25k GT pair is
-                            # same-slope (~954); keeping the higher-raw-q member
-                            # preserves the required decode of both texts.
-                            _weak_i = min(
-                                _cluster_idx,
-                                key=lambda _j: self._saved_abs_t[_j][4])
-                            if _cand_q > self._saved_abs_t[_weak_i][4]:
-                                self._saved_abs_t[_weak_i] = (
+                    _lbl_blind = bool(_src.get('patience_trial'))
+                    if _capture_role != 'early':
+                        with self._saved_abs_t_lock:
+                            # PER-LABEL keep-N (2026-07-08): the cluster key now
+                            # includes (sf, bw).  Same-label re-detections of one
+                            # frame across overlapping windows still collapse to
+                            # keep-N exactly as before — but a CONFLICTING-label
+                            # detection of the same frame gets its own slots.
+                            # Ground truth (matrix, SF12/62.5k = the only 0/5
+                            # combo): separate slow-scan assemblies emitted the
+                            # same burst as SF10/31.25k (partial-burst evidence,
+                            # sc 0.67) and SF12/62.5k (full evidence, sc 0.98);
+                            # first-arriving mislabels consumed both (freq, time)
+                            # slots and the correct-label save was REFUSED —
+                            # whichever label arrived first won regardless of
+                            # merit.  With per-label slots both are captured and
+                            # the decoder's CRC arbitrates (mislabeled captures
+                            # fail fast; the post-decode dedup absorbs the
+                            # duplicate emit).  Bounded cost: one extra capture
+                            # pair per label-conflict, which only slow-pass
+                            # straddle presets exhibit.
+                            # Patience-trial dets dedup by CARRIER ONLY: the
+                            # rotating (sf,bw) hypothesis must not hand each rung
+                            # its own keep-N slots (soundness review: one promoted
+                            # carrier fanned out into N differently-labeled
+                            # captures per packet).
+                            # _src label, not the stale loop variable `d` (the
+                            # WEAKEST det from the batch power-sort — UC audit a):
+                            # the registry must match/register under the label
+                            # the save actually carries.
+                            # Option A extends the cluster key: besides exact
+                            # (sf, bw), a same-SLOPE member collapses onto the
+                            # cluster too (bw^2/2^sf identical) — so a down-alias
+                            # (SF7/62.5k of a real SF9/125k, SF9/62.5k of SF11/125k)
+                            # no longer opens its own keep-2 slots and its own
+                            # never-CRCing decode jobs.  The registry tuple now
+                            # carries bw_quality_db as a 5th field for the quality-
+                            # ranked eviction below.  LORA_SLOPE_DEDUP=0 → exact
+                            # per-(sf,bw) HEAD behaviour.
+                            _lbl_blind = bool(_src.get('patience_trial'))
+                            _cand_slope = _slope(_src['sf'], _src['bw'])
+                            _cand_q = float(_src.get('bw_quality_db', 0.0))
+                            # Option B: effective keep collapses 2→1 under decode
+                            # backlog so a real beacon's 2nd fallback capture is not
+                            # queued while the single slow worker is saturated.
+                            _eff_keep = self._dedup_keep
+                            if (self._keep1_under_load and self._dedup_keep > 1
+                                    and self._decoder is not None
+                                    and self._decoder.pending()
+                                        > self._keep1_load_thresh):
+                                _eff_keep = 1
+                            _cluster_idx = []
+                            _best_diff_q = -1e30   # best q of a same-slope,
+                            #   DIFFERENT-(sf,bw) member already in this cluster
+                            # WIDTH FIT of a label: |log2(bw / measured occupied
+                            # width)|, <= 0.85 means the label's bandwidth is the
+                            # one the burst actually occupies.  Same-slope
+                            # siblings are dechirp-DEGENERATE, so their raw q
+                            # cannot rank them — the alias that a distant gate
+                            # peak's wider crop picked up often scores HIGHER
+                            # (live: SF9/500k at bwq 22.4 beat the true SF7/250k
+                            # at 19.6 and took the cluster slot; the decoder
+                            # then relabelled it by occupied width, seconds
+                            # later).  Width can: a different-label sibling
+                            # whose label fits its width beats one whose label
+                            # does not (or whose width was unmeasurable), in
+                            # either direction; only when neither side settles
+                            # it does the q margin below decide, as before.
+                            import math as _mw
+                            _cand_w = _src.get('width_hz')
+                            _cand_fits = bool(_cand_w) and abs(
+                                _mw.log2(_src['bw'] / float(_cand_w))) <= 0.85
+                            _sib_fits = False      # a different-label sibling fits
+                            _sib_misfit_idx = []   # different-label siblings that don't
+                            for _i, _e in enumerate(self._saved_abs_t):
+                                _sf_hz, _st, _ssf, _sbw = _e[0], _e[1], _e[2], _e[3]
+                                if (abs(_cand_freq - _sf_hz) < _ftol
+                                        and abs(_abs_t_s - _st) < _dt_win
+                                        and (_lbl_blind
+                                             or (_ssf == _src['sf']
+                                                 and _sbw == _src['bw'])
+                                             or (self._slope_dedup
+                                                 and _slope(_ssf, _sbw)
+                                                     == _cand_slope))):
+                                    _match += 1
+                                    _cluster_idx.append(_i)
+                                    if (self._slope_dedup
+                                            and (_ssf != _src['sf']
+                                                 or _sbw != _src['bw'])):
+                                        _best_diff_q = max(_best_diff_q, _e[4])
+                                        _ew = _e[5] if len(_e) > 5 else None
+                                        if _ew and abs(_mw.log2(
+                                                _sbw / float(_ew))) <= 0.85:
+                                            _sib_fits = True
+                                        else:
+                                            _sib_misfit_idx.append(_i)
+                            # RECORD-TIME same-slope alias gate (the eviction below
+                            # only rewrites the registry — it cannot un-create a
+                            # decode job for an alias that already filled a free
+                            # keep-N slot or beat the weakest one).  A same-slope
+                            # member whose raw dechirp quality is MARGIN dB below a
+                            # different-label sibling already in the cluster is the
+                            # 3-6 dB-weaker down-alias (SF7/62.5k of a real
+                            # SF9/125k) — skip RECORDING it entirely so it never
+                            # becomes a decode job, regardless of slot availability.
+                            # A genuinely-strongest same-slope member is never
+                            # gated (it clears the margin), preserving a real weak
+                            # SF7/62.5k that has no stronger sibling.
+                            if (self._slope_dedup and _sib_fits
+                                    and not _cand_fits):
+                                _skip = True           # a sibling's label fits, this one's doesn't
+                            elif (self._slope_dedup and _cand_fits
+                                    and not _sib_fits and _sib_misfit_idx):
+                                # This label fits the burst's width and the
+                                # recorded sibling's doesn't: take its slot.
+                                self._saved_abs_t[_sib_misfit_idx[0]] = (
                                     _cand_freq, _abs_t_s,
                                     _src['sf'], _src['bw'], _cand_q, _cand_w)
+                            elif (self._slope_dedup
+                                    and _best_diff_q - _cand_q > self._slope_margin_db):
+                                _skip = True
+                            elif _match < _eff_keep:
+                                self._saved_abs_t.append(
+                                    (_cand_freq, _abs_t_s,
+                                     _src['sf'], _src['bw'], _cand_q, _cand_w))
+                                if len(self._saved_abs_t) > 4000:
+                                    _cut = _abs_t_s - 10.0
+                                    self._saved_abs_t = [
+                                        e for e in self._saved_abs_t
+                                        if e[1] > _cut]
+                            elif self._slope_dedup and _cluster_idx:
+                                # Cluster full: quality-ranked eviction.  If this
+                                # det's bw_quality_db beats the weakest slot's, evict
+                                # + replace that slot so the true higher-q member
+                                # always wins; the 3-6 dB-weaker alias never
+                                # displaces the real parent.  Registry stays bounded
+                                # (replace, not add) — at most a few evictions until
+                                # the highest-q member holds the slot.  REGRESSION
+                                # GUARD: the SF12/62.5k-vs-SF10/31.25k GT pair is
+                                # same-slope (~954); keeping the higher-raw-q member
+                                # preserves the required decode of both texts.
+                                _weak_i = min(
+                                    _cluster_idx,
+                                    key=lambda _j: self._saved_abs_t[_j][4])
+                                if _cand_q > self._saved_abs_t[_weak_i][4]:
+                                    self._saved_abs_t[_weak_i] = (
+                                        _cand_freq, _abs_t_s,
+                                        _src['sf'], _src['bw'], _cand_q, _cand_w)
+                                else:
+                                    _skip = True
                             else:
                                 _skip = True
-                        else:
-                            _skip = True
                     if _skip:
                         if self.debug >= 1:
                             print(f"         [RFDEDUP] skip "
@@ -5644,7 +6511,7 @@ class SignalRecorder:
                     # images whose source real signal was detected in a different
                     # (overlapping) window than this one — which the per-window
                     # check in detect_preamble misses (~2/3 of images leaked).
-                    _mirror_f = 2.0 * self.center_hz - _cand_freq
+                    _mirror_f = 2.0 * _input_center - _cand_freq
                     with self._img_lock:
                         _cand_pwr = max(
                             (c[1] for c in self._img_carriers
@@ -5701,13 +6568,15 @@ class SignalRecorder:
                     # (carrier_hz was measured relative to the anchor).
                     d = dict(_src)
                     d['freq_hz'] = anchor['freq_hz'] + carrier_hz
-                    off = d['freq_hz'] - self.center_hz
+                    off = d['freq_hz'] - _input_center
                     if _nb_job is not None:
                         # Already extracted by the cropper, centred on
                         # this detection's own carrier (preambles come
                         # 1:1 from gate detections, and the extraction
                         # centre below is exactly the detection freq).
-                        nb = _nb_job['streams'].get(p.get('nb_ix'))
+                        nb = (_shared_save.stream(p.get('nb_ix'))
+                              if _shared_save is not None
+                              else _nb_job['streams'].get(p.get('nb_ix')))
                         if nb is None or len(nb) == 0:
                             continue
                         nb = nb[:int((buf_dur_s + max_pkt_s) * nb_fs)]
@@ -5778,10 +6647,17 @@ class SignalRecorder:
                                 # except in the empty brick-wall band edges
                                 # (the packet spans ±bw/2+corr, well inside
                                 # the ±bw slice).  Detection unchanged.
-                                _ph = np.arange(len(nb), dtype=np.float64)
-                                nb = (nb * np.exp(
-                                    (-2j * np.pi * _po / nb_fs) * _ph)
-                                      ).astype(np.complex64)
+                                if _shared_save is not None:
+                                    # stream() returns a private output, never
+                                    # a view into retained band chunks. Keep
+                                    # mixer temporaries within the charged hop
+                                    # workspace, including tiny-hop callers.
+                                    _mix_capture_inplace(nb, _po, nb_fs, self.hop_n)
+                                else:
+                                    _ph = np.arange(len(nb), dtype=np.float64)
+                                    nb = (nb * np.exp(
+                                        (-2j * np.pi * _po / nb_fs) * _ph)
+                                          ).astype(np.complex64)
                                 _crop_corr = float(_po)
                             if self.debug >= 1 and _crop_corr != 0.0:
                                 print(f"         [CROP-CENTER] "
@@ -5806,7 +6682,7 @@ class SignalRecorder:
                     # one packet's adjacent-window duplicates through is one
                     # extra save_worker invocation per packet, which is
                     # absorbed by the 4-thread save_worker pool.
-                    corrected_abs = self.center_hz + off  # used in filename
+                    corrected_abs = _input_center + off  # used in filename
 
                     # Encode the true capture rate so the decoder reads it
                     # exactly instead of GUESSING from file size (the guess is
@@ -5825,6 +6701,7 @@ class SignalRecorder:
                              f"_{(d['freq_hz'] + _crop_corr) / 1e6:.4f}MHz"
                              f"_{int(round(nb_fs / 1000))}ksps"
                              f"_pwr{int(round(d.get('peak_power_db', 0.0)))}"
+                             f"{_role_name}"
                              f"_{dt_str[:-3]}{_sq % 1000:03d}.cf32")
                     fpath = os.path.join(self.export_dir, fname)
                     # Capacity guard: shed this capture if the undecoded backlog
@@ -5841,6 +6718,13 @@ class SignalRecorder:
                         _admit, _drop, _pend = self._decoder._cap_try_reserve(
                             fpath, _fsize)
                         if not _admit:
+                            if _capture_role == 'early':
+                                print('[HEADER-EARLY] decode file capacity unavailable; '
+                                      'full fallback retained', file=sys.stderr, flush=True)
+                                continue
+                            if _shared_save is not None:
+                                raise RuntimeError('admitted shared capture cannot be saved: '
+                                                   'decoder file capacity exhausted')
                             if _drop == 1 or _drop % 25 == 0:
                                 print(f"         → [CAPTURE-DROP] backlog "
                                       f"{_pend/1e6:.0f}MB ≥ budget "
@@ -5897,8 +6781,7 @@ class SignalRecorder:
                         # decode-confirm is unchanged.
                         _fam_links = []
                         if _lbl_blind:
-                            for _fsf, _fbw in patience_trial_family(
-                                    _src['sf'], _src['bw']):
+                            for _fsf, _fbw in patience_detection_family(_src):
                                 if (_fsf == _src['sf']
                                         and abs(_fbw - _src['bw']) < 1.0):
                                     continue          # primary label itself
@@ -5908,6 +6791,7 @@ class SignalRecorder:
                                     f"_{(d['freq_hz'] + _crop_corr) / 1e6:.4f}MHz"
                                     f"_{int(round(nb_fs / 1000))}ksps"
                                     f"_pwr{int(round(d.get('peak_power_db', 0.0)))}"
+                                    f"{_role_name}"
                                     f"_{dt_str[:-3]}{_sq2 % 1000:03d}.cf32")
                                 _fpath2 = os.path.join(self.export_dir,
                                                        _fname2)
@@ -5931,14 +6815,16 @@ class SignalRecorder:
                         # cancellation is clean (per-symbol amplitude OK).
                         self._decoder.submit(fpath, fname, bucket_key=_bkey,
                                              slow=bool(d.get('patience_trial')),
-                                             prio=float(d.get('bw_quality_db', 0.0)))
+                                             prio=(float('inf') if _capture_role == 'early'
+                                                   else float(d.get('bw_quality_db', 0.0))),
+                                             role=_capture_role, frame_key=_frame_key)
                         # Family-label decode jobs (trial captures only) —
                         # same bucket, slow tier: once any label in the
                         # bucket decodes, the phase-2 bucket dedup skips the
                         # rest, so the ladder costs nothing after a confirm.
                         for _fp2, _fn2 in _fam_links:
                             self._decoder.submit(_fp2, _fn2, bucket_key=_bkey,
-                                                 slow=True)
+                                                 slow=True, role=_capture_role)
                         # Pass 2 — TIME-ISOLATED on this preamble.  Useful at
                         # FAST SF where the hop1 relay arrives ~50-200 ms
                         # after hop0 and they share a single capture file;
@@ -5974,8 +6860,13 @@ class SignalRecorder:
                                 bucket_key=_bkey,
                                 slow=_iso_slow or bool(d.get('patience_trial')),
                                 # relay search runs after every primary
-                                prio=float(d.get('bw_quality_db', 0.0)) - 100.0)
+                                prio=float(d.get('bw_quality_db', 0.0)) - 100.0,
+                                role=_capture_role, frame_key=_frame_key)
             except Exception as e:
+                if _shared_save is not None:
+                    _shared_save._render_failed = True
+                    if _shared_save.role not in ('header_prefix', 'early'):
+                        _shared_save._owner._fail(f'save worker failed: {e}')
                 print(f"[RECORDER] save error: {e}", file=sys.stderr, flush=True)
             finally:
                 if _spool_path is not None:
@@ -5991,8 +6882,12 @@ class SignalRecorder:
                 # workers on a 4 GB Pi.
                 item = extended_full = nb = None
                 extended = _ext_fft_cache = None
+                _ph = _nb2 = None
                 _all = _bparts = _tparts = _tp = _mm = None
                 detections = _nb_job = _dets_sorted = preambles = None
+                if _shared_save is not None:
+                    _shared_save.release()
+                    _shared_save = None
                 self._save_queue.task_done()
 
     def _extract_nb(self, iq, offset_hz, target_bw):
@@ -6000,6 +6895,12 @@ class SignalRecorder:
 
     def flush(self):
         """Wait for all pending saves to complete."""
+        if getattr(self, '_shared', None) is not None:
+            self._shared.close(wait=True)
+            self._shared.raise_if_failed()
+            # Shared close includes the transferred writer lease; no legacy
+            # queue join can hide a stalled/failed writer after that check.
+            return
         if self._crop_queue is not None:
             self._crop_queue.join()
         self._save_queue.join()
@@ -6034,6 +6935,7 @@ class BackgroundDecoder:
         # label wins bw_quality_db by ~10 dB; decoding it first puts the
         # row up at first-decode time, and its admit lets the bucket dedup
         # skip the aliases instead of decoding them.
+        self._abort_event = threading.Event()
         self._queue = queue.PriorityQueue()
         self._qseq = itertools.count()   # FIFO tie-break, keeps jobs uncomparable
         self._lock = threading.Lock()
@@ -6117,6 +7019,54 @@ class BackgroundDecoder:
         self._decoded_buckets = []       # list of bucket_key tuples (admitted)
         self._inflight_buckets = {}      # bucket_key -> dispatch_timestamp
         self._bucket_lock = threading.Lock()
+        # ISO-HOLD (2026-10-31).  The time-isolated twin of a fast-SF primary
+        # (PASS 2 iso: same preamble window, the later relay's energy
+        # blanked) is a RESCUE for that primary, not a search for another
+        # frame.  It used to start alongside the plain job on the same file,
+        # so every verified fast-SF frame paid a second full decode, and on
+        # junk both twins ground to the budget: a 13-message live run spent
+        # 52 s on iso jobs of files whose plain job had already published
+        # and 314 s on iso jobs of junk files (reference run: 30 s + 16 s).
+        # Hold the twin until the plain job on its file has left the system;
+        # skip it when that job published a verified packet (the twin can
+        # only re-decode the same frame — zero relayed packets ever came
+        # from it in four live runs), release it to its tier otherwise.
+        # Holds never strand a job: every plain exit path calls _plain_done,
+        # a stale valve releases holds older than _ISO_HOLD_MAX_S, and drain
+        # flushes them.  Only roles sharing one capture file hold (the
+        # bucket dedup already covers 'default'-role siblings).
+        self._iso_lock = threading.Lock()
+        self._iso_hold = {}              # fpath -> [(job, slow, prio), ...]
+        self._iso_hold_since = {}        # fpath -> monotonic of first hold
+        self._plain_open = {}            # fpath -> plain jobs queued/running
+        self._verified_fnames = {}       # capture basename -> admit time (ordered)
+        # FULL-HOLD (2026-10-31).  The header checkpoint exports an EARLY
+        # crop of a frame as soon as its header reads and the FULL crop of
+        # the same detection when the frame completes; both are decoded,
+        # and for the slow-SF frames that matter the full crop costs 1-9 s
+        # to re-decode a frame the early crop published seconds earlier
+        # (a 13-message live run spent 306 s re-decoding verified
+        # messages, ~half of it in full crops).  A full crop whose early
+        # sibling (same frame key: the early view's parent view number)
+        # is still open waits for it and is skipped once it verified;
+        # released otherwise.  A full crop with no early sibling known at
+        # submit time runs at once, so a header abstain or a fast-SF
+        # frame whose full crop lands first is unchanged.
+        self._fpath_frame = {}           # fpath -> (role, frame_key) for plain jobs
+        self._early_open = {}            # frame_key -> early plain jobs queued/running
+        # frame_key -> monotonic when the header checkpoint PLANNED an early
+        # crop that has not been submitted yet.  On a 4-core host the full
+        # crop of a short frame (SF10/250k, 3.6 s) reaches the queue about a
+        # second before its early crop (header 1 s, export, save worker),
+        # found no early open and ran at once; both then decoded together
+        # and the early took 17 s instead of 2 (emulated Pi, 2026-11-02),
+        # publishing 24 s after the frame against old main's 14 s.  A full
+        # crop whose early is planned waits like one whose early is open;
+        # an early that never arrives releases it after _EARLY_EXPECT_S.
+        self._early_expected = {}
+        self._early_verified = set()     # frame keys whose early crop verified
+        self._full_hold = {}             # frame_key -> [(job, slow, prio), ...]
+        self._full_hold_since = {}       # frame_key -> monotonic of first hold
         # Host-adaptive sibling wait (Pi 5, 2026-10-26): the in-flight wait
         # was a fixed 2 s and the in-flight GC 5 s — right where a decode
         # takes 0.5-1.5 s, wrong where it takes 2-15 s: the mark expired
@@ -6134,7 +7084,14 @@ class BackgroundDecoder:
         self._job_dur_ewma = 0.0         # measured decode wall time, EWMA
         self._ok_dur_ewma = 0.0          # wall time of SUCCESSFUL full-budget
                                          # fast-tier jobs: this host's speed
-        self._wait_since = {}            # fpath -> first time it waited on a sibling
+        # Sibling park: a capture whose RF bucket is already decoding waits
+        # here, OFF the worker, until that job clears the bucket (skipped if
+        # the bucket verified, released otherwise) or its own deadline passes
+        # (then it runs regardless, as the old wait did).  The old wait held a
+        # worker in a 2 s sleep loop and requeued the job every turn: on a
+        # three-worker host one worker was busy waiting while its twin decoded.
+        self._sib_park = {}              # inflight bucket key -> [(job, slow, prio, deadline)]
+        self._park_expired = set()       # fpaths released by deadline: run, do not park again
         # stale in-flight GC: only a crashed/hung worker leaves an entry
         # behind (completion clears it), so bound it by the longest legal
         # fast-tier decode (SF12 scale 2^2.5) with 2x slack
@@ -6183,6 +7140,9 @@ class BackgroundDecoder:
         # Deterministic — no time-based reaper guessing safe intervals.
         self._refs = {}
         self._refs_lock = threading.Lock()
+        # A shared capture view covers a sample interval, not one RF packet.
+        # Keep its role through same-file retries without changing wire/jobs.
+        self._capture_roles = {}
 
         # ---- Pending-capture byte budget (backpressure the unbounded decode
         # queues never provided) ----
@@ -6211,8 +7171,8 @@ class BackgroundDecoder:
                   file=sys.stderr, flush=True)
             self._decoder_script = None
 
-        # Worker POOL: K persistent decoder subprocesses, each driven by its
-        # own manager thread, all pulling from the shared self._queue.  A single
+        # Worker POOL: at most K persistent decoder subprocesses, exclusively
+        # leased per job by manager threads pulling from shared self._queue.  A single
         # serial decoder was the throughput bottleneck once the gate was made
         # fast (dec_q grew to ~220 on a 60-msg burst, ~11x slower than real
         # time).  Dedup (_packet_dedup / _fp_dedup / _submit_recent) is all
@@ -6222,6 +7182,7 @@ class BackgroundDecoder:
         self._active_count = 0          # decodes currently in flight (for pending())
         self._workers = []              # subprocess handles, for drain cleanup
         self._workers_lock = threading.Lock()
+        self._idle_workers = []         # LIFO idle children, exclusive lease per job
         # CPU-affinity isolation: on multi-core hosts, reserve the first 4
         # cores for the GATE process (main, stdin-reader, save-worker, detect
         # pool) and pin DECODE workers to the remaining cores.  Without this
@@ -6400,17 +7361,12 @@ class BackgroundDecoder:
                       "using CPU scale only", file=sys.stderr, flush=True)
         self._n_workers = (_env_nw_i if _env_nw_i > 0 else _w_auto)
         # ---- Two-tier decode on the SAME workers (no oversubscription) ----
-        # Each manager serves the FAST queue first; only when it's empty does it
-        # pull from the SLOW queue.  A capture the fast pass BAILS on ("[BUDGET]
-        # … exhausted" → ran out of realtime budget, may still hold an undecoded
-        # packet) is re-queued to the slow queue and re-decoded with a big
-        # per-job budget.  Because it's the same worker pool, total CPU is
-        # unchanged (no extra processes to oversubscribe the gate) — the slow
-        # re-decodes simply run in the idle gaps after each burst.  Captures live
-        # on /dev/shm so nothing is lost; the rare budget-bound straggler just
-        # arrives a few seconds later instead of being dropped → 100% of
-        # captured packets without slowing the realtime path.
+        # Fast work keeps its quality ordering. Deferred work gets one slot
+        # after eight fast dispatches, or immediately when fast is empty, while
+        # live ring pressure and gate stress permit it. The same fixed worker
+        # pool serves both tiers; at most one slow job is reserved at a time.
         self._slow_queue = queue.Queue()
+        self._fast_since_slow = 0
         # CAPTURE-FIRST DECODE DEFERRAL (2026-07-06): under ring pressure
         # the decode workers' memory-bandwidth load starves the reader
         # (measured: 33 concurrent SF12 decodes -> 17.5 of 20 Msps
@@ -6443,12 +7399,7 @@ class BackgroundDecoder:
         self._slow_released_job = None   # released to fast queue, not yet dequeued
         self._slow_inflight_job = None   # dequeued + decoding
         self._slow_budget = float(os.environ.get('LORA_SLOW_BUDGET_S', '45'))
-        # Slow mop-up runs ONLY when capture is not active.  A big-budget
-        # re-decode running DURING live capture holds workers and starves the
-        # gate's 28 Msps intake → sample drops (measured).  The gate clears this
-        # flag at shutdown/EOF so the slow tier drains the straggler queue then
-        # (captures are on disk; for a continuously-running deployment, clear it
-        # during genuinely idle stretches instead).
+        # Legacy capture-state flag; live release uses pressure/stress guards.
         self._capture_active = True
         self._threads = []
         for _ in range(self._n_workers):
@@ -6461,7 +7412,7 @@ class BackgroundDecoder:
     def _start_worker(self, budget_s=None):
         """Launch persistent worker subprocess.  budget_s overrides the decode
         CPU-time budget (the slow tier passes a large value)."""
-        if self._decoder_script is None:
+        if self._decoder_script is None or self._aborting():
             return None
 
         # Build the key argument for the worker
@@ -6547,14 +7498,20 @@ while True:
             for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS',
                        'MKL_NUM_THREADS', 'NUMEXPR_NUM_THREADS'):
                 _env[_v] = '1'
-            proc = subprocess.Popen(
-                [sys.executable, '-c', worker_code],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                env=_env,
-                preexec_fn=self._lower_priority)
+            # Register creation atomically with fatal-abort enumeration. A
+            # manager cannot respawn a worker after abort has taken its snapshot.
+            with self._workers_lock:
+                if self._aborting():
+                    return None
+                proc = subprocess.Popen(
+                    [sys.executable, '-c', worker_code],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    env=_env,
+                    preexec_fn=self._lower_priority)
+                self._workers.append(proc)
             # Pin worker to the non-gate cores so it cannot preempt the
             # gate's stdin-reader / detect-pool threads on cores 0-3.
             if self._worker_affinity:
@@ -6562,13 +7519,67 @@ while True:
                     os.sched_setaffinity(proc.pid, self._worker_affinity)
                 except (AttributeError, OSError):
                     pass
-            with self._workers_lock:
-                self._workers.append(proc)
             return proc
         except Exception as e:
             print(f"[DECODE] Failed to start worker: {e}",
                   file=sys.stderr, flush=True)
             return None
+
+    @staticmethod
+    def _discard_worker(worker):
+        """Retire one unusable child; managers never cache an unframed pipe."""
+        if worker is None:
+            return
+        try:
+            if worker.poll() is None:
+                worker.kill()
+        except Exception:
+            pass
+        try:
+            worker.wait(timeout=1.0)
+        except Exception:
+            pass
+        for pipe in (getattr(worker, 'stdin', None),
+                     getattr(worker, 'stdout', None),
+                     getattr(worker, 'stderr', None)):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+
+    def _lease_worker(self):
+        """Reuse a warm idle child without changing job priority or capacity."""
+        while True:
+            with self._workers_lock:
+                if self._aborting():
+                    return None
+                worker = self._idle_workers.pop() if self._idle_workers else None
+                if (worker is not None and worker.poll() is None
+                        and not worker.stdin.closed):
+                    return worker
+            if worker is None:
+                # Creation/registration remains atomic with fatal abort. Each
+                # manager owns at most one lease, so the existing manager count
+                # still bounds child concurrency; there is no prewarming.
+                worker = self._start_worker()
+                if worker is not None and self._aborting():
+                    self._discard_worker(worker)
+                    return None
+                return worker
+            self._discard_worker(worker)
+
+    def _return_worker(self, worker):
+        """Return only a fully completed live child, never after fatal abort."""
+        if worker is None:
+            return
+        with self._workers_lock:
+            if (not self._aborting() and worker.poll() is None
+                    and not worker.stdin.closed):
+                if worker not in self._idle_workers:
+                    self._idle_workers.append(worker)
+                return
+        self._discard_worker(worker)
 
     def _rawlog(self, tag, what, text=''):
         """Append one job-lifecycle event to the raw decode log (no-op unless
@@ -6584,6 +7595,60 @@ while True:
                         f.write(text.rstrip('\n') + "\n@@@ END\n")
         except Exception:
             pass
+
+    def _publish_packet_line(self, line, fpath, *, received_at=None):
+        """Publish a complete worker record without ending its capture search.
+
+        Return the timestamped line for the final raw JOB log. Invalid records
+        return None before changing counters, capture summaries or packet logs.
+        Result dedup, bucket completion and capture lifetime remain separate.
+        """
+        if not line.startswith('[PKT] '):
+            return None
+        import json as _json
+        try:
+            record = _json.loads(line[6:])
+            if not isinstance(record, dict):
+                return None
+            key = (record.get('pkt_id') or record.get('packet_id')
+                   or record.get('raw_hex') or record.get('text'))
+            identity = (record.get('proto'), key)
+            if key is not None:
+                hash(identity)
+            record['ts'] = time.time() if received_at is None else received_at
+            encoded = _json.dumps(record, separators=(',', ':'))
+        except (ValueError, TypeError):
+            return None
+
+        # Preserve the existing all-protocol publication and feedback path.
+        # This runs in a decoder manager thread, never the acquisition loop.
+        with self._decoded_lock:
+            self._decoded_total += 1
+            if key is not None:
+                self._decoded_keys.add(identity)
+            try:
+                carrier_mhz = float(record.get('freq_mhz') or 0.0)
+            except (TypeError, ValueError):
+                carrier_mhz = 0.0
+            if carrier_mhz > 0.0:
+                self._confirmed_freqs.append(carrier_mhz * 1e6)
+                if len(self._confirmed_freqs) > 64:
+                    del self._confirmed_freqs[:-64]
+        if self._keep_dir:
+            with self._refs_lock:
+                self._cap_recs.setdefault(fpath, []).append(
+                    {k: record.get(k) for k in (
+                        'proto', 'confidence', 'pktid', 'from', 'to', 'text',
+                        'summary', 'sf', 'bw', 'freq_mhz', 'hops')
+                     if record.get(k) is not None})
+        if self._pkt_log_path:
+            try:
+                with self._pkt_log_lock:
+                    with open(self._pkt_log_path, 'a') as stream:
+                        stream.write(encoded + '\n')
+            except Exception:
+                pass
+        return '[PKT] ' + encoded
 
     def _cap_try_reserve(self, fpath, size):
         """Reserve `size` bytes for a new capture against the pending-capture
@@ -6627,12 +7692,15 @@ while True:
         file.  Called once per worker job completion (success, failure, or
         crash) from the manager thread's `finally` block, so the count is
         guaranteed to wind down even on exceptions."""
+        if self._aborting():
+            return  # fatal evidence remains at its existing path
         with self._refs_lock:
             n = self._refs.get(fpath, 1) - 1
             if n > 0:
                 self._refs[fpath] = n
                 return
             self._refs.pop(fpath, None)
+            self._capture_roles.pop(fpath, None)
         # Release this file's reserved bytes from the capacity budget (whether or
         # not the file is actually unlinked below — its decode is done either way).
         if self._cap_budget:
@@ -6640,7 +7708,7 @@ while True:
                 _sz = self._cap_bytes.pop(fpath, None)
                 if _sz:
                     self._pending_bytes -= _sz
-        if os.environ.get('LORA_KEEP_IQ'):
+        if self._aborting() or os.environ.get('LORA_KEEP_IQ'):
             return          # debugging: keep capture files for autopsy
         with self._refs_lock:
             _recs = self._cap_recs.pop(fpath, None)
@@ -6751,28 +7819,93 @@ while True:
     # 5.0 s covers SF12 LONG_SLOW decodes (the slowest standard preset) with
     # margin.  If a worker has been holding a bucket longer than this it's
     # presumed crashed/wedged and sibling dispatches proceed normally.
-    def _is_bucket_inflight(self, fpath):
-        """True if another worker is currently processing a sibling capture
-        in the same RF bucket (or a same-slope alias bucket) as `fpath`.
+    def _inflight_bucket_key(self, fpath):
+        """The in-flight bucket key another worker is decoding that covers
+        `fpath`'s RF bucket (same bucket or a same-slope alias), or None.
         Auto-GCs entries older than _inflight_max_age_s so a crashed worker
         can't deadlock siblings."""
         with self._bucket_lock:
             bkey = self._fname_bucket.get(fpath)
             if bkey is None:
-                return False
+                return None
             now = time.time()
             stale = []
-            hit = False
+            hit = None
             for key, dispatch_ts in self._inflight_buckets.items():
                 if now - dispatch_ts > self._inflight_max_age_s:
                     stale.append(key)
                     continue
-                if self._bucket_hit(bkey, key):
-                    hit = True
-                    break
+                if hit is None and self._bucket_hit(bkey, key):
+                    hit = key
             for k in stale:
                 self._inflight_buckets.pop(k, None)
             return hit
+
+    def _is_bucket_inflight(self, fpath):
+        """True if another worker is currently processing a sibling capture
+        in the same RF bucket (or a same-slope alias bucket) as `fpath`."""
+        return self._inflight_bucket_key(fpath) is not None
+
+    def _park_sibling(self, job, prio, slow_token):
+        """Park `job` behind the in-flight sibling covering its bucket instead
+        of holding a worker.  Returns True when parked (the caller moves on).
+        Not parked: no sibling in flight, or this job already waited out its
+        deadline once (it then runs concurrently, as the old wait did)."""
+        fpath = job[0]
+        with self._bucket_lock:
+            if fpath in self._park_expired:
+                self._park_expired.discard(fpath)
+                return False
+        key = self._inflight_bucket_key(fpath)
+        if key is None:
+            return False
+        bk = self._fname_bucket.get(fpath)
+        sf = bk[4] if (bk is not None and len(bk) >= 6) else 12
+        deadline = time.time() + max(
+            2.0,
+            1.5 * self._fast_budget_s * 2.0 ** ((sf - 7) * 0.5),
+            2.0 * self._job_dur_ewma)
+        self._slow_retire(slow_token)
+        with self._bucket_lock:
+            self._sib_park.setdefault(key, []).append(
+                (job, slow_token is not None, prio, deadline))
+        self._rawlog('PARK-SIBLING', os.path.basename(fpath))
+        return True
+
+    def _dispose_parked(self, parked, expired=False):
+        for job, slow, prio, _deadline in parked:
+            fpath, fname, relay_after, relay_before, _budget = job
+            if self._bucket_already_decoded(fpath):
+                self._rawlog('SKIP-PARKED', f"{fname} sibling verified")
+                if relay_after is None and relay_before is None:
+                    self._plain_done(fpath)
+                self._ref_dec_and_maybe_unlink(fpath)
+                continue
+            if expired:
+                with self._bucket_lock:
+                    self._park_expired.add(fpath)
+            self._rawlog('RELEASE-PARKED', fname)
+            if slow or self._defer_state:
+                self._slow_queue.put(job)
+            else:
+                self._queue.put((prio, next(self._qseq), job))
+
+    def _flush_stale_parks(self, force=False):
+        """Release parked siblings past their deadline (all of them at drain)
+        so a lost in-flight exit can never strand a capture."""
+        now = time.time()
+        with self._bucket_lock:
+            batch = []
+            for key in list(self._sib_park):
+                entries = self._sib_park[key]
+                keep = [e for e in entries if not force and e[3] > now]
+                batch.extend(e for e in entries if force or e[3] <= now)
+                if keep:
+                    self._sib_park[key] = keep
+                else:
+                    self._sib_park.pop(key, None)
+        if batch:
+            self._dispose_parked(batch, expired=not force)
 
     def _mark_bucket_inflight(self, fpath):
         """Mark this fpath's bucket as in-flight (a worker is about to start
@@ -6792,6 +7925,9 @@ while True:
             if bkey is None:
                 return
             self._inflight_buckets.pop(bkey, None)
+            parked = self._sib_park.pop(bkey, [])
+        if parked:
+            self._dispose_parked(parked)
 
     def set_pressure(self, frac):
         self._pressure = float(frac)
@@ -6813,23 +7949,35 @@ while True:
     def maybe_release_pressure(self):
         """Pressure-clear release: one deferred job at a time while the
         ring is comfortable, without requiring full radio-idle."""
-        if self._defer_state or self._pressure > 0.20:
-            return
-        if self._slow_queue.qsize() == 0 or not self._queue.empty():
-            return
         self._release_one_slow()
 
     def submit(self, fpath, fname, relay_after_syms=None, relay_before_syms=None,
-               bucket_key=None, slow=False, prio=0.0):
+               bucket_key=None, slow=False, prio=0.0, *, role='default',
+               frame_key=None):
         """Queue a capture file for background decoding.
 
         relay_after_syms:  blank first N BW-rate symbols → find hop AFTER primary.
         relay_before_syms: blank from symbol N onward   → find hop BEFORE primary.
         bucket_key:        (cand_freq_hz, abs_t_s) for Phase-2 cross-worker
                            bucket dedup; None disables the dedup for this job.
+        role:              early/shared_full/shared_partial/continuation views search all
+                           their frames; they never consume whole-window buckets.
         """
-        if not self._decoder_script:
+        if role not in ('default', 'early', 'shared_full', 'shared_partial', 'continuation'):
+            raise ValueError('unknown capture role')
+        if not self._decoder_script or self._aborting():
             return
+        with self._refs_lock:
+            previous = self._capture_roles.get(fpath)
+            if previous is not None and previous != role:
+                raise ValueError('capture path reused with a different role')
+            self._capture_roles[fpath] = role
+            self._refs[fpath] = self._refs.get(fpath, 0) + 1
+
+        if role != 'default':
+            bucket_key = None
+            with self._bucket_lock:
+                self._fname_bucket.pop(fpath, None)
 
         # Phase-2: remember which RF bucket this fpath belongs to so the
         # dispatch loop can later skip captures whose bucket already produced
@@ -6854,25 +8002,201 @@ while True:
         # get here the captures are already keep-N-limited per true RF cluster.
         # The post-decode _packet_dedup collapses any duplicate RESULTS, so
         # submitting them all is safe (no FP / no double-count).
-        self._ref_inc(fpath)
-        # slow=True (patience trials): a trial capture is a HYPOTHESIS — it
-        # must never compete with real traffic for the fast decode workers
-        # (measured: trial jobs reordered a knife-edge marginal decode's
-        # worker assignment and flipped it).  The slow tier drains in idle
-        # gaps, which is exactly the right priority for acquisition probes.
+        # Trials and pressure-deferred captures share the bounded slow tier.
         _slow_tier = slow or self._defer_state
         self._rawlog('SUBMIT', f"{fname} relay={relay_after_syms},{relay_before_syms} "
-                               f"tier={'slow' if _slow_tier else 'fast'}")
+                               f"tier={'slow' if _slow_tier else 'fast'}"
+                               + (f" role={role}" if role != 'default' else ''))
         _job = (fpath, fname, relay_after_syms, relay_before_syms, None)
+        _is_plain = relay_after_syms is None and relay_before_syms is None
+        _is_iso = relay_after_syms is not None and relay_before_syms is not None
+        if _is_plain:
+            if frame_key is not None and role in ('early', 'shared_full'):
+                with self._iso_lock:
+                    self._fpath_frame[fpath] = (role, frame_key)
+            self._plain_enqueued(fpath)
+            if role == 'shared_full' and frame_key is not None:
+                with self._iso_lock:
+                    if frame_key in self._early_verified:
+                        _full_action = 'skip'
+                    elif (self._early_open.get(frame_key, 0) > 0
+                          or (frame_key in self._early_expected
+                              and time.monotonic() - self._early_expected[frame_key]
+                              < self._EARLY_EXPECT_S)):
+                        self._full_hold.setdefault(frame_key, []).append((_job, bool(_slow_tier), float(prio)))
+                        self._full_hold_since.setdefault(frame_key, time.monotonic())
+                        _full_action = 'hold'
+                    else:
+                        _full_action = 'run'
+                if _full_action == 'skip':
+                    self._rawlog('FULL-SKIP', f"{fname} early crop already verified")
+                    self._skip_full(fpath)
+                    return
+                if _full_action == 'hold':
+                    self._rawlog('FULL-HOLD', fname)
+                    return
+        elif _is_iso:
+            _base = os.path.basename(fpath)
+            with self._iso_lock:
+                if _base in self._verified_fnames:
+                    _iso_action = 'skip'
+                elif self._plain_open.get(fpath, 0) > 0:
+                    self._iso_hold.setdefault(fpath, []).append((_job, bool(_slow_tier), float(prio)))
+                    self._iso_hold_since.setdefault(fpath, time.monotonic())
+                    _iso_action = 'hold'
+                else:
+                    _iso_action = 'run'
+            if _iso_action == 'skip':
+                self._rawlog('ISO-SKIP', f"{fname} plain job already verified")
+                self._ref_dec_and_maybe_unlink(fpath)
+                return
+            if _iso_action == 'hold':
+                self._rawlog('ISO-HOLD', fname)
+                return
         if _slow_tier:
             self._slow_queue.put(_job)
         else:
             self._queue.put((-float(prio), next(self._qseq), _job))
 
+    _ISO_HOLD_MAX_S = 180.0
+    _EARLY_EXPECT_S = 10.0
+
+    def expect_early(self, frame_key):
+        """The header checkpoint planned an early crop for this frame; its
+        full crop, if it arrives first, waits for it."""
+        if frame_key is None:
+            return
+        with self._iso_lock:
+            if frame_key not in self._early_verified and self._early_open.get(frame_key, 0) == 0:
+                self._early_expected[frame_key] = time.monotonic()
+
+    def _plain_enqueued(self, fpath):
+        with self._iso_lock:
+            self._plain_open[fpath] = self._plain_open.get(fpath, 0) + 1
+            _rf = self._fpath_frame.get(fpath)
+            if _rf is not None and _rf[0] == 'early':
+                self._early_open[_rf[1]] = self._early_open.get(_rf[1], 0) + 1
+                self._early_expected.pop(_rf[1], None)     # the expected early is here
+
+    def _note_verified(self, fname):
+        """A packet from capture `fname` was admitted (any role)."""
+        _base = os.path.basename(str(fname).split('[')[0])
+        with self._iso_lock:
+            self._verified_fnames[_base] = time.monotonic()
+            if len(self._verified_fnames) > 4000:
+                for _k in list(self._verified_fnames)[:2000]:
+                    self._verified_fnames.pop(_k, None)
+            for _fp, (_role, _fk) in self._fpath_frame.items():
+                if _role == 'early' and os.path.basename(_fp) == _base:
+                    self._early_verified.add(_fk)
+                    if len(self._early_verified) > 4000:
+                        self._early_verified = set(list(self._early_verified)[-2000:])
+
+    def _skip_full(self, fpath):
+        """A full crop skipped for its verified early sibling: the file counts
+        as verified (its iso twin skips too) and its plain job leaves."""
+        with self._iso_lock:
+            self._verified_fnames[os.path.basename(fpath)] = time.monotonic()
+        self._plain_done(fpath)
+        self._ref_dec_and_maybe_unlink(fpath)
+
+    def _plain_done(self, fpath):
+        """A plain job on `fpath` left the system (finished, skipped, dropped):
+        when it was the last one, its held iso twins are skipped or released,
+        and when it was an early crop, its held full siblings likewise."""
+        full_batches = []
+        with self._iso_lock:
+            n = self._plain_open.get(fpath, 0) - 1
+            _rf = self._fpath_frame.get(fpath)
+            if _rf is not None and _rf[0] == 'early':
+                m = self._early_open.get(_rf[1], 0) - 1
+                if m > 0:
+                    self._early_open[_rf[1]] = m
+                else:
+                    self._early_open.pop(_rf[1], None)
+                    held_full = self._full_hold.pop(_rf[1], [])
+                    self._full_hold_since.pop(_rf[1], None)
+                    if held_full:
+                        full_batches.append((held_full, _rf[1] in self._early_verified))
+            if n > 0:
+                self._plain_open[fpath] = n
+                held, verified = [], False
+            else:
+                self._plain_open.pop(fpath, None)
+                self._fpath_frame.pop(fpath, None)
+                held = self._iso_hold.pop(fpath, [])
+                self._iso_hold_since.pop(fpath, None)
+                verified = os.path.basename(fpath) in self._verified_fnames
+        self._dispose_held(held, verified)
+        for held_full, early_verified in full_batches:
+            self._dispose_held_full(held_full, early_verified)
+
+    def _dispose_held_full(self, held, early_verified):
+        for job, slow, prio in held:
+            if early_verified:
+                self._rawlog('FULL-SKIP', f"{job[1]} early crop verified")
+                self._skip_full(job[0])
+                continue
+            self._rawlog('FULL-RELEASE', job[1])
+            if slow or self._defer_state:
+                self._slow_queue.put(job)
+            else:
+                self._queue.put((-float(prio), next(self._qseq), job))
+
+    def _dispose_held(self, held, verified):
+        for job, slow, prio in held:
+            if verified:
+                self._rawlog('ISO-SKIP', f"{job[1]} plain job verified")
+                self._ref_dec_and_maybe_unlink(job[0])
+                continue
+            self._rawlog('ISO-RELEASE', job[1])
+            if slow or self._defer_state:
+                self._slow_queue.put(job)
+            else:
+                self._queue.put((-float(prio), next(self._qseq), job))
+
+    def _flush_stale_iso_holds(self, max_age=None):
+        """Release holds whose plain job has not reported for too long (or
+        all of them at drain) so a lost plain exit can never strand a twin."""
+        max_age = self._ISO_HOLD_MAX_S if max_age is None else max_age
+        now = time.monotonic()
+        with self._iso_lock:
+            stale = [f for f, t0 in self._iso_hold_since.items() if now - t0 >= max_age]
+            batches = []
+            for f in stale:
+                batches.append((self._iso_hold.pop(f, []),
+                                os.path.basename(f) in self._verified_fnames))
+                self._iso_hold_since.pop(f, None)
+                self._plain_open.pop(f, None)
+            # A full crop held for an early that was planned but never
+            # submitted (export failed, header view lost) waits only
+            # _EARLY_EXPECT_S; one held for an open early waits max_age.
+            stale_full = [k for k, t0 in self._full_hold_since.items()
+                          if now - t0 >= max_age
+                          or (self._early_open.get(k, 0) == 0 and now - t0 >= self._EARLY_EXPECT_S)]
+            for k in stale_full:
+                self._early_expected.pop(k, None)
+            for k in [k for k, t0 in self._early_expected.items() if now - t0 >= max_age]:
+                self._early_expected.pop(k, None)
+            full_batches = []
+            for k in stale_full:
+                full_batches.append((self._full_hold.pop(k, []), k in self._early_verified))
+                self._full_hold_since.pop(k, None)
+                self._early_open.pop(k, None)
+        for held, verified in batches:
+            self._dispose_held(held, verified)
+        for held, early_verified in full_batches:
+            self._dispose_held_full(held, early_verified)
+
     def pending(self):
         with self._lock:
-            return (self._queue.qsize() + self._slow_queue.qsize()
-                    + self._active_count)
+            n = (self._queue.qsize() + self._slow_queue.qsize()
+                 + self._active_count)
+        with self._iso_lock:
+            n += (sum(len(v) for v in self._iso_hold.values())
+                  + sum(len(v) for v in self._full_hold.values()))
+        with self._bucket_lock:
+            return n + sum(len(v) for v in self._sib_park.values())
 
     def decoded_counts(self):
         """(total_decode_events, distinct_packets) reaching the packet log.
@@ -6892,60 +8216,58 @@ while True:
         return _o
 
     def maybe_release_straggler(self):
-        """Release ONE deferred straggler for a big-budget re-decode IF the
-        decode system is idle right now — fast queue empty AND nothing decoding.
-        The GATE calls this on a no-signal window, so the trigger is the gate's
-        own real-time idle state (no signal in the air + no decode backlog), not
-        a guessed time threshold.  That makes it fully SELF-ADAPTING to traffic
-        density: dense traffic → few no-signal windows / busy decoders → rarely
-        fires (stragglers wait); sparse traffic → many idle windows → drains
-        freely.  active_count==0 caps it to one slow re-decode at a time so it
-        never piles onto a burst, and being driven by real idle it never starves
-        the realtime gate.  No tunable, no polling thread."""
-        if self._slow_queue.qsize() == 0:
-            return
-        if not self._queue.empty():
-            return
+        """Offer one deferred job a pressure-safe, bounded dispatch turn."""
         self._release_one_slow()
 
     def _release_one_slow(self):
         """Move ONE slow-tier job into the fast queue, at most one in flight.
 
-        Callers have already established that no fast-tier work is waiting.
-        The released job is consumed by the SAME fixed worker pool, so this
-        adds no processes and cannot oversubscribe the gate; if every worker
-        is busy it simply waits its turn in the fast queue instead of rotting
-        in the slow one.
+        The fast tier gets eight dispatches between slow turns while both
+        queues remain busy. A released job has priority over new fast arrivals
+        so its reservation guarantees a turn, rather than another starvation
+        point. When fast is empty, no quota delay is necessary.
 
         Realtime guard: gate on LIVE ring occupancy, not on the _defer_state
         latch.  The latch exists to route NEW jobs to the slow tier and holds
         for a 20 s min-dwell; gating releases on it would re-starve the queue
         on exactly the busy hosts this fix targets.  Live pressure is the
         honest "is there room for heavy work right now" signal, and the
-        _gate_stress throttle still pauses a running re-decode if the reader
-        starts dropping.  File mode leaves _pressure at 0.0 → unchanged."""
-        if self._pressure > 0.20:
-            return
+        gate stress blocks admission too. File mode leaves _pressure at 0.0.
+        These guards can delay a turn while capture needs the resources."""
         # ATOMIC guard+dequeue+claim under one lock: the old split (guard in one
         # lock, get_nowait between, increment in another) let two release paths
         # both observe "free" and admit two heavy re-decodes.  get_nowait on a
         # thread-safe queue is cheap enough to hold the lock across.
+        if self._aborting():
+            return False
         with self._lock:
+            if self._pressure > 0.20 or self._gate_stress.is_set():
+                return
             if (self._slow_released_job is not None
                     or self._slow_inflight_job is not None):
                 return                       # occupied — one slow job at a time
+            if not self._queue.empty() and self._fast_since_slow < 8:
+                return
             try:
                 _job = self._slow_queue.get_nowait()
             except queue.Empty:
                 return
             self._slow_released_job = _job   # RELEASED_NOT_DEQUEUED
         try:
-            self._queue.put((1e9, next(self._qseq), _job))   # after any fast job
+            self._queue.put((float('-inf'), next(self._qseq), _job))
         except BaseException:
-            with self._lock:                 # enqueue failed -> release the claim
+            with self._lock:
+                # Keep the existing reference and original FIFO position if
+                # transfer is cancelled before the fast queue accepts it.
+                # get_nowait did not finish the slow queue's task, so restore
+                # its deque directly without counting a second submission.
+                with self._slow_queue.not_empty:
+                    self._slow_queue.queue.appendleft(_job)
+                    self._slow_queue.not_empty.notify()
                 if self._slow_released_job is _job:
                     self._slow_released_job = None
             raise
+        self._slow_queue.task_done()
 
     def _slow_take(self, job):
         """Claim the slow-tier reservation iff `job` IS the released slow job.
@@ -6960,7 +8282,9 @@ while True:
                     and job is self._slow_released_job):
                 self._slow_released_job = None
                 self._slow_inflight_job = job    # RELEASED -> INFLIGHT (atomic)
+                self._fast_since_slow = 0
                 return job                        # identity token for _slow_retire
+            self._fast_since_slow = min(8, self._fast_since_slow + 1)
         return None
 
     def _slow_retire(self, token):
@@ -6990,6 +8314,66 @@ while True:
                 self._queue.put((1e9, next(self._qseq), self._slow_queue.get_nowait()))
             except queue.Empty:
                 break
+            self._slow_queue.task_done()
+
+    def _aborting(self):
+        event = getattr(self, '_abort_event', None)
+        return event is not None and event.is_set()
+
+    def abort(self, timeout=2.0):
+        """Stop owned subprocesses/managers without decoding or deleting inputs."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        self._abort_event.set()
+        # Wake idle managers. Active managers see the event at read/loop bounds.
+        for _ in self._threads:
+            self._queue.put((float('-inf'), next(self._qseq), None))
+        acquired = self._workers_lock.acquire(timeout=max(0.0, deadline-time.monotonic()))
+        if not acquired:
+            return False  # truthful bounded failure if worker creation is wedged
+        try:
+            workers = list(self._workers)
+            self._idle_workers.clear()
+        finally:
+            self._workers_lock.release()
+        clean = True
+        for worker in workers:
+            if worker.poll() is None:
+                try:
+                    worker.terminate()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    clean = False
+        term_deadline = time.monotonic() + max(0.0, deadline-time.monotonic()) / 2
+        for worker in workers:
+            try:
+                worker.wait(timeout=max(0.0, term_deadline-time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                clean = False
+        for worker in workers:
+            if worker.poll() is None:
+                try:
+                    worker.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    clean = False
+        for worker in workers:
+            try:
+                worker.wait(timeout=max(0.0, deadline-time.monotonic()))
+            except Exception:
+                clean = False
+        for thread in self._threads:
+            thread.join(timeout=max(0.0, deadline-time.monotonic()))
+            clean = clean and not thread.is_alive()
+        if clean:
+            for worker in workers:
+                for pipe in (worker.stdin, worker.stdout, worker.stderr):
+                    if pipe is not None:
+                        pipe.close()
+        return clean
 
     def drain(self, timeout=30.0):
         """Wait for pending decodes to finish (e.g. on shutdown).  Keeps folding
@@ -6997,11 +8381,14 @@ while True:
         the drain itself (a backlogged fast job that bailed) are also recovered."""
         deadline = time.time() + timeout
         while self.pending() > 0 and time.time() < deadline:
+            self._flush_stale_iso_holds(max_age=0.0)
+            self._flush_stale_parks(force=True)
             self.drain_slow_into_fast()
             time.sleep(0.2)
         # Close every pool worker's stdin so it exits cleanly; kill stragglers.
         with self._workers_lock:
             _workers = list(self._workers)
+            self._idle_workers.clear()
         for w in _workers:
             if w and w.poll() is None:
                 try:
@@ -7022,19 +8409,22 @@ while True:
             pass
 
     def _manager(self):
-        """Manager thread: drives its OWN persistent worker subprocess.  Serves
-        the FAST queue first; only when it is empty does it pull from the SLOW
-        queue (fast-pass stragglers re-decoded with a big per-job budget).  Same
-        worker pool for both → no CPU oversubscription of the realtime gate."""
+        """Lease one child per job, sharing bounded turns between tiers."""
         worker = None
-        while True:
+        while not self._aborting():
+            self._flush_stale_iso_holds()
+            self._flush_stale_parks()
+            self._release_one_slow()
             # Plain blocking get on the fast queue — NO polling loop (10 threads
             # waking on a timeout competed with the gate's realtime thread and
             # caused sample drops).  The slow mop-up queue is drained by moving
             # its items INTO this fast queue at shutdown (drain_slow_into_fast),
             # so these same blocking workers process the stragglers then, with
             # the big per-job budget carried in the job tuple.
-            _, _, job = self._queue.get()
+            _prio, _, job = self._queue.get()
+            if job is None or self._aborting():
+                self._queue.task_done()
+                break
             # Adaptive throttle: if the gate is actively dropping samples,
             # delay this decode start to free memory bandwidth for the
             # gate's reader thread.  Self-clearing event — once the gate
@@ -7043,6 +8433,8 @@ while True:
             if self._gate_stress.is_set():
                 time.sleep(self._stress_pause_s)
             fpath, fname, relay_after_syms, relay_before_syms, job_budget = job
+            with self._refs_lock:
+                capture_role = self._capture_roles.get(fpath, 'default')
             # Claim the slow-tier reservation ONCE, here, by job identity; every
             # exit path below must retire it (see _slow_retire).
             _slow_token = self._slow_take(job)
@@ -7117,6 +8509,8 @@ while True:
                 # (n_sym, N) symbol matrices.
                 if self._bucket_already_decoded(fpath):
                     self._rawlog('SKIP-BUCKET', os.path.basename(fpath))
+                    if relay_after_syms is None and relay_before_syms is None:
+                        self._plain_done(fpath)
                     self._ref_dec_and_maybe_unlink(fpath)
                     if _slow_token is not None:
                         self._slow_retire(_slow_token)
@@ -7140,68 +8534,27 @@ while True:
                 # above typical decode time (SF7-SF11 finish in 0.5-1.5 s); the
                 # in-flight entry also has a 5 s GC timeout so a crashed worker
                 # can never deadlock siblings indefinitely.
-                if self._is_bucket_inflight(fpath):
-                    # Wait as long as the sibling can legitimately take: the
-                    # fast-tier budget, or twice the measured job duration if
-                    # that is longer.  The loop exits the moment the sibling
-                    # admits or finishes, so this costs nothing where decodes
-                    # are quick; where they take 2-15 s (Pi 5) the old fixed
-                    # 2 s let every sibling run a full duplicate decode.
-                    # the fast-tier budget scales 2^((sf-7)/2) like the
-                    # decoder's own (SF11 = 4x), so size the wait by the
-                    # capture's SF when the bucket key carries it
-                    _bk = self._fname_bucket.get(fpath)
-                    _sfw = _bk[4] if (_bk is not None and len(_bk) >= 6) else 12
-                    _wait_deadline = time.time() + max(
-                        2.0,
-                        1.5 * self._fast_budget_s * 2.0 ** ((_sfw - 7) * 0.5),
-                        2.0 * self._job_dur_ewma)
-                    _skipped = False
-                    # A worker used to SLEEP here for the whole deadline (up to
-                    # 85 s at SF12) while its sibling decoded: with a cluster of
-                    # SF12 copies that serialised the whole pool — 5 worker
-                    # processes, active=1, queue 19 (Pi 5 live).  Wait briefly,
-                    # then put the job BACK on the queue and take the next one;
-                    # it returns once the sibling has admitted (skip) or finished
-                    # (decode).  The original deadline still bounds the total
-                    # time a job can be deferred this way.
-                    _first_wait = self._wait_since.setdefault(fpath, time.time())
-                    _short_deadline = min(_wait_deadline, time.time() + 2.0)
-                    while time.time() < _short_deadline:
-                        time.sleep(0.1)
-                        if self._bucket_already_decoded(fpath):
-                            self._rawlog('SKIP-INFLIGHT-ADMIT', os.path.basename(fpath))
-                            self._ref_dec_and_maybe_unlink(fpath)
-                            self._wait_since.pop(fpath, None)
-                            if _slow_token is not None:
-                                self._slow_retire(_slow_token)
-                            self._queue.task_done()
-                            if self._verbose:
-                                print(f"         [BUCKET-DEDUP] skip {os.path.basename(fpath)} "
-                                      f"— sibling admitted during wait",
-                                      file=sys.stderr, flush=True)
-                            _skipped = True
-                            break
-                        if not self._is_bucket_inflight(fpath):
-                            break
-                    if _skipped:
-                        continue
-                    if (self._is_bucket_inflight(fpath) and _slow_token is None
-                            and time.time() - _first_wait < _wait_deadline - (_short_deadline - 2.0)):
-                        self._rawlog('REQUEUE-SIBLING', os.path.basename(fpath))
-                        self._queue.put((-0.0, next(self._qseq), job))
-                        self._queue.task_done()
-                        continue
-                    self._wait_since.pop(fpath, None)
+                # A sibling of a capture that is decoding right now waits in
+                # the park, off the worker, until that job clears its bucket
+                # (skipped if the bucket verified, released otherwise) or its
+                # own deadline passes.  The former sleep-and-requeue loop held
+                # a worker for 2 s per turn: on a three-worker host one worker
+                # idled while its twin decoded (emulated Pi, 2026-10-31).
+                if self._park_sibling(job, _prio, _slow_token):
+                    self._queue.task_done()
+                    continue
 
                 # Mark this bucket in-flight BEFORE writing to the worker stdin
                 # so siblings see the in-flight state immediately.
                 self._mark_bucket_inflight(fpath)
 
-                # Start this thread's worker if not running
+                # Lease a warm child regardless of which manager dequeued the
+                # job. Cold managers must not bypass already-idle children.
                 if worker is None or worker.poll() is not None:
-                    worker = self._start_worker()
+                    worker = self._lease_worker()
                     if worker is None:
+                        if relay_after_syms is None and relay_before_syms is None:
+                            self._plain_done(fpath)
                         if _slow_token is not None:
                             self._slow_retire(_slow_token)
                         self._queue.task_done()
@@ -7211,6 +8564,7 @@ while True:
                     self._active_count += 1
 
                 t_start = time.time()
+                _job_worker = worker  # retain handle for reaping after EOF/kill
             except BaseException:
                 # unexpected error in the early admission/dedup/worker-start
                 # section (I/O, logging, MemoryError): retire the slow reservation
@@ -7248,11 +8602,19 @@ while True:
                 # fine standalone.  Scale the wall deadline off the same budget
                 # with headroom; floor at 90 s so low-SF behaviour is unchanged.
                 import re as _re_t
-                _bud = float(os.environ.get('LORA_DECODE_BUDGET_S', '12.0') or 0)
+                # Match the exact token sent above, including its rounding.
+                # Slow-tier and pressure-floor overrides otherwise received a
+                # larger CPU allowance but were killed at the default wall limit.
+                _bud = (float(_bud_tok) if _bud_tok else
+                        float(os.environ.get('LORA_DECODE_BUDGET_S', '12.0') or 0))
                 _sfm = _re_t.search(r'SF(\d+)_', fname)
                 _sf_t = int(_sfm.group(1)) if _sfm else 7
                 _scaled_bud = _bud * (2.0 ** ((_sf_t - 7) * 0.5)) if _bud > 0 else 60.0
                 _wall = max(90.0, _scaled_bud * 1.5 + 30.0)
+                _cpu_budget_log = f'{_scaled_bud:.1f}' if _bud > 0 else 'unlimited'
+                self._rawlog('START', f"{fname} pid={worker.pid} "
+                                      f"base_budget={_bud} cpu_budget={_cpu_budget_log} "
+                                      f"wall_budget={_wall:.1f}")
                 output_lines = []
                 deadline = time.time() + _wall
                 timed_out = True
@@ -7270,7 +8632,7 @@ while True:
                 # buffer stays empty and can't steal bytes from us.
                 _rbuf = b''
                 _wfd = worker.stdout.fileno()
-                while time.time() < deadline:
+                while time.time() < deadline and not self._aborting():
                     _nl = _rbuf.find(b'\n')
                     if _nl < 0:
                         _rdy, _, _ = _select.select(
@@ -7294,8 +8656,18 @@ while True:
                         timed_out = False
                         break
                     if line.startswith('__BEGIN__'):
+                        self._rawlog('WORKER-READY', f"{fname} pid={worker.pid}")
                         continue
+                    if line.startswith('[PKT] '):
+                        # A completed frame need not wait for later-frame
+                        # searches, recovery passes or the worker deadline.
+                        # Keep the same receipt timestamp in JSONL and raw JOB
+                        # evidence; finalization must not publish it again.
+                        line = self._publish_packet_line(line, fpath) or line
                     output_lines.append(line)
+
+                if self._aborting():
+                    continue  # finally balances job state; preserve the input file
 
                 if timed_out:
                     # Distinguish worker death (EOF mid-job) from a genuine
@@ -7328,68 +8700,30 @@ while True:
                                     f"budget={job_budget} elapsed={elapsed:.1f}s "
                                     f"timed_out={timed_out}", output or '(empty)')
 
-                # Structured packet log: append each [PKT] record (decoded or
-                # encrypted-header-only) with a receive timestamp to the JSONL the
-                # web UI tails.  The web dedups by (pktid,hop); here we just append.
-                if '[PKT]' in output:
-                    import json as _json
-                    _now = time.time()
-                    _out = []
-                    for _ln in output.split('\n'):
-                        if _ln.startswith('[PKT] '):
-                            try:
-                                _r = _json.loads(_ln[6:])
-                            except Exception:
-                                continue
-                            # Authoritative decode count (data-path truth, not the
-                            # noisy compact stdout).  Distinct-packet key prefers a
-                            # stable identity: Meshtastic PacketID+hop, else the raw
-                            # payload hex, else the decoded text.
-                            _uk = (_r.get('pkt_id') or _r.get('packet_id')
-                                   or _r.get('raw_hex') or _r.get('text'))
-                            with self._decoded_lock:
-                                self._decoded_total += 1
-                                if _uk is not None:
-                                    self._decoded_keys.add((_r.get('proto'), _uk))
-                                try:
-                                    _cfm = float(_r.get('freq_mhz') or 0.0)
-                                except (TypeError, ValueError):
-                                    _cfm = 0.0
-                                if _cfm > 0.0:
-                                    self._confirmed_freqs.append(_cfm * 1e6)
-                                    if len(self._confirmed_freqs) > 64:
-                                        del self._confirmed_freqs[:-64]
-                            if self._keep_dir:
-                                with self._refs_lock:
-                                    self._cap_recs.setdefault(fpath, []).append(
-                                        {k: _r.get(k) for k in (
-                                            'proto', 'confidence', 'pktid', 'from',
-                                            'to', 'text', 'summary', 'sf', 'bw',
-                                            'freq_mhz', 'hops') if _r.get(k) is not None})
-                            if self._pkt_log_path:
-                                _r['ts'] = _now
-                                _out.append(_json.dumps(_r, separators=(',', ':')))
-                    if _out and self._pkt_log_path:
-                        try:
-                            with self._pkt_log_lock:
-                                with open(self._pkt_log_path, 'a') as _pf:
-                                    _pf.write('\n'.join(_out) + '\n')
-                        except Exception:
-                            pass
-
                 # Fast-pass straggler recovery: if a PRIMARY fast decode BAILED
                 # on its realtime budget it may still hold an undecoded packet
                 # (marginal CFO/SNR needing the rescue, or a 2nd packet).
+                # A wall preemption can happen before the CPU-budget marker:
+                # retain one slow turn after a plausible explicit-header parse.
+                # This is search progress, not a verified packet: header-like
+                # noise can qualify once. Silence, no parse and worker EOF do not.
                 # Re-queue it to the SLOW tier with a big budget; the same
                 # workers run it in the post-burst idle gap.  post-decode
                 # _packet_dedup suppresses anything already emitted → no
                 # double-count.  Only PRIMARY (not relay/iso) jobs, only from
                 # the fast tier (is_slow guards against infinite re-queue).
                 if ((job_budget is None or _stress_shrunk) and output
-                        and '[BUDGET]' in output
+                        and ('[BUDGET]' in output or
+                             (timed_out and not worker_died and any(
+                                 4 <= int(_hm.group(1)) <= 237
+                                 for _hm in _re_t.finditer(
+                                     r'(?m)^\s*Header:\s+PL=(\d+)\s+CR=4/[5-8]\s+'
+                                     r'CRC=(?:yes|no)\s+HDR_CHK=(?:OK|FAIL)\b',
+                                     output))))
                         and relay_after_syms is None
                         and relay_before_syms is None):
                     self._ref_inc(fpath)
+                    self._plain_enqueued(fpath)
                     self._rawlog('REQUEUE-SLOW', fname)
                     self._slow_queue.put((fpath, fname, None, None,
                                           self._slow_budget))
@@ -7410,7 +8744,8 @@ while True:
                         _display_fname = fname + '[pre]'
                     else:
                         _display_fname = fname
-                    text = self._compact(output or '', _display_fname, elapsed)
+                    text = self._compact(output or '', _display_fname, elapsed,
+                                         role=capture_role)
                     if text:
                         sys.stdout.write(text)
                         # Latency markers: wall-clock emit time per decoded packet
@@ -7438,6 +8773,8 @@ while True:
                         pass
                     worker = None
             finally:
+                if worker is None:
+                    self._discard_worker(_job_worker)
                 # RSS-bound worker recycle: decode workers ratchet to ~2 GB
                 # anon each (numpy scratch never returned to the OS) and
                 # nothing ever recycled them — the measured OOM driver on
@@ -7460,13 +8797,13 @@ while True:
                                 worker.stdin.close()
                                 worker.wait(timeout=5)
                             except Exception:
-                                try:
-                                    worker.kill()
-                                except Exception:
-                                    pass
+                                pass
+                            self._discard_worker(worker)
                             worker = None
                     except Exception:
                         pass
+                if relay_after_syms is None and relay_before_syms is None:
+                    self._plain_done(fpath)
                 with self._lock:
                     self._active_count -= 1
                 if _slow_token is not None:
@@ -7483,6 +8820,8 @@ while True:
                 # on exception / timeout / worker crash — those decrement paths
                 # are exactly when leaks would otherwise accumulate.
                 self._ref_dec_and_maybe_unlink(fpath)
+                self._return_worker(worker)
+                worker = None
 
     @staticmethod
     def _payload_fingerprint(payload_bytes):
@@ -7506,7 +8845,7 @@ while True:
         """Hamming distance between two 64-bit integers."""
         return bin(a ^ b).count('1')
 
-    def _compact(self, output, fname, elapsed=0):
+    def _compact(self, output, fname, elapsed=0, *, role='default'):
         """Extract key decode results from full process_file output.
 
         When the decoder's chained-mask produces MULTIPLE decode results
@@ -7533,16 +8872,18 @@ while True:
             for sec in sections:
                 if sec.strip():
                     r = self._compact_single(sec, fname, elapsed,
-                                              _is_relay, _is_pre, _is_secondary)
+                                              _is_relay, _is_pre, _is_secondary,
+                                              admit_bucket=role == 'default')
                     if r:
                         results.append(r)
             return ''.join(results)
 
         return self._compact_single(output, fname, elapsed,
-                                     _is_relay, _is_pre, _is_secondary)
+                                     _is_relay, _is_pre, _is_secondary,
+                                     admit_bucket=role == 'default')
 
     def _compact_single(self, output, fname, elapsed,
-                         _is_relay, _is_pre, _is_secondary):
+                         _is_relay, _is_pre, _is_secondary, *, admit_bucket=True):
         """Parse one decoder section (single decode attempt)."""
         lines = output.split('\n')
         crc_line = None
@@ -7721,6 +9062,17 @@ while True:
         if _pkt_id is not None and _hops_taken is not None and 'FAIL' not in (crc_line or ''):
             _pkey = (_pkt_id, _hops_taken)
             _now_pkt = time.time()
+            # The capture decoded a CRC-verified frame whether or not the
+            # publication dedup below admits it as new: a [DUP] of a frame
+            # another crop already published is still proof that this
+            # file's twin has nothing left to rescue, and that this RF
+            # bucket (the same transmission, captured again by the KEEP-2
+            # second window or an alias peak) needs no further decode. A
+            # retransmission of the same frame seconds later is its own
+            # bucket and still decodes; only copies of this instant skip.
+            self._note_verified(fname)
+            if admit_bucket:
+                self._mark_bucket_decoded(fname)
             with self._packet_dedup_lock:
                 stale = [k for k, t in self._packet_dedup.items()
                          if _now_pkt - t > 60.0]
@@ -7732,10 +9084,6 @@ while True:
                             f"[DUP] {_pkt_id} hop{_hops_taken} — "
                             f"same hop already decoded recently\n")
                 self._packet_dedup[_pkey] = _now_pkt
-                # Phase-2: tell the dispatch loop that this RF bucket is
-                # covered so sibling captures (KEEP-2 second save + PASS-2-iso
-                # resubmit) skip their decode at dispatch time.
-                self._mark_bucket_decoded(fname)
 
         # Payload fingerprint dedup: suppress same raw payload within 30s.
         # Targets non-Meshtastic frames (LoRaWAN, MeshCore, CRC-only) that have no
@@ -7776,6 +9124,11 @@ while True:
                     _now_fp = time.time()
                     _FP_WINDOW = 30.0
                     _FP_THRESH = 14
+                    self._note_verified(fname)
+                    # A verified frame covers its RF bucket whether or not the
+                    # payload dedup below publishes it (see the packet-ID path).
+                    if admit_bucket:
+                        self._mark_bucket_decoded(fname)
                     with self._fp_dedup_lock:
                         # Prune stale entries
                         for _k in [k for k, t in self._fp_dedup.items()
@@ -7790,10 +9143,6 @@ while True:
                                     f"[FP-DEDUP] duplicate payload suppressed\n")
                         if len(self._fp_dedup) < 512:
                             self._fp_dedup[_fp] = _now_fp
-                            # Phase-2: same as for _packet_dedup admit —
-                            # bucket is now covered; sibling captures
-                            # skip decode at dispatch.
-                            self._mark_bucket_decoded(fname)
             except Exception:
                 pass
 
@@ -8019,6 +9368,34 @@ class AutoGainGovernor:
             self.cool = self.COOL_WIN
 
 
+def _abort_failed_pipeline(pool, decoder, recorder):
+    """Best-effort bounded failure cleanup; never replace the original error."""
+    for label, owner in (('decoder', decoder), ('detect pool', pool)):
+        if owner is None:
+            continue
+        try:
+            if not owner.abort(timeout=2.0):
+                print(f'[FATAL CLEANUP] {label} did not confirm complete shutdown',
+                      file=sys.stderr, flush=True)
+        except BaseException as error:
+            print(f'[FATAL CLEANUP] {label}: {error!r}', file=sys.stderr, flush=True)
+    # Stop the optional header worker without finalizing/draining new captures.
+    shared = getattr(recorder, '_shared', None) if recorder is not None else None
+    if shared is not None:
+        controller = getattr(shared, 'header_controller', None)
+        if controller is not None:
+            try:
+                if controller.close(wait=True) is False:
+                    print('[FATAL CLEANUP] header worker did not confirm shutdown',
+                          file=sys.stderr, flush=True)
+            except BaseException as error:
+                print(f'[FATAL CLEANUP] header worker: {error!r}', file=sys.stderr, flush=True)
+        try:
+            shared.close(wait=False)
+        except BaseException as error:
+            print(f'[FATAL CLEANUP] shared capture: {error!r}', file=sys.stderr, flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description='LoRa Schmidl-Cox Detector')
     p.add_argument('-r', '--rate', type=int, default=40_000_000)
@@ -8211,6 +9588,10 @@ def main():
     _pat_futile = {}      # promoted bin -> futile energy-present window count
     _pat_confirmed = set()  # promoted bins with >=1 decode confirm
     _pat_cooldown = {}    # bin -> wc when re-promotion is allowed again
+    _coverage_counts = {'patience': 0, 'configured': 0}
+    _coverage_total = _coverage_reported = 0
+    _coverage_report_at = 0.0
+    _coverage_representative = None
     def _pat_note_detection(_freq_hz):
         """A REAL detection published at _freq_hz: zero accumulated hits and
         expire any promotion within ±1 MHz — patience only pursues carriers
@@ -8518,14 +9899,14 @@ def main():
         _SLOW_MIN_TICKS = 0
     _slow_last_fire = -10**9
     _slow_pending = {}   # bucket -> (exact_bin, expiry_tick): triggers that
-    _slow_hold = []      # (due_tick, dets, assembly, reg_tot_s): non-slow-class
+    _slow_hold = []      # (due_tick, dets, assembly, reg_tot_s, history_anchor)
                          # slow-pass hits held so the main pass can claim them
                          # fired while a scan was in flight, deferred instead
                          # of dropped (the drop-if-busy race lost ~2/29 real
                          # SF12 frames per leg whose trigger ticks all landed
                          # in another bucket's busy shadow — typically their
                          # own IQ-image's scan)
-    _slow_results = queue.Queue()   # (dets_slow, _iq_long, reg_tot_s, trig)
+    _slow_results = queue.Queue()   # (dets_slow, _iq_long, reg_tot_s, trig, history_anchor)
     # Tail samples consumed last iter (for save).  Prepended to this iter's iq
     # so the audio timeline stays continuous — without this, every save creates
     # a `tail_n` audio gap between adjacent Welch windows and packets that land
@@ -8596,6 +9977,9 @@ def main():
     # _live_center_mhz is read by the closures/loop below; the integer-bin transition
     # blip during a manual change lasts < 1 window and self-corrects.
     _live_center_mhz = a.center
+    # Detector-clock lower bound for windows and lookback after a retune.
+    # Raw ring coordinates include drops; tot_s intentionally does not.
+    _history_floor = 0
     _ctl_path = os.environ.get('LORA_SDR_CTL') or None
     try:
         _ctl_mtime = os.stat(_ctl_path).st_mtime if _ctl_path else None
@@ -8625,7 +10009,10 @@ def main():
     recorder = None
     if a.export_iq:
         recorder = SignalRecorder(
-            a.export_iq, a.rate, center_hz, hop_n, debug=a.debug)
+            a.export_iq, a.rate, center_hz, hop_n, debug=a.debug,
+            window_n=win_n)
+        if is_live:
+            recorder.set_history_reader(reader)
         print(f"Export: {a.export_iq}/ (window+pre-read tail, fs=8×BW)",
               file=sys.stderr)
 
@@ -8711,8 +10098,8 @@ def main():
     # no per-preset tuning.  Env-overridable for experiments.
     _LAG = int(os.environ.get('LORA_COMMIT_LAG', 4)) if _pool is not None else 0
     # Samples one trailing window contributes to a tail — must match the slice
-    # _commit_oldest uses (slot[:win_n][hop_n:] = win_n-hop_n samples).
-    _tail_seg_n = max(1, win_n - hop_n)
+    # _commit_oldest uses (the last hop_n samples, capped by the window).
+    _tail_seg_n = max(1, min(hop_n, win_n))
 
     def _tail_windows_needed(dets):
         """Trailing in-flight windows required to fully cover the tail of the
@@ -8720,14 +10107,14 @@ def main():
         used in _commit_oldest so the commit never fires before the capture's
         forward samples exist — which is what makes a low _LAG safe for EVERY SF
         (SF12's multi-second packet needs several trailing windows; SF7 needs 1)."""
-        if not dets:
+        if not dets or recorder is None or getattr(recorder, '_shared', None) is not None:
             return 0
-        _a0 = max(dets, key=lambda x: x.get('peak_power_db', 0.0))
-        # patience_trial dets size for the same-slope family's slowest
-        # symbol time (see patience_cap_params) — an alias-sized tail
-        # truncates the true payload.  Non-trial: identical to 2**sf/bw.
-        _need = int((16 + 4.25 + 8 + 120) * patience_cap_params(_a0)[1] * a.rate)
+        _need = _capture_tail_n(recorder, dets, win_n, warn=False)
         return -(-_need // _tail_seg_n)   # ceil
+
+    def _source_before_retune(anchor):
+        return (is_live and anchor is not None
+                and anchor[2] < reader.history_anchor()[2])
 
     def _commit_oldest():
         """Pop the oldest in-flight window, wait for its detection, print and
@@ -8736,10 +10123,21 @@ def main():
         it = _inflight.popleft()
         _t_res0 = time.time()
         dets0 = _pool.result(it['seq'])
+        if it.get('ledger') is not None:
+            _ledger.outcomes(it['ledger'], _pool.outcomes(it['seq']))
+            _ledger.write(it['ledger'])
+        if _source_before_retune(it.get('history_anchor')):
+            # The worker has finished with this slot. Releasing it at retune
+            # would let a new dispatch overwrite IQ still read by that worker.
+            _pool.release_slot(it['slot'])
+            print(f"[RETUNE] discarded old detector window {it['seq']}",
+                  file=sys.stderr, flush=True)
+            return
         _res_wait = time.time() - _t_res0
         if _res_wait > 0.2 and os.environ.get('LORA_SLOW_DEBUG'):
             print(f"[COMMIT-WAIT] {_res_wait:.2f}s on seq {it['seq']}",
                   file=sys.stderr, flush=True)
+        dets0 = _onair_filter(dets0, it['tot_s'] / a.rate, 'pool')
         _elapsed = time.time() - t_start
         for d in dets0:
             if d.get('patience_trial'):
@@ -8756,21 +10154,20 @@ def main():
         if recorder:
             buf0 = _pool.slot_array(it['slot'])[:win_n]
             _tparts = []
-            _need_tail_n = 0
-            if _inflight and dets0:
+            # Even with no trailing pool window yet, an NB job must pend
+            # for the required future tail instead of finalizing base-only.
+            _need_tail_n = _capture_tail_n(recorder, dets0, win_n)
+            if _inflight and dets0 and getattr(recorder, '_shared', None) is None:
                 # Tail must cover the FULL packet AFTER the preamble.  A single
                 # next-window overlap (~0.5 s) is enough for short-SF packets,
                 # but long ones run past it and lose their payload: SF11/125
                 # packets are ~1.4 s and SF12/125 ~2.9 s, so a 2 s capture
                 # truncates the payload and the decoder yields only the header
                 # plus a handful of nibbles (LONG_MODERATE was 38/120 for this
-                # reason).  Gather the forward-overlap (hop_n:) of as many
+                # reason). Gather the new hop (-hop_n:) from as many
                 # subsequent in-flight windows as needed to span max_pkt_s for
                 # the detected SF/BW.  Short-SF presets need only 1 window, so
                 # their behaviour is unchanged.  Copies (slots get reused).
-                _a0 = max(dets0, key=lambda x: x.get('peak_power_db', 0.0))
-                _sym_t0 = (2 ** _a0['sf']) / _a0['bw']
-                _need_tail_n = int((16 + 4.25 + 8 + 120) * _sym_t0 * a.rate)
                 _acc = 0
                 _prev_seq = it['seq']
                 for _itn in _inflight:
@@ -8778,7 +10175,7 @@ def main():
                         break      # emergency skip left a gap: truncate the
                                    # tail rather than stitch across it
                     _prev_seq = _itn['seq']
-                    _seg = _pool.slot_array(_itn['slot'])[:win_n][hop_n:]
+                    _seg = _pool.slot_array(_itn['slot'])[:win_n][-hop_n:]
                     _tparts.append(_seg.copy())
                     _acc += len(_seg)
                     if _acc >= _need_tail_n:
@@ -8793,7 +10190,8 @@ def main():
                 recorder.update_deferred(dets0, buf0, it['tot_s'],
                                          pre_hop=it['pre_hop'],
                                          need_tail_n=_need_tail_n,
-                                         tail_parts=_tparts)
+                                         tail_parts=_tparts,
+                                         history_anchor=it.get('history_anchor'))
             else:
                 # Legacy wideband path (LORA_NB_PENDING=0, or NB setup
                 # degenerate): eager concat, save worker FFT-crops.
@@ -8834,6 +10232,41 @@ def main():
       _PEAK_CAP_LO = 3
       _peak_cap = _PEAK_CAP_HI
       _cap_calm = 0
+      _gate_doomed = {'peaks': 0, 'windows': 0, 'reported': time.monotonic()}
+      from gate_ledger import ledger_from_environ as _ledger_from_environ
+      _ledger = _ledger_from_environ(os.environ, a.debug, tempfile.gettempdir())
+      _lrec = None
+      _onair = OnAirFrames()
+      _onair_floor = [0.0]          # the latest window's PSD floor (dB)
+
+      def _onair_elev(d):
+          # Power over the floor.  The detection's own figure is the gate
+          # peak's PSD power, except for the slow pass, which reports a
+          # nominal 20 dB; the latest window's PSD at the carrier is read
+          # too and the larger wins, so a long frame still on air is seen
+          # at its true strength whichever path detected it.
+          _e = float(d['peak_power_db']) - _onair_floor[0]
+          try:
+              _b = 2048 + int(round((float(d['freq_hz']) - _live_center_mhz * 1e6)
+                                    / (a.rate / 4096.0)))
+              if 3 <= _b < 4093 and _psd_gate is not None:
+                  _e = max(_e, float(np.max(_psd_gate[_b - 3:_b + 4])) - _onair_floor[0])
+          except (NameError, TypeError, ValueError):
+              pass
+          return _e
+
+      def _onair_filter(dets, abst_base_s, where):
+          """Drop receiver copies of frames on air; register the strong
+          survivors for their airtime.  Same rule as the in-window
+          arbitration, across windows."""
+          def _drop(d, abst, elev, src):
+              if a.debug >= 1:
+                  print(f"  [GATE] intermod copy dropped ({where}): "
+                        f"{d['freq_hz'] / 1e6:.4f}MHz SF{d['sf']}/{int(d['bw']) // 1000}k "
+                        f"+{elev:.0f}dB under on-air {src['freq_hz'] / 1e6:.4f}MHz "
+                        f"+{src['elev']:.0f}dB (t={abst:.2f}s, frame {src['t0']:.2f}-{src['t1']:.2f}s)",
+                        file=sys.stderr, flush=True)
+          return _onair.filter(dets, abst_base_s, _onair_elev, _capture_duration_s, _drop)
       _ring_n_total = max(1, int(a.rate * a.buf_seconds))
       # Proactive budget clamp state ([GATE-BUDGET] block in the loop; live
       # only).  EWMAs (alpha 0.3) of the MEASURED per-peak detect cost and the
@@ -8930,6 +10363,8 @@ def main():
                   _nb = max(1, int(round(_hw / _fr2)))
                   _pp[max(0, _sb - _nb):min(4096, _sb + _nb + 1)] = np.median(_pp)
       while True:
+        if recorder is not None:
+            recorder.raise_shared_failure()
         _t_step = time.time()
         dets = []   # per-iteration default: the detect-pool path commits its
                     # detections asynchronously and never binds `dets` in this
@@ -8950,12 +10385,47 @@ def main():
                         _nc = float(_cc['center_hz']) / 1e6
                         if _nc != _live_center_mhz:
                             _live_center_mhz = _nc
-                            # The recorder reads center_hz live to compute each
-                            # capture's wideband crop offset (off = freq_hz -
-                            # center_hz).  It MUST track the retune or it crops the
-                            # wrong slice and every decode fails after a move.
+                            if is_live:
+                                _retune_before = reader.history_anchor()
                             if recorder is not None:
-                                recorder.center_hz = _live_center_mhz * 1e6
+                                recorder.retune(_live_center_mhz * 1e6)
+                            if is_live:
+                                # Shared capture owns its generation rollover;
+                                # legacy/no-recorder paths still invalidate once.
+                                if reader.history_anchor()[2] == _retune_before[2]:
+                                    reader.invalidate_history()
+                                _retune_anchor = reader.received_history_anchor()
+                                _capture = getattr(recorder, '_shared', None)
+                                _retune_raw_start = (_capture._generation_start
+                                    if _capture is not None else _retune_anchor[0])
+                                _history_floor = _retune_raw_start - _retune_anchor[1]
+                                # This is the published receive boundary. The
+                                # radio polls control independently; it is not
+                                # an acquisition-side hardware-retune timestamp.
+                            buf_pos = 0
+                            if _lz is not None:
+                                _lz.reset()
+                                buf = None
+                            else:
+                                buf = np.zeros(win_n, dtype=np.complex64)
+                            pre_hop = None
+                            _carry_tail = None
+                            _prehop_hist.clear()
+                            _slice_cache.clear()
+                            _slow_halves.clear()
+                            if _slow_hold:
+                                print(f'[RETUNE] discarded {len(_slow_hold)} old held slow captures',
+                                      file=sys.stderr, flush=True)
+                            _slow_hold.clear()
+                            _slow_pending.clear()
+                            _slow_seeds.clear()
+                            _slow_exact.clear()
+                            _slow_backoff.clear()
+                            _slow_fruitless.clear()
+                            _slow_last_fire = -10**9
+                            # Keep _inflight slots and the old _slow_busy owner
+                            # until their workers finish; consume stale results
+                            # below without publishing or repopulating bins.
                             sys.stderr.write('detector: live center -> %.4f MHz\n'
                                              % _live_center_mhz); sys.stderr.flush()
                             # Patience accumulator is indexed by ABSOLUTE PSD
@@ -9021,6 +10491,7 @@ def main():
                                      else np.zeros(0, dtype=np.complex64)), 0
 
             if skipped > 0:
+                _slow_halves.clear()
                 # Temporal discontinuity — reset state
                 tot_skip += skipped
                 skip_s = skipped / a.rate
@@ -9092,7 +10563,9 @@ def main():
             # window and is contiguous with it.  Used as recording lookback so
             # the decoder always sees the full preamble even when it started
             # before the detection window.
-            if recorder:
+            _ph1 = tot_s - _n_iq - win_n + hop_n
+            _ph0 = _ph1 - _max_pre_hop_n
+            if recorder and _ph0 >= _history_floor:
                 # Save the most recent _max_pre_hop_n samples from the portion
                 # about to leave the window.  These are contiguous with the new
                 # window: buf[hop_n-_max_pre_hop_n:hop_n] = [T-0.4s, T-0.1s).
@@ -9102,8 +10575,6 @@ def main():
                 #
                 # The OLD (pre-slide) buf spans abs [tot_s-len(iq)-win_n,
                 # tot_s-len(iq)); pre_hop's abs range is [_ph0, _ph1).
-                _ph1 = tot_s - _n_iq - win_n + hop_n
-                _ph0 = _ph1 - _max_pre_hop_n
                 _ph_ref = None
                 if _prehop_ref_on:
                     # Reuse an earlier _hop_own if one FULLY CONTAINS the
@@ -9131,6 +10602,8 @@ def main():
                                _lz.seg_owned(hop_n - _max_pre_hop_n,
                                              _max_pre_hop_n))
                     _prehop_copies += 1
+            else:
+                pre_hop = None  # no real lookback before the new generation
             if _lz is not None:
                 _lz.slide(iq)      # 40 MB raw slide vs 320 MB c64 traffic
                 buf = None         # nothing may touch buf until materialized
@@ -9138,7 +10611,7 @@ def main():
                 buf[:sh] = buf[len(iq):]
                 buf[sh:] = iq
         buf_pos += _n_iq
-        if buf_pos < win_n:
+        if buf_pos < win_n or tot_s - win_n < _history_floor:
             continue
         _prof['read'] += time.time() - _t_step
         _t_step = time.time()
@@ -9492,6 +10965,13 @@ def main():
                     del _pat_promoted[_pb]
                     del _pat_futile[_pb]
 
+        _onair_floor[0] = float(np.median(_psd_gate))
+        # ---- gate ledger: this window's record (gate_ledger.py) ----
+        if _ledger is not None:
+            _lrec = _ledger.begin(wc + 1, tot_s / a.rate, win_n / a.rate,
+                                  float(np.median(_psd_gate)),
+                                  a.rate / 4096.0, _live_center_mhz * 1e6)
+            _ledger.scanned(_lrec, _gate_peaks)
         # ---- [PRESCREEN] outcome-learned persistent-junk suppression ----
         # Sits AFTER patience accumulation (its masks see the untouched peak
         # list) and BEFORE the throttle + channelizer/patience forced-peak
@@ -9610,9 +11090,19 @@ def main():
                                and wc - _jk_verify_recent[0][0] > 40):
                             _jk_verify_recent.popleft()
                     else:
+                        if _lrec is not None:
+                            _ledger.removed(_lrec, 'prescreen',
+                                            [_pk for _pk in _gate_peaks if _pk not in _jk_kept])
                         _gate_peaks = _jk_kept
                         if not _gate_peaks:
                             _jk_sup_windows += 1
+
+        # Preserve measured energy for slow-preamble accumulation. Fast-worker
+        # shedding bounds compute; it must not turn observed narrow RF into
+        # an absent seed (cap0 lost the third observation of a real preamble).
+        # Snapshot AFTER prescreen, BEFORE fast caps/forced channel placeholders.
+        # Slow width/strength, cooldown, busy and admission guards stay below.
+        _slow_observed_peaks = tuple(_gate_peaks)
 
         # ---- Keep-up-driven peak throttle ----
         # The energy gate's job is bounding COMPUTE, not judging what's real —
@@ -9789,9 +11279,44 @@ def main():
             _pool.set_cap_override(
                 -1 if _cap_eff == 0
                 else (_cap_eff if _cap_eff <= _BUDGET_CAP_FLOOR else 0))
+        # Peaks the SC stage is certain to refuse (strong and narrower than
+        # any LoRa bandwidth) leave before the cap: a spur comb tooth at
+        # +50 dB must not outrank a real preamble at +40 dB in the sort.
+        _n_doomed = 0
+        # Bins of this window's dropped spur peaks.  A forced placeholder
+        # (channelizer or patience) must not be planted on one: the
+        # placeholder's nominal 125 kHz width would send the dechirp trial a
+        # carrier the gate just measured at 10 kHz, and the trial fires on a
+        # CW spur (live run 2026-11-02: 100 junk SF12/62.5k full captures of
+        # 29.6 s each, 1219 s of slow-tier decode, after the spur peak that
+        # used to block the placeholder started leaving before the cap).
+        _doomed_bins = []
+        if _gate_peaks:
+            _floor_gate = float(np.median(_psd_gate))
+            _fres_gate0 = a.rate / 4096.0
+            _live_peaks = [_pk for _pk in _gate_peaks
+                           if not _gate_peak_doomed(_pk, _fres_gate0, _floor_gate)]
+            _n_doomed = len(_gate_peaks) - len(_live_peaks)
+            if _n_doomed:
+                _dropped = [_pk for _pk in _gate_peaks if _pk not in _live_peaks]
+                _doomed_bins = [float(_pk[0]) for _pk in _dropped]
+                if _lrec is not None:
+                    _ledger.removed(_lrec, 'doomed', _dropped)
+                _gate_peaks = _live_peaks
+                _gate_doomed['peaks'] += _n_doomed
+                _gate_doomed['windows'] += 1
+        if (_gate_doomed['peaks'] and a.debug >= 1
+                and time.monotonic() - _gate_doomed['reported'] >= 60.0):
+            print(f"[GATE] dropped {_gate_doomed['peaks']} spur-width peak(s) "
+                  f"over {_gate_doomed['windows']} window(s) before the cap "
+                  f"(strong, narrower than {MIN_LORA_BW_HZ / SC_WIDTH_RATIO / 1e3:.1f} kHz)",
+                  file=sys.stderr, flush=True)
+            _gate_doomed.update(peaks=0, windows=0, reported=time.monotonic())
         if len(_gate_peaks) > _cap_eff:
             _gate_peaks.sort(key=lambda p: -p[2])
             _n_shed = len(_gate_peaks) - _cap_eff
+            if _lrec is not None:
+                _ledger.removed(_lrec, 'shed', _gate_peaks[_cap_eff:])
             _gate_peaks = _gate_peaks[:_cap_eff]
             print(f"[GATE-THROTTLE] shed {_n_shed} weakest candidate peak(s) "
                   f"(cap {_cap_eff})", file=sys.stderr, flush=True)
@@ -9802,22 +11327,30 @@ def main():
         # weak/far signals that would despread fine), giving dedicated-narrowband-
         # receiver sensitivity.  No false-positive risk: dechirp + CRC reject empty
         # windows; cost bounded by the cap.  ADDITIVE — non-channel peaks untouched.
-        if _dechirp_src and not _win_backlogged:
+        _configured_chans, _coverage_rejected = _covered_dechirp_channels(
+            [(_c-_live_center_mhz*1e6, _s, _b) for _c,_b,_s in _dechirp_src],
+            _live_center_mhz*1e6, a.rate)
+        _covered_dechirp_src = [(_live_center_mhz*1e6+_o, _b, _s)
+                                for _o,_s,_b in _configured_chans]
+        if _covered_dechirp_src and not _win_backlogged:
             _fres_gate = a.rate / 4096.0
             _cen_hz = _live_center_mhz * 1e6
-            for _cc, _bw_hz, _csf in _dechirp_src:
+            for _cc, _bw_hz, _csf in _covered_dechirp_src:
                 _cbin = 2048 + int(round((_cc - _cen_hz) / _fres_gate))
-                if 0 <= _cbin < 4096 and not any(abs(_pk[0] - _cbin) < 15 for _pk in _gate_peaks):
+                if (0 <= _cbin < 4096 and not any(abs(_pk[0] - _cbin) < 15 for _pk in _gate_peaks)
+                        and not any(abs(_db - _cbin) < 15 for _db in _doomed_bins)):
                     _wbins = max(3, int(round(_bw_hz / _fres_gate)))
                     # carry the channel's REAL PSD value (not a placeholder) so the
                     # spur-reject / power ordering downstream treat it correctly
                     _gate_peaks.append((_cbin, _wbins, float(_psd_gate[_cbin]), float(np.median(_psd_gate))))   # forced; dechirp decides
+                    if _lrec is not None:
+                        _ledger.forced(_lrec, 1)
             # Fix #3 (per-channel compute): a strong signal's sidelobes each fall within
             # ±bw of a channel and would EACH fire the expensive forced dechirp + decode.
             # Keep only the peak NEAREST each channel centre (the carrier); drop the
             # in-channel sidelobes so the dechirp runs ONCE per channel.  Peaks OUTSIDE
             # the learned channels (wideband discovery) are untouched.
-            for _cc, _bw_hz, _csf in _dechirp_src:
+            for _cc, _bw_hz, _csf in _covered_dechirp_src:
                 _cbin = 2048 + int(round((_cc - _cen_hz) / _fres_gate))
                 _w = max(1, int(round(_bw_hz / _fres_gate)))
                 _in = [_pk for _pk in _gate_peaks if abs(_pk[0] - _cbin) < _w]
@@ -9863,6 +11396,25 @@ def main():
                         continue                    # futility cooldown: this
                                                     # bin burned a full futile
                                                     # cycle with zero confirms
+                    if sum(1 for _qb0 in _pat_cooldown
+                           if abs(_cb - _qb0) <= 205) >= 2:
+                        # REGION FUTILITY (2026-10-31): a wandering junk
+                        # source re-earns promotion at a new bin every
+                        # cycle — the per-bin cooldown (±29 kHz) never
+                        # catches it.  Live: carriers at 916.3-917.4 MHz
+                        # were promoted, burned 12 futile windows, retired
+                        # and replaced by a neighbour 20-40 times per run,
+                        # holding all 4 slots; the forced dechirps drove the
+                        # budget cap from 24 to 10 peaks per window and the
+                        # gate shed 10-30 peaks per window — one first
+                        # transmission was detected 2.5 s late and one not
+                        # at all (its retransmission was).  Two futile
+                        # carriers within ±500 kHz (the "detected normally"
+                        # neighbourhood) make the region junk until their
+                        # cooldowns lapse.  Real traffic there still decodes
+                        # through the main path, and a decode confirm lifts
+                        # nearby cooldowns as before.
+                        continue
                     if any(abs(_cb - _db0) <= 205 and wc - _dwc0 <= 600
                            for _db0, _dwc0 in _pat_det_bins.items()):
                         continue                    # being detected normally
@@ -9875,7 +11427,7 @@ def main():
                         continue                    # CW/continuous — not a beacon
                     if any(abs((_cc0 - _cen_pat) / _fres_pat + 2048 - _cb)
                            < max(3.0, _bw0 / _fres_pat)
-                           for _cc0, _bw0, _sf0 in _dechirp_src):
+                           for _cc0, _bw0, _sf0 in _covered_dechirp_src):
                         continue                    # a channel already covers it
                     _lo = max(0, _cb - 4); _hi = min(4096, _cb + 5)
                     _wv = _pat_hits[_lo:_hi].astype(np.float64)
@@ -9890,6 +11442,22 @@ def main():
                           % (_phz / 1e6, float(_pat_hits[_cb]),
                              int(_duty * 100), len(_pat_promoted), PATIENCE_CAP),
                           file=sys.stderr, flush=True)
+        # Partition this window's rotating rungs before adding placeholders.
+        # A narrower covered rung survives even if its wider alias cannot be
+        # received; that same feasible family travels to capture and decode.
+        _patience_chans = []
+        if _pat_promoted and not _win_backlogged:
+            _cen_pat = _live_center_mhz * 1e6
+            for _pi, (_pb, (_pexp, _phz)) in enumerate(_pat_promoted.items()):
+                for _k in range(PATIENCE_TRIALS_PER_WIN):
+                    _tsf, _tbw = PATIENCE_TRIALS[
+                        (wc * PATIENCE_TRIALS_PER_WIN + _pi + _k)
+                        % len(PATIENCE_TRIALS)]
+                    _patience_chans.append((_phz - _cen_pat, _tsf, _tbw, True))
+        _patience_chans, _patience_uncovered = _covered_dechirp_channels(
+            _patience_chans, _live_center_mhz*1e6, a.rate)
+        _coverage_rejected.extend(_patience_uncovered)
+        _covered_patience_offsets = {_channel[0] for _channel in _patience_chans}
         # Forced peak per active promotion, every window (mirrors the
         # channelizer force above; 125 kHz width placeholder — the per-peak
         # pipeline measures the real width/preset itself).
@@ -9897,9 +11465,12 @@ def main():
             _fres_pat = a.rate / 4096.0
             _cen_pat = _live_center_mhz * 1e6
             for _pb, (_pexp, _phz) in _pat_promoted.items():
+                if _phz-_cen_pat not in _covered_patience_offsets:
+                    continue  # real energy peaks remain available to ordinary SC
                 _cbin = 2048 + int(round((_phz - _cen_pat) / _fres_pat))
                 if (0 <= _cbin < 4096
-                        and not any(abs(_pk[0] - _cbin) < 15 for _pk in _gate_peaks)):
+                        and not any(abs(_pk[0] - _cbin) < 15 for _pk in _gate_peaks)
+                        and not any(abs(_db - _cbin) < 15 for _db in _doomed_bins)):
                     _gate_peaks.append((_cbin,
                                         max(3, int(round(125e3 / _fres_pat))),
                                         float(_psd_gate[_cbin]),
@@ -9912,27 +11483,22 @@ def main():
         # the plain SC chain and the promotion is pointless below ~+2 dB.
         # Rebuilt every window; handed to BOTH detect paths (pool dispatch
         # carries it per-task so live channel changes reach the workers too).
-        _win_chans = [(_c - _live_center_mhz * 1e6, _s, _b)
-                      for (_c, _b, _s) in _dechirp_src]
-        if _pat_promoted and not _win_backlogged:
-            _cen_pat = _live_center_mhz * 1e6
-            for _pi, (_pb, (_pexp, _phz)) in enumerate(_pat_promoted.items()):
-                for _k in range(PATIENCE_TRIALS_PER_WIN):
-                    _tsf, _tbw = PATIENCE_TRIALS[
-                        (wc * PATIENCE_TRIALS_PER_WIN + _pi + _k)
-                        % len(PATIENCE_TRIALS)]
-                    _win_chans.append((_phz - _cen_pat, _tsf, _tbw, True))
+        _win_chans = _configured_chans + _patience_chans
+        for _excluded in _coverage_rejected:
+            _coverage_counts[_excluded['source']] += 1
+        _coverage_total += len(_coverage_rejected)
+        if _coverage_rejected:
+            _coverage_representative = _coverage_rejected[0]
+        if (_coverage_total != _coverage_reported
+                and time.monotonic()-_coverage_report_at >= 5.0):
+            _report_dechirp_coverage(_coverage_representative, _coverage_total,
+                                    _coverage_counts, 'main')
+            _coverage_reported = _coverage_total
+            _coverage_report_at = time.monotonic()
 
-        # Try to release ONE deferred straggler for a big-budget re-decode.  Drive
-        # this off the decode system's ACTUAL idle state — maybe_release_straggler
-        # self-gates on (slow queue non-empty AND fast queue empty AND nothing
-        # decoding) — NOT off the gate's per-window peak count.  Peak count was a
-        # broken proxy for "idle": at high gain find_peaks returns spur peaks every
-        # window, so the old `if not has_energy` guard was never true and the slow
-        # queue never drained (observed: 4 SF11 stragglers stuck indefinitely while
-        # the gate sat with no real traffic).  Realtime stays protected by the
-        # _gate_stress throttle, which pauses the heavy re-decode if the gate starts
-        # dropping samples; this call itself is just a few cheap checks.
+        # Offer deferred work a turn every window, including under sustained
+        # traffic. The scheduler limits it to one reservation, uses a fast-job
+        # quota, and blocks release while ring pressure or gate stress is high.
         if decoder is not None:
             decoder.maybe_release_straggler()
         if decoder and is_live and (wc & 3) == 0:
@@ -10106,6 +11672,9 @@ def main():
             if _skip_win:
                 _hyb_skipped += 1
                 _seq += 1            # the gap the tail builder honours
+                if _lrec is not None:
+                    _ledger.dispatched(_lrec, _gate_peaks, 'skipped', _cap_eff)
+                    _ledger.write(_lrec)
             else:
                 _slot = _pool.acquire_slot()
                 if _lz is not None and buf is None:
@@ -10117,9 +11686,14 @@ def main():
                 _pool.slot_array(_slot)[:len(buf)] = buf
                 _pool.dispatch(_slot, _seq, len(buf), _psd_gate, _gate_peaks,
                                spur_db=_spur_db, center=_live_center_mhz,
-                               dechirp_chans=(_win_chans or None))
+                               dechirp_chans=_win_chans)
+                if _lrec is not None:
+                    _ledger.dispatched(_lrec, _gate_peaks, 'pool', _cap_eff)
                 _inflight.append({'seq': _seq, 'slot': _slot,
-                                  'pre_hop': pre_hop, 'tot_s': tot_s})
+                                  'pre_hop': pre_hop, 'tot_s': tot_s,
+                                  'ledger': _lrec,
+                                  'history_anchor': (reader.history_anchor(tot_s)
+                                      if is_live else None)})
                 _seq += 1
                 # Tail-aware commit: once depth exceeds the base lag, commit the
                 # oldest ONLY when its detection is ready AND enough trailing windows
@@ -10158,10 +11732,14 @@ def main():
                 # and patience placeholders were all appended above, so any
                 # of them firing lands in _gate_peaks and takes the else.
                 dets = []
+                if _lrec is not None:
+                    _ledger.dispatched(_lrec, _gate_peaks, 'quiet', _cap_eff)
+                    _ledger.write(_lrec)
             else:
                 if _lz is not None and buf is None:
                     # MATERIALIZATION TRIGGER (inline detect): peaks exist
                     buf = _lz.materialize()
+                _l_out = [] if _lrec is not None else None
                 dets = detect_preamble(buf, a.rate, a.bandwidth,
                                        _live_center_mhz,
                                        sc_threshold=a.threshold,
@@ -10172,7 +11750,13 @@ def main():
                                        debug=a.debug,
                                        cached_psd=_psd_gate,
                                        cached_peaks=_gate_peaks,
-                                       dechirp_chans=(_win_chans or None))
+                                       dechirp_chans=(_win_chans or None),
+                                       outcomes=_l_out)
+                if _lrec is not None:
+                    _ledger.dispatched(_lrec, _gate_peaks, 'inline', _cap_eff)
+                    _ledger.outcomes(_lrec, _l_out)
+                    _ledger.write(_lrec)
+                dets = _onair_filter(dets, tot_s / a.rate, 'inline')
             dt = time.time() - tw; elapsed = time.time() - t_start
             _prof['detect'] += dt
             if is_live and _bgt['margin'] > 0.0:
@@ -10218,18 +11802,11 @@ def main():
                 # feed_tail() below completes it from the hops the loop
                 # processes anyway — identical samples, zero stall, and
                 # capture length no longer depends on pipeline speed.
-                _max_pkt_s = max(
-                    148.25 * patience_cap_params(d)[1] for d in dets)
-                # Cap = min(airtime, 24*win_n) (UC audit p).  Was
-                # min(airtime, 3*win_n, ring/2) — a stale blocking-read-era
-                # bound that truncated every frame past ~4.5 s (SF12/62.5k =
-                # 9.7 s, SF12/125k = 4.9 s) to a decoded header + cut payload.
-                # The deferred tail accumulates from LOOP HOPS (refs), not ring
-                # reads, so the ring/2 bound never applied; the slow-pass path
-                # already raised to 24*win_n for exactly this reason.  NB-mode
-                # crops each hop to KB as it arrives, so the longer pending job
-                # is tiny (and still bounded by the 3-job cap).
-                _max_tail_n = min(int(_max_pkt_s * a.rate), 24 * win_n)
+                # Only the streaming NB path receives the larger allowance.
+                # LORA_NO_DEFER remains a bounded blocking wideband read.
+                _max_tail_n = _capture_tail_n(
+                    recorder, dets, win_n,
+                    allow_nb=not bool(os.environ.get('LORA_NO_DEFER')))
                 if os.environ.get('LORA_NO_DEFER'):
                     # owned: the tail is retained as _carry_tail across the
                     # next read (and can become `buf` via iq[-win_n:])
@@ -10266,6 +11843,11 @@ def main():
                 _max_pkt_s = max(
                     148.25 * patience_cap_params(d)[1] for d in dets)
                 _max_tail_n = min(int(_max_pkt_s * a.rate), 3 * win_n)
+                _wanted = max(_capture_duration_s(d) for d in dets) * a.rate
+                if _max_tail_n < _wanted:
+                    print('[CAPTURE-LIMIT] blocking file tail retains its '
+                          'legacy bound; long frames may be truncated',
+                          file=sys.stderr, flush=True)
                 if _max_tail_n > 0:
                     # owned: retained as _carry_tail across the next read
                     # (and can become `buf` via iq[-win_n:])
@@ -10325,7 +11907,7 @@ def main():
         if recorder:
             _t_feed0 = time.time()
             recorder._dbg_tot_s = tot_s
-            recorder.feed_tail(_hop_own)
+            recorder.feed_tail(_hop_own, sample_pos=tot_s)
             _prof['feed'] += time.time() - _t_feed0
         _t_slowblk0 = time.time()
         _slow_tick += 1
@@ -10335,26 +11917,21 @@ def main():
                                     / (a.rate / 4096.0))) + 2048)
         _floor_gate_db = float(np.median(_psd_gate))
         _new_seeds = {}
-        for _p in _gate_peaks:
+        for _p in _slow_observed_peaks:
             # PEAK-RELATIVE narrowness: the gate's contour width is floor-
             # relative and useless for strong signals (a 55 dB same-room
             # SF12/31.25k beacon spans 1.1 MHz at floor+6 via its phase-
             # noise skirt — it was dismissed as 'wide' while its -41 dB IQ
             # image seeded instead). A narrow signal is narrow at
             # PEAK-12 dB at any strength: 31.25/41.67k span 7-9 bins
-            # there, 125 kHz spans ~26. Bound: 16 bins (78 kHz).
+            # there, 125 kHz spans ~26 at 20 Msps. Scale the original
+            # 16-bin allowance up at lower sample rates so its physical
+            # width does not shrink (10 Msps needs 32 bins, not 16).
             _b0 = int(_p[0])
             if not (2 <= _b0 <= 4093):
                 continue
-            _pkdb = float(_psd_gate[_b0-2:_b0+3].max())
-            _wthr = max(_pkdb - 12.0, _floor_gate_db + 6.0)
-            _lo_w = _b0
-            while _lo_w > 0 and _psd_gate[_lo_w-1] > _wthr:
-                _lo_w -= 1
-            _hi_w = _b0
-            while _hi_w < 4095 and _psd_gate[_hi_w+1] > _wthr:
-                _hi_w += 1
-            if _hi_w - _lo_w + 1 > 16:
+            if not _slow_seed_is_narrow(_psd_gate, _b0, a.rate,
+                                        _floor_gate_db):
                 continue                      # not narrow at peak-12
             if _p[2] - _floor_gate_db < 10.0:
                 continue                      # ambient-junk strength — slow
@@ -10444,24 +12021,59 @@ def main():
         # scan was < _SLOW_MIN_TICKS ago or the ring says the gate is behind.
         # Deferrals keep _slow_pending intact so the trigger refires.
         _slow_rate_ok = True
+        _slow_admit_reason = 'unbounded'
+        _slow_unfinished = _slow_free = -1
+        _slow_backlog_s = -1.0
         if _fire and _SLOW_MIN_TICKS and len(_slow_halves) == 8:
+            # Refresh AFTER this window's dispatch/commits. The main peak cap
+            # also counts completed slots retained for capture tails, which
+            # are not unfinished detector work. At its ordinary floor, allow
+            # one bounded scan only when a worker AND a slot are available
+            # and unread IQ is below one hop. Keep the peak throttle intact.
+            if _pool is not None:
+                _slow_unfinished = sum(
+                    1 for _it in _inflight if not _pool.ready(_it['seq']))
+                _slow_free = _pool.n_free()
+            _slow_avail = reader.available() if is_live else 0
+            _slow_backlog_s = _slow_avail / float(a.rate)
+            _slow_admit_reason = 'normal'
             if _slow_tick - _slow_last_fire < _SLOW_MIN_TICKS:
                 _slow_rate_ok = False
-            elif (is_live
-                  and reader.available() / float(_ring_n_total) > 0.3):
+                _slow_defer_reason = 'spacing'
+            elif is_live and _slow_avail / float(_ring_n_total) > 0.3:
                 _slow_rate_ok = False
-            elif is_live and _bgt['cap_last'] <= _BUDGET_CAP_FLOOR:
-                # Budget clamp at its floor: the workers are already the
-                # deficit, and this scan (concat + detect_preamble over a
-                # 4 s assembly, 45 % of the gate process's CPU on a Pi 5
-                # under a spur comb) runs in the SAME process.  Triggers
-                # stay pending and fire once the cap recovers.
+                _slow_defer_reason = 'ring'
+            elif is_live and _cap_eff <= _BUDGET_CAP_FLOOR:
+                if (_cap_eff == _BUDGET_CAP_FLOOR and _cap_eff >= 2
+                        and _bgt.get('emergency', 0) == 0
+                        and _pool is not None
+                        and _slow_unfinished < a.detect_workers
+                        and _slow_free > 0 and _slow_avail < hop_n):
+                    _slow_admit_reason = 'floor-spare'
+                else:
+                    _slow_rate_ok = False
+                    _slow_defer_reason = 'budget'
+            if _slow_rate_ok and _slow_busy[0]:
                 _slow_rate_ok = False
+                _slow_defer_reason = 'busy'
             if not _slow_rate_ok and os.environ.get('LORA_SLOW_DEBUG'):
                 print(f"[SLOW] rate-bound defer tick={_slow_tick} "
-                      f"(last={_slow_last_fire})", file=sys.stderr)
+                      f"(last={_slow_last_fire}) reason={_slow_defer_reason} "
+                      f"cap_eff={_cap_eff} cap_last={_bgt['cap_last']} "
+                      f"unfinished={_slow_unfinished} free_slots={_slow_free} "
+                      f"backlog_s={_slow_backlog_s:.3f} "
+                      f"emergency={_bgt.get('emergency', 0)}",
+                      file=sys.stderr)
         if (_fire and len(_slow_halves) == 8 and not _slow_busy[0]
                 and _slow_rate_ok):
+            if os.environ.get('LORA_SLOW_DEBUG'):
+                print(f"[SLOW-ADMIT] tick={_slow_tick} seeds={len(_fire)} "
+                      f"reason={_slow_admit_reason} "
+                      f"cap_eff={_cap_eff} cap_last={_bgt['cap_last']} "
+                      f"unfinished={_slow_unfinished} free_slots={_slow_free} "
+                      f"backlog_s={_slow_backlog_s:.3f} "
+                      f"emergency={_bgt.get('emergency', 0)}",
+                      file=sys.stderr)
             _slow_last_fire = _slow_tick
             _slow_pending.clear()
             # parts refs only — the 640 MB concat happens IN THE THREAD
@@ -10470,10 +12082,15 @@ def main():
             _trig_bg = list(_fire)
             _seedpk_bg = [(float(_b), 13, 20.0, None) for _b in _trig_bg]
             _regpos_bg = tot_s
+            # Retain identity even if a carry makes the sample clocks
+            # disagree; registration validates the mapping before recovery.
+            _history_bg = reader.history_anchor() if is_live else None
+            _center_bg = _live_center_mhz
             _slow_busy[0] = True
 
             def _slow_scan_bg(_hv=_halves_bg, _spk=_seedpk_bg,
-                              _tg=_trig_bg, _rp=_regpos_bg):
+                              _tg=_trig_bg, _rp=_regpos_bg,
+                              _ha=_history_bg, _center=_center_bg):
                 # BACKGROUND slow scan (0.5-0.6 s of FFT work): ran on the
                 # main loop before and, stacked with p90 read+dispatch,
                 # pushed iterations past the 500 ms hop budget -> ring
@@ -10489,7 +12106,7 @@ def main():
                     _iql = np.concatenate(_hv)   # off-loop
                     try:
                         _ds = detect_preamble(
-                            _iql, a.rate, a.bandwidth, _live_center_mhz,
+                            _iql, a.rate, a.bandwidth, _center,
                             sc_threshold=a.threshold,
                             ethresh=a.energy_threshold,
                             spur_db=_spur_db, dc_notch_mhz=a.dc_notch,
@@ -10502,7 +12119,7 @@ def main():
                         print(f"[SLOW-SCAN] {time.time() - _t0:.2f}s "
                               f"seeds={len(_tg)} hits={len(_ds or [])} (bg)",
                               file=sys.stderr, flush=True)
-                    _slow_results.put((_ds or [], _iql, _rp, _tg))
+                    _slow_results.put((_ds or [], _iql, _rp, _tg, _ha))
                 except Exception as _se:
                     print(f"[SLOW-SCAN] bg scan failed: {_se!r}",
                           file=sys.stderr, flush=True)
@@ -10525,7 +12142,11 @@ def main():
         if _slow_hold and recorder:
             _due = [h for h in _slow_hold if h[0] <= _slow_tick]
             _slow_hold = [h for h in _slow_hold if h[0] > _slow_tick]
-            for _dl, _dets_h, _iql_h, _rts_h in _due:
+            for _dl, _dets_h, _iql_h, _rts_h, _ha_h in _due:
+                if _source_before_retune(_ha_h):
+                    print('[RETUNE] discarded old held slow capture',
+                          file=sys.stderr, flush=True)
+                    continue
                 _keep_h = []
                 for d in _dets_h:
                     _da = (_rts_h - len(_iql_h)) / a.rate + d.get('preamble_t_s', 0.0)
@@ -10537,10 +12158,18 @@ def main():
                     if not _dup:
                         _keep_h.append(d)
                 if _keep_h:
-                    _record_slow(_keep_h, _iql_h, _rts_h)
+                    _record_slow_capture(
+                        recorder, _keep_h, _iql_h, _rts_h, sample_pos=tot_s,
+                        hop_n=hop_n, win_n=win_n, recent_hops=_slow_halves,
+                        history_reader=reader if is_live else None,
+                        history_anchor=_ha_h)
         # consume finished background scans (bookkeeping on main thread)
         while not _slow_results.empty():
-            dets_slow, _iq_long, _reg_tot_s, _trig_done = _slow_results.get()
+            dets_slow, _iq_long, _reg_tot_s, _trig_done, _history_done = _slow_results.get()
+            if _source_before_retune(_history_done):
+                print('[RETUNE] discarded old slow result',
+                      file=sys.stderr, flush=True)
+                continue
             _hit_bins = set()
             _hit_cool = {}       # hit bin -> post-hit cooldown (ticks)
             for d in dets_slow:
@@ -10602,6 +12231,8 @@ def main():
                         _slow_backoff[_bk] = _bo
                         _slow_seeds[_bk] = -_bo
             if dets_slow:
+                dets_slow = _onair_filter(dets_slow, (_reg_tot_s - len(_iq_long)) / a.rate, 'slow')
+            if dets_slow:
                 for d in dets_slow:
                     _pat_note_detection(d['freq_hz'])
                     _jk_note_detection(d['freq_hz'])
@@ -10614,54 +12245,6 @@ def main():
                           f"pwr={d['peak_power_db']:.1f}dB "
                           f"abst={_abst:.2f}s [slow-pass]",
                           flush=True)
-                def _record_slow(_dets, _iql, _rts):
-                        _slow_pkt_s = max(
-                            (148.25 * (2 ** d['sf']) / d['bw']) for d in _dets)
-                        # 24-window cap, not 12: SF12/31.25k frames run up to
-                        # ~19.4 s and the 12 s cap GUARANTEED truncation (the
-                        # soak's zero-decode wall for every >=9 s-airtime
-                        # preset). Deferred tails accumulate from loop hops —
-                        # NOT ring reads — so the old ring/2 bound does not
-                        # apply to the live path.
-                        _slow_tail_n = min(int(_slow_pkt_s * a.rate),
-                                           24 * win_n)
-                        # DEFERRED IN BOTH MODES: the file-mode blocking read
-                        # CONSUMED stream the loop would otherwise process —
-                        # every long-frame tail literally ate the next
-                        # beacon's windows (12-window tails halved straddler
-                        # detections; 24 made it worse). feed_tail() runs
-                        # unconditionally below, so pending jobs complete
-                        # from the hops in either mode.
-                        # ASYNC-SCAN GAP FILL: hops that streamed while the
-                        # background scan ran are still in _slow_halves —
-                        # hand them to the job so the base abuts the first
-                        # feed_tail hop (they were silently MISSING before:
-                        # 0.5-1.0 s hole at every live slow capture's seam).
-                        _gap_n = tot_s - _rts
-                        _gap_parts = None
-                        _reg_pos = _rts
-                        if _gap_n > 0 and hop_n > 0:
-                            _k = int(_gap_n) // hop_n
-                            if (_k * hop_n == _gap_n
-                                    and 0 < _k <= len(_slow_halves)):
-                                _gap_parts = list(_slow_halves)[-_k:]
-                                _reg_pos = tot_s
-                                _slow_tail_n = max(0, _slow_tail_n
-                                                   - _k * hop_n)
-                            else:
-                                # catchup/discontinuity between snapshot and
-                                # registration — cannot fill seamlessly; the
-                                # tail would splice. Register with the base
-                                # only and let it truncate.
-                                print(f"         [SLOW-GAP] unfillable gap "
-                                      f"{_gap_n} samples — truncated base "
-                                      f"capture", flush=True)
-                                _slow_tail_n = 0
-                        recorder.update_deferred(_dets, _iql,
-                                                 _reg_pos, pre_hop=None,
-                                                 need_tail_n=_slow_tail_n,
-                                                 owned_buf=True,
-                                                 gap_parts=_gap_parts)
                 if recorder:
                     # The slow pass exists for the 31.25k/41.67k presets; its
                     # alias-chain vote may still resolve a wider class and then
@@ -10670,18 +12253,27 @@ def main():
                     # recorder cannot know it is a copy yet.  Live: 17 of 96
                     # detections, 23-25 SF12/125k decode jobs for 3 frames, the
                     # off-centre copies 30-50 s each.  Slow-class hits record
-                    # now; any other class is HELD commit-lag + 6 hops (the
+                    # now, including modes whose 16-symbol gate exceeds the
+                    # main window. Other classes are HELD commit-lag + 6 hops (the
                     # main pass commits _LAG hops late and its tail assembly
                     # adds a few more — measured 2-5 s behind the slow pass)
                     # and recorded only if the main pass has not claimed the
                     # same label within +-bw and 1.5 s by then.
-                    _slow_now = [d for d in dets_slow if int(d['bw']) in (31250, 41667)]
-                    _slow_later = [d for d in dets_slow if int(d['bw']) not in (31250, 41667)]
+                    _slow_now = [d for d in dets_slow
+                                 if _slow_record_immediately(d, win_n / a.rate)]
+                    _slow_later = [d for d in dets_slow
+                                   if not _slow_record_immediately(d, win_n / a.rate)]
                     if _slow_now:
-                        _record_slow(_slow_now, _iq_long, _reg_tot_s)
+                        _record_slow_capture(
+                            recorder, _slow_now, _iq_long, _reg_tot_s,
+                            sample_pos=tot_s, hop_n=hop_n, win_n=win_n,
+                            recent_hops=_slow_halves,
+                            history_reader=reader if is_live else None,
+                            history_anchor=_history_done)
                     if _slow_later:
                         _slow_hold.append((_slow_tick + min(_LAG + 6, _slow_halves.maxlen),
-                                           _slow_later, _iq_long, _reg_tot_s))   # gap fill needs <= maxlen hops
+                                           _slow_later, _iq_long, _reg_tot_s,
+                                           _history_done))
         _prof['slow'] += time.time() - _t_slowblk0
         _t_step = time.time()
 
@@ -10703,6 +12295,7 @@ def main():
             if avail > int(0.8 * _ring_n):
                 skipped_ahead = reader.skip_to_latest(win_n)
                 if skipped_ahead > 0:
+                    _slow_halves.clear()
                     tot_skip += skipped_ahead
                     skip_s = skipped_ahead / a.rate
                     print(f"[{elapsed:6.1f}s] CATCHUP skip {skipped_ahead/1e6:.1f}M "
@@ -10849,38 +12442,48 @@ def main():
 
     except KeyboardInterrupt:
         pass
+    except BaseException:
+        _abort_failed_pipeline(_pool, decoder, recorder)
+        raise
 
-    # Drain any in-flight multiprocess-detect windows (commit them to the
-    # recorder), then shut the detect pool down.
-    if _pool is not None:
-        while _inflight:
-            _commit_oldest()
-        _pool.close()
+    try:
+        # Drain any in-flight multiprocess-detect windows (commit them to the
+        # recorder), then shut the detect pool down.
+        if _pool is not None:
+            while _inflight:
+                _commit_oldest()
+            _pool.close()
+        if _ledger is not None:
+            _ledger.close()
 
-    # Drain pending saves first (they submit to decoder), then drain decoder
-    if recorder:
-        pending_saves = recorder._save_queue.qsize()
-        if pending_saves > 0:
-            print(f"\nWaiting for {pending_saves} pending save(s)...",
-                  file=sys.stderr)
-        recorder.flush()
+        if recorder:
+            try:
+                recorder.flush_pending(wait=True)   # deferred tails: finalize
+                                           # (and crop) before the decoder
+                                           # drain so stragglers decode
+            except Exception:
+                pass
+            # Finalizing pending tails can enqueue NEW saves. Join those saves
+            # before testing decoder.pending(), or EOF can exit before their
+            # captures are submitted to the decoder.
+            pending_saves = recorder._save_queue.qsize()
+            if pending_saves > 0:
+                print(f"\nWaiting for {pending_saves} pending save(s)...",
+                      file=sys.stderr)
+            recorder.flush()
+        if decoder:
+            # Capture has ended (EOF) — move the deferred straggler queue into the
+            # fast queue so the workers re-decode them now (big budget), without
+            # having competed with the realtime gate during capture.
+            decoder.drain_slow_into_fast()
+            if decoder.pending() > 0:
+                print(f"\nWaiting for {decoder.pending()} pending decode(s)...",
+                      file=sys.stderr)
+                decoder.drain(timeout=3600.0)
 
-    if recorder:
-        try:
-            recorder.flush_pending(wait=True)   # deferred tails: finalize
-                                       # (and crop) before the decoder
-                                       # drain so stragglers decode
-        except Exception:
-            pass
-    if decoder:
-        # Capture has ended (EOF) — move the deferred straggler queue into the
-        # fast queue so the workers re-decode them now (big budget), without
-        # having competed with the realtime gate during capture.
-        decoder.drain_slow_into_fast()
-        if decoder.pending() > 0:
-            print(f"\nWaiting for {decoder.pending()} pending decode(s)...",
-                  file=sys.stderr)
-            decoder.drain(timeout=3600.0)
+    except BaseException:
+        _abort_failed_pipeline(_pool, decoder, recorder)
+        raise
 
     total_drops = reader.drops if is_live else 0
     _dec_summary = ''

@@ -72,6 +72,7 @@ def _worker_main(shm_names, win_n, task_q, result_q, params, cap_override=None):
         # main thread until one drains.  Truncating here (strongest peaks
         # first — the same shed-weakest rule the gate applies) or skipping
         # (-1) lets that backlog drain in milliseconds instead.
+        _co = 0
         if cap_override is not None and peaks:
             _co = cap_override.value
             if _co < 0:
@@ -93,7 +94,8 @@ def _worker_main(shm_names, win_n, task_q, result_q, params, cap_override=None):
                 kw['spur_db'] = spur_db
             _c = task_center if task_center is not None else center
             _t0 = time.perf_counter()
-            dets = L.detect_preamble(iq, wb_fs, wb_bw, _c, **kw)
+            _out = []
+            dets = L.detect_preamble(iq, wb_fs, wb_bw, _c, outcomes=_out, **kw)
             # Measured detect cost rides along with the result: the gate's
             # proactive peak-budget clamp needs the WORKER's wall time per
             # peak, not the ~15 ms the main loop spends dispatching (which it
@@ -105,9 +107,12 @@ def _worker_main(shm_names, win_n, task_q, result_q, params, cap_override=None):
             break   # shutdown SIGINT mid-detect — exit quietly
         except Exception as e:
             dets = []
-            result_q.put((seq, dets, 'ERR:%s' % e, None))
+            result_q.put((seq, dets, 'ERR:%s' % e, None, None))
             continue
-        result_q.put((seq, dets, None, _cost))
+        # The detect stage's per-peak verdicts ride along for the gate
+        # ledger, with the emergency cap the worker applied (if any).
+        result_q.put((seq, dets, None, _cost,
+                      {'peaks': _out, 'cap_override': _co if (cap_override is not None and peaks) else 0}))
 
     for s in shms:
         s.close()
@@ -115,6 +120,7 @@ def _worker_main(shm_names, win_n, task_q, result_q, params, cap_override=None):
 
 class DetectPool:
     def __init__(self, n_workers, n_slots, win_n, params):
+        self._aborted = False
         self.win_n = win_n
         self.n_slots = n_slots
         # Shared-memory slots, each holds one full window (complex64).
@@ -148,6 +154,7 @@ class DetectPool:
             p.start()
             self._workers.append(p)
         self._results = {}   # seq -> dets, filled as results arrive
+        self._outcomes = {}  # seq -> detect-stage verdicts (gate ledger)
         self._costs = []     # (detect_seconds, n_peaks) per finished window,
                              # drained by the gate's budget clamp
 
@@ -169,10 +176,12 @@ class DetectPool:
         # center (MHz) and dechirp_chans are passed per-task so a live
         # center-frequency change / live channel apply / patience trial takes
         # effect without re-spawning workers; None → use the spawn-time params.
+        if self._aborted:
+            raise RuntimeError('detect pool has been aborted')
         self._task_q.put((slot, seq, n, psd, peaks, spur_db, center,
                           dechirp_chans))
 
-    def _absorb(self, rseq, dets, err, cost=None):
+    def _absorb(self, rseq, dets, err, cost=None, outcomes=None):
         if err is not None:
             # Worker-side detect exceptions used to vanish silently (the
             # third tuple field was read and dropped): a systematic failure
@@ -181,6 +190,7 @@ class DetectPool:
             print(f"[POOL] worker error on window {rseq}: {err}",
                   file=sys.stderr, flush=True)
         self._results[rseq] = dets
+        self._outcomes[rseq] = outcomes
         if cost is not None:
             self._costs.append(cost)
 
@@ -223,6 +233,11 @@ class DetectPool:
             self._absorb(*_item)
         return self._results.pop(seq)
 
+    def outcomes(self, seq):
+        """The detect stage's per-peak verdicts for a window whose result()
+        was taken: {'peaks': [...], 'cap_override': n} or None."""
+        return self._outcomes.pop(seq, None)
+
     def ready(self, seq):
         """Non-blocking: drain any arrived results, return True if `seq` is done.
         Lets the gate make a tail-aware commit decision without blocking the
@@ -237,6 +252,61 @@ class DetectPool:
     def peek(self, seq):
         """Return `seq`'s dets without removing them (call after ready())."""
         return self._results.get(seq)
+
+    def abort(self, timeout=2.0):
+        """Failure-only discard of queued work; never wait on queue feeders."""
+        self._aborted = True
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        clean = True
+        # Consumers are about to stop. Joining a task feeder whose pipe is full
+        # would hang interpreter exit even after every worker has been reaped.
+        for q in (self._task_q, self._result_q):
+            try:
+                q.cancel_join_thread()
+                q.close()
+            except Exception:
+                clean = False
+        for worker in self._workers:
+            if worker.is_alive():
+                try:
+                    worker.terminate()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    clean = False
+        term_deadline = time.monotonic() + max(0.0, deadline-time.monotonic()) / 2
+        for worker in self._workers:
+            try:
+                worker.join(timeout=max(0.0, term_deadline-time.monotonic()))
+            except Exception:
+                clean = False
+        for worker in self._workers:
+            if worker.is_alive():
+                try:
+                    worker.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    clean = False
+        for worker in self._workers:
+            try:
+                worker.join(timeout=max(0.0, deadline-time.monotonic()))
+                clean = clean and not worker.is_alive()
+            except Exception:
+                clean = False
+        self._views.clear()
+        for memory in self._shms:
+            try:
+                memory.close()
+            except Exception:
+                clean = False
+            try:
+                memory.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                clean = False
+        return clean
 
     def close(self):
         for _ in self._workers:
