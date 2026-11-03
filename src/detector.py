@@ -6764,6 +6764,16 @@ class SignalRecorder:
                         # admitted packet (see BackgroundDecoder._bucket_hit).
                         _bkey = (_cand_freq, _abs_t_s, _ftol, _dt_win,
                                  int(d['sf']), float(d['bw']))
+                        # An early crop is one frame at a header-exact instant,
+                        # so its bucket always uses the per-frame airtime window:
+                        # never the 1.5 s forced-dechirp cooldown, which on a
+                        # channelised carrier would make a different packet a
+                        # second later look like a copy of the one just decoded.
+                        _bkey_early = (_cand_freq, _abs_t_s, _ftol,
+                                       max(0.03, 24.0 * (2 ** int(d['sf'])) / float(d['bw'])),
+                                       int(d['sf']), float(d['bw']))
+                        if _capture_role == 'early':
+                            _bkey = _bkey_early
                         # TRIAL LABEL LADDER (2026-07-16, defect-2 companion):
                         # the decoder locks SF/BW from the capture FILENAME —
                         # it can relabel SF at the same BW (WRONG_SF retry)
