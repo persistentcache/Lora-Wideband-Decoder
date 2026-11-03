@@ -161,3 +161,24 @@ def test_early_crop_sibling_is_released_when_its_twin_fails(dec, tmp_path):
     _, _, released = dec._queue.get_nowait()
     assert released is job2 and copy.exists()
 
+
+def test_a_skipped_early_crop_also_retires_its_held_full_sibling(dec, tmp_path):
+    """Early A verifies; early B of the same frame is skipped as a parked
+    sibling.  B's held full crop must be skipped as well, not released."""
+    a = capture(tmp_path, 'c_early_1.cf32', (915.0163e6, 100.0, 60e3, 0.1, 12, 62.5e3), dec,
+                role='early', frame_key=1)
+    b = capture(tmp_path, 'c_early_2.cf32', (915.0166e6, 100.01, 60e3, 0.1, 12, 62.5e3), dec,
+                role='early', frame_key=2)
+    full_b = tmp_path / 'c_full_2.cf32'; full_b.write_bytes(b'iq')
+    dec.submit(str(full_b), full_b.name, role='shared_full', frame_key=2)   # waits for early B
+    _, job_a = take(dec)
+    dec._mark_bucket_inflight(job_a[0])
+    prio_b, job_b = take(dec)
+    assert dec._park_sibling(job_b, prio_b, None)
+    assert dec._queue.empty() and dec.pending() == 2                      # B parked, full B held
+    dec._compact(mesh('0x12345678'), a.name, role='early')
+    dec._clear_bucket_inflight(job_a[0])                                  # A done: B skipped ...
+    assert dec._queue.empty() and dec._slow_queue.empty()
+    assert not b.exists() and not full_b.exists()                         # ... and so is full B
+    assert dec.pending() == 0 and not dec._full_hold
+

@@ -7886,6 +7886,7 @@ while True:
             if self._bucket_already_decoded(fpath):
                 self._rawlog('SKIP-PARKED', f"{fname} sibling verified")
                 if relay_after is None and relay_before is None:
+                    self._early_covered_by_sibling(fpath)
                     self._plain_done(fpath)
                 self._ref_dec_and_maybe_unlink(fpath)
                 continue
@@ -8112,6 +8113,18 @@ while True:
                     self._early_verified.add(_fk)
                     if len(self._early_verified) > 4000:
                         self._early_verified = set(list(self._early_verified)[-2000:])
+
+    def _early_covered_by_sibling(self, fpath):
+        """An early crop skipped because a same-bucket sibling already
+        published its frame counts as verified for its own full sibling:
+        otherwise the held full crop would be released and decode the frame
+        a second time (emulated SF10 2026-11-03: PARK -> SKIP-PARKED early,
+        then a 4 s FULL-RELEASE decode of the same frame)."""
+        with self._iso_lock:
+            _rf = self._fpath_frame.get(fpath)
+            if _rf is not None and _rf[0] == 'early':
+                self._early_verified.add(_rf[1])
+                self._verified_fnames[os.path.basename(fpath)] = time.monotonic()
 
     def _skip_full(self, fpath):
         """A full crop skipped for its verified early sibling: the file counts
@@ -8558,6 +8571,7 @@ while True:
                 if self._bucket_already_decoded(fpath):
                     self._rawlog('SKIP-BUCKET', os.path.basename(fpath))
                     if relay_after_syms is None and relay_before_syms is None:
+                        self._early_covered_by_sibling(fpath)
                         self._plain_done(fpath)
                     self._ref_dec_and_maybe_unlink(fpath)
                     if _slow_token is not None:
