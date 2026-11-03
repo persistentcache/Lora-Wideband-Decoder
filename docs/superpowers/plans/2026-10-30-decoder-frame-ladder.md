@@ -221,7 +221,48 @@ Twenty SF7/125k CR4/8 first transmissions through the live pipeline in the defau
 
 The decoder error seen once each in runs 12 and 13 is located and fixed: `_recenter_and_decode` returned `False` when the CPU budget ran out between recenter rungs, and its caller indexed the result as a span tuple. Under the pool's small slow-tier budgets that aborted the job; in run 12 the job was message 7's early capture, which is why that message waited 24 s for its full capture. It returns None now, and decoder tracebacks also go to stdout so the raw job log keeps them (the pool discards worker stderr).
 
+## Early-expect hold and the merge gate (b52d20e)
+
+The 5 Msps four-core emulation of the SF10/250k recording was the one case where the
+branch published later than old main (24.2 s default / 21.1 s plain against 14.3 s).
+The decode pool's FULL-HOLD only knew about an early crop once that crop was enqueued;
+on a slow host the full crop arrived first, was decoded in full, and the early crop then
+found a verified sibling and was skipped. `HeaderCaptureController` now reports
+`on_early_planned(frame)` the moment an early crop is planned, `DecodePool.expect_early`
+records it, and a full crop of that frame waits (bounded by `_EARLY_EXPECT_S = 10 s`, and
+released by the stale valve if the early crop never comes). Re-emulated with the same
+caps: default arm 13.2 s (old main 14.3 s). Four tests in `tests/test_iso_hold.py`.
+
+The merge gate itself (evidence under `Desktop/LoRa-Merge-Gate-20261102/`,
+`merge_gate_report.txt` assembled by `report.py`), old main 921afce against HEAD:
+
+- Corpus, 197 stored recordings, serial, alternating order: decode wall
+  min/median/mean/p95/max old 0.81/1.37/2.41/10.91/33.91 s, new 0.67/1.13/1.45/3.59/13.66 s;
+  total 476 -> 286 s (-40 %); recordings with a packet 183 -> 188; no lost output, five
+  gained; nothing slower by more than 1.25x and 0.5 s (two cases slower by ~0.4 s).
+- Impairments, 80 stored noise/drift captures: targets 78/80 -> 79/80, no lost output,
+  wall -14.6 %.
+- Emulated four-core Pi at 1.6 GHz, 5 and 10 Msps: old main missed the junk and diag
+  recordings at both rates and published SF12/250k at 77 s and 128 s; the branch's
+  default mode published every message (5 Msps 13.2-42.5 s, 10 Msps 19.8-46.9 s) with
+  zero sample loss. The branch's *plain* mode on that host is the one place a message
+  publishes later than old main: SF10/250k 21-28 s against 14.3 s. In isolation on one
+  1.6 GHz core the new decoder takes 2.9 s on the old 2025 ms plain capture and 3.5 s on
+  the new 3647 ms one (the worst-case frame bound from ebdbccd), so the gap is
+  scheduling contention when three copies of the frame decode together on four slow
+  cores, not decoder cost; plain mode is only chosen when the host cannot carry the
+  frame-exact budget.
+- Live, same evening, USRP + Heltec, 13-message ladder, two detector workers each:
+  old main decoded 10/13 and never saw the three SF12/62.5k long frames (its captures
+  of them were 4 s long); RF-end to decode-job 3.58/5.34/13.53 s min/median/max, 219
+  jobs totalling 1048 s, 13 worker errors, 51 crop-queue-full, dec_q up to 58, RSS up to
+  25.7 GiB. HEAD decoded 13/13, every message faster than old main's on the same
+  message: 1.58/2.74/3.65 s (publication 1.27/2.73/3.47 s), 114 jobs totalling 307 s,
+  no worker errors, dec_q max 5, RSS max 9.9 GiB, CRC audit 20/20.
+
 ## Ledger
+
+2026-11-03 (b52d20e + merge gate): early-expect hold; SF10/250k 5 Msps emulation 24.2 -> 13.2 s (old 14.3). Old-main live baseline `oldmain_live_20261103` (the `oldmain_live_20261102` attempt failed the harness receipt because `prepare.py` only pinned two detector workers when a profile was given; fixed in the harness) 10/13, misses the SF12/62.5k long frames; `ladder_live19_b52d20e` 13/13, 1.58-3.65 s. Full numbers in the section above and `Desktop/LoRa-Merge-Gate-20261102/merge_gate_report.txt`.
 
 2026-11-02 (49867ab): recenter budget returns None (`tests/test_decoder_recenter_budget.py`); SF7 stress run `Desktop/LoRa-SF7-Stress-20261102/run_20261102_212142` 20/20 first-attempt, 2.58-3.38 s; 984 tests.
 
