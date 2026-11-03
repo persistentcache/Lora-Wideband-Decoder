@@ -2647,6 +2647,71 @@ def _supervised_recycle(reason):
     return _supervised_restart(reason)
 
 
+# ---- Boot autostart (run/web.py --autostart, or LORA_AUTOSTART=1) ------------
+# The installed systemd unit (install.sh --install-service) launches the web
+# server at boot with this flag so the SDR pipeline starts by itself with the
+# saved settings (lora_web/web_settings.json: SDR, radio, protocols ...).
+# At boot the SDR often enumerates AFTER the service starts, and the
+# supervisor deliberately gives up after _SUP_MAX_ATTEMPTS so a broken config
+# cannot restart-storm.  Autostart therefore keeps trying on its own clock,
+# resetting that budget, until the detector has reported healthy telemetry
+# once ([STAT] stamps last_healthy_at) or the user presses Stop in the UI.
+AUTOSTART = {'pending': False, 'attempts': 0, 'cancelled': False}
+_AUTOSTART_FIRST_DELAY_S = 3.0      # let the server and USB settle
+_AUTOSTART_RETRY_S = 20.0
+
+
+def _autostart_tick(start=None):
+    """One autostart decision.  Returns 'started', 'failed', 'healthy',
+    'cancelled', 'running' (a launch is up, waiting for telemetry),
+    'supervised' (it died but the crash watcher is still retrying) or 'off'."""
+    start = start or start_pipeline
+    if not AUTOSTART['pending']:
+        return 'off'
+    if AUTOSTART['cancelled']:
+        AUTOSTART['pending'] = False
+        return 'cancelled'
+    if PIPELINE.get('last_healthy_at', 0.0) > 0.0:
+        AUTOSTART['pending'] = False
+        print('[AUTOSTART] pipeline healthy after %d attempt(s); handing over to '
+              'the supervisor' % AUTOSTART['attempts'], file=sys.stderr, flush=True)
+        return 'healthy'
+    proc = PIPELINE.get('proc')
+    if PIPELINE.get('running') and proc is not None and proc.poll() is None:
+        return 'running'
+    if (PIPELINE.get('want_running') and SETTINGS.get('auto_restart', True)
+            and PIPELINE.get('restart_attempts', 0) < _SUP_MAX_ATTEMPTS):
+        return 'supervised'      # the crash watcher is still inside its own budget
+    # Never launched, or the supervisor gave up: fresh budget, try again.
+    # Under the supervisor's lock so the crash watcher can never launch a
+    # second detector while this one is inside start_pipeline's settle sleep.
+    with _SUPERVISOR_LOCK:
+        PIPELINE['restart_attempts'] = 0
+        AUTOSTART['attempts'] += 1
+        try:
+            r = start(); ok = bool(r.get('ok')); err = r.get('error')
+        except Exception as e:          # keep retrying at boot whatever failed
+            ok, err = False, str(e)
+    print('[AUTOSTART] attempt %d: %s' % (AUTOSTART['attempts'],
+          'started' if ok else 'failed: %s' % err), file=sys.stderr, flush=True)
+    return 'started' if ok else 'failed'
+
+
+def _autostart_loop(sleep=time.sleep):
+    sleep(_AUTOSTART_FIRST_DELAY_S)
+    while AUTOSTART['pending']:
+        _autostart_tick()
+        sleep(_AUTOSTART_RETRY_S)
+
+
+def _autostart_cancel():
+    """A deliberate Stop from the UI ends the boot autostart; the service's
+    saved intent is otherwise honoured until the pipeline is healthy."""
+    if AUTOSTART['pending']:
+        AUTOSTART['cancelled'] = True
+        print('[AUTOSTART] cancelled by Stop', file=sys.stderr, flush=True)
+
+
 def stop_pipeline():
     # Intent OFF, FIRST — before the kill — so the watcher's crash path (and
     # any in-flight no-telemetry escalation) treats this deliberate teardown
@@ -3716,6 +3781,7 @@ def api_start():
 
 @app.route('/api/pipeline/stop', methods=['POST'])
 def api_stop():
+    _autostart_cancel()
     return jsonify(stop_pipeline())
 
 
@@ -4048,6 +4114,11 @@ def main():
     ap.add_argument('--debug-out', default=None,
                     help='Override --debug bundle file path (default: '
                          'lora_debug_<ts>.txt in the project root).')
+    ap.add_argument('--autostart', action='store_true',
+                    help='Start the SDR pipeline with the saved settings as soon '
+                         'as the server is up, retrying until it is healthy '
+                         '(what the installed systemd service uses; also '
+                         'enabled by LORA_AUTOSTART=1).')
     a = ap.parse_args()
     global CFG, DEBUG_BUNDLE_PATH
     CFG = load_config(a.config)
@@ -4103,6 +4174,11 @@ def main():
     _apply_unknown_flag()
     threading.Thread(target=_tail_health, daemon=True).start()
     threading.Thread(target=_tail_psd, daemon=True).start()
+    if a.autostart or os.environ.get('LORA_AUTOSTART', '') not in ('', '0'):
+        AUTOSTART.update(pending=True, attempts=0, cancelled=False)
+        print('lora_web: autostart on — the %s pipeline starts with the saved settings'
+              % SETTINGS.get('sdr', 'bladerf'), flush=True)
+        threading.Thread(target=_autostart_loop, daemon=True).start()
     _startup_line = (f"lora_web: config={CFG.get('_path')}  tailing={log_path}  "
                      f"serving http://{host}:{port}")
     if os.environ.get('LORA_DEBUG') == '1':

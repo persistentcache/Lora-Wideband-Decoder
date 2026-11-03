@@ -37,6 +37,23 @@ since the installer added you to `plugdev`), hit **Start**, and packets
 stream in live. The whole pipeline - SDR capture, detector, decoder -
 is launched from the web UI based on `lora.toml`.
 
+### Start at boot (optional)
+
+```bash
+./install.sh --install-service      # also accepts --installservice / --installautorun
+```
+
+installs and enables a systemd unit (`lora-wideband-decoder`) that runs the
+web UI at boot as your user and starts the SDR pipeline by itself with the
+settings last saved in the UI (SDR, centre frequency, rate, protocols, ...).
+Configure once in the UI, and from then on the receiver comes up on its own
+after a power cycle. If the SDR enumerates late the server keeps retrying
+until the pipeline reports healthy; pressing **Stop** in the UI ends that.
+`journalctl -u lora-wideband-decoder -f` shows the log,
+`sudo systemctl stop lora-wideband-decoder` releases the SDR, and
+`./install.sh --uninstall-service` removes the unit. `python3 run/web.py
+--autostart` does the same autostart without systemd.
+
 ## Supported SDRs
 
 | Device | Path | Notes |
