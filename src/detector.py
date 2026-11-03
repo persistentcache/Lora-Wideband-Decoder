@@ -334,6 +334,18 @@ SC_WIDTH_ELEV_DB = 15.0
 SC_WIDTH_RATIO = 2.5
 MIN_LORA_BW_HZ = 31_250.0
 
+# A same-slope detection this many dB weaker than a time-coincident kept one
+# is a receiver copy of it (intermod, spur mixing), not a second transmitter.
+# Measured copies sit 25-40 dB down; two real nodes on different channels
+# within one preamble span of each other and 20 dB apart are the cost.
+INTERMOD_COPY_DB = 20.0
+
+
+def _same_slope(a, b):
+    """Same chirp slope family: bw^2 / 2^sf equal (a preset and its
+    same-slope aliases, e.g. SF7/125k ~ SF9/250k ~ SF11/500k)."""
+    return abs(a['bw'] ** 2 / 2.0 ** a['sf'] - b['bw'] ** 2 / 2.0 ** b['sf']) < 1.0
+
 
 def _sc_width_admits(bw_hz, width_hz, elev_db):
     """True when a peak of this measured width and elevation may carry a
@@ -4460,6 +4472,37 @@ def detect_preamble(iq, wb_fs, wb_bw, center_mhz, sc_threshold=0.7,
                         and abs(_d['preamble_t_s'] - _k['preamble_t_s']) < 2.0
                         and abs((_d['freq_hz'] - _center_hz_arb)
                                 + (_k['freq_hz'] - _center_hz_arb)) < 30e3):
+                    _dup = True
+                    break
+                # INTERMOD / SPUR-MIXED COPY: a strong frame reappears at the
+                # receiver's spur carriers (live 2026-11-02: a +51 dB
+                # SF7/125k at 915.002 left a time-aligned chirp 25 dB down at
+                # 911.123, 3.88 MHz away on the 1 MHz spur grid; the junk
+                # capture's own IQ holds it).  The copy keeps the chirp
+                # slope, so a same-slope dechirp or SC at that carrier
+                # confirms it; the patience gate then had 100 such 29.6 s
+                # captures decoded on noise in one run.  A detection that
+                # starts when a kept one starts, shares its slope family
+                # (bw^2 / 2^sf: same preset or its aliases) and is at least
+                # INTERMOD_COPY_DB weaker is that copy, whatever its carrier.
+                _pdiff = _d.get('peak_power_db', 0.0) - _k.get('peak_power_db', 0.0)
+                if (abs(_d['preamble_t_s'] - _k['preamble_t_s'])
+                        < max(_span, _kspan)
+                        and _same_slope(_d, _k)
+                        and abs(_pdiff) >= INTERMOD_COPY_DB):
+                    # The order is by dechirp quality, and a clean copy can
+                    # outscore the frame it copies, so the weaker of the
+                    # pair goes whichever came first.
+                    _copy, _real = (_d, _k) if _pdiff < 0 else (_k, _d)
+                    if debug >= 1:
+                        print("  [GATE] intermod copy dropped: %.4fMHz SF%d/%dk %+.0fdB under "
+                              "%.4fMHz SF%d/%dk at t=%.0fms"
+                              % (_copy['freq_hz'] / 1e6, _copy['sf'], _copy['bw'] // 1000,
+                                 -abs(_pdiff), _real['freq_hz'] / 1e6, _real['sf'],
+                                 _real['bw'] // 1000, _copy['preamble_t_s'] * 1000),
+                              file=sys.stderr, flush=True)
+                    if _real is _d:
+                        _kept[_ki] = _d
                     _dup = True
                     break
             if not _dup:
