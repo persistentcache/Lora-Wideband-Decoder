@@ -6763,7 +6763,8 @@ class SignalRecorder:
                         # dedup can recognise same-slope ALIAS labels of an
                         # admitted packet (see BackgroundDecoder._bucket_hit).
                         _bkey = (_cand_freq, _abs_t_s, _ftol, _dt_win,
-                                 int(d['sf']), float(d['bw']))
+                                 int(d['sf']), float(d['bw']),
+                                 float(d.get('peak_power_db', 0.0) or 0.0))
                         # An early crop is one frame at a header-exact instant,
                         # so its bucket always uses the per-frame airtime window:
                         # never the 1.5 s forced-dechirp cooldown, which on a
@@ -6771,7 +6772,8 @@ class SignalRecorder:
                         # second later look like a copy of the one just decoded.
                         _bkey_early = (_cand_freq, _abs_t_s, _ftol,
                                        max(0.03, 24.0 * (2 ** int(d['sf'])) / float(d['bw'])),
-                                       int(d['sf']), float(d['bw']))
+                                       int(d['sf']), float(d['bw']),
+                                       float(d.get('peak_power_db', 0.0) or 0.0))
                         if _capture_role == 'early':
                             _bkey = _bkey_early
                         # TRIAL LABEL LADDER (2026-07-16, defect-2 companion):
@@ -7027,6 +7029,10 @@ class BackgroundDecoder:
         # so it's proven not to merge hop0/hop1.
         self._fname_bucket = {}          # fpath -> bucket_key tuple
         self._decoded_buckets = []       # list of bucket_key tuples (admitted)
+        # Buckets whose early crop read the header and failed every retry:
+        # parked copies of that instant skip instead of failing the same way
+        # (ladder 24: three copies of one corrupted SF12/62.5k frame, 98 s).
+        self._exhausted_buckets = []
         self._inflight_buckets = {}      # bucket_key -> dispatch_timestamp
         self._bucket_lock = threading.Lock()
         # ISO-HOLD (2026-10-31).  The time-isolated twin of a fast-SF primary
@@ -7779,6 +7785,24 @@ while True:
                     return True
         return False
 
+    def _bucket_exhausted(self, fpath):
+        """Has a capture in this RF bucket already read the frame's header and
+        failed its payload after every retry (see _early_exhausted_outcome)?"""
+        with self._bucket_lock:
+            bkey = self._fname_bucket.get(fpath)
+            if bkey is None:
+                return False
+            return any(self._bucket_hit(bkey, key) for key in self._exhausted_buckets)
+
+    def _mark_bucket_exhausted(self, fpath):
+        with self._bucket_lock:
+            bkey = self._fname_bucket.get(fpath)
+            if bkey is None:
+                return
+            self._exhausted_buckets.append(bkey)
+            if len(self._exhausted_buckets) > 200:
+                self._exhausted_buckets = self._exhausted_buckets[-100:]
+
     @staticmethod
     def _bucket_hit(cand, key):
         """Same RF bucket (exact per-frame tolerances) — OR a same-slope
@@ -7864,6 +7888,8 @@ while True:
         in the same RF bucket (or a same-slope alias bucket) as `fpath`."""
         return self._inflight_bucket_key(fpath) is not None
 
+    _PARK_STRONGER_DB = 6.0
+
     def _park_sibling(self, job, prio, slow_token):
         """Park `job` behind the in-flight sibling covering its bucket instead
         of holding a worker.  Returns True when parked (the caller moves on).
@@ -7878,6 +7904,13 @@ while True:
         if key is None:
             return False
         bk = self._fname_bucket.get(fpath)
+        # A sibling clearly STRONGER than the job in flight decodes alongside
+        # it: the first copy of a frame to arrive can be a receiver image 60 dB
+        # down that takes 16 s to fail, and parking the real copy behind it
+        # cost a live message 11 s (2026-11-03, ladder 24: 7 of 31 parks).
+        if (bk is not None and len(bk) >= 7 and len(key) >= 7
+                and bk[6] - key[6] > self._PARK_STRONGER_DB):
+            return False
         sf = bk[4] if (bk is not None and len(bk) >= 6) else 12
         deadline = time.time() + max(
             2.0,
@@ -7897,6 +7930,13 @@ while True:
                 self._rawlog('SKIP-PARKED', f"{fname} sibling verified")
                 if relay_after is None and relay_before is None:
                     self._early_covered_by_sibling(fpath)
+                    self._plain_done(fpath)
+                self._ref_dec_and_maybe_unlink(fpath)
+                continue
+            if self._bucket_exhausted(fpath):
+                self._rawlog('SKIP-PARKED', f"{fname} sibling exhausted: {self._EXHAUSTED_WHY}")
+                if relay_after is None and relay_before is None:
+                    self._early_exhausted_by_sibling(fpath)
                     self._plain_done(fpath)
                 self._ref_dec_and_maybe_unlink(fpath)
                 continue
@@ -8136,6 +8176,15 @@ while True:
                 self._early_verified.add(_rf[1])
                 self._verified_fnames[os.path.basename(fpath)] = time.monotonic()
 
+    def _early_exhausted_by_sibling(self, fpath):
+        """An early crop skipped because a same-bucket sibling already read
+        this frame's header and failed every retry: its own held full crop is
+        retired through the exhausted path, never marked verified."""
+        with self._iso_lock:
+            _rf = self._fpath_frame.get(fpath)
+            if _rf is not None and _rf[0] == 'early' and _rf[1] not in self._early_verified:
+                self._early_exhausted.add(_rf[1])
+
     def _skip_full(self, fpath):
         """A full crop skipped for its verified early sibling: the file counts
         as verified (its iso twin skips too) and its plain job leaves."""
@@ -8166,6 +8215,13 @@ while True:
         `early_exhausted` (see _early_exhausted_outcome) lets a failed early
         crop retire its full sibling instead of releasing it."""
         full_batches = []
+        if early_exhausted:
+            with self._iso_lock:
+                _rf0 = self._fpath_frame.get(fpath)
+                _mark = (_rf0 is not None and _rf0[0] == 'early'
+                         and _rf0[1] not in self._early_verified)
+            if _mark:
+                self._mark_bucket_exhausted(fpath)
         with self._iso_lock:
             n = self._plain_open.get(fpath, 0) - 1
             _rf = self._fpath_frame.get(fpath)
