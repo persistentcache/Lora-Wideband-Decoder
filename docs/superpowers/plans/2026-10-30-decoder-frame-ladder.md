@@ -340,7 +340,10 @@ pool is exercised by replays and live runs:
   packets, 50 -> 33 jobs, 421 -> 266 s, latencies within 0.4 s; capped
   10 Msps identical packets, zero loss, latencies within the capped host's
   run-to-run spread (main alone gave 40.5/46.0/61.1 s on the junk recording
-  across three runs); live ladder 13/13, every message from its first
+  across three runs; three further paired repeats of junk and SF10 at 10 Msps
+  came out 31.6/46.1/31.7 against 40.1/37.9/33.7 s and 29.3/28.4/22.2 against
+  28.3/29.2/27.6 s, equal within that spread with fewer jobs); live ladder
+  13/13, every message from its first
   transmission, 1.66/2.85/5.19 s min/median/max, 64 jobs totalling 120 s
   against main's 102 jobs and 279 s the same evening, RSS 7.6 GiB, zero
   full-crop releases, zero parked releases.
