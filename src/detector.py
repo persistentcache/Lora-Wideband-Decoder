@@ -9029,6 +9029,15 @@ while True:
             if in_result and s.startswith('CRC:'):
                 crc_line = s
                 in_result = False
+            elif (s.startswith('CRC:') and ' OK' in s
+                    and crc_line is not None and 'FAIL' in crc_line):
+                # The first RESULT failed its CRC and a later pass of the SAME
+                # attempt (early recentre, frac-park rescue) then read the frame
+                # clean: the clean read is the verdict.  Keeping the FAIL here
+                # skipped _note_verified for a published packet, so the pool
+                # released the frame's held full crop and parked siblings to
+                # decode it again (live 2026-11-03: two per ladder, 3-8 s each).
+                crc_line = s
             # Protocol line (falls between RESULT and packet block)
             if s.startswith('Protocol:'):
                 protocol_line = s

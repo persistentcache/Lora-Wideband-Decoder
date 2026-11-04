@@ -345,3 +345,36 @@ def test_a_verified_early_is_never_marked_exhausted(dec, tmp_path):
     dec._plain_done(job[0], early_exhausted=True)          # a stale flag cannot demote a verified frame
     assert 39 in dec._early_verified and 39 not in dec._early_exhausted
 
+
+RECENTRE_RESCUE = (
+    'Found 4 preamble candidates:\n'
+    '  Header: PL=60 CR=4/8 CRC=yes HDR_CHK=OK  nibs=[3, 12]\n'
+    '  === RESULT ===\n'
+    '  Payload (60 bytes): ffffffffe0956aba6214af3f\n'
+    '  CRC: FAIL FAIL\n'
+    '  Protocol: Unknown(0x0B) (sync=0x0B)\n'
+    '  === early recenter by -3296 Hz ===\n'
+    '  Header: PL=60 CR=4/8 CRC=yes HDR_CHK=OK  nibs=[3, 12]\n'
+    '  === SOFT PAYLOAD DECODE ===\n'
+    '  CRC: xor-CCITT-LE OK\n'
+    '  Meshtastic header: dst=ffffffff src=ba6a95e0\n'
+    '  --- Meshtastic Packet ---\n'
+    '  From: !ba6a95e0  To: broadcast\n'
+    '  PacketID: 0xddab1462  Flags: 0x21 (hop_limit=1 hop_start=1 hops_taken=0)\n'
+    '  Message: "LWDFIX28-28D1 0012 CUSTOM_SF12_500_CR8"\n\n')
+
+
+def test_a_clean_crc_after_a_failed_first_result_still_verifies_the_early(dec, tmp_path):
+    """Live 2026-11-03 message 12: the first RESULT failed its CRC, the early
+    recentre pass then read the frame clean and published it, yet the pool
+    released the held full crop because the parser kept the first verdict."""
+    early, full = early_full(tmp_path)
+    dec.submit(str(early), early.name, role='early', frame_key=39)
+    dec.submit(str(full), full.name, role='shared_full', frame_key=39)
+    _, _, job = dec._queue.get_nowait()
+    dec._compact(RECENTRE_RESCUE, early.name, role='early')
+    assert 39 in dec._early_verified
+    dec._plain_done(job[0])
+    dec._ref_dec_and_maybe_unlink(job[0])
+    assert dec._queue.empty() and dec.pending() == 0 and not full.exists()   # FULL-SKIP, not release
+
