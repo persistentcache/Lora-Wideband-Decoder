@@ -24,7 +24,7 @@ def mesh(identifier):
             f'PacketID: {identifier} Flags: 0x00 (hop_limit=0 hop_start=0 hops_taken=0)\n\n')
 
 
-@pytest.mark.parametrize('role',['early','shared_full','shared_partial','continuation'])
+@pytest.mark.parametrize('role',['shared_full','shared_partial','continuation'])
 def test_role_never_registers_waits_or_marks_whole_window(dec,tmp_path,role):
     bucket=(915e6,100.,12,62500)
     legacy=tmp_path/'legacy.cf32'; legacy.write_bytes(b'iq')
@@ -41,6 +41,31 @@ def test_role_never_registers_waits_or_marks_whole_window(dec,tmp_path,role):
     assert dec._decoded_buckets==before
     dec._clear_bucket_inflight(str(path))
     assert dec._is_bucket_inflight(str(legacy))
+
+
+def test_early_crop_is_one_frame_and_keeps_its_bucket(dec,tmp_path):
+    """An early crop is planned from its own decoded header, so unlike the
+    multi-frame shared views it owns exactly one frame's RF bucket: it waits
+    behind a same-bucket job in flight, skips once that bucket verified, and
+    its own verified decode covers the bucket for its KEEP-2 / sibling-peak
+    copies (live 2026-11-03: 78 early copies of already-published frames)."""
+    bucket=(915e6,100.,60e3,0.1,12,62500)
+    legacy=tmp_path/'legacy.cf32'; legacy.write_bytes(b'iq')
+    dec.submit(str(legacy),legacy.name,bucket_key=bucket)
+    dec._mark_bucket_inflight(str(legacy))
+    early=tmp_path/'early.cf32'; early.write_bytes(b'iq')
+    dec.submit(str(early),early.name,bucket_key=(915.0003e6,100.01,60e3,0.1,12,62500),role='early')
+    assert dec._is_bucket_inflight(str(early))             # a same-frame job is decoding
+    dec._mark_bucket_decoded(legacy.name)
+    assert dec._bucket_already_decoded(str(early))         # ... and once verified, the early skips
+    other=tmp_path/'early2.cf32'; other.write_bytes(b'iq')
+    dec.submit(str(other),other.name,bucket_key=(915e6,130.,60e3,0.1,12,62500),role='early')
+    before=list(dec._decoded_buckets)
+    dec._compact(mesh('0x12345678'),other.name,role='early')   # a verified early marks its own bucket
+    assert len(dec._decoded_buckets)==len(before)+1
+    later=tmp_path/'later.cf32'; later.write_bytes(b'iq')
+    dec.submit(str(later),later.name,bucket_key=(915e6,131.,60e3,0.1,12,62500))
+    assert not dec._bucket_already_decoded(str(later))     # a frame 1 s later is its own bucket
 
 
 def test_default_bucket_admission_remains_unchanged(dec,tmp_path):
@@ -104,7 +129,11 @@ for line in sys.stdin:
         with pytest.raises(StopManager):dec._manager()
         assert ('meshtastic','0x22222222') in dec._decoded_keys
         assert dec.decoded_counts()[1]==(2 if early=='success' else 1)
-        assert not dec._decoded_buckets and not dec._fname_bucket
+        # The early crop owns its frame's bucket (one bucket at most, marked only
+        # when it verified); the shared views still register none and nothing
+        # was skipped: the second frame in the full view always decodes.
+        assert len(dec._decoded_buckets)==(1 if early=='success' else 0)
+        assert set(dec._fname_bucket)<={str(paths[0])}
         assert not any(row[0]=='SKIP-BUCKET' for row in raw)
         assert dec.pending()==0 and not dec._refs
         assert not dec._capture_roles

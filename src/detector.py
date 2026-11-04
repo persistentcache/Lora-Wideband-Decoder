@@ -6763,7 +6763,19 @@ class SignalRecorder:
                         # dedup can recognise same-slope ALIAS labels of an
                         # admitted packet (see BackgroundDecoder._bucket_hit).
                         _bkey = (_cand_freq, _abs_t_s, _ftol, _dt_win,
-                                 int(d['sf']), float(d['bw']))
+                                 int(d['sf']), float(d['bw']),
+                                 float(d.get('peak_power_db', 0.0) or 0.0))
+                        # An early crop is one frame at a header-exact instant,
+                        # so its bucket always uses the per-frame airtime window:
+                        # never the 1.5 s forced-dechirp cooldown, which on a
+                        # channelised carrier would make a different packet a
+                        # second later look like a copy of the one just decoded.
+                        _bkey_early = (_cand_freq, _abs_t_s, _ftol,
+                                       max(0.03, 24.0 * (2 ** int(d['sf'])) / float(d['bw'])),
+                                       int(d['sf']), float(d['bw']),
+                                       float(d.get('peak_power_db', 0.0) or 0.0))
+                        if _capture_role == 'early':
+                            _bkey = _bkey_early
                         # TRIAL LABEL LADDER (2026-07-16, defect-2 companion):
                         # the decoder locks SF/BW from the capture FILENAME —
                         # it can relabel SF at the same BW (WRONG_SF retry)
@@ -7017,6 +7029,10 @@ class BackgroundDecoder:
         # so it's proven not to merge hop0/hop1.
         self._fname_bucket = {}          # fpath -> bucket_key tuple
         self._decoded_buckets = []       # list of bucket_key tuples (admitted)
+        # Buckets whose early crop read the header and failed every retry:
+        # parked copies of that instant skip instead of failing the same way
+        # (ladder 24: three copies of one corrupted SF12/62.5k frame, 98 s).
+        self._exhausted_buckets = []
         self._inflight_buckets = {}      # bucket_key -> dispatch_timestamp
         self._bucket_lock = threading.Lock()
         # ISO-HOLD (2026-10-31).  The time-isolated twin of a fast-SF primary
@@ -7065,6 +7081,14 @@ class BackgroundDecoder:
         # an early that never arrives releases it after _EARLY_EXPECT_S.
         self._early_expected = {}
         self._early_verified = set()     # frame keys whose early crop verified
+        # Frame keys whose early crop read the header and then failed the
+        # payload after every retry WITHOUT running out of budget.  The early
+        # crop is planned from that very header to end at the frame's end
+        # (header_capture_controller abstains rather than clip), so its full
+        # sibling holds the same frame samples: decoding them again cannot
+        # succeed.  Live runs 2026-10-31..11-03: 21 full crops released after
+        # such an early crop, 0 recovered a packet, 686 s of decode spent.
+        self._early_exhausted = set()
         self._full_hold = {}             # frame_key -> [(job, slow, prio), ...]
         self._full_hold_since = {}       # frame_key -> monotonic of first hold
         # Host-adaptive sibling wait (Pi 5, 2026-10-26): the in-flight wait
@@ -7761,6 +7785,24 @@ while True:
                     return True
         return False
 
+    def _bucket_exhausted(self, fpath):
+        """Has a capture in this RF bucket already read the frame's header and
+        failed its payload after every retry (see _early_exhausted_outcome)?"""
+        with self._bucket_lock:
+            bkey = self._fname_bucket.get(fpath)
+            if bkey is None:
+                return False
+            return any(self._bucket_hit(bkey, key) for key in self._exhausted_buckets)
+
+    def _mark_bucket_exhausted(self, fpath):
+        with self._bucket_lock:
+            bkey = self._fname_bucket.get(fpath)
+            if bkey is None:
+                return
+            self._exhausted_buckets.append(bkey)
+            if len(self._exhausted_buckets) > 200:
+                self._exhausted_buckets = self._exhausted_buckets[-100:]
+
     @staticmethod
     def _bucket_hit(cand, key):
         """Same RF bucket (exact per-frame tolerances) — OR a same-slope
@@ -7846,6 +7888,8 @@ while True:
         in the same RF bucket (or a same-slope alias bucket) as `fpath`."""
         return self._inflight_bucket_key(fpath) is not None
 
+    _PARK_STRONGER_DB = 6.0
+
     def _park_sibling(self, job, prio, slow_token):
         """Park `job` behind the in-flight sibling covering its bucket instead
         of holding a worker.  Returns True when parked (the caller moves on).
@@ -7860,6 +7904,13 @@ while True:
         if key is None:
             return False
         bk = self._fname_bucket.get(fpath)
+        # A sibling clearly STRONGER than the job in flight decodes alongside
+        # it: the first copy of a frame to arrive can be a receiver image 60 dB
+        # down that takes 16 s to fail, and parking the real copy behind it
+        # cost a live message 11 s (2026-11-03, ladder 24: 7 of 31 parks).
+        if (bk is not None and len(bk) >= 7 and len(key) >= 7
+                and bk[6] - key[6] > self._PARK_STRONGER_DB):
+            return False
         sf = bk[4] if (bk is not None and len(bk) >= 6) else 12
         deadline = time.time() + max(
             2.0,
@@ -7878,6 +7929,14 @@ while True:
             if self._bucket_already_decoded(fpath):
                 self._rawlog('SKIP-PARKED', f"{fname} sibling verified")
                 if relay_after is None and relay_before is None:
+                    self._early_covered_by_sibling(fpath)
+                    self._plain_done(fpath)
+                self._ref_dec_and_maybe_unlink(fpath)
+                continue
+            if self._bucket_exhausted(fpath):
+                self._rawlog('SKIP-PARKED', f"{fname} sibling exhausted: {self._EXHAUSTED_WHY}")
+                if relay_after is None and relay_before is None:
+                    self._early_exhausted_by_sibling(fpath)
                     self._plain_done(fpath)
                 self._ref_dec_and_maybe_unlink(fpath)
                 continue
@@ -7960,8 +8019,15 @@ while True:
         relay_before_syms: blank from symbol N onward   → find hop BEFORE primary.
         bucket_key:        (cand_freq_hz, abs_t_s) for Phase-2 cross-worker
                            bucket dedup; None disables the dedup for this job.
-        role:              early/shared_full/shared_partial/continuation views search all
+        role:              shared_full/shared_partial/continuation views search all
                            their frames; they never consume whole-window buckets.
+                           An early crop is ONE frame planned from its decoded
+                           header, so it keeps its bucket like a default capture:
+                           a same-frame sibling (the gate labels one burst at
+                           carriers a few hundred Hz apart, two header checkpoints
+                           follow) parks behind the one in flight and skips once
+                           it verifies, instead of decoding the same frame twice
+                           (live 2026-11-03: 78 such early jobs, 93 s, none new).
         """
         if role not in ('default', 'early', 'shared_full', 'shared_partial', 'continuation'):
             raise ValueError('unknown capture role')
@@ -7974,7 +8040,7 @@ while True:
             self._capture_roles[fpath] = role
             self._refs[fpath] = self._refs.get(fpath, 0) + 1
 
-        if role != 'default':
+        if role not in ('default', 'early'):
             bucket_key = None
             with self._bucket_lock:
                 self._fname_bucket.pop(fpath, None)
@@ -8019,6 +8085,8 @@ while True:
                 with self._iso_lock:
                     if frame_key in self._early_verified:
                         _full_action = 'skip'
+                    elif frame_key in self._early_exhausted:
+                        _full_action = 'skip-dud'
                     elif (self._early_open.get(frame_key, 0) > 0
                           or (frame_key in self._early_expected
                               and time.monotonic() - self._early_expected[frame_key]
@@ -8030,6 +8098,10 @@ while True:
                         _full_action = 'run'
                 if _full_action == 'skip':
                     self._rawlog('FULL-SKIP', f"{fname} early crop already verified")
+                    self._skip_full(fpath)
+                    return
+                if _full_action == 'skip-dud':
+                    self._rawlog('FULL-SKIP', f"{fname} {self._EXHAUSTED_WHY}")
                     self._skip_full(fpath)
                     return
                 if _full_action == 'hold':
@@ -8092,6 +8164,27 @@ while True:
                     if len(self._early_verified) > 4000:
                         self._early_verified = set(list(self._early_verified)[-2000:])
 
+    def _early_covered_by_sibling(self, fpath):
+        """An early crop skipped because a same-bucket sibling already
+        published its frame counts as verified for its own full sibling:
+        otherwise the held full crop would be released and decode the frame
+        a second time (emulated SF10 2026-11-03: PARK -> SKIP-PARKED early,
+        then a 4 s FULL-RELEASE decode of the same frame)."""
+        with self._iso_lock:
+            _rf = self._fpath_frame.get(fpath)
+            if _rf is not None and _rf[0] == 'early':
+                self._early_verified.add(_rf[1])
+                self._verified_fnames[os.path.basename(fpath)] = time.monotonic()
+
+    def _early_exhausted_by_sibling(self, fpath):
+        """An early crop skipped because a same-bucket sibling already read
+        this frame's header and failed every retry: its own held full crop is
+        retired through the exhausted path, never marked verified."""
+        with self._iso_lock:
+            _rf = self._fpath_frame.get(fpath)
+            if _rf is not None and _rf[0] == 'early' and _rf[1] not in self._early_verified:
+                self._early_exhausted.add(_rf[1])
+
     def _skip_full(self, fpath):
         """A full crop skipped for its verified early sibling: the file counts
         as verified (its iso twin skips too) and its plain job leaves."""
@@ -8100,15 +8193,43 @@ while True:
         self._plain_done(fpath)
         self._ref_dec_and_maybe_unlink(fpath)
 
-    def _plain_done(self, fpath):
+    _EXHAUSTED_WHY = ('early crop covered the frame: header read, payload failed '
+                      'after every retry')
+
+    @staticmethod
+    def _early_exhausted_outcome(output, timed_out):
+        """True when a finished early-crop job proves its full sibling futile:
+        the explicit header was read (so the crop spans the whole frame), no
+        packet came out, and the decoder stopped on its own rather than on
+        the budget, a wall timeout or an error."""
+        if not output or timed_out:
+            return False
+        if '[PKT]' in output or '[BUDGET]' in output or 'ERROR' in output:
+            return False
+        return 'HDR_CHK=OK' in output
+
+    def _plain_done(self, fpath, early_exhausted=False):
         """A plain job on `fpath` left the system (finished, skipped, dropped):
         when it was the last one, its held iso twins are skipped or released,
-        and when it was an early crop, its held full siblings likewise."""
+        and when it was an early crop, its held full siblings likewise.
+        `early_exhausted` (see _early_exhausted_outcome) lets a failed early
+        crop retire its full sibling instead of releasing it."""
         full_batches = []
+        if early_exhausted:
+            with self._iso_lock:
+                _rf0 = self._fpath_frame.get(fpath)
+                _mark = (_rf0 is not None and _rf0[0] == 'early'
+                         and _rf0[1] not in self._early_verified)
+            if _mark:
+                self._mark_bucket_exhausted(fpath)
         with self._iso_lock:
             n = self._plain_open.get(fpath, 0) - 1
             _rf = self._fpath_frame.get(fpath)
             if _rf is not None and _rf[0] == 'early':
+                if early_exhausted and _rf[1] not in self._early_verified:
+                    self._early_exhausted.add(_rf[1])
+                    if len(self._early_exhausted) > 4000:
+                        self._early_exhausted = set(list(self._early_exhausted)[-2000:])
                 m = self._early_open.get(_rf[1], 0) - 1
                 if m > 0:
                     self._early_open[_rf[1]] = m
@@ -8117,7 +8238,8 @@ while True:
                     held_full = self._full_hold.pop(_rf[1], [])
                     self._full_hold_since.pop(_rf[1], None)
                     if held_full:
-                        full_batches.append((held_full, _rf[1] in self._early_verified))
+                        full_batches.append((held_full, _rf[1] in self._early_verified,
+                                             _rf[1] in self._early_exhausted))
             if n > 0:
                 self._plain_open[fpath] = n
                 held, verified = [], False
@@ -8128,13 +8250,17 @@ while True:
                 self._iso_hold_since.pop(fpath, None)
                 verified = os.path.basename(fpath) in self._verified_fnames
         self._dispose_held(held, verified)
-        for held_full, early_verified in full_batches:
-            self._dispose_held_full(held_full, early_verified)
+        for held_full, early_verified, early_exhausted in full_batches:
+            self._dispose_held_full(held_full, early_verified, early_exhausted)
 
-    def _dispose_held_full(self, held, early_verified):
+    def _dispose_held_full(self, held, early_verified, early_exhausted=False):
         for job, slow, prio in held:
             if early_verified:
                 self._rawlog('FULL-SKIP', f"{job[1]} early crop verified")
+                self._skip_full(job[0])
+                continue
+            if early_exhausted:
+                self._rawlog('FULL-SKIP', f"{job[1]} {self._EXHAUSTED_WHY}")
                 self._skip_full(job[0])
                 continue
             self._rawlog('FULL-RELEASE', job[1])
@@ -8180,13 +8306,14 @@ while True:
                 self._early_expected.pop(k, None)
             full_batches = []
             for k in stale_full:
-                full_batches.append((self._full_hold.pop(k, []), k in self._early_verified))
+                full_batches.append((self._full_hold.pop(k, []), k in self._early_verified,
+                                     k in self._early_exhausted))
                 self._full_hold_since.pop(k, None)
                 self._early_open.pop(k, None)
         for held, verified in batches:
             self._dispose_held(held, verified)
-        for held, early_verified in full_batches:
-            self._dispose_held_full(held, early_verified)
+        for held, early_verified, early_exhausted in full_batches:
+            self._dispose_held_full(held, early_verified, early_exhausted)
 
     def pending(self):
         with self._lock:
@@ -8510,6 +8637,7 @@ while True:
                 if self._bucket_already_decoded(fpath):
                     self._rawlog('SKIP-BUCKET', os.path.basename(fpath))
                     if relay_after_syms is None and relay_before_syms is None:
+                        self._early_covered_by_sibling(fpath)
                         self._plain_done(fpath)
                     self._ref_dec_and_maybe_unlink(fpath)
                     if _slow_token is not None:
@@ -8571,6 +8699,7 @@ while True:
                 # so it can never leak and permanently disable the drain.
                 self._slow_retire(_slow_token)
                 raise
+            output, timed_out = '', False   # defined even when the protocol fails before a result
             try:
                 # Send file path, search mode, and per-job budget to worker.
                 # Format: "<fpath>\t<mode>\t<budget>\n"
@@ -8803,7 +8932,8 @@ while True:
                     except Exception:
                         pass
                 if relay_after_syms is None and relay_before_syms is None:
-                    self._plain_done(fpath)
+                    self._plain_done(fpath, early_exhausted=self._early_exhausted_outcome(
+                        output, timed_out))
                 with self._lock:
                     self._active_count -= 1
                 if _slow_token is not None:
@@ -8873,14 +9003,14 @@ while True:
                 if sec.strip():
                     r = self._compact_single(sec, fname, elapsed,
                                               _is_relay, _is_pre, _is_secondary,
-                                              admit_bucket=role == 'default')
+                                              admit_bucket=role in ('default', 'early'))
                     if r:
                         results.append(r)
             return ''.join(results)
 
         return self._compact_single(output, fname, elapsed,
                                      _is_relay, _is_pre, _is_secondary,
-                                     admit_bucket=role == 'default')
+                                     admit_bucket=role in ('default', 'early'))
 
     def _compact_single(self, output, fname, elapsed,
                          _is_relay, _is_pre, _is_secondary, *, admit_bucket=True):
@@ -8955,6 +9085,15 @@ while True:
             if in_result and s.startswith('CRC:'):
                 crc_line = s
                 in_result = False
+            elif (s.startswith('CRC:') and ' OK' in s
+                    and crc_line is not None and 'FAIL' in crc_line):
+                # The first RESULT failed its CRC and a later pass of the SAME
+                # attempt (early recentre, frac-park rescue) then read the frame
+                # clean: the clean read is the verdict.  Keeping the FAIL here
+                # skipped _note_verified for a published packet, so the pool
+                # released the frame's held full crop and parked siblings to
+                # decode it again (live 2026-11-03: two per ladder, 3-8 s each).
+                crc_line = s
             # Protocol line (falls between RESULT and packet block)
             if s.startswith('Protocol:'):
                 protocol_line = s

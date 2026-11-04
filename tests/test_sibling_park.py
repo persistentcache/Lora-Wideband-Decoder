@@ -128,3 +128,98 @@ def test_drain_releases_every_parked_sibling(dec, tmp_path):
     dec._flush_stale_parks(force=True)
     assert dec._queue.get_nowait()[2] is job2
     assert not dec._sib_park
+
+
+def test_early_crop_sibling_parks_behind_its_twin_and_skips_once_it_verifies(dec, tmp_path):
+    """Two early crops of ONE frame (the gate labelled the burst at carriers a
+    few hundred Hz apart; two header checkpoints followed) decode once."""
+    first = capture(tmp_path, 'a_early_1.cf32', (915.0163e6, 100.0, 60e3, 0.1, 12, 62.5e3), dec,
+                    role='early', frame_key=1)
+    copy = capture(tmp_path, 'a_early_2.cf32', (915.0166e6, 100.01, 60e3, 0.1, 12, 62.5e3), dec,
+                   role='early', frame_key=2)
+    _, job1 = take(dec)
+    dec._mark_bucket_inflight(job1[0])
+    prio2, job2 = take(dec)
+    assert dec._park_sibling(job2, prio2, None)
+    assert dec._queue.empty() and dec.pending() == 1 and copy.exists()
+    dec._compact(mesh('0x12345678'), first.name, role='early')
+    dec._clear_bucket_inflight(job1[0])
+    assert dec._queue.empty() and dec._slow_queue.empty()
+    assert not copy.exists() and dec.pending() == 0
+
+
+def test_early_crop_sibling_is_released_when_its_twin_fails(dec, tmp_path):
+    first = capture(tmp_path, 'b_early_1.cf32', (915.0163e6, 100.0, 60e3, 0.1, 12, 62.5e3), dec,
+                    role='early', frame_key=1)
+    copy = capture(tmp_path, 'b_early_2.cf32', (915.0166e6, 100.01, 60e3, 0.1, 12, 62.5e3), dec,
+                   role='early', frame_key=2)
+    _, job1 = take(dec)
+    dec._mark_bucket_inflight(job1[0])
+    prio2, job2 = take(dec)
+    assert dec._park_sibling(job2, prio2, None)
+    dec._clear_bucket_inflight(job1[0])                # nothing verified: the copy gets its turn
+    _, _, released = dec._queue.get_nowait()
+    assert released is job2 and copy.exists()
+
+
+def test_a_skipped_early_crop_also_retires_its_held_full_sibling(dec, tmp_path):
+    """Early A verifies; early B of the same frame is skipped as a parked
+    sibling.  B's held full crop must be skipped as well, not released."""
+    a = capture(tmp_path, 'c_early_1.cf32', (915.0163e6, 100.0, 60e3, 0.1, 12, 62.5e3), dec,
+                role='early', frame_key=1)
+    b = capture(tmp_path, 'c_early_2.cf32', (915.0166e6, 100.01, 60e3, 0.1, 12, 62.5e3), dec,
+                role='early', frame_key=2)
+    full_b = tmp_path / 'c_full_2.cf32'; full_b.write_bytes(b'iq')
+    dec.submit(str(full_b), full_b.name, role='shared_full', frame_key=2)   # waits for early B
+    _, job_a = take(dec)
+    dec._mark_bucket_inflight(job_a[0])
+    prio_b, job_b = take(dec)
+    assert dec._park_sibling(job_b, prio_b, None)
+    assert dec._queue.empty() and dec.pending() == 2                      # B parked, full B held
+    dec._compact(mesh('0x12345678'), a.name, role='early')
+    dec._clear_bucket_inflight(job_a[0])                                  # A done: B skipped ...
+    assert dec._queue.empty() and dec._slow_queue.empty()
+    assert not b.exists() and not full_b.exists()                         # ... and so is full B
+    assert dec.pending() == 0 and not dec._full_hold
+
+
+def test_a_clearly_stronger_sibling_is_not_parked(dec, tmp_path):
+    """Ladder 24, message 11: a 3 dB receiver image arrived first and took
+    16 s to fail; the 64 dB real copy must decode alongside it, not wait."""
+    weak = capture(tmp_path, 'w_early_1.cf32', (914.9874e6, 100.0, 60e3, 0.1, 12, 500e3, 3.0), dec,
+                   role='early', frame_key=1)
+    strong = capture(tmp_path, 'w_early_2.cf32', (914.9874e6, 100.01, 60e3, 0.1, 12, 500e3, 64.0), dec,
+                     role='early', frame_key=2)
+    _, job1 = take(dec)
+    dec._mark_bucket_inflight(job1[0])
+    prio2, job2 = take(dec)
+    assert dec._is_bucket_inflight(job2[0])
+    assert not dec._park_sibling(job2, prio2, None)          # runs now
+    # ... while an equal or weaker sibling still parks.
+    equal = capture(tmp_path, 'w_early_3.cf32', (914.9874e6, 100.02, 60e3, 0.1, 12, 500e3, 5.0), dec,
+                    role='early', frame_key=3)
+    prio3, job3 = take(dec)
+    assert dec._park_sibling(job3, prio3, None)
+
+
+def test_parked_copies_of_an_exhausted_frame_skip_and_retire_their_fulls(dec, tmp_path):
+    """Ladder 24: three early crops of one corrupted SF12/62.5k frame; the
+    first read the header and failed every retry (35 s), then the two parked
+    copies were released and failed the same way (27 s + 35 s)."""
+    from test_iso_hold import DUD
+    a = capture(tmp_path, 'x_early_1.cf32', (915.0164e6, 100.0, 60e3, 0.1, 12, 62.5e3, 20.0), dec,
+                role='early', frame_key=1)
+    b = capture(tmp_path, 'x_early_2.cf32', (915.0168e6, 100.01, 60e3, 0.1, 12, 62.5e3, 20.0), dec,
+                role='early', frame_key=2)
+    full_b = tmp_path / 'x_full_2.cf32'; full_b.write_bytes(b'iq')
+    dec.submit(str(full_b), full_b.name, role='shared_full', frame_key=2)
+    _, job_a = take(dec)
+    dec._mark_bucket_inflight(job_a[0])
+    prio_b, job_b = take(dec)
+    assert dec._park_sibling(job_b, prio_b, None)
+    dec._plain_done(job_a[0], early_exhausted=dec._early_exhausted_outcome(DUD, False))
+    dec._clear_bucket_inflight(job_a[0])
+    assert dec._queue.empty() and dec._slow_queue.empty()
+    assert not b.exists() and not full_b.exists() and dec.pending() == 0
+    assert 2 in dec._early_exhausted and 2 not in dec._early_verified
+

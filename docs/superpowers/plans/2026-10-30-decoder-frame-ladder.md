@@ -260,7 +260,97 @@ The merge gate itself (evidence under `Desktop/LoRa-Merge-Gate-20261102/`,
   message: 1.58/2.74/3.65 s (publication 1.27/2.73/3.47 s), 114 jobs totalling 307 s,
   no worker errors, dec_q max 5, RSS max 9.9 GiB, CRC audit 20/20.
 
+## Round 2: the decode pool stops decoding the same frame twice (b11eecb .. fb3a2a8)
+
+After v3.0 the last live ladder still spent 307 s of decode on 13 messages:
+114 jobs, of which 83 published a packet the pool had already published and
+two spent 52 s and 44 s on one SF12/62.5k frame whose payload never passed
+its CRC.  Five pool changes, each from a measured pattern:
+
+- **A failed early crop retires its full sibling (b11eecb).**  Across every
+  live run since 2026-10-31, 21 full crops were released after their early
+  crop had read the header and failed every retry; none recovered a packet;
+  686 s of decode.  The early crop is planned from that header to end at the
+  frame's end, so its full sibling holds the same samples.  The pool now
+  classifies the finished early job (header read, no packet, not a budget
+  bail, timeout or error) and skips the full crop; budget bails, timeouts and
+  header-less early crops still release it.
+- **Early crops own their RF bucket (e754d13).**  In frame-exact capture every
+  capture is an early or shared view, and both roles were exempt from the RF
+  bucket dedup.  An early crop is one frame, so the exemption only cost: the
+  gate labels one burst at carriers a few hundred Hz apart, two header
+  checkpoints follow, and both early crops were decoded (78 such jobs in one
+  ladder).  Early crops now park behind a same-frame sibling in flight and skip
+  once it verified; shared views are unchanged.
+- **A skipped early crop retires its held full (b7a90b2)**, found in the first
+  emulation of e754d13: PARK then SKIP-PARKED early, then a 4 s FULL-RELEASE
+  of the same frame.
+- **An early crop's bucket uses the per-frame airtime window (f3c4812)**, never
+  the 1.5 s forced-dechirp cooldown, so a different packet a second later on a
+  channelised carrier can never be taken for a copy.
+- **A clean CRC after a failed first result is the verdict (fb3a2a8)**, found
+  in the ladder of f3c4812: message 12's early crop failed its first read,
+  the recentre pass decoded it clean and published it, but the admission
+  parser kept the first CRC line, skipped `_note_verified`, and the pool
+  released the held full crop and a parked sibling (two per ladder, 3-8 s).
+
+Validation (evidence under `Desktop/LoRa-PiEmul-20261031/*_dd3`, `*_10m_pi2`,
+`*_5m_pi2`, `sf10_*_5m_rep[123]`, live arms `ladder_live22_dedup4`,
+`ladder_live23_main`, `ladder_live24_dedup5`; `report_dedup.py` in the merge
+gate directory assembles it).  decoder.py is untouched, so the 197-recording
+corpus and the 80 impairment captures are identical by construction; the
+pool is exercised by replays and live runs:
+
+- Uncapped replay of the four wideband recordings, main vs f3c4812, two arms
+  concurrently: identical packet sets, identical publication latencies to
+  0.1 s, 44 -> 40 jobs.
+- Emulated four-core Pi at 1.6 GHz, three arms concurrently: at 10 Msps the
+  branch publishes every recording sooner than main (35.5/25.6/27.3/48.6 s
+  against 40.5/26.2/28.7/51.0 s), identical packets, zero loss, 1028 -> 821 s
+  of decode.  At 5 Msps three recordings are within a second and SF10/250k
+  looked 6 s slower in one run; three paired repeats gave 13.3/20.2/13.4 s
+  for the branch against 19.2/21.0/23.2 s for main, so that was host noise.
+- A first five-arm pass (two uncapped and three capped at once) overloaded
+  the laptop: the branch's capped SF12/250k arm died on a 12 s catch-up
+  discontinuity and its uncapped SF10 arm stalled 12 s at start-up and never
+  saw the first transmission.  Per-window detector profiling was identical
+  across arms, and every clean rerun above was unaffected; emulation arms
+  are run one set at a time from now on.
+- Live, same evening, USRP + Heltec, two detector workers: main 07d4655
+  decoded 13/13 with RF-end-to-decode 1.69/3.03/52.03 s min/median/max (its
+  first transmission of message 7 was never detected and the firmware's own
+  retransmission 46 s later was decoded; an acquisition miss of the kind
+  seen before, unrelated to the pool), 102 jobs, 279 s, RSS 10.9 GiB.  The
+  branch at f3c4812 decoded 13/13 at 1.61/2.62/6.37 s, 63 jobs, 246 s, RSS
+  7.7 GiB; message 12 at 6.37 s was the parser defect fixed in fb3a2a8.
+- The fb3a2a8 ladder decoded 13/13 but taught two more things.  Message 6
+  took 115 s: the gate saw nothing during its first transmission and the
+  firmware's retransmission was decoded, the same acquisition miss main had
+  on message 7 above (one per ladder tonight, either arm; next target, with
+  the gate ledger enabled in live runs).  Message 11 took 11 s and that one
+  was the parking rule: a 3 dB receiver image of the frame arrived first and
+  took 16 s to fail while the 64 dB real copy waited behind it (7 of 31 parks
+  that run put a clearly stronger crop behind a weaker one), and three early
+  crops of one corrupted frame each burned ~30 s because the parked copies
+  were released when the first failed.
+- **bcb42eb**: the bucket key carries the detection power and a sibling more
+  than 6 dB stronger than the job in flight decodes alongside it; an early
+  crop that exhausted its retries marks its bucket so parked copies skip and
+  their fulls retire.  Validation of bcb42eb: uncapped replay identical
+  packets, 50 -> 33 jobs, 421 -> 266 s, latencies within 0.4 s; capped
+  10 Msps identical packets, zero loss, latencies within the capped host's
+  run-to-run spread (main alone gave 40.5/46.0/61.1 s on the junk recording
+  across three runs; three further paired repeats of junk and SF10 at 10 Msps
+  came out 31.6/46.1/31.7 against 40.1/37.9/33.7 s and 29.3/28.4/22.2 against
+  28.3/29.2/27.6 s, equal within that spread with fewer jobs); live ladder
+  13/13, every message from its first
+  transmission, 1.66/2.85/5.19 s min/median/max, 64 jobs totalling 120 s
+  against main's 102 jobs and 279 s the same evening, RSS 7.6 GiB, zero
+  full-crop releases, zero parked releases.
+
 ## Ledger
+
+2026-11-03 (round 2, perf/decode-dedup, final bcb42eb): see the section above; evidence `report_dedup.py` output in `Desktop/LoRa-Merge-Gate-20261102/round2_report.txt`.
 
 2026-11-03 (b52d20e + merge gate): early-expect hold; SF10/250k 5 Msps emulation 24.2 -> 13.2 s (old 14.3). Old-main live baseline `oldmain_live_20261103` (the `oldmain_live_20261102` attempt failed the harness receipt because `prepare.py` only pinned two detector workers when a profile was given; fixed in the harness) 10/13, misses the SF12/62.5k long frames; `ladder_live19_b52d20e` 13/13, 1.58-3.65 s. Full numbers in the section above and `Desktop/LoRa-Merge-Gate-20261102/merge_gate_report.txt`.
 
