@@ -1,4 +1,6 @@
-# LoRa Wideband Decoder
+# GHOSTWIRE
+### (Formerly: LoRa Wideband Decoder/LWD)
+<hr>
 
 **One SDR, the whole band, every LoRa conversation on it - live.**
 
